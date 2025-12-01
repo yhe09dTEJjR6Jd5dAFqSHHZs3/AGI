@@ -243,12 +243,16 @@ class AgentThread(threading.Thread):
                 exp_buffer.add(img_tensor.cpu(), mouse_tensor.cpu(), reward, td_error, screen_novelty)
 
                 pred_np = pred_mouse.cpu().numpy()[0]
-                dx_norm = pred_np[0] * 10 
-                dy_norm = pred_np[1] * 10
-                
-                try:
-                    pyautogui.move(dx_norm, dy_norm, _pause=False)
-                except: pass
+                dx_norm = float(pred_np[0] * 10)
+                dy_norm = float(pred_np[1] * 10)
+                dx = int(round(dx_norm))
+                dy = int(round(dy_norm))
+                if dx == 0 and abs(dx_norm) > 0.2: dx = 1 if dx_norm > 0 else -1
+                if dy == 0 and abs(dy_norm) > 0.2: dy = 1 if dy_norm > 0 else -1
+                if dx != 0 or dy != 0:
+                    try:
+                        pyautogui.moveRel(dx, -dy, _pause=False)
+                    except: pass
             
             except Exception:
                 pass
@@ -278,39 +282,52 @@ class SciFiWindow(QtWidgets.QWidget):
         self.move(frame.topLeft())
 
     def initUI(self):
-        layout = QtWidgets.QVBoxLayout()
+        outer = QtWidgets.QVBoxLayout()
+        outer.setContentsMargins(20, 20, 20, 20)
+        card = QtWidgets.QFrame()
+        card.setObjectName("card")
+        card_layout = QtWidgets.QVBoxLayout()
+        card_layout.setContentsMargins(30, 30, 30, 30)
+        card_layout.setSpacing(20)
         self.label = QtWidgets.QLabel("SYSTEM: ONLINE")
         self.label.setAlignment(QtCore.Qt.AlignCenter)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setValue(0)
-        self.progress.setTextVisible(False)
-        
+        self.progress.setTextVisible(True)
+        self.progress.setFormat("%p%")
         self.info_label = QtWidgets.QLabel("AI AGENT RUNNING...")
         self.info_label.setAlignment(QtCore.Qt.AlignCenter)
-
-        layout.addWidget(self.label)
-        layout.addStretch()
-        layout.addWidget(self.info_label)
-        layout.addWidget(self.progress)
-        self.setLayout(layout)
-
+        card_layout.addWidget(self.label)
+        card_layout.addStretch()
+        card_layout.addWidget(self.info_label)
+        card_layout.addWidget(self.progress)
+        card.setLayout(card_layout)
+        shadow = QtWidgets.QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(30)
+        shadow.setOffset(0, 0)
+        shadow.setColor(QtGui.QColor(0, 240, 255, 150))
+        card.setGraphicsEffect(shadow)
+        outer.addWidget(card)
+        self.setLayout(outer)
         style = """
-            QWidget {
-                background-color: #050a14;
+            #card {
+                background-color: qradialgradient(cx:0.5, cy:0.5, fx:0.5, fy:0.5, radius:1.0, stop:0 #0a1224, stop:1 #050a14);
                 border: 2px solid #00f0ff;
-                border-radius: 10px;
+                border-radius: 16px;
             }
             QLabel {
                 color: #00f0ff;
                 font-family: Consolas;
-                font-size: 16px;
+                font-size: 18px;
                 font-weight: bold;
                 border: none;
             }
             QProgressBar {
                 border: 1px solid #00f0ff;
-                background-color: #111;
-                height: 20px;
+                background-color: #0a0f1f;
+                height: 26px;
+                text-align: center;
+                color: #00f0ff;
             }
             QProgressBar::chunk {
                 background-color: #00f0ff;
