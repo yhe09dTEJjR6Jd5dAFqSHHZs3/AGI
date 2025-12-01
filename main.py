@@ -269,9 +269,9 @@ def get_mouse_state():
     left_btn = 0
     right_btn = 0
     try:
-        win32api = import_or_install("win32api")
-        if win32api.GetKeyState(0x01) < 0: left_btn = 1
-        if win32api.GetKeyState(0x02) < 0: right_btn = 1
+        if platform.system().lower().startswith("win"):
+            if ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000: left_btn = 1
+            if ctypes.windll.user32.GetAsyncKeyState(0x02) & 0x8000: right_btn = 1
     except Exception:
         pass
     status = 0
@@ -375,6 +375,7 @@ class AgentThread(threading.Thread):
         sct = mss.mss()
         criterion = nn.MSELoss()
         context_latents = deque(maxlen=12)
+        last_cache_clear = time.time()
         while global_running:
             if global_optimizing or global_pause_recording:
                 time.sleep(0.1)
@@ -424,6 +425,9 @@ class AgentThread(threading.Thread):
                 exp_buffer.add(img_tensor.cpu(), mouse_tensor.cpu(), reward, td_error, screen_novelty, latent.cpu())
                 pred_np = pred_mouse.cpu().numpy()[0]
                 move_mouse(float(pred_np[0]), float(pred_np[1]), float(pred_np[2]))
+                if device.type == "cuda" and time.time() - last_cache_clear > 30:
+                    torch.cuda.empty_cache()
+                    last_cache_clear = time.time()
             except Exception:
                 pass
             elapsed = time.time() - start_time
@@ -435,6 +439,7 @@ class SciFiWindow(QtWidgets.QWidget):
     finished_signal = QtCore.pyqtSignal()
     status_signal = QtCore.pyqtSignal(str)
     info_signal = QtCore.pyqtSignal(str)
+    progress_signal = QtCore.pyqtSignal(int)
 
     def __init__(self):
         super().__init__()
@@ -447,6 +452,7 @@ class SciFiWindow(QtWidgets.QWidget):
         self.finished_signal.connect(self.on_optimization_finished)
         self.status_signal.connect(self.label.setText)
         self.info_signal.connect(self.info_label.setText)
+        self.progress_signal.connect(self.progress.setValue)
 
     def center(self):
         frame = self.frameGeometry()
@@ -511,7 +517,7 @@ class SciFiWindow(QtWidgets.QWidget):
     def trigger_optimization(self):
         self.status_signal.emit("SYSTEM: OPTIMIZING")
         self.info_signal.emit("TRAINING NEURAL NETWORK...")
-        QtCore.QMetaObject.invokeMethod(self.progress, "setValue", QtCore.Q_ARG(int, 0))
+        self.progress_signal.emit(0)
         self.optimizer_signal.emit()
 
     def run_optimization(self):
@@ -574,7 +580,7 @@ class SciFiWindow(QtWidgets.QWidget):
                 scaler.step(optimizer)
                 scaler.update()
             progress_val = int((i + 1) / total_steps * 100)
-            QtCore.QMetaObject.invokeMethod(self.progress, "setValue", QtCore.Q_ARG(int, progress_val))
+            self.progress_signal.emit(progress_val)
             time.sleep(0.01)
         save_state()
         self.finished_signal.emit()
