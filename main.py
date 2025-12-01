@@ -3,6 +3,8 @@ import os
 import time
 import threading
 import pickle
+import shutil
+import glob
 import math
 import random
 import warnings
@@ -48,9 +50,12 @@ pyautogui.FAILSAFE = False
 
 DESKTOP_PATH = os.path.join(os.path.expanduser("~"), "Desktop")
 BASE_DIR = os.path.join(DESKTOP_PATH, "AAA")
+BUFFER_DIR = os.path.join(BASE_DIR, "experience_pool_chunks")
 
 if not os.path.exists(BASE_DIR):
     os.makedirs(BASE_DIR)
+if not os.path.exists(BUFFER_DIR):
+    os.makedirs(BUFFER_DIR)
 
 global_running = True
 global_optimizing = False
@@ -68,6 +73,8 @@ max_ram_gb = 16.0
 max_buffer_gb = 10.0
 standard_res = (128, 128)
 latent_pool = 4
+chunk_entry_limit = 512
+chunk_byte_limit = 256 * 1024 * 1024
 
 lock = threading.Lock()
 mouse_left_down = False
@@ -177,6 +184,21 @@ class ExperienceBuffer:
             total_bytes += self._sample_bytes(item)
         return total_bytes / (1024**3)
 
+    def load_chunks(self):
+        if not os.path.isdir(BUFFER_DIR):
+            return False
+        chunk_files = sorted(glob.glob(os.path.join(BUFFER_DIR, "chunk_*.pt")))
+        if not chunk_files:
+            return False
+        loaded = []
+        for path in chunk_files:
+            try:
+                loaded.extend(torch.load(path, map_location="cpu"))
+            except Exception:
+                continue
+        self.buffer = loaded
+        return True
+
     def enforce_limit(self):
         total_gb = self._buffer_size_gb()
         while total_gb > max_buffer_gb and len(self.buffer) > 0:
@@ -197,12 +219,28 @@ class ExperienceBuffer:
         return sequences
 
     def save(self):
-        path = os.path.join(BASE_DIR, "experience_pool.pkl")
-        try:
-            with open(path, "wb") as f:
-                pickle.dump(self.buffer, f)
-        except Exception:
-            pass
+        temp_dir = os.path.join(BUFFER_DIR, ".tmp")
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        os.makedirs(temp_dir)
+        chunk = []
+        chunk_bytes = 0
+        chunk_idx = 0
+        for entry in self.buffer:
+            entry_bytes = self._sample_bytes(entry)
+            if chunk and (chunk_bytes + entry_bytes > chunk_byte_limit or len(chunk) >= chunk_entry_limit):
+                torch.save(chunk, os.path.join(temp_dir, f"chunk_{chunk_idx}.pt"))
+                chunk_idx += 1
+                chunk = []
+                chunk_bytes = 0
+            chunk.append(entry)
+            chunk_bytes += entry_bytes
+        torch.save(chunk, os.path.join(temp_dir, f"chunk_{chunk_idx}.pt"))
+        for existing in glob.glob(os.path.join(BUFFER_DIR, "chunk_*.pt")):
+            os.remove(existing)
+        for fname in os.listdir(temp_dir):
+            os.replace(os.path.join(temp_dir, fname), os.path.join(BUFFER_DIR, fname))
+        shutil.rmtree(temp_dir)
 
 exp_buffer = ExperienceBuffer()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -214,6 +252,8 @@ scaler = GradScaler(enabled=device.type == "cuda")
 def ensure_files():
     if not os.path.exists(BASE_DIR):
         os.makedirs(BASE_DIR)
+    if not os.path.exists(BUFFER_DIR):
+        os.makedirs(BUFFER_DIR)
     buffer_path = os.path.join(BASE_DIR, "experience_pool.pkl")
     model_path = os.path.join(BASE_DIR, "ai_model.pth")
     action_path = os.path.join(BASE_DIR, "action_model.pth")
@@ -221,6 +261,9 @@ def ensure_files():
     if not os.path.exists(buffer_path):
         with open(buffer_path, "wb") as f:
             pickle.dump([], f)
+    chunk_files = glob.glob(os.path.join(BUFFER_DIR, "chunk_*.pt"))
+    if not chunk_files:
+        torch.save([], os.path.join(BUFFER_DIR, "chunk_0.pt"))
     if not os.path.exists(model_path):
         torch.save(ai_model.state_dict(), model_path)
     if not os.path.exists(action_path):
@@ -234,12 +277,17 @@ def load_state():
     model_path = os.path.join(BASE_DIR, "ai_model.pth")
     action_path = os.path.join(BASE_DIR, "action_model.pth")
     future_path = os.path.join(BASE_DIR, "future_model.pth")
-    if os.path.exists(buffer_path):
+    loaded = exp_buffer.load_chunks()
+    if not loaded and os.path.exists(buffer_path):
         try:
             with open(buffer_path, "rb") as f:
                 exp_buffer.buffer = pickle.load(f)
+            exp_buffer.save()
+            loaded = True
         except Exception:
             exp_buffer.buffer = []
+    if not loaded and not glob.glob(os.path.join(BUFFER_DIR, "chunk_*.pt")):
+        torch.save([], os.path.join(BUFFER_DIR, "chunk_0.pt"))
     if os.path.exists(model_path):
         try:
             ai_model.load_state_dict(torch.load(model_path, map_location=device))
@@ -616,7 +664,6 @@ if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
     ensure_files()
     load_state()
-    global mouse_left_down, mouse_right_down
     init_state = get_mouse_state()
     init_status = int(round(init_state[2] * 3))
     mouse_left_down = init_status in (1, 3)
