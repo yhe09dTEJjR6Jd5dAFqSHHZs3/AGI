@@ -101,7 +101,7 @@ class ActionPredictor(nn.Module):
 class ExperienceBuffer:
     def __init__(self):
         self.buffer = []
-    
+
     def add(self, state_img, mouse_state, reward, td_error, screen_novelty):
         img = state_img.float()
         if img.dim() == 4:
@@ -120,27 +120,24 @@ class ExperienceBuffer:
         self.buffer.append(data)
         self.enforce_limit()
 
+    def _sample_bytes(self, entry):
+        img_size = entry["img"].element_size() * entry["img"].nelement()
+        mouse_size = entry["mouse"].element_size() * entry["mouse"].nelement()
+        meta_size = 24
+        return img_size + mouse_size + meta_size
+
+    def _buffer_size_gb(self):
+        total_bytes = 0
+        for item in self.buffer:
+            total_bytes += self._sample_bytes(item)
+        return total_bytes / (1024**3)
+
     def enforce_limit(self):
-        if len(self.buffer) % 50 != 0:
-            return
-        
-        try:
-            sample_size = 0
-            if len(self.buffer) > 0:
-                s = self.buffer[0]
-                img_size = s["img"].element_size() * s["img"].nelement()
-                mouse_size = s["mouse"].element_size() * s["mouse"].nelement()
-                sample_size = img_size + mouse_size + 64 
-            
-            total_size_gb = (len(self.buffer) * sample_size) / (1024**3)
-            
-            if total_size_gb > max_buffer_gb:
-                self.buffer.sort(key=lambda x: x["reward"])
-                cut_idx = int(len(self.buffer) * 0.2)
-                self.buffer = self.buffer[cut_idx:]
-        except:
-            if len(self.buffer) > 5000:
-                self.buffer = self.buffer[-4000:]
+        total_gb = self._buffer_size_gb()
+        while total_gb > max_buffer_gb and len(self.buffer) > 0:
+            min_idx = min(range(len(self.buffer)), key=lambda i: self.buffer[i]["reward"])
+            removed = self.buffer.pop(min_idx)
+            total_gb -= self._sample_bytes(removed) / (1024**3)
 
     def sample(self, batch_size=32):
         if len(self.buffer) < batch_size:
@@ -160,6 +157,20 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ai_model = Autoencoder().to(device)
 action_model = ActionPredictor().to(device)
 scaler = GradScaler(enabled=device.type == "cuda")
+
+def ensure_files():
+    if not os.path.exists(BASE_DIR):
+        os.makedirs(BASE_DIR)
+    buffer_path = os.path.join(BASE_DIR, "experience_pool.pkl")
+    model_path = os.path.join(BASE_DIR, "ai_model.pth")
+    action_path = os.path.join(BASE_DIR, "action_model.pth")
+    if not os.path.exists(buffer_path):
+        with open(buffer_path, "wb") as f:
+            pickle.dump([], f)
+    if not os.path.exists(model_path):
+        torch.save(ai_model.state_dict(), model_path)
+    if not os.path.exists(action_path):
+        torch.save(action_model.state_dict(), action_path)
 
 def load_state():
     global exp_buffer
@@ -474,6 +485,7 @@ class InputHandler:
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
+    ensure_files()
     load_state()
     window = SciFiWindow()
     window.show()
