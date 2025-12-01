@@ -3,25 +3,45 @@ import os
 import time
 import threading
 import pickle
-import psutil
 import math
 import random
 import warnings
-import numpy as np
-import cv2
-import mss
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
-from PyQt5 import QtWidgets, QtCore, QtGui
-from pynput import keyboard
-import pyautogui
-import ctypes
-import platform
+import subprocess
+import importlib
+from collections import deque
 
 warnings.filterwarnings("ignore")
+
+def import_or_install(module_name, package_name=None):
+    try:
+        return importlib.import_module(module_name)
+    except ImportError:
+        pkg = package_name or module_name
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+        except Exception:
+            sys.exit(1)
+        return importlib.import_module(module_name)
+    except Exception:
+        sys.exit(1)
+
+psutil = import_or_install("psutil")
+np = import_or_install("numpy")
+cv2 = import_or_install("cv2", "opencv-python")
+mss = import_or_install("mss")
+torch = import_or_install("torch")
+nn = torch.nn
+optim = torch.optim
+F = torch.nn.functional
+autocast = import_or_install("torch.cuda.amp").autocast
+GradScaler = import_or_install("torch.cuda.amp").GradScaler
+QtWidgets = import_or_install("PyQt5").QtWidgets
+QtCore = import_or_install("PyQt5").QtCore
+QtGui = import_or_install("PyQt5").QtGui
+keyboard = import_or_install("pynput.keyboard")
+pyautogui = import_or_install("pyautogui")
+ctypes = import_or_install("ctypes")
+platform = import_or_install("platform")
 
 pyautogui.FAILSAFE = False
 
@@ -40,6 +60,8 @@ center_x, center_y = screen_width // 2, screen_height // 2
 
 current_fps = 30
 current_scale = 0.5
+resolution_factor = 1.0
+temporal_context_window = 4
 max_vram_gb = 4.0
 max_ram_gb = 16.0
 max_buffer_gb = 10.0
@@ -47,6 +69,11 @@ standard_res = (128, 128)
 latent_pool = 4
 
 lock = threading.Lock()
+
+def scaled_standard_res():
+    with lock:
+        factor = resolution_factor
+    return max(1, int(standard_res[0] * factor)), max(1, int(standard_res[1] * factor))
 
 class Autoencoder(nn.Module):
     def __init__(self):
@@ -83,39 +110,53 @@ class Autoencoder(nn.Module):
         latent = self.encode(x)
         return self.decode(latent, x.shape[2:])
 
+class FuturePredictor(nn.Module):
+    def __init__(self):
+        super(FuturePredictor, self).__init__()
+        embed_dim = 64 * latent_pool * latent_pool
+        self.fc = nn.Sequential(
+            nn.Linear(embed_dim * 2, 512),
+            nn.ReLU(),
+            nn.Linear(512, embed_dim)
+        )
+
+    def forward(self, aggregated):
+        return self.fc(aggregated)
+
 class ActionPredictor(nn.Module):
     def __init__(self):
         super(ActionPredictor, self).__init__()
         embed_dim = 64 * latent_pool * latent_pool
         self.fc = nn.Sequential(
-            nn.Linear(embed_dim + 4, 256),
+            nn.Linear(embed_dim * 2, 256),
             nn.ReLU(),
             nn.Linear(256, 4)
         )
-    
-    def forward(self, embedding, action):
-        embedding_flat = embedding.view(embedding.size(0), -1)
-        x = torch.cat([embedding_flat, action], dim=1)
-        return self.fc(x)
+
+    def forward(self, aggregated):
+        return self.fc(aggregated)
 
 class ExperienceBuffer:
     def __init__(self):
         self.buffer = []
 
-    def add(self, state_img, mouse_state, reward, td_error, screen_novelty):
+    def add(self, state_img, mouse_state, reward, td_error, screen_novelty, latent_tensor):
         img = state_img.float()
         if img.dim() == 4:
             img = img[0]
-        img = F.interpolate(img.unsqueeze(0), size=standard_res, mode="bilinear", align_corners=False).squeeze(0).half()
+        res_h, res_w = scaled_standard_res()
+        img = F.interpolate(img.unsqueeze(0), size=(res_h, res_w), mode="bilinear", align_corners=False).squeeze(0).half()
         mouse = mouse_state.float()
         if mouse.dim() > 1:
             mouse = mouse[0]
+        latent_store = latent_tensor.detach().cpu().half()
         data = {
             "img": img,
             "mouse": mouse,
             "reward": reward,
             "error": td_error,
-            "novelty": screen_novelty
+            "novelty": screen_novelty,
+            "latent": latent_store
         }
         self.buffer.append(data)
         self.enforce_limit()
@@ -123,8 +164,9 @@ class ExperienceBuffer:
     def _sample_bytes(self, entry):
         img_size = entry["img"].element_size() * entry["img"].nelement()
         mouse_size = entry["mouse"].element_size() * entry["mouse"].nelement()
+        latent_size = entry["latent"].element_size() * entry["latent"].nelement()
         meta_size = 24
-        return img_size + mouse_size + meta_size
+        return img_size + mouse_size + latent_size + meta_size
 
     def _buffer_size_gb(self):
         total_bytes = 0
@@ -139,22 +181,30 @@ class ExperienceBuffer:
             removed = self.buffer.pop(min_idx)
             total_gb -= self._sample_bytes(removed) / (1024**3)
 
-    def sample(self, batch_size=32):
-        if len(self.buffer) < batch_size:
-            return self.buffer
-        return random.sample(self.buffer, batch_size)
+    def sample_sequences(self, batch_size, window):
+        if len(self.buffer) <= window:
+            return []
+        sequences = []
+        max_start = len(self.buffer) - window - 1
+        for _ in range(batch_size):
+            idx = random.randint(0, max_start)
+            context_entries = self.buffer[idx:idx + window]
+            target_entry = self.buffer[idx + window]
+            sequences.append((context_entries, target_entry))
+        return sequences
 
     def save(self):
         path = os.path.join(BASE_DIR, "experience_pool.pkl")
         try:
             with open(path, "wb") as f:
                 pickle.dump(self.buffer, f)
-        except:
+        except Exception:
             pass
 
 exp_buffer = ExperienceBuffer()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ai_model = Autoencoder().to(device)
+future_model = FuturePredictor().to(device)
 action_model = ActionPredictor().to(device)
 scaler = GradScaler(enabled=device.type == "cuda")
 
@@ -164,6 +214,7 @@ def ensure_files():
     buffer_path = os.path.join(BASE_DIR, "experience_pool.pkl")
     model_path = os.path.join(BASE_DIR, "ai_model.pth")
     action_path = os.path.join(BASE_DIR, "action_model.pth")
+    future_path = os.path.join(BASE_DIR, "future_model.pth")
     if not os.path.exists(buffer_path):
         with open(buffer_path, "wb") as f:
             pickle.dump([], f)
@@ -171,92 +222,114 @@ def ensure_files():
         torch.save(ai_model.state_dict(), model_path)
     if not os.path.exists(action_path):
         torch.save(action_model.state_dict(), action_path)
+    if not os.path.exists(future_path):
+        torch.save(future_model.state_dict(), future_path)
 
 def load_state():
     global exp_buffer
     buffer_path = os.path.join(BASE_DIR, "experience_pool.pkl")
     model_path = os.path.join(BASE_DIR, "ai_model.pth")
     action_path = os.path.join(BASE_DIR, "action_model.pth")
+    future_path = os.path.join(BASE_DIR, "future_model.pth")
     if os.path.exists(buffer_path):
         try:
             with open(buffer_path, "rb") as f:
                 exp_buffer.buffer = pickle.load(f)
-        except:
+        except Exception:
             exp_buffer.buffer = []
     if os.path.exists(model_path):
         try:
             ai_model.load_state_dict(torch.load(model_path, map_location=device))
-        except:
+        except Exception:
             pass
     if os.path.exists(action_path):
         try:
             action_model.load_state_dict(torch.load(action_path, map_location=device))
-        except:
+        except Exception:
+            pass
+    if os.path.exists(future_path):
+        try:
+            future_model.load_state_dict(torch.load(future_path, map_location=device))
+        except Exception:
             pass
 
 def save_state():
     torch.save(ai_model.state_dict(), os.path.join(BASE_DIR, "ai_model.pth"))
     torch.save(action_model.state_dict(), os.path.join(BASE_DIR, "action_model.pth"))
+    torch.save(future_model.state_dict(), os.path.join(BASE_DIR, "future_model.pth"))
     exp_buffer.save()
 
 def get_mouse_state():
     x_phys, y_phys = pyautogui.position()
     x = x_phys - center_x
     y = center_y - y_phys
-    
     left_btn = 0
     right_btn = 0
-    
     try:
-        import win32api
+        win32api = import_or_install("win32api")
         if win32api.GetKeyState(0x01) < 0: left_btn = 1
         if win32api.GetKeyState(0x02) < 0: right_btn = 1
-    except:
+    except Exception:
         pass
-
     status = 0
     if left_btn and right_btn: status = 3
     elif left_btn: status = 1
     elif right_btn: status = 2
-    
     return [x / screen_width, y / screen_height, status / 3.0, 1.0]
 
-def move_mouse(dx, dy):
+def move_mouse(pred_abs_x, pred_abs_y):
+    current = get_mouse_state()
+    dx = (pred_abs_x - current[0]) * screen_width
+    dy = (pred_abs_y - current[1]) * screen_height
     if platform.system().lower().startswith("win"):
         try:
-            ctypes.windll.user32.mouse_event(0x0001, int(dx), int(dy), 0, 0)
+            ctypes.windll.user32.mouse_event(0x0001, int(dx), int(-dy), 0, 0)
             return
-        except:
+        except Exception:
             pass
     try:
-        pyautogui.moveRel(int(dx), int(dy), _pause=False)
-    except:
+        pyautogui.moveRel(int(dx), int(-dy), _pause=False)
+    except Exception:
         pass
+
+def aggregate_latents(latents):
+    embed_dim = 64 * latent_pool * latent_pool
+    if len(latents) == 0:
+        return torch.zeros(1, embed_dim * 2, device=device)
+    stacked = torch.stack(latents).view(len(latents), -1)
+    mean = stacked.mean(dim=0, keepdim=True)
+    std = stacked.std(dim=0, keepdim=True) + 1e-6
+    return torch.cat([mean, std], dim=1)
 
 class ResourceMonitor(threading.Thread):
     def run(self):
-        global current_fps, current_scale
+        global current_fps, current_scale, resolution_factor, temporal_context_window
+        prev_m = None
         while global_running:
             cpu = psutil.cpu_percent()
             mem = psutil.virtual_memory().percent
-            
             gpu = 0
             vram = 0
             if torch.cuda.is_available():
                 try:
-                    vram = torch.cuda.memory_allocated() / (1024**3) / max_vram_gb * 100
-                except: pass
-
+                    vram_use = torch.cuda.memory_allocated() / (1024**3)
+                    vram = min(100.0, vram_use / max_vram_gb * 100)
+                except Exception:
+                    vram = 0
             m_val = max(cpu, mem, gpu, vram)
-            
+            delta = 0 if prev_m is None else m_val - prev_m
+            prev_m = m_val
             with lock:
-                if m_val > 80:
-                    current_fps = max(1, current_fps - 2)
+                if delta > 0.5:
+                    current_fps = max(1, int(current_fps * 0.9))
                     current_scale = max(0.05, current_scale * 0.9)
-                elif m_val < 60:
-                    current_fps = min(120, current_fps + 2)
+                    resolution_factor = max(0.2, resolution_factor * 0.9)
+                    temporal_context_window = max(2, temporal_context_window - 1)
+                elif delta < -0.5:
+                    current_fps = min(120, int(current_fps * 1.05) + 1)
                     current_scale = min(1.0, current_scale * 1.05)
-            
+                    resolution_factor = min(1.0, resolution_factor * 1.05)
+                    temporal_context_window = min(12, temporal_context_window + 1)
             time.sleep(1)
 
 class AgentThread(threading.Thread):
@@ -264,68 +337,58 @@ class AgentThread(threading.Thread):
         global global_pause_recording
         sct = mss.mss()
         criterion = nn.MSELoss()
-
+        context_latents = deque(maxlen=12)
         while global_running:
             if global_optimizing or global_pause_recording:
                 time.sleep(0.1)
                 continue
-
             start_time = time.time()
-
             with lock:
                 fps = current_fps
                 scale = current_scale
-
+                res_factor = resolution_factor
+                window_len = temporal_context_window
             try:
                 monitor = {"top": 0, "left": 0, "width": screen_width, "height": screen_height}
                 img_np = np.array(sct.grab(monitor))
                 img_np = cv2.cvtColor(img_np, cv2.COLOR_BGRA2RGB)
-                
                 h, w = img_np.shape[:2]
-                target_h = int(h * scale)
-                target_w = int(w * scale)
-                
+                target_h = int(h * scale * res_factor)
+                target_w = int(w * scale * res_factor)
                 target_h = (target_h // 4) * 4
                 target_w = (target_w // 4) * 4
                 if target_h < 4: target_h = 4
                 if target_w < 4: target_w = 4
-                
                 img_resized = cv2.resize(img_np, (target_w, target_h))
                 img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
                 img_tensor = img_tensor.unsqueeze(0).to(device)
-
+                with torch.no_grad():
+                    aggregated = aggregate_latents(list(context_latents)[-window_len:])
+                    predicted_latent_vec = future_model(aggregated)
+                    predicted_latent = predicted_latent_vec.view(1, 64, latent_pool, latent_pool)
+                    predicted_img = ai_model.decode(predicted_latent, img_tensor.shape[2:])
                 mouse_val = get_mouse_state()
                 mouse_tensor = torch.tensor([mouse_val], dtype=torch.float32).to(device)
-
                 with torch.no_grad():
-                    recon = ai_model(img_tensor)
-                    screen_novelty = criterion(recon, img_tensor).item()
-
                     latent = ai_model.encode(img_tensor)
-                    pred_mouse = action_model(latent, mouse_tensor)
-                    
-                action_novelty = torch.mean((pred_mouse - mouse_tensor)**2).item()
-                
+                context_latents.append(latent.detach())
+                with torch.no_grad():
+                    pred_mouse_raw = action_model(aggregated)
+                pred_mouse = torch.zeros_like(mouse_tensor)
+                pred_mouse[:, 0] = torch.tanh(pred_mouse_raw[:, 0]) * 0.5
+                pred_mouse[:, 1] = torch.tanh(pred_mouse_raw[:, 1]) * 0.5
+                pred_mouse[:, 2] = torch.sigmoid(pred_mouse_raw[:, 2])
+                pred_mouse[:, 3] = torch.ones_like(pred_mouse[:, 3])
+                screen_novelty = criterion(predicted_img, img_tensor).item()
+                action_novelty = torch.mean((pred_mouse - mouse_tensor) ** 2).item()
                 survival_penalty = 0.0001
                 reward = (screen_novelty * action_novelty) - survival_penalty
-                
                 td_error = screen_novelty + action_novelty
-
-                exp_buffer.add(img_tensor.cpu(), mouse_tensor.cpu(), reward, td_error, screen_novelty)
-
+                exp_buffer.add(img_tensor.cpu(), mouse_tensor.cpu(), reward, td_error, screen_novelty, latent.cpu())
                 pred_np = pred_mouse.cpu().numpy()[0]
-                dx_norm = float(pred_np[0] * 10)
-                dy_norm = float(pred_np[1] * 10)
-                dx = int(round(dx_norm))
-                dy = int(round(dy_norm))
-                if dx == 0 and abs(dx_norm) > 0.2: dx = 1 if dx_norm > 0 else -1
-                if dy == 0 and abs(dy_norm) > 0.2: dy = 1 if dy_norm > 0 else -1
-                if dx != 0 or dy != 0:
-                    move_mouse(dx, -dy)
-            
+                move_mouse(float(pred_np[0]), float(pred_np[1]))
             except Exception:
                 pass
-
             elapsed = time.time() - start_time
             sleep_time = max(0, (1.0 / fps) - elapsed)
             time.sleep(sleep_time)
@@ -416,42 +479,62 @@ class SciFiWindow(QtWidgets.QWidget):
 
     def _optimize_task(self):
         global global_optimizing, global_pause_recording
-        samples = exp_buffer.sample(64)
+        samples = exp_buffer.sample_sequences(64, temporal_context_window)
         if len(samples) == 0:
             global_optimizing = False
             global_pause_recording = False
             self.finished_signal.emit()
             return
         total_steps = 100
-
-        optimizer = optim.Adam(list(ai_model.parameters()) + list(action_model.parameters()), lr=1e-3)
+        optimizer = optim.Adam(list(ai_model.parameters()) + list(action_model.parameters()) + list(future_model.parameters()), lr=1e-3)
         loss_fn = nn.MSELoss()
-
         for i in range(total_steps):
-            if not global_running: break
-
-            for j in range(0, len(samples), 16):
-                batch_samples = samples[j:j + 16]
-                imgs = torch.stack([F.interpolate(s["img"].float(), size=standard_res, mode="bilinear", align_corners=False) for s in batch_samples]).to(device)
-                mse_mouse = torch.stack([s["mouse"].float() for s in batch_samples]).to(device)
-
+            if not global_running:
+                break
+            batch_indices = list(range(0, len(samples), 8))
+            for start in batch_indices:
+                batch = samples[start:start + 8]
+                context_latent_list = []
+                target_imgs = []
+                target_mice = []
+                target_latents = []
+                for context_entries, target_entry in batch:
+                    latents = [item["latent"].float() for item in context_entries]
+                    context_latent_list.append(latents)
+                    target_imgs.append(target_entry["img"].float())
+                    target_mice.append(target_entry["mouse"].float())
+                    target_latents.append(target_entry["latent"].float())
                 optimizer.zero_grad()
+                agg_batch = []
+                for latents in context_latent_list:
+                    agg = aggregate_latents([l.to(device) for l in latents])
+                    agg_batch.append(agg)
+                aggregated_tensor = torch.cat(agg_batch, dim=0)
+                target_imgs_tensor = torch.stack(target_imgs).to(device)
+                target_mice_tensor = torch.stack(target_mice).to(device)
+                target_latents_tensor = torch.stack(target_latents).to(device)
                 with autocast(enabled=device.type == "cuda"):
-                    latent = ai_model.encode(imgs)
-                    recon = ai_model.decode(latent, imgs.shape[2:])
-                    loss_ae = loss_fn(recon, imgs)
-                    pred_act = action_model(latent, mse_mouse)
-                    loss_act = loss_fn(pred_act, mse_mouse)
-                    loss = loss_ae + loss_act
+                    pred_latent_vec = future_model(aggregated_tensor)
+                    pred_latent = pred_latent_vec.view(-1, 64, latent_pool, latent_pool)
+                    pred_img = ai_model.decode(pred_latent, target_imgs_tensor.shape[2:])
+                    pred_mouse_raw = action_model(aggregated_tensor)
+                    pred_mouse = torch.zeros_like(target_mice_tensor)
+                    pred_mouse[:, 0] = torch.tanh(pred_mouse_raw[:, 0]) * 0.5
+                    pred_mouse[:, 1] = torch.tanh(pred_mouse_raw[:, 1]) * 0.5
+                    pred_mouse[:, 2] = torch.sigmoid(pred_mouse_raw[:, 2])
+                    pred_mouse[:, 3] = torch.ones_like(pred_mouse[:, 3])
+                    recon = ai_model(target_imgs_tensor)
+                    loss_screen = loss_fn(pred_img, target_imgs_tensor)
+                    loss_mouse = loss_fn(pred_mouse, target_mice_tensor)
+                    loss_ae = loss_fn(recon, target_imgs_tensor) + loss_fn(target_latents_tensor, ai_model.encode(target_imgs_tensor))
+                    loss = loss_screen + loss_mouse + loss_ae
                 scaler.scale(loss).backward()
-                torch.nn.utils.clip_grad_norm_(list(ai_model.parameters()) + list(action_model.parameters()), 1.0)
+                torch.nn.utils.clip_grad_norm_(list(ai_model.parameters()) + list(action_model.parameters()) + list(future_model.parameters()), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
-
             progress_val = int((i + 1) / total_steps * 100)
             QtCore.QMetaObject.invokeMethod(self.progress, "setValue", QtCore.Q_ARG(int, progress_val))
             time.sleep(0.01)
-
         save_state()
         self.finished_signal.emit()
 
@@ -476,7 +559,6 @@ class InputHandler:
             global_running = False
             QtWidgets.QApplication.quit()
             return False
-        
         if key == keyboard.Key.enter:
             if not global_optimizing:
                 global_pause_recording = True
@@ -489,13 +571,9 @@ if __name__ == "__main__":
     load_state()
     window = SciFiWindow()
     window.show()
-
     monitor_thread = ResourceMonitor()
     monitor_thread.start()
-
     agent_thread = AgentThread()
     agent_thread.start()
-
     input_handler = InputHandler(window)
-
     sys.exit(app.exec_())
