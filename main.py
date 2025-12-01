@@ -13,9 +13,13 @@ import mss
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 from PyQt5 import QtWidgets, QtCore, QtGui
 from pynput import keyboard
 import pyautogui
+import ctypes
+import platform
 
 warnings.filterwarnings("ignore")
 
@@ -39,6 +43,8 @@ current_scale = 0.5
 max_vram_gb = 4.0
 max_ram_gb = 16.0
 max_buffer_gb = 10.0
+standard_res = (128, 128)
+latent_pool = 4
 
 lock = threading.Lock()
 
@@ -53,6 +59,7 @@ class Autoencoder(nn.Module):
             nn.Conv2d(32, 64, 3, stride=1, padding=1),
             nn.ReLU()
         )
+        self.pool = nn.AdaptiveAvgPool2d((latent_pool, latent_pool))
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(64, 32, 3, stride=1, padding=1),
             nn.ReLU(),
@@ -62,26 +69,32 @@ class Autoencoder(nn.Module):
             nn.Sigmoid()
         )
 
-    def forward(self, x):
+    def encode(self, x):
         x = self.encoder(x)
-        x = self.decoder(x)
+        x = self.pool(x)
         return x
+
+    def decode(self, latent, output_size):
+        x = self.decoder(latent)
+        x = F.interpolate(x, size=output_size, mode="bilinear", align_corners=False)
+        return x
+
+    def forward(self, x):
+        latent = self.encode(x)
+        return self.decode(latent, x.shape[2:])
 
 class ActionPredictor(nn.Module):
     def __init__(self):
         super(ActionPredictor, self).__init__()
+        embed_dim = 64 * latent_pool * latent_pool
         self.fc = nn.Sequential(
-            nn.Linear(64 + 4, 128),
+            nn.Linear(embed_dim + 4, 256),
             nn.ReLU(),
-            nn.Linear(128, 4)
+            nn.Linear(256, 4)
         )
     
     def forward(self, embedding, action):
-        b, c, h, w = embedding.size()
-        embedding_flat = embedding.view(b, -1)
-        if embedding_flat.size(1) != 64:
-            matcher = nn.Linear(embedding_flat.size(1), 64).to(embedding.device)
-            embedding_flat = matcher(embedding_flat)
+        embedding_flat = embedding.view(embedding.size(0), -1)
         x = torch.cat([embedding_flat, action], dim=1)
         return self.fc(x)
 
@@ -90,9 +103,16 @@ class ExperienceBuffer:
         self.buffer = []
     
     def add(self, state_img, mouse_state, reward, td_error, screen_novelty):
+        img = state_img.float()
+        if img.dim() == 4:
+            img = img[0]
+        img = F.interpolate(img.unsqueeze(0), size=standard_res, mode="bilinear", align_corners=False).squeeze(0).half()
+        mouse = mouse_state.float()
+        if mouse.dim() > 1:
+            mouse = mouse[0]
         data = {
-            "img": state_img.half(),
-            "mouse": mouse_state,
+            "img": img,
+            "mouse": mouse,
             "reward": reward,
             "error": td_error,
             "novelty": screen_novelty
@@ -139,6 +159,34 @@ exp_buffer = ExperienceBuffer()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ai_model = Autoencoder().to(device)
 action_model = ActionPredictor().to(device)
+scaler = GradScaler(enabled=device.type == "cuda")
+
+def load_state():
+    global exp_buffer
+    buffer_path = os.path.join(BASE_DIR, "experience_pool.pkl")
+    model_path = os.path.join(BASE_DIR, "ai_model.pth")
+    action_path = os.path.join(BASE_DIR, "action_model.pth")
+    if os.path.exists(buffer_path):
+        try:
+            with open(buffer_path, "rb") as f:
+                exp_buffer.buffer = pickle.load(f)
+        except:
+            exp_buffer.buffer = []
+    if os.path.exists(model_path):
+        try:
+            ai_model.load_state_dict(torch.load(model_path, map_location=device))
+        except:
+            pass
+    if os.path.exists(action_path):
+        try:
+            action_model.load_state_dict(torch.load(action_path, map_location=device))
+        except:
+            pass
+
+def save_state():
+    torch.save(ai_model.state_dict(), os.path.join(BASE_DIR, "ai_model.pth"))
+    torch.save(action_model.state_dict(), os.path.join(BASE_DIR, "action_model.pth"))
+    exp_buffer.save()
 
 def get_mouse_state():
     x_phys, y_phys = pyautogui.position()
@@ -161,6 +209,18 @@ def get_mouse_state():
     elif right_btn: status = 2
     
     return [x / screen_width, y / screen_height, status / 3.0, 1.0]
+
+def move_mouse(dx, dy):
+    if platform.system().lower().startswith("win"):
+        try:
+            ctypes.windll.user32.mouse_event(0x0001, int(dx), int(dy), 0, 0)
+            return
+        except:
+            pass
+    try:
+        pyautogui.moveRel(int(dx), int(dy), _pause=False)
+    except:
+        pass
 
 class ResourceMonitor(threading.Thread):
     def run(self):
@@ -229,9 +289,9 @@ class AgentThread(threading.Thread):
                 with torch.no_grad():
                     recon = ai_model(img_tensor)
                     screen_novelty = criterion(recon, img_tensor).item()
-                    
-                    latent = ai_model.encoder(img_tensor)
-                    pred_mouse = action_model(latent, mouse_tensor) 
+
+                    latent = ai_model.encode(img_tensor)
+                    pred_mouse = action_model(latent, mouse_tensor)
                     
                 action_novelty = torch.mean((pred_mouse - mouse_tensor)**2).item()
                 
@@ -250,9 +310,7 @@ class AgentThread(threading.Thread):
                 if dx == 0 and abs(dx_norm) > 0.2: dx = 1 if dx_norm > 0 else -1
                 if dy == 0 and abs(dy_norm) > 0.2: dy = 1 if dy_norm > 0 else -1
                 if dx != 0 or dy != 0:
-                    try:
-                        pyautogui.moveRel(dx, -dy, _pause=False)
-                    except: pass
+                    move_mouse(dx, -dy)
             
             except Exception:
                 pass
@@ -346,39 +404,44 @@ class SciFiWindow(QtWidgets.QWidget):
         t.start()
 
     def _optimize_task(self):
-        global global_optimizing
-        samples = exp_buffer.sample(32)
+        global global_optimizing, global_pause_recording
+        samples = exp_buffer.sample(64)
+        if len(samples) == 0:
+            global_optimizing = False
+            global_pause_recording = False
+            self.finished_signal.emit()
+            return
         total_steps = 100
-        
+
         optimizer = optim.Adam(list(ai_model.parameters()) + list(action_model.parameters()), lr=1e-3)
         loss_fn = nn.MSELoss()
 
         for i in range(total_steps):
             if not global_running: break
-            
-            if len(samples) > 0:
-                for batch in samples:
-                    img = batch["img"].float().to(device)
-                    mse_mouse = batch["mouse"].float().to(device)
-                    
-                    optimizer.zero_grad()
-                    recon = ai_model(img)
-                    loss_ae = loss_fn(recon, img)
-                    
-                    latent = ai_model.encoder(img).detach()
+
+            for j in range(0, len(samples), 16):
+                batch_samples = samples[j:j + 16]
+                imgs = torch.stack([F.interpolate(s["img"].float(), size=standard_res, mode="bilinear", align_corners=False) for s in batch_samples]).to(device)
+                mse_mouse = torch.stack([s["mouse"].float() for s in batch_samples]).to(device)
+
+                optimizer.zero_grad()
+                with autocast(enabled=device.type == "cuda"):
+                    latent = ai_model.encode(imgs)
+                    recon = ai_model.decode(latent, imgs.shape[2:])
+                    loss_ae = loss_fn(recon, imgs)
                     pred_act = action_model(latent, mse_mouse)
-                    loss_act = loss_fn(pred_act, mse_mouse) 
-                    
+                    loss_act = loss_fn(pred_act, mse_mouse)
                     loss = loss_ae + loss_act
-                    loss.backward()
-                    optimizer.step()
+                scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(list(ai_model.parameters()) + list(action_model.parameters()), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
 
             progress_val = int((i + 1) / total_steps * 100)
             QtCore.QMetaObject.invokeMethod(self.progress, "setValue", QtCore.Q_ARG(int, progress_val))
             time.sleep(0.01)
 
-        torch.save(ai_model.state_dict(), os.path.join(BASE_DIR, "ai_model.pth"))
-        exp_buffer.save()
+        save_state()
         self.finished_signal.emit()
 
     def on_optimization_finished(self):
@@ -411,6 +474,7 @@ class InputHandler:
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
+    load_state()
     window = SciFiWindow()
     window.show()
 
