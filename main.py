@@ -30,6 +30,7 @@ np = import_or_install("numpy")
 cv2 = import_or_install("cv2", "opencv-python")
 mss = import_or_install("mss")
 torch = import_or_install("torch")
+torch.backends.cudnn.benchmark = True
 nn = torch.nn
 optim = torch.optim
 F = torch.nn.functional
@@ -69,6 +70,8 @@ standard_res = (128, 128)
 latent_pool = 4
 
 lock = threading.Lock()
+mouse_left_down = False
+mouse_right_down = False
 
 def scaled_standard_res():
     with lock:
@@ -277,20 +280,53 @@ def get_mouse_state():
     elif right_btn: status = 2
     return [x / screen_width, y / screen_height, status / 3.0, 1.0]
 
-def move_mouse(pred_abs_x, pred_abs_y):
+def apply_mouse_buttons(pred_status):
+    global mouse_left_down, mouse_right_down
+    status_idx = int(round(max(0.0, min(1.0, pred_status)) * 3))
+    target_left = status_idx in (1, 3)
+    target_right = status_idx in (2, 3)
+    if target_left != mouse_left_down:
+        try:
+            if target_left:
+                if platform.system().lower().startswith("win"):
+                    ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
+                pyautogui.mouseDown(button="left")
+            else:
+                if platform.system().lower().startswith("win"):
+                    ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
+                pyautogui.mouseUp(button="left")
+            mouse_left_down = target_left
+        except Exception:
+            pass
+    if target_right != mouse_right_down:
+        try:
+            if target_right:
+                if platform.system().lower().startswith("win"):
+                    ctypes.windll.user32.mouse_event(0x0008, 0, 0, 0, 0)
+                pyautogui.mouseDown(button="right")
+            else:
+                if platform.system().lower().startswith("win"):
+                    ctypes.windll.user32.mouse_event(0x0010, 0, 0, 0, 0)
+                pyautogui.mouseUp(button="right")
+            mouse_right_down = target_right
+        except Exception:
+            pass
+
+def move_mouse(pred_abs_x, pred_abs_y, pred_status):
     current = get_mouse_state()
     dx = (pred_abs_x - current[0]) * screen_width
     dy = (pred_abs_y - current[1]) * screen_height
     if platform.system().lower().startswith("win"):
         try:
             ctypes.windll.user32.mouse_event(0x0001, int(dx), int(-dy), 0, 0)
-            return
         except Exception:
             pass
-    try:
-        pyautogui.moveRel(int(dx), int(-dy), _pause=False)
-    except Exception:
-        pass
+    else:
+        try:
+            pyautogui.moveRel(int(dx), int(-dy), _pause=False)
+        except Exception:
+            pass
+    apply_mouse_buttons(pred_status)
 
 def aggregate_latents(latents):
     embed_dim = 64 * latent_pool * latent_pool
@@ -319,13 +355,14 @@ class ResourceMonitor(threading.Thread):
             m_val = max(cpu, mem, gpu, vram)
             delta = 0 if prev_m is None else m_val - prev_m
             prev_m = m_val
+            high_load = m_val > 90
             with lock:
-                if delta > 0.5:
+                if high_load or delta > 0.5:
                     current_fps = max(1, int(current_fps * 0.9))
                     current_scale = max(0.05, current_scale * 0.9)
                     resolution_factor = max(0.2, resolution_factor * 0.9)
                     temporal_context_window = max(2, temporal_context_window - 1)
-                elif delta < -0.5:
+                elif delta < -0.5 and m_val < 85:
                     current_fps = min(120, int(current_fps * 1.05) + 1)
                     current_scale = min(1.0, current_scale * 1.05)
                     resolution_factor = min(1.0, resolution_factor * 1.05)
@@ -386,7 +423,7 @@ class AgentThread(threading.Thread):
                 td_error = screen_novelty + action_novelty
                 exp_buffer.add(img_tensor.cpu(), mouse_tensor.cpu(), reward, td_error, screen_novelty, latent.cpu())
                 pred_np = pred_mouse.cpu().numpy()[0]
-                move_mouse(float(pred_np[0]), float(pred_np[1]))
+                move_mouse(float(pred_np[0]), float(pred_np[1]), float(pred_np[2]))
             except Exception:
                 pass
             elapsed = time.time() - start_time
@@ -396,6 +433,8 @@ class AgentThread(threading.Thread):
 class SciFiWindow(QtWidgets.QWidget):
     optimizer_signal = QtCore.pyqtSignal()
     finished_signal = QtCore.pyqtSignal()
+    status_signal = QtCore.pyqtSignal(str)
+    info_signal = QtCore.pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -406,6 +445,8 @@ class SciFiWindow(QtWidgets.QWidget):
         self.initUI()
         self.optimizer_signal.connect(self.run_optimization)
         self.finished_signal.connect(self.on_optimization_finished)
+        self.status_signal.connect(self.label.setText)
+        self.info_signal.connect(self.info_label.setText)
 
     def center(self):
         frame = self.frameGeometry()
@@ -468,9 +509,9 @@ class SciFiWindow(QtWidgets.QWidget):
         self.setStyleSheet(style)
 
     def trigger_optimization(self):
-        self.label.setText("SYSTEM: OPTIMIZING")
-        self.info_label.setText("TRAINING NEURAL NETWORK...")
-        self.progress.setValue(0)
+        self.status_signal.emit("SYSTEM: OPTIMIZING")
+        self.info_signal.emit("TRAINING NEURAL NETWORK...")
+        QtCore.QMetaObject.invokeMethod(self.progress, "setValue", QtCore.Q_ARG(int, 0))
         self.optimizer_signal.emit()
 
     def run_optimization(self):
@@ -569,6 +610,11 @@ if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
     ensure_files()
     load_state()
+    global mouse_left_down, mouse_right_down
+    init_state = get_mouse_state()
+    init_status = int(round(init_state[2] * 3))
+    mouse_left_down = init_status in (1, 3)
+    mouse_right_down = init_status in (2, 3)
     window = SciFiWindow()
     window.show()
     monitor_thread = ResourceMonitor()
