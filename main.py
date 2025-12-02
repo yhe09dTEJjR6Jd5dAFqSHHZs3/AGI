@@ -74,14 +74,23 @@ def clamp_value(val, lower, upper):
 
 def default_config():
     fps_bounds = [1, 120]
-    res_factor_default = 1.0
-    scale_default = 1.0
-    context_default = 4
-    base_resolution = [128, 128]
-    latent_default = 4
+    cpu_cores = psutil.cpu_count(logical=False) or psutil.cpu_count()
+    mem_info = psutil.virtual_memory()
+    mem_ratio = 1.0 - mem_info.percent / 100.0
+    res_factor_default = clamp_value(mem_ratio, 0.2, 1.0)
+    scale_default = clamp_value(0.5 + mem_ratio * 0.5, 0.05, 1.0)
+    context_default = clamp_value(int(2 + (cpu_cores or 1) * 0.5), 2, 12)
+    base_resolution = [max(32, int(64 * scale_default)), max(32, int(64 * scale_default))]
+    latent_default = clamp_value(int(4 * scale_default + context_default * 0.25), 2, 12)
+    fps_dynamic = clamp_value(int(fps_bounds[1] * mem_ratio), fps_bounds[0], fps_bounds[1])
+    chunk_limit = int(clamp_value(mem_info.available / (1024**2 * 256), 128, 1024))
+    chunk_bytes = int(clamp_value(mem_info.available * 0.05, 64 * 1024 * 1024, 512 * 1024 * 1024))
+    lr_dynamic = clamp_value(1e-3 * mem_ratio * (cpu_cores or 1) / 4.0, 5e-4, 5e-3)
+    mini_batch_dynamic = int(clamp_value((cpu_cores or 1) * mem_ratio, 4, 32))
+    train_steps_dynamic = int(clamp_value(50 + mem_ratio * 150, 50, 300))
     config = {
         "capture": {
-            "fps": fps_bounds[1] // 4,
+            "fps": fps_dynamic,
             "fps_bounds": fps_bounds,
             "scale": scale_default,
             "resolution_factor": res_factor_default,
@@ -92,20 +101,20 @@ def default_config():
         "limits": {
             "max_vram_gb": 4.0,
             "max_ram_gb": 16.0,
-            "max_buffer_gb": 10.0
+            "max_buffer_gb": 20.0
         },
         "buffer": {
-            "chunk_entry_limit": 512,
-            "chunk_byte_limit": 256 * 1024 * 1024
+            "chunk_entry_limit": chunk_limit,
+            "chunk_byte_limit": chunk_bytes
         },
         "resource": {
-            "cooldown_seconds": 2.0,
+            "cooldown_seconds": clamp_value(1.0 + mem_ratio, 1.0, 3.0),
             "downscale_factor": 0.85,
-            "downscale_threshold": 90.0,
+            "downscale_threshold": clamp_value(70.0 + mem_ratio * 20.0, 70.0, 90.0),
             "downscale_delta": 0.8,
-            "upscale_threshold": 80.0,
+            "upscale_threshold": clamp_value(60.0 + mem_ratio * 15.0, 60.0, 85.0),
             "upscale_delta": 0.3,
-            "upscale_growth": 1.02,
+            "upscale_growth": clamp_value(1.01 + mem_ratio * 0.03, 1.01, 1.04),
             "spike_delta": 0.5,
             "min_scale": 0.05,
             "min_resolution_factor": 0.2,
@@ -115,11 +124,11 @@ def default_config():
         },
         "learning": {
             "survival_penalty": 0.01,
-            "sample_batch": 64,
-            "train_steps": 100,
-            "mini_batch": 8,
-            "learning_rate": 1e-3,
-            "grad_clip": 1.0
+            "sample_batch": int(clamp_value(32 * mem_ratio + cpu_cores, 32, 128)),
+            "train_steps": train_steps_dynamic,
+            "mini_batch": mini_batch_dynamic,
+            "learning_rate": lr_dynamic,
+            "grad_clip": clamp_value(0.5 + mem_ratio * 1.0, 0.5, 1.5)
         }
     }
     return config
@@ -424,32 +433,40 @@ def ensure_files():
     if not os.path.exists(BUFFER_DIR):
         os.makedirs(BUFFER_DIR)
     buffer_path = os.path.join(BASE_DIR, "experience_pool.pkl")
-    model_path = os.path.join(BASE_DIR, "ai_model.pth")
-    action_path = os.path.join(BASE_DIR, "action_model.pth")
-    future_path = os.path.join(BASE_DIR, "future_model.pth")
-    value_path = os.path.join(BASE_DIR, "value_model.pth")
+    model_files = {
+        "screen_future": os.path.join(BASE_DIR, "ai_model_screen_future.pth"),
+        "mouse_predict": os.path.join(BASE_DIR, "ai_model_mouse_predict.pth"),
+        "mouse_output": os.path.join(BASE_DIR, "ai_model_mouse_output.pth"),
+        "autoencoder": os.path.join(BASE_DIR, "ai_model_autoencoder.pth"),
+        "value": os.path.join(BASE_DIR, "ai_model_value.pth")
+    }
     if not os.path.exists(buffer_path):
         with open(buffer_path, "wb") as f:
             pickle.dump([], f)
     chunk_files = glob.glob(os.path.join(BUFFER_DIR, "chunk_*.pt"))
     if not chunk_files:
         torch.save([], os.path.join(BUFFER_DIR, "chunk_0.pt"))
-    if not os.path.exists(model_path):
-        torch.save(ai_model.state_dict(), model_path)
-    if not os.path.exists(action_path):
-        torch.save(action_model.state_dict(), action_path)
-    if not os.path.exists(future_path):
-        torch.save(future_model.state_dict(), future_path)
-    if not os.path.exists(value_path):
-        torch.save(value_model.state_dict(), value_path)
+    if not os.path.exists(model_files["autoencoder"]):
+        torch.save(ai_model.state_dict(), model_files["autoencoder"])
+    if not os.path.exists(model_files["mouse_output"]):
+        torch.save(action_model.state_dict(), model_files["mouse_output"])
+    if not os.path.exists(model_files["screen_future"]):
+        torch.save(future_model.state_dict(), model_files["screen_future"])
+    if not os.path.exists(model_files["mouse_predict"]):
+        torch.save(action_model.state_dict(), model_files["mouse_predict"])
+    if not os.path.exists(model_files["value"]):
+        torch.save(value_model.state_dict(), model_files["value"])
 
 def load_state():
     global exp_buffer
     buffer_path = os.path.join(BASE_DIR, "experience_pool.pkl")
-    model_path = os.path.join(BASE_DIR, "ai_model.pth")
-    action_path = os.path.join(BASE_DIR, "action_model.pth")
-    future_path = os.path.join(BASE_DIR, "future_model.pth")
-    value_path = os.path.join(BASE_DIR, "value_model.pth")
+    model_files = {
+        "screen_future": os.path.join(BASE_DIR, "ai_model_screen_future.pth"),
+        "mouse_predict": os.path.join(BASE_DIR, "ai_model_mouse_predict.pth"),
+        "mouse_output": os.path.join(BASE_DIR, "ai_model_mouse_output.pth"),
+        "autoencoder": os.path.join(BASE_DIR, "ai_model_autoencoder.pth"),
+        "value": os.path.join(BASE_DIR, "ai_model_value.pth")
+    }
     loaded = exp_buffer.load_chunks()
     if not loaded and os.path.exists(buffer_path):
         with open(buffer_path, "rb") as f:
@@ -459,20 +476,23 @@ def load_state():
         loaded = True
     if not loaded and not glob.glob(os.path.join(BUFFER_DIR, "chunk_*.pt")):
         torch.save([], os.path.join(BUFFER_DIR, "chunk_0.pt"))
-    if os.path.exists(model_path):
-        ai_model.load_state_dict(torch.load(model_path, map_location=device))
-    if os.path.exists(action_path):
-        action_model.load_state_dict(torch.load(action_path, map_location=device))
-    if os.path.exists(future_path):
-        future_model.load_state_dict(torch.load(future_path, map_location=device))
-    if os.path.exists(value_path):
-        value_model.load_state_dict(torch.load(value_path, map_location=device))
+    if os.path.exists(model_files["autoencoder"]):
+        ai_model.load_state_dict(torch.load(model_files["autoencoder"], map_location=device))
+    if os.path.exists(model_files["mouse_output"]):
+        action_model.load_state_dict(torch.load(model_files["mouse_output"], map_location=device))
+    if os.path.exists(model_files["screen_future"]):
+        future_model.load_state_dict(torch.load(model_files["screen_future"], map_location=device))
+    if os.path.exists(model_files["mouse_predict"]):
+        action_model.load_state_dict(torch.load(model_files["mouse_predict"], map_location=device))
+    if os.path.exists(model_files["value"]):
+        value_model.load_state_dict(torch.load(model_files["value"], map_location=device))
 
 def save_state():
-    torch.save(ai_model.state_dict(), os.path.join(BASE_DIR, "ai_model.pth"))
-    torch.save(action_model.state_dict(), os.path.join(BASE_DIR, "action_model.pth"))
-    torch.save(future_model.state_dict(), os.path.join(BASE_DIR, "future_model.pth"))
-    torch.save(value_model.state_dict(), os.path.join(BASE_DIR, "value_model.pth"))
+    torch.save(ai_model.state_dict(), os.path.join(BASE_DIR, "ai_model_autoencoder.pth"))
+    torch.save(action_model.state_dict(), os.path.join(BASE_DIR, "ai_model_mouse_output.pth"))
+    torch.save(future_model.state_dict(), os.path.join(BASE_DIR, "ai_model_screen_future.pth"))
+    torch.save(action_model.state_dict(), os.path.join(BASE_DIR, "ai_model_mouse_predict.pth"))
+    torch.save(value_model.state_dict(), os.path.join(BASE_DIR, "ai_model_value.pth"))
     exp_buffer.save()
 
 def get_mouse_state():
