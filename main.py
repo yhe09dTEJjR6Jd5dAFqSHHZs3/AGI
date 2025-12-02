@@ -73,16 +73,16 @@ set_dpi_awareness()
 def clamp_value(val, lower, upper):
     return max(lower, min(upper, val))
 
+VISION_WIDTH = 256
+VISION_HEIGHT = 160
+
 def default_config():
     fps_bounds = [1, 100]
     cpu_cores = psutil.cpu_count(logical=False) or psutil.cpu_count()
     mem_info = psutil.virtual_memory()
     mem_ratio = 1.0 - mem_info.percent / 100.0
-    res_factor_default = clamp_value(mem_ratio, 0.05, 1.0)
-    scale_default = clamp_value(0.5 + mem_ratio * 0.5, 0.01, 1.0)
     context_default = clamp_value(int(2 + (cpu_cores or 1) * 0.5), 1, 100)
-    base_resolution = [max(32, int(64 * scale_default)), max(32, int(64 * scale_default))]
-    latent_default = clamp_value(int(4 * scale_default + context_default * 0.25), 2, 12)
+    latent_default = clamp_value(int(4 + context_default * 0.25), 2, 12)
     fps_dynamic = clamp_value(int(fps_bounds[1] * mem_ratio), fps_bounds[0], fps_bounds[1])
     chunk_limit = int(clamp_value(mem_info.available / (1024**2 * 256), 128, 1024))
     chunk_bytes = int(clamp_value(mem_info.available * 0.05, 64 * 1024 * 1024, 512 * 1024 * 1024))
@@ -93,10 +93,10 @@ def default_config():
         "capture": {
             "fps": fps_dynamic,
             "fps_bounds": fps_bounds,
-            "scale": scale_default,
-            "resolution_factor": res_factor_default,
+            "scale": 1.0,
+            "resolution_factor": 1.0,
             "context_window": context_default,
-            "standard_resolution": base_resolution,
+            "standard_resolution": [VISION_HEIGHT, VISION_WIDTH],
             "latent_pool": latent_default
         },
         "limits": {
@@ -110,16 +110,9 @@ def default_config():
         },
         "resource": {
             "cooldown_seconds": clamp_value(0.5 + mem_ratio * 0.5, 0.3, 1.5),
-            "downscale_factor": 0.85,
-            "downscale_threshold": clamp_value(70.0 + mem_ratio * 20.0, 70.0, 90.0),
-            "downscale_delta": 0.8,
-            "upscale_threshold": clamp_value(60.0 + mem_ratio * 15.0, 60.0, 85.0),
-            "upscale_delta": 0.3,
-            "upscale_growth": clamp_value(1.01 + mem_ratio * 0.03, 1.01, 1.04),
-            "spike_delta": 0.5,
-            "min_scale": 0.01,
+            "min_scale": 1.0,
             "max_scale": 1.0,
-            "min_resolution_factor": 0.01,
+            "min_resolution_factor": 1.0,
             "max_resolution_factor": 1.0,
             "min_context": 1,
             "max_context": 100
@@ -233,9 +226,7 @@ mouse_left_down = False
 mouse_right_down = False
 
 def scaled_standard_res():
-    with lock:
-        factor = resolution_factor
-    return max(1, int(standard_res[0] * factor)), max(1, int(standard_res[1] * factor))
+    return standard_res
 
 class Autoencoder(nn.Module):
     def __init__(self):
@@ -603,12 +594,12 @@ def aggregate_latents(latents):
 
 class ResourceMonitor(threading.Thread):
     def run(self):
-        global current_fps, current_scale, resolution_factor, temporal_context_window
-        moving_load = 61.8
-        last_adjust = time.time()
+        global current_fps, temporal_context_window
         r_cfg = config_data["resource"]
         cooldown = r_cfg["cooldown_seconds"]
-        target_load = 61.8
+        target_high = 61.8
+        target_low = 38.2
+        last_adjust = time.time()
         while global_running:
             cpu = psutil.cpu_percent()
             mem = psutil.virtual_memory().percent
@@ -617,34 +608,23 @@ class ResourceMonitor(threading.Thread):
             if torch.cuda.is_available():
                 vram_use = torch.cuda.memory_allocated() / (1024**3)
                 vram_torch = min(100.0, vram_use / max_vram_gb * 100)
-            gpu = gpu_util
-            vram = max(vram_util, vram_torch)
-            m_val = max(cpu, mem, gpu, vram)
-            moving_load = 0.65 * moving_load + 0.35 * m_val
-            load_error = m_val - target_load
+            m_val = max(cpu, mem, gpu_util, vram_util, vram_torch)
             now = time.time()
-            effective_cooldown = max(0.1, cooldown * (0.5 + min(abs(load_error) / max(target_load, 1e-6), 1.0)))
-            adjust_allowed = (now - last_adjust) >= effective_cooldown
-            with lock:
-                if adjust_allowed and abs(load_error) >= 0.1:
+            if now - last_adjust >= cooldown:
+                with lock:
                     fps_lower, fps_upper = config_data["capture"]["fps_bounds"]
-                    prev_values = (current_fps, current_scale, resolution_factor, temporal_context_window)
-                    severity = clamp_value(abs(load_error) / max(target_load, 1e-6), 0.05, 2.5)
-                    if load_error > 0:
-                        shrink = 1 + severity * 0.4
-                        current_fps = max(fps_lower, int(max(fps_lower, current_fps / shrink)))
-                        current_scale = max(r_cfg["min_scale"], current_scale / (1 + severity * 0.3))
-                        resolution_factor = max(r_cfg["min_resolution_factor"], resolution_factor / (1 + severity * 0.3))
-                        temporal_context_window = max(r_cfg["min_context"], temporal_context_window - max(1, int(severity * 3)))
-                    else:
-                        boost = 1 + severity * 0.25
-                        current_fps = min(fps_upper, int(current_fps * boost) + 1)
-                        current_scale = min(r_cfg["max_scale"], current_scale * (1 + severity * 0.2))
-                        resolution_factor = min(r_cfg["max_resolution_factor"], resolution_factor * (1 + severity * 0.2))
-                        temporal_context_window = min(r_cfg["max_context"], temporal_context_window + max(1, int(severity * 3)))
-                    if (current_fps, current_scale, resolution_factor, temporal_context_window) != prev_values:
-                        last_adjust = now
-                persist_config()
+                    context_min = r_cfg["min_context"]
+                    context_max = r_cfg["max_context"]
+                    if m_val > target_high:
+                        delta = max(1, int((m_val - target_high) / 5) + 1)
+                        current_fps = max(fps_lower, current_fps - delta)
+                        temporal_context_window = max(context_min, temporal_context_window - delta)
+                    elif m_val < target_low:
+                        delta = max(1, int((target_low - m_val) / 5) + 1)
+                        current_fps = min(fps_upper, current_fps + delta)
+                        temporal_context_window = min(context_max, temporal_context_window + delta)
+                    last_adjust = now
+                    persist_config()
             time.sleep(1)
 
 class AgentThread(threading.Thread):
@@ -662,19 +642,12 @@ class AgentThread(threading.Thread):
             start_time = time.time()
             with lock:
                 fps = current_fps
-                scale = current_scale
-                res_factor = resolution_factor
                 window_len = temporal_context_window
             monitor = {"top": 0, "left": 0, "width": screen_width, "height": screen_height}
             img_np = np.array(sct.grab(monitor))
             img_np = cv2.cvtColor(img_np, cv2.COLOR_BGRA2RGB)
-            h, w = img_np.shape[:2]
-            target_h = int(h * scale * res_factor)
-            target_w = int(w * scale * res_factor)
-            target_h = (target_h // 4) * 4
-            target_w = (target_w // 4) * 4
-            if target_h < 4: target_h = 4
-            if target_w < 4: target_w = 4
+            target_w = VISION_WIDTH
+            target_h = VISION_HEIGHT
             img_resized = cv2.resize(img_np, (target_w, target_h))
             img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
             img_tensor = img_tensor.unsqueeze(0).to(device)
