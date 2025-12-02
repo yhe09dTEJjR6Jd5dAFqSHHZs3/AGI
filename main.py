@@ -60,6 +60,15 @@ if not os.path.exists(BASE_DIR):
 if not os.path.exists(BUFFER_DIR):
     os.makedirs(BUFFER_DIR)
 
+def set_dpi_awareness():
+    if platform.system().lower().startswith("win") and hasattr(ctypes, "windll") and hasattr(ctypes.windll, "user32"):
+        if hasattr(ctypes.windll, "shcore") and hasattr(ctypes.windll.shcore, "SetProcessDpiAwareness"):
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        if hasattr(ctypes.windll.user32, "SetProcessDPIAware"):
+            ctypes.windll.user32.SetProcessDPIAware()
+
+set_dpi_awareness()
+
 def clamp_value(val, lower, upper):
     return max(lower, min(upper, val))
 
@@ -311,22 +320,13 @@ class ExperienceBuffer:
         return True
 
     def enforce_limit(self):
+        removed_any = False
         while self._buffer_size_gb() > max_buffer_gb and len(self.buffer) > 0:
-            while self.heap and (self.heap[0][1] >= len(self.buffer)):
-                heapq.heappop(self.heap)
-            if not self.heap:
-                break
-            _, idx = heapq.heappop(self.heap)
-            if idx >= len(self.buffer):
-                continue
-            removed = self.buffer[idx]
-            removed_bytes = self._sample_bytes(removed)
-            last_idx = len(self.buffer) - 1
-            if idx != last_idx:
-                self.buffer[idx] = self.buffer[last_idx]
-                heapq.heappush(self.heap, (self.buffer[idx]["reward"], idx))
-            self.buffer.pop()
-            self.total_bytes -= removed_bytes
+            removed = self.buffer.pop(0)
+            self.total_bytes -= self._sample_bytes(removed)
+            removed_any = True
+        if removed_any:
+            self.rebuild_metadata()
 
     def sample_sequences(self, batch_size, window):
         if len(self.buffer) <= window:
@@ -502,24 +502,24 @@ class ResourceMonitor(threading.Thread):
             now = time.time()
             adjust_allowed = (now - last_adjust) >= cooldown
             with lock:
-                if adjust_allowed and (m_val > r_cfg["downscale_threshold"] or delta > r_cfg["downscale_delta"]):
-                    current_fps = max(1, int(current_fps * r_cfg["downscale_factor"]))
+                if adjust_allowed and delta > 0:
+                    fps_lower, fps_upper = config_data["capture"]["fps_bounds"]
+                    prev_values = (current_fps, current_scale, resolution_factor, temporal_context_window)
+                    current_fps = max(fps_lower, int(current_fps * r_cfg["downscale_factor"]))
                     current_scale = max(r_cfg["min_scale"], current_scale * r_cfg["downscale_factor"])
                     resolution_factor = max(r_cfg["min_resolution_factor"], resolution_factor * r_cfg["downscale_factor"])
                     temporal_context_window = max(r_cfg["min_context"], temporal_context_window - 1)
-                    last_adjust = now
-                elif adjust_allowed and m_val < r_cfg["upscale_threshold"] and delta < r_cfg["upscale_delta"]:
-                    current_fps = min(config_data["capture"]["fps_bounds"][1], int(current_fps * r_cfg["upscale_growth"]) + 1)
-                    current_scale = min(1.0, current_scale * r_cfg["upscale_growth"]) 
+                    if (current_fps, current_scale, resolution_factor, temporal_context_window) != prev_values:
+                        last_adjust = now
+                elif adjust_allowed and delta < 0:
+                    fps_lower, fps_upper = config_data["capture"]["fps_bounds"]
+                    prev_values = (current_fps, current_scale, resolution_factor, temporal_context_window)
+                    current_fps = min(fps_upper, int(current_fps * r_cfg["upscale_growth"]) + 1)
+                    current_scale = min(1.0, current_scale * r_cfg["upscale_growth"])
                     resolution_factor = min(r_cfg["max_resolution_factor"], resolution_factor * r_cfg["upscale_growth"])
                     temporal_context_window = min(r_cfg["max_context"], temporal_context_window + 1)
-                    last_adjust = now
-                elif adjust_allowed and delta > r_cfg["spike_delta"]:
-                    current_fps = max(1, int(current_fps * r_cfg["downscale_factor"]))
-                    current_scale = max(r_cfg["min_scale"], current_scale * r_cfg["downscale_factor"])
-                    resolution_factor = max(r_cfg["min_resolution_factor"], resolution_factor * r_cfg["downscale_factor"])
-                    temporal_context_window = max(r_cfg["min_context"], temporal_context_window - 1)
-                    last_adjust = now
+                    if (current_fps, current_scale, resolution_factor, temporal_context_window) != prev_values:
+                        last_adjust = now
                 persist_config()
             time.sleep(1)
 
