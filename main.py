@@ -269,7 +269,8 @@ class ExperienceBuffer:
         if img.dim() == 4:
             img = img[0]
         res_h, res_w = scaled_standard_res()
-        img = F.interpolate(img.unsqueeze(0), size=(res_h, res_w), mode="bilinear", align_corners=False).squeeze(0).half()
+        img = F.interpolate(img.unsqueeze(0), size=(res_h, res_w), mode="bilinear", align_corners=False).squeeze(0)
+        img = torch.clamp(img * 255.0, 0, 255).to(torch.uint8)
         mouse = mouse_state.float()
         if mouse.dim() > 1:
             mouse = mouse[0]
@@ -571,13 +572,15 @@ class AgentThread(threading.Thread):
             pred_mouse[:, 0] = torch.tanh(pos_raw[:, 0]) * 0.5
             pred_mouse[:, 1] = torch.tanh(pos_raw[:, 1]) * 0.5
             pred_status_idx = int(torch.argmax(status_probs, dim=1).item())
-            screen_novelty = criterion(predicted_img, img_tensor).item()
+            screen_mse = criterion(predicted_img, img_tensor).item()
+            screen_novelty = math.log1p(screen_mse) * 10000
             pos_loss = torch.mean((pred_mouse[:, :2] - mouse_tensor[:, :2]) ** 2)
             status_target = torch.tensor([int(mouse_val[2])], device=device, dtype=torch.long)
             status_loss = F.cross_entropy(status_logits, status_target)
-            action_novelty = (pos_loss + status_loss).item()
+            action_novelty_raw = (pos_loss + status_loss).item()
+            action_novelty = math.log1p(action_novelty_raw) * 10000
             survival_penalty = config_data["learning"]["survival_penalty"]
-            reward = (screen_novelty * action_novelty) - survival_penalty
+            reward = (screen_novelty * action_novelty) / 10000 - survival_penalty
             td_error = screen_novelty + action_novelty
             exp_buffer.add(img_tensor.cpu(), mouse_tensor.cpu(), reward, td_error, screen_novelty, latent.cpu())
             pred_np = pred_mouse.cpu().numpy()[0]
@@ -703,7 +706,8 @@ class SciFiWindow(QtWidgets.QWidget):
                 for context_entries, target_entry in batch:
                     latents = [item["latent"].float() for item in context_entries]
                     context_latent_list.append(latents)
-                    target_imgs.append(target_entry["img"].float())
+                    img_dtype = torch.float16 if device.type == "cuda" else torch.float32
+                    target_imgs.append(target_entry["img"].to(dtype=img_dtype) / 255.0)
                     target_mice.append(target_entry["mouse"].float())
                     target_latents.append(target_entry["latent"].float())
                 optimizer.zero_grad()
