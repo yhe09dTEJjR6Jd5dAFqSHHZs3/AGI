@@ -47,6 +47,7 @@ keyboard = import_or_install("pynput.keyboard")
 pyautogui = import_or_install("pyautogui")
 ctypes = import_or_install("ctypes")
 platform = import_or_install("platform")
+pynvml = import_or_install("pynvml")
 
 pyautogui.FAILSAFE = False
 
@@ -73,13 +74,13 @@ def clamp_value(val, lower, upper):
     return max(lower, min(upper, val))
 
 def default_config():
-    fps_bounds = [1, 120]
+    fps_bounds = [1, 100]
     cpu_cores = psutil.cpu_count(logical=False) or psutil.cpu_count()
     mem_info = psutil.virtual_memory()
     mem_ratio = 1.0 - mem_info.percent / 100.0
-    res_factor_default = clamp_value(mem_ratio, 0.2, 1.0)
-    scale_default = clamp_value(0.5 + mem_ratio * 0.5, 0.05, 1.0)
-    context_default = clamp_value(int(2 + (cpu_cores or 1) * 0.5), 2, 12)
+    res_factor_default = clamp_value(mem_ratio, 0.05, 1.0)
+    scale_default = clamp_value(0.5 + mem_ratio * 0.5, 0.01, 1.0)
+    context_default = clamp_value(int(2 + (cpu_cores or 1) * 0.5), 1, 100)
     base_resolution = [max(32, int(64 * scale_default)), max(32, int(64 * scale_default))]
     latent_default = clamp_value(int(4 * scale_default + context_default * 0.25), 2, 12)
     fps_dynamic = clamp_value(int(fps_bounds[1] * mem_ratio), fps_bounds[0], fps_bounds[1])
@@ -108,7 +109,7 @@ def default_config():
             "chunk_byte_limit": chunk_bytes
         },
         "resource": {
-            "cooldown_seconds": clamp_value(1.0 + mem_ratio, 1.0, 3.0),
+            "cooldown_seconds": clamp_value(0.5 + mem_ratio * 0.5, 0.3, 1.5),
             "downscale_factor": 0.85,
             "downscale_threshold": clamp_value(70.0 + mem_ratio * 20.0, 70.0, 90.0),
             "downscale_delta": 0.8,
@@ -116,11 +117,12 @@ def default_config():
             "upscale_delta": 0.3,
             "upscale_growth": clamp_value(1.01 + mem_ratio * 0.03, 1.01, 1.04),
             "spike_delta": 0.5,
-            "min_scale": 0.05,
-            "min_resolution_factor": 0.2,
+            "min_scale": 0.01,
+            "max_scale": 1.0,
+            "min_resolution_factor": 0.01,
             "max_resolution_factor": 1.0,
-            "min_context": 2,
-            "max_context": 12
+            "min_context": 1,
+            "max_context": 100
         },
         "learning": {
             "survival_penalty": 0.01,
@@ -147,6 +149,19 @@ def load_or_create_config():
                 cfg_dict[k] = cfg_dict.get(k, v)
         return cfg_dict
     cfg = merge(defaults, cfg)
+    capture_cfg = cfg["capture"]
+    fps_low = clamp_value(int(capture_cfg.get("fps_bounds", [1, 100])[0]), 1, 100)
+    fps_high = clamp_value(int(capture_cfg.get("fps_bounds", [1, 100])[1]), fps_low, 100)
+    capture_cfg["fps_bounds"] = [fps_low, fps_high]
+    capture_cfg["scale"] = clamp_value(capture_cfg.get("scale", defaults["capture"]["scale"]), 0.01, 1.0)
+    capture_cfg["resolution_factor"] = clamp_value(capture_cfg.get("resolution_factor", defaults["capture"]["resolution_factor"]), 0.01, 1.0)
+    capture_cfg["context_window"] = int(clamp_value(int(capture_cfg.get("context_window", defaults["capture"]["context_window"])), 1, 100))
+    resource_cfg = cfg["resource"]
+    resource_cfg["max_scale"] = clamp_value(resource_cfg.get("max_scale", 1.0), 0.5, 1.0)
+    resource_cfg["min_scale"] = clamp_value(resource_cfg.get("min_scale", defaults["resource"]["min_scale"]), 0.01, resource_cfg["max_scale"])
+    resource_cfg["min_resolution_factor"] = clamp_value(resource_cfg.get("min_resolution_factor", defaults["resource"]["min_resolution_factor"]), 0.01, resource_cfg["max_resolution_factor"])
+    resource_cfg["min_context"] = int(clamp_value(int(resource_cfg.get("min_context", defaults["resource"]["min_context"])), 1, 100))
+    resource_cfg["max_context"] = int(clamp_value(int(resource_cfg.get("max_context", defaults["resource"]["max_context"])), resource_cfg["min_context"], 100))
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     return cfg
@@ -167,11 +182,12 @@ def apply_config():
     capture_cfg = config_data["capture"]
     limits_cfg = config_data["limits"]
     buffer_cfg = config_data["buffer"]
+    resource_cfg = config_data["resource"]
     fps_lower, fps_upper = capture_cfg["fps_bounds"]
     current_fps = clamp_value(capture_cfg["fps"], fps_lower, fps_upper)
-    current_scale = clamp_value(capture_cfg["scale"], 0.05, 1.0)
-    resolution_factor = clamp_value(capture_cfg["resolution_factor"], 0.2, 1.0)
-    temporal_context_window = clamp_value(int(capture_cfg["context_window"]), 2, 12)
+    current_scale = clamp_value(capture_cfg["scale"], resource_cfg["min_scale"], resource_cfg["max_scale"])
+    resolution_factor = clamp_value(capture_cfg["resolution_factor"], resource_cfg["min_resolution_factor"], resource_cfg["max_resolution_factor"])
+    temporal_context_window = clamp_value(int(capture_cfg["context_window"]), resource_cfg["min_context"], resource_cfg["max_context"])
     standard_res = tuple(capture_cfg["standard_resolution"])
     latent_pool = max(1, int(capture_cfg["latent_pool"]))
     max_vram_gb = limits_cfg["max_vram_gb"]
@@ -181,6 +197,26 @@ def apply_config():
     chunk_byte_limit = int(buffer_cfg["chunk_byte_limit"])
 
 apply_config()
+
+gpu_handle = None
+
+def init_gpu_handle():
+    global gpu_handle
+    if torch.cuda.is_available():
+        pynvml.nvmlInit()
+        count = pynvml.nvmlDeviceGetCount()
+        if count > 0:
+            gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+init_gpu_handle()
+
+def gpu_stats():
+    if gpu_handle is None:
+        return 0.0, 0.0
+    util = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
+    mem_info = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
+    vram_percent = min(100.0, mem_info.used / (1024**3) / max(max_vram_gb, 1e-6) * 100)
+    return float(util.gpu), float(vram_percent)
 
 def persist_config():
     config_data["capture"]["fps"] = current_fps
@@ -565,33 +601,36 @@ class ResourceMonitor(threading.Thread):
         while global_running:
             cpu = psutil.cpu_percent()
             mem = psutil.virtual_memory().percent
-            gpu = 0
-            vram = 0
+            gpu_util, vram_util = gpu_stats()
+            vram_torch = 0.0
             if torch.cuda.is_available():
                 vram_use = torch.cuda.memory_allocated() / (1024**3)
-                vram = min(100.0, vram_use / max_vram_gb * 100)
+                vram_torch = min(100.0, vram_use / max_vram_gb * 100)
+            gpu = gpu_util
+            vram = max(vram_util, vram_torch)
             m_val = max(cpu, mem, gpu, vram)
-            moving_load = 0.8 * moving_load + 0.2 * m_val
-            load_error = moving_load - target_load
+            moving_load = 0.65 * moving_load + 0.35 * m_val
+            load_error = m_val - target_load
             now = time.time()
-            adjust_allowed = (now - last_adjust) >= cooldown
+            effective_cooldown = max(0.1, cooldown * (0.5 + min(abs(load_error) / max(target_load, 1e-6), 1.0)))
+            adjust_allowed = (now - last_adjust) >= effective_cooldown
             with lock:
-                if adjust_allowed and abs(load_error) >= 0.5:
+                if adjust_allowed and abs(load_error) >= 0.1:
                     fps_lower, fps_upper = config_data["capture"]["fps_bounds"]
                     prev_values = (current_fps, current_scale, resolution_factor, temporal_context_window)
-                    severity = clamp_value(abs(load_error) / max(target_load, 1e-6), 0.05, 1.5)
+                    severity = clamp_value(abs(load_error) / max(target_load, 1e-6), 0.05, 2.5)
                     if load_error > 0:
-                        dynamic_scale = 1 + severity
-                        current_fps = max(fps_lower, int(current_fps / dynamic_scale))
-                        current_scale = max(r_cfg["min_scale"], current_scale / dynamic_scale)
-                        resolution_factor = max(r_cfg["min_resolution_factor"], resolution_factor / dynamic_scale)
-                        temporal_context_window = max(r_cfg["min_context"], temporal_context_window - max(1, int(severity * 2)))
+                        shrink = 1 + severity * 0.4
+                        current_fps = max(fps_lower, int(max(fps_lower, current_fps / shrink)))
+                        current_scale = max(r_cfg["min_scale"], current_scale / (1 + severity * 0.3))
+                        resolution_factor = max(r_cfg["min_resolution_factor"], resolution_factor / (1 + severity * 0.3))
+                        temporal_context_window = max(r_cfg["min_context"], temporal_context_window - max(1, int(severity * 3)))
                     else:
-                        growth = 1 + severity
-                        current_fps = min(fps_upper, int(current_fps * growth) + 1)
-                        current_scale = min(1.0, current_scale * growth)
-                        resolution_factor = min(r_cfg["max_resolution_factor"], resolution_factor * growth)
-                        temporal_context_window = min(r_cfg["max_context"], temporal_context_window + max(1, int(severity * 2)))
+                        boost = 1 + severity * 0.25
+                        current_fps = min(fps_upper, int(current_fps * boost) + 1)
+                        current_scale = min(r_cfg["max_scale"], current_scale * (1 + severity * 0.2))
+                        resolution_factor = min(r_cfg["max_resolution_factor"], resolution_factor * (1 + severity * 0.2))
+                        temporal_context_window = min(r_cfg["max_context"], temporal_context_window + max(1, int(severity * 3)))
                     if (current_fps, current_scale, resolution_factor, temporal_context_window) != prev_values:
                         last_adjust = now
                 persist_config()
