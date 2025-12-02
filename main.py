@@ -10,6 +10,7 @@ import random
 import warnings
 import subprocess
 import importlib
+import json
 from collections import deque
 import heapq
 
@@ -52,11 +53,92 @@ pyautogui.FAILSAFE = False
 DESKTOP_PATH = os.path.join(os.path.expanduser("~"), "Desktop")
 BASE_DIR = os.path.join(DESKTOP_PATH, "AAA")
 BUFFER_DIR = os.path.join(BASE_DIR, "experience_pool_chunks")
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
 if not os.path.exists(BASE_DIR):
     os.makedirs(BASE_DIR)
 if not os.path.exists(BUFFER_DIR):
     os.makedirs(BUFFER_DIR)
+
+def clamp_value(val, lower, upper):
+    return max(lower, min(upper, val))
+
+def default_config():
+    fps_bounds = [1, 120]
+    res_factor_default = 1.0
+    scale_default = 1.0
+    context_default = 4
+    base_resolution = [128, 128]
+    latent_default = 4
+    config = {
+        "capture": {
+            "fps": fps_bounds[1] // 4,
+            "fps_bounds": fps_bounds,
+            "scale": scale_default,
+            "resolution_factor": res_factor_default,
+            "context_window": context_default,
+            "standard_resolution": base_resolution,
+            "latent_pool": latent_default
+        },
+        "limits": {
+            "max_vram_gb": 4.0,
+            "max_ram_gb": 16.0,
+            "max_buffer_gb": 10.0
+        },
+        "buffer": {
+            "chunk_entry_limit": 512,
+            "chunk_byte_limit": 256 * 1024 * 1024
+        },
+        "resource": {
+            "cooldown_seconds": 2.0,
+            "downscale_factor": 0.85,
+            "downscale_threshold": 90.0,
+            "downscale_delta": 0.8,
+            "upscale_threshold": 80.0,
+            "upscale_delta": 0.3,
+            "upscale_growth": 1.02,
+            "spike_delta": 0.5,
+            "min_scale": 0.05,
+            "min_resolution_factor": 0.2,
+            "max_resolution_factor": 1.0,
+            "min_context": 2,
+            "max_context": 12
+        },
+        "learning": {
+            "survival_penalty": 0.01,
+            "sample_batch": 64,
+            "train_steps": 100,
+            "mini_batch": 8,
+            "learning_rate": 1e-3,
+            "grad_clip": 1.0
+        }
+    }
+    return config
+
+def load_or_create_config():
+    cfg = None
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = None
+    if cfg is None:
+        cfg = default_config()
+    defaults = default_config()
+    def merge(defaults_dict, cfg_dict):
+        for k, v in defaults_dict.items():
+            if isinstance(v, dict):
+                cfg_dict[k] = merge(v, cfg_dict.get(k, {}))
+            else:
+                cfg_dict[k] = cfg_dict.get(k, v)
+        return cfg_dict
+    cfg = merge(defaults, cfg)
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    return cfg
+
+config_data = load_or_create_config()
 
 global_running = True
 global_optimizing = False
@@ -65,17 +147,37 @@ global_pause_recording = False
 screen_width, screen_height = pyautogui.size()
 center_x, center_y = screen_width // 2, screen_height // 2
 
-current_fps = 30
-current_scale = 0.5
-resolution_factor = 1.0
-temporal_context_window = 4
-max_vram_gb = 4.0
-max_ram_gb = 16.0
-max_buffer_gb = 10.0
-standard_res = (128, 128)
-latent_pool = 4
-chunk_entry_limit = 512
-chunk_byte_limit = 256 * 1024 * 1024
+def apply_config():
+    global current_fps, current_scale, resolution_factor, temporal_context_window
+    global max_vram_gb, max_ram_gb, max_buffer_gb, standard_res, latent_pool
+    global chunk_entry_limit, chunk_byte_limit
+    capture_cfg = config_data["capture"]
+    limits_cfg = config_data["limits"]
+    buffer_cfg = config_data["buffer"]
+    fps_lower, fps_upper = capture_cfg["fps_bounds"]
+    current_fps = clamp_value(capture_cfg["fps"], fps_lower, fps_upper)
+    current_scale = clamp_value(capture_cfg["scale"], 0.05, 1.0)
+    resolution_factor = clamp_value(capture_cfg["resolution_factor"], 0.2, 1.0)
+    temporal_context_window = clamp_value(int(capture_cfg["context_window"]), 2, 12)
+    standard_res = tuple(capture_cfg["standard_resolution"])
+    latent_pool = max(1, int(capture_cfg["latent_pool"]))
+    max_vram_gb = limits_cfg["max_vram_gb"]
+    max_ram_gb = limits_cfg["max_ram_gb"]
+    max_buffer_gb = limits_cfg["max_buffer_gb"]
+    chunk_entry_limit = int(buffer_cfg["chunk_entry_limit"])
+    chunk_byte_limit = int(buffer_cfg["chunk_byte_limit"])
+
+apply_config()
+
+def persist_config():
+    config_data["capture"]["fps"] = current_fps
+    config_data["capture"]["scale"] = current_scale
+    config_data["capture"]["resolution_factor"] = resolution_factor
+    config_data["capture"]["context_window"] = temporal_context_window
+    config_data["capture"]["standard_resolution"] = list(standard_res)
+    config_data["capture"]["latent_pool"] = latent_pool
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(config_data, f, ensure_ascii=False, indent=2)
 
 lock = threading.Lock()
 mouse_left_down = False
@@ -418,7 +520,8 @@ class ResourceMonitor(threading.Thread):
         global current_fps, current_scale, resolution_factor, temporal_context_window
         prev_m = None
         last_adjust = time.time()
-        cooldown = 2.0
+        r_cfg = config_data["resource"]
+        cooldown = r_cfg["cooldown_seconds"]
         while global_running:
             cpu = psutil.cpu_percent()
             mem = psutil.virtual_memory().percent
@@ -436,24 +539,25 @@ class ResourceMonitor(threading.Thread):
             now = time.time()
             adjust_allowed = (now - last_adjust) >= cooldown
             with lock:
-                if adjust_allowed and (m_val > 90 or delta > 0.8):
-                    current_fps = max(1, int(current_fps * 0.85))
-                    current_scale = max(0.05, current_scale * 0.85)
-                    resolution_factor = max(0.2, resolution_factor * 0.85)
-                    temporal_context_window = max(2, temporal_context_window - 1)
+                if adjust_allowed and (m_val > r_cfg["downscale_threshold"] or delta > r_cfg["downscale_delta"]):
+                    current_fps = max(1, int(current_fps * r_cfg["downscale_factor"]))
+                    current_scale = max(r_cfg["min_scale"], current_scale * r_cfg["downscale_factor"])
+                    resolution_factor = max(r_cfg["min_resolution_factor"], resolution_factor * r_cfg["downscale_factor"])
+                    temporal_context_window = max(r_cfg["min_context"], temporal_context_window - 1)
                     last_adjust = now
-                elif adjust_allowed and m_val < 80 and delta < 0.3:
-                    current_fps = min(120, int(current_fps * 1.02) + 1)
-                    current_scale = min(1.0, current_scale * 1.02)
-                    resolution_factor = min(1.0, resolution_factor * 1.02)
-                    temporal_context_window = min(12, temporal_context_window + 1)
+                elif adjust_allowed and m_val < r_cfg["upscale_threshold"] and delta < r_cfg["upscale_delta"]:
+                    current_fps = min(config_data["capture"]["fps_bounds"][1], int(current_fps * r_cfg["upscale_growth"]) + 1)
+                    current_scale = min(1.0, current_scale * r_cfg["upscale_growth"]) 
+                    resolution_factor = min(r_cfg["max_resolution_factor"], resolution_factor * r_cfg["upscale_growth"])
+                    temporal_context_window = min(r_cfg["max_context"], temporal_context_window + 1)
                     last_adjust = now
-                elif adjust_allowed and delta > 0.5:
-                    current_fps = max(1, int(current_fps * 0.9))
-                    current_scale = max(0.05, current_scale * 0.9)
-                    resolution_factor = max(0.2, resolution_factor * 0.9)
-                    temporal_context_window = max(2, temporal_context_window - 1)
+                elif adjust_allowed and delta > r_cfg["spike_delta"]:
+                    current_fps = max(1, int(current_fps * r_cfg["downscale_factor"]))
+                    current_scale = max(r_cfg["min_scale"], current_scale * r_cfg["downscale_factor"])
+                    resolution_factor = max(r_cfg["min_resolution_factor"], resolution_factor * r_cfg["downscale_factor"])
+                    temporal_context_window = max(r_cfg["min_context"], temporal_context_window - 1)
                     last_adjust = now
+                persist_config()
             time.sleep(1)
 
 class AgentThread(threading.Thread):
@@ -461,7 +565,7 @@ class AgentThread(threading.Thread):
         global global_pause_recording
         sct = mss.mss()
         criterion = nn.MSELoss()
-        context_latents = deque(maxlen=12)
+        context_latents = deque(maxlen=config_data["resource"]["max_context"])
         last_cache_clear = time.time()
         while global_running:
             if global_optimizing or global_pause_recording:
@@ -509,7 +613,7 @@ class AgentThread(threading.Thread):
                 status_target = torch.tensor([int(mouse_val[2])], device=device, dtype=torch.long)
                 status_loss = F.cross_entropy(status_logits, status_target)
                 action_novelty = (pos_loss + status_loss).item()
-                survival_penalty = 0.0001
+                survival_penalty = config_data["learning"]["survival_penalty"]
                 reward = (screen_novelty * action_novelty) - survival_penalty
                 td_error = screen_novelty + action_novelty
                 exp_buffer.add(img_tensor.cpu(), mouse_tensor.cpu(), reward, td_error, screen_novelty, latent.cpu())
@@ -616,21 +720,21 @@ class SciFiWindow(QtWidgets.QWidget):
 
     def _optimize_task(self):
         global global_optimizing, global_pause_recording
-        samples = exp_buffer.sample_sequences(64, temporal_context_window)
+        samples = exp_buffer.sample_sequences(config_data["learning"]["sample_batch"], temporal_context_window)
         if len(samples) == 0:
             global_optimizing = False
             global_pause_recording = False
             self.finished_signal.emit()
             return
-        total_steps = 100
-        optimizer = optim.Adam(list(ai_model.parameters()) + list(action_model.parameters()) + list(future_model.parameters()), lr=1e-3)
+        total_steps = config_data["learning"]["train_steps"]
+        optimizer = optim.Adam(list(ai_model.parameters()) + list(action_model.parameters()) + list(future_model.parameters()), lr=config_data["learning"]["learning_rate"])
         loss_fn = nn.MSELoss()
         for i in range(total_steps):
             if not global_running:
                 break
-            batch_indices = list(range(0, len(samples), 8))
+            batch_indices = list(range(0, len(samples), config_data["learning"]["mini_batch"]))
             for start in batch_indices:
-                batch = samples[start:start + 8]
+                batch = samples[start:start + config_data["learning"]["mini_batch"]]
                 context_latent_list = []
                 target_imgs = []
                 target_mice = []
@@ -667,7 +771,7 @@ class SciFiWindow(QtWidgets.QWidget):
                     loss_ae = loss_fn(recon, target_imgs_tensor) + loss_fn(target_latents_tensor, ai_model.encode(target_imgs_tensor))
                     loss = loss_screen + loss_mouse + loss_ae
                 scaler.scale(loss).backward()
-                torch.nn.utils.clip_grad_norm_(list(ai_model.parameters()) + list(action_model.parameters()) + list(future_model.parameters()), 1.0)
+                torch.nn.utils.clip_grad_norm_(list(ai_model.parameters()) + list(action_model.parameters()) + list(future_model.parameters()), config_data["learning"]["grad_clip"])
                 scaler.step(optimizer)
                 scaler.update()
             progress_val = int((i + 1) / total_steps * 100)
