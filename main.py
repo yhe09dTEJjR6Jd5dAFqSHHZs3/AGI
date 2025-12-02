@@ -484,10 +484,11 @@ def aggregate_latents(latents):
 class ResourceMonitor(threading.Thread):
     def run(self):
         global current_fps, current_scale, resolution_factor, temporal_context_window
-        prev_m = None
+        moving_load = 61.8
         last_adjust = time.time()
         r_cfg = config_data["resource"]
         cooldown = r_cfg["cooldown_seconds"]
+        target_load = 61.8
         while global_running:
             cpu = psutil.cpu_percent()
             mem = psutil.virtual_memory().percent
@@ -497,27 +498,27 @@ class ResourceMonitor(threading.Thread):
                 vram_use = torch.cuda.memory_allocated() / (1024**3)
                 vram = min(100.0, vram_use / max_vram_gb * 100)
             m_val = max(cpu, mem, gpu, vram)
-            delta = 0 if prev_m is None else m_val - prev_m
-            prev_m = m_val
+            moving_load = 0.8 * moving_load + 0.2 * m_val
+            load_error = moving_load - target_load
             now = time.time()
             adjust_allowed = (now - last_adjust) >= cooldown
             with lock:
-                if adjust_allowed and delta > 0:
+                if adjust_allowed and abs(load_error) >= 0.5:
                     fps_lower, fps_upper = config_data["capture"]["fps_bounds"]
                     prev_values = (current_fps, current_scale, resolution_factor, temporal_context_window)
-                    current_fps = max(fps_lower, int(current_fps * r_cfg["downscale_factor"]))
-                    current_scale = max(r_cfg["min_scale"], current_scale * r_cfg["downscale_factor"])
-                    resolution_factor = max(r_cfg["min_resolution_factor"], resolution_factor * r_cfg["downscale_factor"])
-                    temporal_context_window = max(r_cfg["min_context"], temporal_context_window - 1)
-                    if (current_fps, current_scale, resolution_factor, temporal_context_window) != prev_values:
-                        last_adjust = now
-                elif adjust_allowed and delta < 0:
-                    fps_lower, fps_upper = config_data["capture"]["fps_bounds"]
-                    prev_values = (current_fps, current_scale, resolution_factor, temporal_context_window)
-                    current_fps = min(fps_upper, int(current_fps * r_cfg["upscale_growth"]) + 1)
-                    current_scale = min(1.0, current_scale * r_cfg["upscale_growth"])
-                    resolution_factor = min(r_cfg["max_resolution_factor"], resolution_factor * r_cfg["upscale_growth"])
-                    temporal_context_window = min(r_cfg["max_context"], temporal_context_window + 1)
+                    severity = clamp_value(abs(load_error) / max(target_load, 1e-6), 0.05, 1.5)
+                    if load_error > 0:
+                        dynamic_scale = 1 + severity
+                        current_fps = max(fps_lower, int(current_fps / dynamic_scale))
+                        current_scale = max(r_cfg["min_scale"], current_scale / dynamic_scale)
+                        resolution_factor = max(r_cfg["min_resolution_factor"], resolution_factor / dynamic_scale)
+                        temporal_context_window = max(r_cfg["min_context"], temporal_context_window - max(1, int(severity * 2)))
+                    else:
+                        growth = 1 + severity
+                        current_fps = min(fps_upper, int(current_fps * growth) + 1)
+                        current_scale = min(1.0, current_scale * growth)
+                        resolution_factor = min(r_cfg["max_resolution_factor"], resolution_factor * growth)
+                        temporal_context_window = min(r_cfg["max_context"], temporal_context_window + max(1, int(severity * 2)))
                     if (current_fps, current_scale, resolution_factor, temporal_context_window) != prev_values:
                         last_adjust = now
                 persist_config()
