@@ -322,6 +322,9 @@ class ExperienceBuffer:
         self.total_bytes = 0
         self.counter = 0
         self.chunk_files = []
+        temp_dir = os.path.join(BUFFER_DIR, ".tmp")
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
 
     def add(self, state_img, mouse_state, reward, td_error, screen_novelty, latent_tensor):
         img = state_img.float()
@@ -459,7 +462,8 @@ exp_buffer = ExperienceBuffer()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ai_model = Autoencoder().to(device)
 future_model = FuturePredictor().to(device)
-action_model = ActionPredictor().to(device)
+predict_action_model = ActionPredictor().to(device)
+policy_action_model = ActionPredictor().to(device)
 value_model = ValuePredictor().to(device)
 scaler = GradScaler(enabled=device.type == "cuda")
 
@@ -485,11 +489,11 @@ def ensure_files():
     if not os.path.exists(model_files["autoencoder"]):
         torch.save(ai_model.state_dict(), model_files["autoencoder"])
     if not os.path.exists(model_files["mouse_output"]):
-        torch.save(action_model.state_dict(), model_files["mouse_output"])
+        torch.save(policy_action_model.state_dict(), model_files["mouse_output"])
     if not os.path.exists(model_files["screen_future"]):
         torch.save(future_model.state_dict(), model_files["screen_future"])
     if not os.path.exists(model_files["mouse_predict"]):
-        torch.save(action_model.state_dict(), model_files["mouse_predict"])
+        torch.save(predict_action_model.state_dict(), model_files["mouse_predict"])
     if not os.path.exists(model_files["value"]):
         torch.save(value_model.state_dict(), model_files["value"])
 
@@ -515,21 +519,28 @@ def load_state():
     if os.path.exists(model_files["autoencoder"]):
         ai_model.load_state_dict(torch.load(model_files["autoencoder"], map_location=device))
     if os.path.exists(model_files["mouse_output"]):
-        action_model.load_state_dict(torch.load(model_files["mouse_output"], map_location=device))
+        policy_action_model.load_state_dict(torch.load(model_files["mouse_output"], map_location=device))
     if os.path.exists(model_files["screen_future"]):
         future_model.load_state_dict(torch.load(model_files["screen_future"], map_location=device))
     if os.path.exists(model_files["mouse_predict"]):
-        action_model.load_state_dict(torch.load(model_files["mouse_predict"], map_location=device))
+        predict_action_model.load_state_dict(torch.load(model_files["mouse_predict"], map_location=device))
+    elif os.path.exists(model_files["mouse_output"]):
+        predict_action_model.load_state_dict(torch.load(model_files["mouse_output"], map_location=device))
+    if not os.path.exists(model_files["mouse_output"]) and os.path.exists(model_files["mouse_predict"]):
+        policy_action_model.load_state_dict(torch.load(model_files["mouse_predict"], map_location=device))
     if os.path.exists(model_files["value"]):
         value_model.load_state_dict(torch.load(model_files["value"], map_location=device))
 
 def save_state():
     torch.save(ai_model.state_dict(), os.path.join(BASE_DIR, "ai_model_autoencoder.pth"))
-    torch.save(action_model.state_dict(), os.path.join(BASE_DIR, "ai_model_mouse_output.pth"))
+    torch.save(policy_action_model.state_dict(), os.path.join(BASE_DIR, "ai_model_mouse_output.pth"))
     torch.save(future_model.state_dict(), os.path.join(BASE_DIR, "ai_model_screen_future.pth"))
-    torch.save(action_model.state_dict(), os.path.join(BASE_DIR, "ai_model_mouse_predict.pth"))
+    torch.save(predict_action_model.state_dict(), os.path.join(BASE_DIR, "ai_model_mouse_predict.pth"))
     torch.save(value_model.state_dict(), os.path.join(BASE_DIR, "ai_model_value.pth"))
     exp_buffer.save()
+
+def position_scale():
+    return torch.tensor([float(center_x), float(center_y)], device=device)
 
 def get_mouse_state():
     x_phys, y_phys = pyautogui.position()
@@ -545,7 +556,7 @@ def get_mouse_state():
     if left_btn and right_btn: status = 3
     elif left_btn: status = 1
     elif right_btn: status = 2
-    return [x / screen_width, y / screen_height, float(status)]
+    return [float(x), float(y), float(status)]
 
 def apply_mouse_buttons(status_idx):
     global mouse_left_down, mouse_right_down
@@ -573,8 +584,8 @@ def apply_mouse_buttons(status_idx):
         mouse_right_down = target_right
 
 def move_mouse(pred_abs_x, pred_abs_y, pred_status):
-    target_x = clamp_value(pred_abs_x * screen_width + center_x, 0, screen_width - 1)
-    target_y = clamp_value(center_y - pred_abs_y * screen_height, 0, screen_height - 1)
+    target_x = clamp_value(pred_abs_x + center_x, 0, screen_width - 1)
+    target_y = clamp_value(center_y - pred_abs_y, 0, screen_height - 1)
     if platform.system().lower().startswith("win"):
         ctypes.windll.user32.SetCursorPos(int(target_x), int(target_y))
     else:
@@ -639,6 +650,7 @@ class ResourceMonitor(threading.Thread):
 class AgentThread(threading.Thread):
     def run(self):
         global global_pause_recording
+        import random
         sct = mss.mss()
         criterion = nn.MSELoss()
         context_latents = deque(maxlen=config_data["resource"]["max_context"])
@@ -673,29 +685,35 @@ class AgentThread(threading.Thread):
                 predicted_img = ai_model.decode(predicted_latent, img_tensor.shape[2:])
             mouse_val = get_mouse_state()
             mouse_tensor = torch.tensor([mouse_val], dtype=torch.float32).to(device)
+            pos_scale_tensor = position_scale()
             with torch.no_grad():
                 latent = ai_model.encode(img_tensor)
             context_latents.append(latent.detach())
             with torch.no_grad():
-                pos_raw, status_logits = action_model(aggregated)
-                status_probs = torch.softmax(status_logits, dim=1)
+                pred_pos_raw, pred_status_logits = predict_action_model(aggregated)
+                policy_pos_raw, policy_status_logits = policy_action_model(aggregated)
+                policy_status_probs = torch.softmax(policy_status_logits, dim=1)
             pred_mouse = torch.zeros((1, 3), device=device)
-            pred_mouse[:, 0] = torch.tanh(pos_raw[:, 0]) * 0.5
-            pred_mouse[:, 1] = torch.tanh(pos_raw[:, 1]) * 0.5
-            pred_status_idx = int(torch.argmax(status_probs, dim=1).item())
+            pred_mouse[:, 0] = torch.tanh(pred_pos_raw[:, 0]) * pos_scale_tensor[0]
+            pred_mouse[:, 1] = torch.tanh(pred_pos_raw[:, 1]) * pos_scale_tensor[1]
+            policy_mouse = torch.zeros((1, 3), device=device)
+            policy_mouse[:, 0] = torch.tanh(policy_pos_raw[:, 0]) * pos_scale_tensor[0]
+            policy_mouse[:, 1] = torch.tanh(policy_pos_raw[:, 1]) * pos_scale_tensor[1]
+            pred_status_idx = int(torch.argmax(policy_status_probs, dim=1).item())
             screen_mse = criterion(predicted_img, img_tensor).item()
             screen_novelty = math.log1p(screen_mse) * 10000
             pos_loss = torch.mean((pred_mouse[:, :2] - mouse_tensor[:, :2]) ** 2)
             status_target = torch.tensor([int(mouse_val[2])], device=device, dtype=torch.long)
-            status_loss = F.cross_entropy(status_logits, status_target)
+            status_loss = F.cross_entropy(pred_status_logits, status_target)
             action_novelty_raw = (pos_loss + status_loss).item()
             action_novelty = math.log1p(action_novelty_raw) * 10000
             survival_penalty = config_data["learning"]["survival_penalty"]
-            reward = (screen_novelty * action_novelty) / 10000 - survival_penalty
+            random_scale = max(1.0, (screen_novelty + action_novelty) / 10000.0)
+            reward = (screen_novelty * action_novelty) / 10000 - survival_penalty + random.uniform(-1.0, 1.0) * random_scale
             td_error = screen_novelty + action_novelty
             exp_buffer.add(img_tensor.cpu(), mouse_tensor.cpu(), reward, td_error, screen_novelty, latent.cpu())
-            pred_np = pred_mouse.cpu().numpy()[0]
-            move_mouse(float(pred_np[0]), float(pred_np[1]), pred_status_idx)
+            policy_np = policy_mouse.cpu().numpy()[0]
+            move_mouse(float(policy_np[0]), float(policy_np[1]), pred_status_idx)
             if device.type == "cuda" and time.time() - last_cache_clear > 30:
                 torch.cuda.empty_cache()
                 last_cache_clear = time.time()
@@ -802,7 +820,7 @@ class SciFiWindow(QtWidgets.QWidget):
             self.finished_signal.emit()
             return
         total_steps = config_data["learning"]["train_steps"]
-        optimizer = optim.Adam(list(ai_model.parameters()) + list(action_model.parameters()) + list(future_model.parameters()) + list(value_model.parameters()), lr=config_data["learning"]["learning_rate"])
+        optimizer = optim.Adam(list(ai_model.parameters()) + list(predict_action_model.parameters()) + list(policy_action_model.parameters()) + list(future_model.parameters()) + list(value_model.parameters()), lr=config_data["learning"]["learning_rate"])
         loss_fn = nn.MSELoss()
         for i in range(total_steps):
             if not global_running:
@@ -838,29 +856,36 @@ class SciFiWindow(QtWidgets.QWidget):
                     pred_latent_vec = future_model(aggregated_tensor)
                     pred_latent = pred_latent_vec.view(-1, 64, latent_pool, latent_pool)
                     pred_img = ai_model.decode(pred_latent, target_imgs_tensor.shape[2:])
-                    pos_raw, status_logits = action_model(aggregated_tensor)
-                    pos_pred = torch.zeros((target_mice_tensor.shape[0], 2), device=device)
-                    pos_pred[:, 0] = torch.tanh(pos_raw[:, 0]) * 0.5
-                    pos_pred[:, 1] = torch.tanh(pos_raw[:, 1]) * 0.5
+                    pred_pos_raw, pred_status_logits = predict_action_model(aggregated_tensor)
+                    policy_pos_raw, policy_status_logits = policy_action_model(aggregated_tensor)
+                    pos_scale_tensor = position_scale()
+                    pred_pos = torch.zeros((target_mice_tensor.shape[0], 2), device=device)
+                    pred_pos[:, 0] = torch.tanh(pred_pos_raw[:, 0]) * pos_scale_tensor[0]
+                    pred_pos[:, 1] = torch.tanh(pred_pos_raw[:, 1]) * pos_scale_tensor[1]
+                    policy_pos = torch.zeros((target_mice_tensor.shape[0], 2), device=device)
+                    policy_pos[:, 0] = torch.tanh(policy_pos_raw[:, 0]) * pos_scale_tensor[0]
+                    policy_pos[:, 1] = torch.tanh(policy_pos_raw[:, 1]) * pos_scale_tensor[1]
                     recon = ai_model(target_imgs_tensor)
                     loss_screen = loss_fn(pred_img, target_imgs_tensor)
                     target_pos = target_mice_tensor[:, :2]
                     target_status = target_mice_tensor[:, 2].long()
-                    pos_std = torch.clamp(target_pos.std(dim=0, unbiased=False).mean(), 0.05, 0.5) + 1e-6
-                    dist = torch.distributions.Normal(pos_pred, pos_std)
+                    min_std = max(1.0, min(float(center_x), float(center_y)) * 0.002)
+                    max_std = max(float(center_x), float(center_y)) * 0.25
+                    pos_std = torch.clamp(target_pos.std(dim=0, unbiased=False).mean(), min_std, max_std) + 1e-6
+                    dist = torch.distributions.Normal(policy_pos, pos_std)
                     log_prob_pos = dist.log_prob(target_pos).sum(dim=1)
-                    log_prob_status = F.log_softmax(status_logits, dim=1).gather(1, target_status.unsqueeze(1)).squeeze(1)
+                    log_prob_status = F.log_softmax(policy_status_logits, dim=1).gather(1, target_status.unsqueeze(1)).squeeze(1)
                     log_prob = log_prob_pos + log_prob_status
                     values = value_model(aggregated_tensor)
                     advantage = reward_norm.detach()
                     policy_loss = -(advantage * log_prob).mean()
                     value_loss = F.mse_loss(values, reward_tensor)
-                    status_loss = F.cross_entropy(status_logits, target_status)
-                    loss_mouse = loss_fn(pos_pred, target_pos) + status_loss
+                    predict_loss = loss_fn(pred_pos, target_pos) + F.cross_entropy(pred_status_logits, target_status)
+                    policy_supervised = loss_fn(policy_pos, target_pos) + F.cross_entropy(policy_status_logits, target_status)
                     loss_ae = loss_fn(recon, target_imgs_tensor) + loss_fn(target_latents_tensor, ai_model.encode(target_imgs_tensor))
-                    loss = loss_screen + loss_mouse + loss_ae + policy_loss + value_loss
+                    loss = loss_screen + predict_loss + policy_supervised + loss_ae + policy_loss + value_loss
                 scaler.scale(loss).backward()
-                torch.nn.utils.clip_grad_norm_(list(ai_model.parameters()) + list(action_model.parameters()) + list(future_model.parameters()) + list(value_model.parameters()), config_data["learning"]["grad_clip"])
+                torch.nn.utils.clip_grad_norm_(list(ai_model.parameters()) + list(predict_action_model.parameters()) + list(policy_action_model.parameters()) + list(future_model.parameters()) + list(value_model.parameters()), config_data["learning"]["grad_clip"])
                 scaler.step(optimizer)
                 scaler.update()
             progress_val = int((i + 1) / total_steps * 100)
