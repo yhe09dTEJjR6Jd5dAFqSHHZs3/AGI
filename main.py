@@ -257,6 +257,19 @@ class ActionPredictor(nn.Module):
         state_logits = self.state_head(features)
         return pos, state_logits
 
+class ValuePredictor(nn.Module):
+    def __init__(self):
+        super(ValuePredictor, self).__init__()
+        embed_dim = 64 * latent_pool * latent_pool
+        self.value_net = nn.Sequential(
+            nn.Linear(embed_dim * 2, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+
+    def forward(self, aggregated):
+        return self.value_net(aggregated).squeeze(1)
+
 class ExperienceBuffer:
     def __init__(self):
         self.buffer = []
@@ -402,6 +415,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ai_model = Autoencoder().to(device)
 future_model = FuturePredictor().to(device)
 action_model = ActionPredictor().to(device)
+value_model = ValuePredictor().to(device)
 scaler = GradScaler(enabled=device.type == "cuda")
 
 def ensure_files():
@@ -413,6 +427,7 @@ def ensure_files():
     model_path = os.path.join(BASE_DIR, "ai_model.pth")
     action_path = os.path.join(BASE_DIR, "action_model.pth")
     future_path = os.path.join(BASE_DIR, "future_model.pth")
+    value_path = os.path.join(BASE_DIR, "value_model.pth")
     if not os.path.exists(buffer_path):
         with open(buffer_path, "wb") as f:
             pickle.dump([], f)
@@ -425,6 +440,8 @@ def ensure_files():
         torch.save(action_model.state_dict(), action_path)
     if not os.path.exists(future_path):
         torch.save(future_model.state_dict(), future_path)
+    if not os.path.exists(value_path):
+        torch.save(value_model.state_dict(), value_path)
 
 def load_state():
     global exp_buffer
@@ -432,6 +449,7 @@ def load_state():
     model_path = os.path.join(BASE_DIR, "ai_model.pth")
     action_path = os.path.join(BASE_DIR, "action_model.pth")
     future_path = os.path.join(BASE_DIR, "future_model.pth")
+    value_path = os.path.join(BASE_DIR, "value_model.pth")
     loaded = exp_buffer.load_chunks()
     if not loaded and os.path.exists(buffer_path):
         with open(buffer_path, "rb") as f:
@@ -447,11 +465,14 @@ def load_state():
         action_model.load_state_dict(torch.load(action_path, map_location=device))
     if os.path.exists(future_path):
         future_model.load_state_dict(torch.load(future_path, map_location=device))
+    if os.path.exists(value_path):
+        value_model.load_state_dict(torch.load(value_path, map_location=device))
 
 def save_state():
     torch.save(ai_model.state_dict(), os.path.join(BASE_DIR, "ai_model.pth"))
     torch.save(action_model.state_dict(), os.path.join(BASE_DIR, "action_model.pth"))
     torch.save(future_model.state_dict(), os.path.join(BASE_DIR, "future_model.pth"))
+    torch.save(value_model.state_dict(), os.path.join(BASE_DIR, "value_model.pth"))
     exp_buffer.save()
 
 def get_mouse_state():
@@ -722,7 +743,7 @@ class SciFiWindow(QtWidgets.QWidget):
             self.finished_signal.emit()
             return
         total_steps = config_data["learning"]["train_steps"]
-        optimizer = optim.Adam(list(ai_model.parameters()) + list(action_model.parameters()) + list(future_model.parameters()), lr=config_data["learning"]["learning_rate"])
+        optimizer = optim.Adam(list(ai_model.parameters()) + list(action_model.parameters()) + list(future_model.parameters()) + list(value_model.parameters()), lr=config_data["learning"]["learning_rate"])
         loss_fn = nn.MSELoss()
         for i in range(total_steps):
             if not global_running:
@@ -734,6 +755,7 @@ class SciFiWindow(QtWidgets.QWidget):
                 target_imgs = []
                 target_mice = []
                 target_latents = []
+                rewards = []
                 for context_entries, target_entry in batch:
                     latents = [item["latent"].float() for item in context_entries]
                     context_latent_list.append(latents)
@@ -741,6 +763,7 @@ class SciFiWindow(QtWidgets.QWidget):
                     target_imgs.append(target_entry["img"].to(dtype=img_dtype) / 255.0)
                     target_mice.append(target_entry["mouse"].float())
                     target_latents.append(target_entry["latent"].float())
+                    rewards.append(float(target_entry["reward"]))
                 optimizer.zero_grad()
                 agg_batch = []
                 for latents in context_latent_list:
@@ -750,6 +773,8 @@ class SciFiWindow(QtWidgets.QWidget):
                 target_imgs_tensor = torch.stack(target_imgs).to(device)
                 target_mice_tensor = torch.stack(target_mice).to(device)
                 target_latents_tensor = torch.stack(target_latents).to(device)
+                reward_tensor = torch.tensor(rewards, device=device, dtype=torch.float32)
+                reward_norm = (reward_tensor - reward_tensor.mean()) / (reward_tensor.std(unbiased=False) + 1e-6)
                 with autocast(enabled=device.type == "cuda"):
                     pred_latent_vec = future_model(aggregated_tensor)
                     pred_latent = pred_latent_vec.view(-1, 64, latent_pool, latent_pool)
@@ -762,12 +787,21 @@ class SciFiWindow(QtWidgets.QWidget):
                     loss_screen = loss_fn(pred_img, target_imgs_tensor)
                     target_pos = target_mice_tensor[:, :2]
                     target_status = target_mice_tensor[:, 2].long()
+                    pos_std = torch.clamp(target_pos.std(dim=0, unbiased=False).mean(), 0.05, 0.5) + 1e-6
+                    dist = torch.distributions.Normal(pos_pred, pos_std)
+                    log_prob_pos = dist.log_prob(target_pos).sum(dim=1)
+                    log_prob_status = F.log_softmax(status_logits, dim=1).gather(1, target_status.unsqueeze(1)).squeeze(1)
+                    log_prob = log_prob_pos + log_prob_status
+                    values = value_model(aggregated_tensor)
+                    advantage = reward_norm.detach()
+                    policy_loss = -(advantage * log_prob).mean()
+                    value_loss = F.mse_loss(values, reward_tensor)
                     status_loss = F.cross_entropy(status_logits, target_status)
                     loss_mouse = loss_fn(pos_pred, target_pos) + status_loss
                     loss_ae = loss_fn(recon, target_imgs_tensor) + loss_fn(target_latents_tensor, ai_model.encode(target_imgs_tensor))
-                    loss = loss_screen + loss_mouse + loss_ae
+                    loss = loss_screen + loss_mouse + loss_ae + policy_loss + value_loss
                 scaler.scale(loss).backward()
-                torch.nn.utils.clip_grad_norm_(list(ai_model.parameters()) + list(action_model.parameters()) + list(future_model.parameters()), config_data["learning"]["grad_clip"])
+                torch.nn.utils.clip_grad_norm_(list(ai_model.parameters()) + list(action_model.parameters()) + list(future_model.parameters()) + list(value_model.parameters()), config_data["learning"]["grad_clip"])
                 scaler.step(optimizer)
                 scaler.update()
             progress_val = int((i + 1) / total_steps * 100)
