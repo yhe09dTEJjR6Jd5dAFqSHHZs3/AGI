@@ -79,17 +79,21 @@ VISION_HEIGHT = 160
 
 def default_config():
     fps_bounds = [1, 100]
-    cpu_cores = psutil.cpu_count(logical=False) or psutil.cpu_count()
+    cpu_raw = psutil.cpu_count(logical=False) or psutil.cpu_count() or 1
+    cpu_cores = max(1, int(cpu_raw))
     mem_info = psutil.virtual_memory()
-    mem_ratio = 1.0 - mem_info.percent / 100.0
-    context_default = clamp_value(int(2 + (cpu_cores or 1) * 0.5), 1, 100)
+    mem_percent = clamp_value(float(getattr(mem_info, "percent", 100.0) or 100.0), 0.0, 100.0)
+    mem_available = max(float(getattr(mem_info, "available", 0.0) or 0.0), 1.0)
+    mem_ratio = clamp_value(1.0 - mem_percent / 100.0, 0.05, 1.0)
+    context_default = clamp_value(int(2 + cpu_cores * 0.5), 1, 100)
     latent_default = clamp_value(int(4 + context_default * 0.25), 2, 12)
     fps_dynamic = clamp_value(int(fps_bounds[1] * mem_ratio), fps_bounds[0], fps_bounds[1])
-    chunk_limit = int(clamp_value(mem_info.available / (1024**2 * 256), 128, 1024))
-    chunk_bytes = int(clamp_value(mem_info.available * 0.05, 64 * 1024 * 1024, 512 * 1024 * 1024))
+    mem_available_mb = mem_available / (1024**2)
+    chunk_limit = int(clamp_value(mem_available_mb / 256.0, 128, 1024))
+    chunk_bytes = int(clamp_value(mem_available * 0.05, 64 * 1024 * 1024, 512 * 1024 * 1024))
     lr_dynamic = clamp_value(1e-3 * mem_ratio * (cpu_cores or 1) / 4.0, 5e-4, 5e-3)
-    mini_batch_dynamic = int(clamp_value((cpu_cores or 1) * mem_ratio, 4, 32))
-    train_steps_dynamic = int(clamp_value(50 + mem_ratio * 150, 50, 300))
+    mini_batch_dynamic = int(clamp_value(cpu_cores * mem_ratio, 4, 32))
+    train_steps_dynamic = int(clamp_value(50 + mem_ratio * 150, 1, 300))
     config = {
         "capture": {
             "fps": fps_dynamic,
@@ -130,11 +134,17 @@ def default_config():
     return config
 
 def load_or_create_config():
-    cfg = default_config()
+    defaults = default_config()
+    cfg = defaults
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-    defaults = default_config()
+            raw_text = f.read()
+        text = raw_text.strip()
+        has_structure = len(text) > 0 and text[0] == "{" and text[-1] == "}" and text.count(":") >= 3
+        if has_structure:
+            loaded = json.loads(text)
+            if isinstance(loaded, dict) and len(loaded.keys()) >= 3:
+                cfg = loaded
     def merge(defaults_dict, cfg_dict):
         for k, v in defaults_dict.items():
             if isinstance(v, dict):
@@ -143,6 +153,8 @@ def load_or_create_config():
                 cfg_dict[k] = cfg_dict.get(k, v)
         return cfg_dict
     cfg = merge(defaults, cfg)
+    if len(cfg.keys()) < 3:
+        cfg = defaults
     capture_cfg = cfg["capture"]
     fps_low = clamp_value(int(capture_cfg.get("fps_bounds", [1, 100])[0]), 1, 100)
     fps_high = clamp_value(int(capture_cfg.get("fps_bounds", [1, 100])[1]), fps_low, 100)
@@ -206,7 +218,7 @@ def init_gpu_handle():
 init_gpu_handle()
 
 def gpu_stats():
-    if gpu_handle is None:
+    if not torch.cuda.is_available() or gpu_handle is None:
         return 0.0, 0.0
     util = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
     mem_info = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
@@ -863,23 +875,23 @@ class SciFiWindow(QtWidgets.QWidget):
         for i in range(total_steps):
             if not global_running:
                 break
-                batch_indices = list(range(0, len(samples), config_data["learning"]["mini_batch"]))
-                for start in batch_indices:
-                    batch = samples[start:start + config_data["learning"]["mini_batch"]]
-                    context_latent_list = []
-                    target_imgs = []
-                    target_mice = []
-                    target_latents = []
-                    rewards = []
-                    for context_entries, target_entry in batch:
-                        latents = [item["latent"].float() for item in context_entries]
-                        context_latent_list.append(latents)
-                        img_dtype = torch.float16 if device.type == "cuda" else torch.float32
-                        target_imgs.append(target_entry["img"].to(dtype=img_dtype) / 255.0)
-                        target_mice.append(target_entry["mouse"].float())
-                        target_latents.append(target_entry["latent"].float())
-                        rewards.append(float(target_entry["reward"]))
-                optimizer.zero_grad()
+            batch_indices = list(range(0, len(samples), config_data["learning"]["mini_batch"]))
+            for start in batch_indices:
+                batch = samples[start:start + config_data["learning"]["mini_batch"]]
+                context_latent_list = []
+                target_imgs = []
+                target_mice = []
+                target_latents = []
+                rewards = []
+                for context_entries, target_entry in batch:
+                    latents = [item["latent"].float() for item in context_entries]
+                    context_latent_list.append(latents)
+                    img_dtype = torch.float16 if device.type == "cuda" else torch.float32
+                    target_imgs.append(target_entry["img"].to(dtype=img_dtype) / 255.0)
+                    target_mice.append(target_entry["mouse"].float())
+                    target_latents.append(target_entry["latent"].float())
+                    rewards.append(float(target_entry["reward"]))
+                optimizer.zero_grad(set_to_none=True)
                 agg_batch = []
                 for latents in context_latent_list:
                     agg = aggregate_latents(latents)
@@ -924,6 +936,10 @@ class SciFiWindow(QtWidgets.QWidget):
                 torch.nn.utils.clip_grad_norm_(list(ai_model.parameters()) + list(predict_action_model.parameters()) + list(policy_action_model.parameters()) + list(future_model.parameters()) + list(value_model.parameters()), config_data["learning"]["grad_clip"])
                 scaler.step(optimizer)
                 scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                del loss, pred_latent_vec, pred_latent, pred_img, pred_pos_raw, pred_status_logits, policy_pos_raw, policy_status_logits, recon, aggregated_tensor, target_imgs_tensor, target_imgs_with_coords, target_mice_tensor, target_latents_tensor, reward_tensor, reward_norm, pos_scale_tensor, values, advantage, policy_loss, value_loss, predict_loss, policy_supervised, loss_screen, dist, log_prob_pos, log_prob_status, log_prob
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
             progress_val = int((i + 1) / total_steps * 100)
             self.progress_signal.emit(progress_val)
             time.sleep(0.01)
