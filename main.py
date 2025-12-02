@@ -14,6 +14,7 @@ import importlib.util
 import json
 from collections import deque
 import heapq
+import bisect
 
 warnings.filterwarnings("ignore")
 
@@ -164,6 +165,7 @@ config_data = load_or_create_config()
 global_running = True
 global_optimizing = False
 global_pause_recording = False
+buffer_gpu_resident = False
 
 screen_width, screen_height = pyautogui.size()
 center_x, center_y = screen_width // 2, screen_height // 2
@@ -228,11 +230,20 @@ mouse_right_down = False
 def scaled_standard_res():
     return standard_res
 
+def add_coord_channels(rgb_tensor):
+    b, c, h, w = rgb_tensor.shape
+    x_range = torch.linspace(-1.0, 1.0, steps=w, device=rgb_tensor.device, dtype=rgb_tensor.dtype)
+    y_range = torch.linspace(-1.0, 1.0, steps=h, device=rgb_tensor.device, dtype=rgb_tensor.dtype)
+    y_grid, x_grid = torch.meshgrid(y_range, x_range, indexing="ij")
+    x_chan = x_grid.unsqueeze(0).expand(b, -1, -1, -1)
+    y_chan = y_grid.unsqueeze(0).expand(b, -1, -1, -1)
+    return torch.cat([rgb_tensor, x_chan, y_chan], dim=1)
+
 class Autoencoder(nn.Module):
     def __init__(self):
         super(Autoencoder, self).__init__()
         self.encoder = nn.Sequential(
-            nn.Conv2d(3, 16, 3, stride=2, padding=1),
+            nn.Conv2d(5, 16, 3, stride=2, padding=1),
             nn.ReLU(),
             nn.Conv2d(16, 32, 3, stride=2, padding=1),
             nn.ReLU(),
@@ -317,7 +328,14 @@ class ExperienceBuffer:
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
+    def _priority_value(self, entry):
+        reward_term = abs(float(entry["reward"]))
+        error_term = abs(float(entry["error"]))
+        novelty_term = float(entry["novelty"])
+        return reward_term + error_term + novelty_term + 1e-6
+
     def add(self, state_img, mouse_state, reward, td_error, screen_novelty, latent_tensor):
+        store_on_gpu = buffer_gpu_resident and torch.cuda.is_available()
         img = state_img.float()
         if img.dim() == 4:
             img = img[0]
@@ -327,7 +345,19 @@ class ExperienceBuffer:
         mouse = mouse_state.float()
         if mouse.dim() > 1:
             mouse = mouse[0]
-        latent_store = latent_tensor.detach().cpu().half()
+        latent_store = latent_tensor.detach().half()
+        if store_on_gpu:
+            img = img.to(device, non_blocking=True)
+            mouse = mouse.to(device, non_blocking=True)
+            latent_store = latent_store.to(device, non_blocking=True)
+        else:
+            img = img.cpu()
+            mouse = mouse.cpu()
+            latent_store = latent_store.cpu()
+            if torch.cuda.is_available():
+                img = img.pin_memory()
+                mouse = mouse.pin_memory()
+                latent_store = latent_store.pin_memory()
         data = {
             "img": img,
             "mouse": mouse,
@@ -341,7 +371,8 @@ class ExperienceBuffer:
         self.total_bytes += entry_bytes
         idx = len(self.buffer) - 1
         self.counter += 1
-        heapq.heappush(self.heap, (reward, idx))
+        priority = self._priority_value(data)
+        heapq.heappush(self.heap, (-priority, idx))
         self.enforce_limit()
 
     def _sample_bytes(self, entry):
@@ -357,7 +388,7 @@ class ExperienceBuffer:
     def rebuild_metadata(self):
         buffer_list = list(self.buffer)
         self.total_bytes = sum(self._sample_bytes(item) for item in buffer_list)
-        self.heap = [(item["reward"], idx) for idx, item in enumerate(buffer_list)]
+        self.heap = [(-self._priority_value(item), idx) for idx, item in enumerate(buffer_list)]
         heapq.heapify(self.heap)
         self.buffer = deque(buffer_list)
         self.counter = len(buffer_list)
@@ -402,8 +433,30 @@ class ExperienceBuffer:
             return []
         sequences = []
         max_start = len(buffer_list) - window - 1
+        top_candidates = []
+        if self.heap:
+            top_count = max(1, batch_size // 4)
+            top_entries = heapq.nsmallest(top_count, self.heap)
+            for _, idx in top_entries:
+                start_idx = min(max(idx - window, 0), max_start)
+                top_candidates.append(start_idx)
+        priorities = []
+        for start in range(max_start + 1):
+            target_entry = buffer_list[start + window]
+            priorities.append(self._priority_value(target_entry))
+        cumulative = []
+        total = 0.0
+        for val in priorities:
+            total += val
+            cumulative.append(total)
         for _ in range(batch_size):
-            idx = random.randint(0, max_start)
+            if top_candidates:
+                idx = top_candidates.pop(0)
+            elif total > 0:
+                r = random.random() * total
+                idx = bisect.bisect_left(cumulative, r)
+            else:
+                idx = random.randint(0, max_start)
             context_entries = buffer_list[idx:idx + window]
             target_entry = buffer_list[idx + window]
             sequences.append((context_entries, target_entry))
@@ -597,7 +650,7 @@ def aggregate_latents(latents):
 
 class ResourceMonitor(threading.Thread):
     def run(self):
-        global current_fps, temporal_context_window
+        global current_fps, temporal_context_window, buffer_gpu_resident
         r_cfg = config_data["resource"]
         cooldown = r_cfg["cooldown_seconds"]
         target_high = 61.8
@@ -611,6 +664,7 @@ class ResourceMonitor(threading.Thread):
             if torch.cuda.is_available():
                 vram_use = torch.cuda.memory_allocated() / (1024**3)
                 vram_torch = min(100.0, vram_use / max_vram_gb * 100)
+            buffer_gpu_resident = torch.cuda.is_available() and vram_util < 50.0
             m_val = max(cpu, mem, gpu_util, vram_util, vram_torch)
             now = time.time()
             if now - last_adjust >= cooldown:
@@ -652,13 +706,14 @@ class AgentThread(threading.Thread):
             target_w = VISION_WIDTH
             target_h = VISION_HEIGHT
             img_resized = cv2.resize(img_np, (target_w, target_h))
-            img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
-            img_tensor = img_tensor.unsqueeze(0).to(device)
+            rgb_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
+            rgb_tensor = rgb_tensor.unsqueeze(0).to(device)
+            img_tensor = add_coord_channels(rgb_tensor)
             with torch.no_grad():
                 aggregated = aggregate_latents(list(context_latents)[-window_len:])
                 predicted_latent_vec = future_model(aggregated)
                 predicted_latent = predicted_latent_vec.view(1, 64, latent_pool, latent_pool)
-                predicted_img = ai_model.decode(predicted_latent, img_tensor.shape[2:])
+                predicted_img = ai_model.decode(predicted_latent, rgb_tensor.shape[2:])
             mouse_val = get_mouse_state()
             mouse_tensor = torch.tensor([mouse_val], dtype=torch.float32).to(device)
             pos_scale_tensor = position_scale()
@@ -680,11 +735,12 @@ class AgentThread(threading.Thread):
             status_loss = F.cross_entropy(pred_status_logits, status_target)
             action_novelty_raw = (pos_loss + status_loss).item()
             action_novelty = math.log1p(action_novelty_raw) * 10000
-            screen_mse = criterion(predicted_img, img_tensor).item()
+            screen_mse = criterion(predicted_img, rgb_tensor).item()
             screen_novelty = math.log1p(screen_mse) * 10000
             policy_mouse = torch.zeros((1, 3), device=device)
             policy_mouse_norm = torch.tanh(policy_pos_raw[:, :2])
-            noise_scale = clamp_value((screen_novelty + action_novelty) / 20000.0, 0.01, 0.5)
+            novelty_total = screen_novelty + action_novelty
+            noise_scale = clamp_value(math.log1p(novelty_total) / 5000.0 + novelty_total / 200000.0, 0.01, 0.8)
             action_noise = torch.randn_like(policy_mouse_norm) * noise_scale
             noisy_mouse_norm = torch.clamp(policy_mouse_norm + action_noise, -1.0, 1.0)
             policy_mouse[:, 0] = noisy_mouse_norm[:, 0] * pos_scale_tensor[0]
@@ -692,7 +748,7 @@ class AgentThread(threading.Thread):
             survival_penalty = config_data["learning"]["survival_penalty"]
             reward = (screen_novelty * action_novelty) / 10000 - survival_penalty
             td_error = screen_novelty + action_novelty
-            exp_buffer.add(img_tensor.cpu(), mouse_tensor.cpu(), reward, td_error, screen_novelty, latent.cpu())
+            exp_buffer.add(rgb_tensor.detach(), mouse_tensor.detach().cpu(), reward, td_error, screen_novelty, latent.detach())
             policy_np = policy_mouse.cpu().numpy()[0]
             move_mouse(float(policy_np[0]), float(policy_np[1]), pred_status_idx)
             if device.type == "cuda" and time.time() - last_cache_clear > 30:
@@ -807,22 +863,22 @@ class SciFiWindow(QtWidgets.QWidget):
         for i in range(total_steps):
             if not global_running:
                 break
-            batch_indices = list(range(0, len(samples), config_data["learning"]["mini_batch"]))
-            for start in batch_indices:
-                batch = samples[start:start + config_data["learning"]["mini_batch"]]
-                context_latent_list = []
-                target_imgs = []
-                target_mice = []
-                target_latents = []
-                rewards = []
-                for context_entries, target_entry in batch:
-                    latents = [item["latent"].float() for item in context_entries]
-                    context_latent_list.append(latents)
-                    img_dtype = torch.float16 if device.type == "cuda" else torch.float32
-                    target_imgs.append(target_entry["img"].to(dtype=img_dtype) / 255.0)
-                    target_mice.append(target_entry["mouse"].float())
-                    target_latents.append(target_entry["latent"].float())
-                    rewards.append(float(target_entry["reward"]))
+                batch_indices = list(range(0, len(samples), config_data["learning"]["mini_batch"]))
+                for start in batch_indices:
+                    batch = samples[start:start + config_data["learning"]["mini_batch"]]
+                    context_latent_list = []
+                    target_imgs = []
+                    target_mice = []
+                    target_latents = []
+                    rewards = []
+                    for context_entries, target_entry in batch:
+                        latents = [item["latent"].float() for item in context_entries]
+                        context_latent_list.append(latents)
+                        img_dtype = torch.float16 if device.type == "cuda" else torch.float32
+                        target_imgs.append(target_entry["img"].to(dtype=img_dtype) / 255.0)
+                        target_mice.append(target_entry["mouse"].float())
+                        target_latents.append(target_entry["latent"].float())
+                        rewards.append(float(target_entry["reward"]))
                 optimizer.zero_grad()
                 agg_batch = []
                 for latents in context_latent_list:
@@ -830,6 +886,7 @@ class SciFiWindow(QtWidgets.QWidget):
                     agg_batch.append(agg)
                 aggregated_tensor = torch.cat(agg_batch, dim=0)
                 target_imgs_tensor = torch.stack(target_imgs).to(device)
+                target_imgs_with_coords = add_coord_channels(target_imgs_tensor)
                 target_mice_tensor = torch.stack(target_mice).to(device)
                 target_latents_tensor = torch.stack(target_latents).to(device)
                 reward_tensor = torch.tensor(rewards, device=device, dtype=torch.float32)
@@ -843,7 +900,7 @@ class SciFiWindow(QtWidgets.QWidget):
                     pos_scale_tensor = position_scale()
                     pred_pos_norm = torch.tanh(pred_pos_raw[:, :2])
                     policy_pos_norm = torch.tanh(policy_pos_raw[:, :2])
-                    recon = ai_model(target_imgs_tensor)
+                    recon = ai_model(target_imgs_with_coords)
                     loss_screen = loss_fn(pred_img, target_imgs_tensor)
                     target_pos = target_mice_tensor[:, :2]
                     target_pos_norm = torch.clamp(target_pos / pos_scale_tensor, -1.0, 1.0)
@@ -861,7 +918,7 @@ class SciFiWindow(QtWidgets.QWidget):
                     value_loss = F.mse_loss(values, reward_tensor)
                     predict_loss = loss_fn(pred_pos_norm, target_pos_norm) + F.cross_entropy(pred_status_logits, target_status)
                     policy_supervised = loss_fn(policy_pos_norm, target_pos_norm) + F.cross_entropy(policy_status_logits, target_status)
-                    loss_ae = loss_fn(recon, target_imgs_tensor) + loss_fn(target_latents_tensor, ai_model.encode(target_imgs_tensor))
+                    loss_ae = loss_fn(recon, target_imgs_tensor) + loss_fn(target_latents_tensor, ai_model.encode(target_imgs_with_coords))
                     loss = loss_screen + predict_loss + policy_supervised + loss_ae + policy_loss + value_loss
                 scaler.scale(loss).backward()
                 torch.nn.utils.clip_grad_norm_(list(ai_model.parameters()) + list(predict_action_model.parameters()) + list(policy_action_model.parameters()) + list(future_model.parameters()) + list(value_model.parameters()), config_data["learning"]["grad_clip"])
