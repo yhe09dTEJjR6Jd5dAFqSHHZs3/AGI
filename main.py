@@ -40,9 +40,9 @@ optim = torch.optim
 F = torch.nn.functional
 autocast = import_or_install("torch.cuda.amp").autocast
 GradScaler = import_or_install("torch.cuda.amp").GradScaler
-QtWidgets = import_or_install("PyQt5").QtWidgets
-QtCore = import_or_install("PyQt5").QtCore
-QtGui = import_or_install("PyQt5").QtGui
+QtWidgets = import_or_install("PyQt5.QtWidgets", "PyQt5")
+QtCore = import_or_install("PyQt5.QtCore", "PyQt5")
+QtGui = import_or_install("PyQt5.QtGui", "PyQt5")
 keyboard = import_or_install("pynput.keyboard")
 pyautogui = import_or_install("pyautogui")
 ctypes = import_or_install("ctypes")
@@ -263,6 +263,7 @@ class ExperienceBuffer:
         self.heap = []
         self.total_bytes = 0
         self.counter = 0
+        self.chunk_files = []
 
     def add(self, state_img, mouse_state, reward, td_error, screen_novelty, latent_tensor):
         img = state_img.float()
@@ -313,10 +314,22 @@ class ExperienceBuffer:
         chunk_files = sorted(glob.glob(os.path.join(BUFFER_DIR, "chunk_*.pt")))
         if not chunk_files:
             return False
-        loaded = []
-        for path in chunk_files:
-            loaded.extend(torch.load(path, map_location="cpu"))
-        self.buffer = loaded
+        self.chunk_files = chunk_files
+        retained = []
+        total_bytes = 0
+        limit_bytes = max_buffer_gb * (1024**3)
+        for path in reversed(chunk_files):
+            entries = torch.load(path, map_location="cpu")
+            for entry in reversed(entries):
+                entry_bytes = self._sample_bytes(entry)
+                if total_bytes + entry_bytes > limit_bytes:
+                    break
+                retained.append(entry)
+                total_bytes += entry_bytes
+            if total_bytes >= limit_bytes:
+                break
+        retained.reverse()
+        self.buffer = retained
         self.rebuild_metadata()
         return True
 
@@ -348,7 +361,13 @@ class ExperienceBuffer:
         os.makedirs(temp_dir)
         chunk = []
         chunk_bytes = 0
-        chunk_idx = 0
+        existing = sorted(glob.glob(os.path.join(BUFFER_DIR, "chunk_*.pt")))
+        start_idx = 0
+        if existing:
+            last = os.path.splitext(os.path.basename(existing[-1]))[0].split("_")
+            if len(last) > 1 and last[-1].isdigit():
+                start_idx = int(last[-1]) + 1
+        chunk_idx = start_idx
         for entry in self.buffer:
             entry_bytes = self._sample_bytes(entry)
             if chunk and (chunk_bytes + entry_bytes > chunk_byte_limit or len(chunk) >= chunk_entry_limit):
@@ -364,6 +383,19 @@ class ExperienceBuffer:
         for fname in os.listdir(temp_dir):
             os.replace(os.path.join(temp_dir, fname), os.path.join(BUFFER_DIR, fname))
         shutil.rmtree(temp_dir)
+        self._enforce_disk_limit()
+
+    def _disk_usage_gb(self):
+        size = 0
+        for path in glob.glob(os.path.join(BUFFER_DIR, "chunk_*.pt")):
+            size += os.path.getsize(path)
+        return size / (1024**3)
+
+    def _enforce_disk_limit(self):
+        files = sorted(glob.glob(os.path.join(BUFFER_DIR, "chunk_*.pt")))
+        while self._disk_usage_gb() > 20.0 and files:
+            oldest = files.pop(0)
+            os.remove(oldest)
 
 exp_buffer = ExperienceBuffer()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -464,13 +496,12 @@ def apply_mouse_buttons(status_idx):
         mouse_right_down = target_right
 
 def move_mouse(pred_abs_x, pred_abs_y, pred_status):
-    current = get_mouse_state()
-    dx = (pred_abs_x - current[0]) * screen_width
-    dy = (pred_abs_y - current[1]) * screen_height
+    target_x = clamp_value(pred_abs_x * screen_width + center_x, 0, screen_width - 1)
+    target_y = clamp_value(center_y - pred_abs_y * screen_height, 0, screen_height - 1)
     if platform.system().lower().startswith("win"):
-        ctypes.windll.user32.mouse_event(0x0001, int(dx), int(-dy), 0, 0)
+        ctypes.windll.user32.SetCursorPos(int(target_x), int(target_y))
     else:
-        pyautogui.moveRel(int(dx), int(-dy), _pause=False)
+        pyautogui.moveTo(int(target_x), int(target_y), _pause=False)
     apply_mouse_buttons(pred_status)
 
 def aggregate_latents(latents):
