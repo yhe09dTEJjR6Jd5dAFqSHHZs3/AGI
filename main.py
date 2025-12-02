@@ -11,6 +11,7 @@ import warnings
 import subprocess
 import importlib
 from collections import deque
+import heapq
 
 warnings.filterwarnings("ignore")
 
@@ -139,16 +140,23 @@ class ActionPredictor(nn.Module):
         embed_dim = 64 * latent_pool * latent_pool
         self.fc = nn.Sequential(
             nn.Linear(embed_dim * 2, 256),
-            nn.ReLU(),
-            nn.Linear(256, 4)
+            nn.ReLU()
         )
+        self.pos_head = nn.Linear(256, 2)
+        self.state_head = nn.Linear(256, 4)
 
     def forward(self, aggregated):
-        return self.fc(aggregated)
+        features = self.fc(aggregated)
+        pos = self.pos_head(features)
+        state_logits = self.state_head(features)
+        return pos, state_logits
 
 class ExperienceBuffer:
     def __init__(self):
         self.buffer = []
+        self.heap = []
+        self.total_bytes = 0
+        self.counter = 0
 
     def add(self, state_img, mouse_state, reward, td_error, screen_novelty, latent_tensor):
         img = state_img.float()
@@ -169,6 +177,11 @@ class ExperienceBuffer:
             "latent": latent_store
         }
         self.buffer.append(data)
+        entry_bytes = self._sample_bytes(data)
+        self.total_bytes += entry_bytes
+        idx = len(self.buffer) - 1
+        self.counter += 1
+        heapq.heappush(self.heap, (reward, idx))
         self.enforce_limit()
 
     def _sample_bytes(self, entry):
@@ -179,10 +192,13 @@ class ExperienceBuffer:
         return img_size + mouse_size + latent_size + meta_size
 
     def _buffer_size_gb(self):
-        total_bytes = 0
-        for item in self.buffer:
-            total_bytes += self._sample_bytes(item)
-        return total_bytes / (1024**3)
+        return self.total_bytes / (1024**3)
+
+    def rebuild_metadata(self):
+        self.total_bytes = sum(self._sample_bytes(item) for item in self.buffer)
+        self.heap = [(item["reward"], idx) for idx, item in enumerate(self.buffer)]
+        heapq.heapify(self.heap)
+        self.counter = len(self.buffer)
 
     def load_chunks(self):
         if not os.path.isdir(BUFFER_DIR):
@@ -197,14 +213,26 @@ class ExperienceBuffer:
             except Exception:
                 continue
         self.buffer = loaded
+        self.rebuild_metadata()
         return True
 
     def enforce_limit(self):
-        total_gb = self._buffer_size_gb()
-        while total_gb > max_buffer_gb and len(self.buffer) > 0:
-            min_idx = min(range(len(self.buffer)), key=lambda i: self.buffer[i]["reward"])
-            removed = self.buffer.pop(min_idx)
-            total_gb -= self._sample_bytes(removed) / (1024**3)
+        while self._buffer_size_gb() > max_buffer_gb and len(self.buffer) > 0:
+            while self.heap and (self.heap[0][1] >= len(self.buffer)):
+                heapq.heappop(self.heap)
+            if not self.heap:
+                break
+            _, idx = heapq.heappop(self.heap)
+            if idx >= len(self.buffer):
+                continue
+            removed = self.buffer[idx]
+            removed_bytes = self._sample_bytes(removed)
+            last_idx = len(self.buffer) - 1
+            if idx != last_idx:
+                self.buffer[idx] = self.buffer[last_idx]
+                heapq.heappush(self.heap, (self.buffer[idx]["reward"], idx))
+            self.buffer.pop()
+            self.total_bytes -= removed_bytes
 
     def sample_sequences(self, batch_size, window):
         if len(self.buffer) <= window:
@@ -283,6 +311,7 @@ def load_state():
             with open(buffer_path, "rb") as f:
                 exp_buffer.buffer = pickle.load(f)
             exp_buffer.save()
+            exp_buffer.rebuild_metadata()
             loaded = True
         except Exception:
             exp_buffer.buffer = []
@@ -326,11 +355,10 @@ def get_mouse_state():
     if left_btn and right_btn: status = 3
     elif left_btn: status = 1
     elif right_btn: status = 2
-    return [x / screen_width, y / screen_height, status / 3.0, 1.0]
+    return [x / screen_width, y / screen_height, float(status)]
 
-def apply_mouse_buttons(pred_status):
+def apply_mouse_buttons(status_idx):
     global mouse_left_down, mouse_right_down
-    status_idx = int(round(max(0.0, min(1.0, pred_status)) * 3))
     target_left = status_idx in (1, 3)
     target_right = status_idx in (2, 3)
     if target_left != mouse_left_down:
@@ -389,6 +417,8 @@ class ResourceMonitor(threading.Thread):
     def run(self):
         global current_fps, current_scale, resolution_factor, temporal_context_window
         prev_m = None
+        last_adjust = time.time()
+        cooldown = 2.0
         while global_running:
             cpu = psutil.cpu_percent()
             mem = psutil.virtual_memory().percent
@@ -403,18 +433,27 @@ class ResourceMonitor(threading.Thread):
             m_val = max(cpu, mem, gpu, vram)
             delta = 0 if prev_m is None else m_val - prev_m
             prev_m = m_val
-            high_load = m_val > 90
+            now = time.time()
+            adjust_allowed = (now - last_adjust) >= cooldown
             with lock:
-                if high_load or delta > 0.5:
+                if adjust_allowed and (m_val > 90 or delta > 0.8):
+                    current_fps = max(1, int(current_fps * 0.85))
+                    current_scale = max(0.05, current_scale * 0.85)
+                    resolution_factor = max(0.2, resolution_factor * 0.85)
+                    temporal_context_window = max(2, temporal_context_window - 1)
+                    last_adjust = now
+                elif adjust_allowed and m_val < 80 and delta < 0.3:
+                    current_fps = min(120, int(current_fps * 1.02) + 1)
+                    current_scale = min(1.0, current_scale * 1.02)
+                    resolution_factor = min(1.0, resolution_factor * 1.02)
+                    temporal_context_window = min(12, temporal_context_window + 1)
+                    last_adjust = now
+                elif adjust_allowed and delta > 0.5:
                     current_fps = max(1, int(current_fps * 0.9))
                     current_scale = max(0.05, current_scale * 0.9)
                     resolution_factor = max(0.2, resolution_factor * 0.9)
                     temporal_context_window = max(2, temporal_context_window - 1)
-                elif delta < -0.5 and m_val < 85:
-                    current_fps = min(120, int(current_fps * 1.05) + 1)
-                    current_scale = min(1.0, current_scale * 1.05)
-                    resolution_factor = min(1.0, resolution_factor * 1.05)
-                    temporal_context_window = min(12, temporal_context_window + 1)
+                    last_adjust = now
             time.sleep(1)
 
 class AgentThread(threading.Thread):
@@ -459,20 +498,23 @@ class AgentThread(threading.Thread):
                     latent = ai_model.encode(img_tensor)
                 context_latents.append(latent.detach())
                 with torch.no_grad():
-                    pred_mouse_raw = action_model(aggregated)
-                pred_mouse = torch.zeros_like(mouse_tensor)
-                pred_mouse[:, 0] = torch.tanh(pred_mouse_raw[:, 0]) * 0.5
-                pred_mouse[:, 1] = torch.tanh(pred_mouse_raw[:, 1]) * 0.5
-                pred_mouse[:, 2] = torch.sigmoid(pred_mouse_raw[:, 2])
-                pred_mouse[:, 3] = torch.ones_like(pred_mouse[:, 3])
+                    pos_raw, status_logits = action_model(aggregated)
+                    status_probs = torch.softmax(status_logits, dim=1)
+                pred_mouse = torch.zeros((1, 3), device=device)
+                pred_mouse[:, 0] = torch.tanh(pos_raw[:, 0]) * 0.5
+                pred_mouse[:, 1] = torch.tanh(pos_raw[:, 1]) * 0.5
+                pred_status_idx = int(torch.argmax(status_probs, dim=1).item())
                 screen_novelty = criterion(predicted_img, img_tensor).item()
-                action_novelty = torch.mean((pred_mouse - mouse_tensor) ** 2).item()
+                pos_loss = torch.mean((pred_mouse[:, :2] - mouse_tensor[:, :2]) ** 2)
+                status_target = torch.tensor([int(mouse_val[2])], device=device, dtype=torch.long)
+                status_loss = F.cross_entropy(status_logits, status_target)
+                action_novelty = (pos_loss + status_loss).item()
                 survival_penalty = 0.0001
                 reward = (screen_novelty * action_novelty) - survival_penalty
                 td_error = screen_novelty + action_novelty
                 exp_buffer.add(img_tensor.cpu(), mouse_tensor.cpu(), reward, td_error, screen_novelty, latent.cpu())
                 pred_np = pred_mouse.cpu().numpy()[0]
-                move_mouse(float(pred_np[0]), float(pred_np[1]), float(pred_np[2]))
+                move_mouse(float(pred_np[0]), float(pred_np[1]), pred_status_idx)
                 if device.type == "cuda" and time.time() - last_cache_clear > 30:
                     torch.cuda.empty_cache()
                     last_cache_clear = time.time()
@@ -612,15 +654,16 @@ class SciFiWindow(QtWidgets.QWidget):
                     pred_latent_vec = future_model(aggregated_tensor)
                     pred_latent = pred_latent_vec.view(-1, 64, latent_pool, latent_pool)
                     pred_img = ai_model.decode(pred_latent, target_imgs_tensor.shape[2:])
-                    pred_mouse_raw = action_model(aggregated_tensor)
-                    pred_mouse = torch.zeros_like(target_mice_tensor)
-                    pred_mouse[:, 0] = torch.tanh(pred_mouse_raw[:, 0]) * 0.5
-                    pred_mouse[:, 1] = torch.tanh(pred_mouse_raw[:, 1]) * 0.5
-                    pred_mouse[:, 2] = torch.sigmoid(pred_mouse_raw[:, 2])
-                    pred_mouse[:, 3] = torch.ones_like(pred_mouse[:, 3])
+                    pos_raw, status_logits = action_model(aggregated_tensor)
+                    pos_pred = torch.zeros((target_mice_tensor.shape[0], 2), device=device)
+                    pos_pred[:, 0] = torch.tanh(pos_raw[:, 0]) * 0.5
+                    pos_pred[:, 1] = torch.tanh(pos_raw[:, 1]) * 0.5
                     recon = ai_model(target_imgs_tensor)
                     loss_screen = loss_fn(pred_img, target_imgs_tensor)
-                    loss_mouse = loss_fn(pred_mouse, target_mice_tensor)
+                    target_pos = target_mice_tensor[:, :2]
+                    target_status = target_mice_tensor[:, 2].long()
+                    status_loss = F.cross_entropy(status_logits, target_status)
+                    loss_mouse = loss_fn(pos_pred, target_pos) + status_loss
                     loss_ae = loss_fn(recon, target_imgs_tensor) + loss_fn(target_latents_tensor, ai_model.encode(target_imgs_tensor))
                     loss = loss_screen + loss_mouse + loss_ae
                 scaler.scale(loss).backward()
@@ -665,7 +708,7 @@ if __name__ == "__main__":
     ensure_files()
     load_state()
     init_state = get_mouse_state()
-    init_status = int(round(init_state[2] * 3))
+    init_status = int(init_state[2])
     mouse_left_down = init_status in (1, 3)
     mouse_right_down = init_status in (2, 3)
     window = SciFiWindow()
