@@ -587,7 +587,7 @@ def aggregate_latents(latents):
     embed_dim = 64 * latent_pool * latent_pool
     if len(latents) == 0:
         return torch.zeros(1, embed_dim * 2, device=device)
-    stacked = torch.stack(latents).view(len(latents), -1)
+    stacked = torch.stack([l.to(device) for l in latents]).view(len(latents), -1)
     mean = stacked.mean(dim=0, keepdim=True)
     std = stacked.std(dim=0, keepdim=True) + 1e-6
     return torch.cat([mean, std], dim=1)
@@ -661,28 +661,33 @@ class AgentThread(threading.Thread):
             pos_scale_tensor = position_scale()
             with torch.no_grad():
                 latent = ai_model.encode(img_tensor)
-            context_latents.append(latent.detach())
+            context_latents.append(latent.detach().cpu())
             with torch.no_grad():
                 pred_pos_raw, pred_status_logits = predict_action_model(aggregated)
                 policy_pos_raw, policy_status_logits = policy_action_model(aggregated)
                 policy_status_probs = torch.softmax(policy_status_logits, dim=1)
             pred_mouse = torch.zeros((1, 3), device=device)
-            pred_mouse[:, 0] = torch.tanh(pred_pos_raw[:, 0]) * pos_scale_tensor[0]
-            pred_mouse[:, 1] = torch.tanh(pred_pos_raw[:, 1]) * pos_scale_tensor[1]
-            policy_mouse = torch.zeros((1, 3), device=device)
-            policy_mouse[:, 0] = torch.tanh(policy_pos_raw[:, 0]) * pos_scale_tensor[0]
-            policy_mouse[:, 1] = torch.tanh(policy_pos_raw[:, 1]) * pos_scale_tensor[1]
+            pred_mouse_norm = torch.tanh(pred_pos_raw[:, :2])
+            pred_mouse[:, 0] = pred_mouse_norm[:, 0] * pos_scale_tensor[0]
+            pred_mouse[:, 1] = pred_mouse_norm[:, 1] * pos_scale_tensor[1]
             pred_status_idx = int(torch.argmax(policy_status_probs, dim=1).item())
-            screen_mse = criterion(predicted_img, img_tensor).item()
-            screen_novelty = math.log1p(screen_mse) * 10000
-            pos_loss = torch.mean((pred_mouse[:, :2] - mouse_tensor[:, :2]) ** 2)
+            mouse_norm = torch.clamp(mouse_tensor[:, :2] / pos_scale_tensor, -1.0, 1.0)
+            pos_loss = torch.mean((pred_mouse_norm - mouse_norm) ** 2)
             status_target = torch.tensor([int(mouse_val[2])], device=device, dtype=torch.long)
             status_loss = F.cross_entropy(pred_status_logits, status_target)
             action_novelty_raw = (pos_loss + status_loss).item()
             action_novelty = math.log1p(action_novelty_raw) * 10000
+            screen_mse = criterion(predicted_img, img_tensor).item()
+            screen_novelty = math.log1p(screen_mse) * 10000
+            policy_mouse = torch.zeros((1, 3), device=device)
+            policy_mouse_norm = torch.tanh(policy_pos_raw[:, :2])
+            noise_scale = clamp_value((screen_novelty + action_novelty) / 20000.0, 0.01, 0.5)
+            action_noise = torch.randn_like(policy_mouse_norm) * noise_scale
+            noisy_mouse_norm = torch.clamp(policy_mouse_norm + action_noise, -1.0, 1.0)
+            policy_mouse[:, 0] = noisy_mouse_norm[:, 0] * pos_scale_tensor[0]
+            policy_mouse[:, 1] = noisy_mouse_norm[:, 1] * pos_scale_tensor[1]
             survival_penalty = config_data["learning"]["survival_penalty"]
-            random_scale = max(1.0, (screen_novelty + action_novelty) / 10000.0)
-            reward = (screen_novelty * action_novelty) / 10000 - survival_penalty + random.uniform(-1.0, 1.0) * random_scale
+            reward = (screen_novelty * action_novelty) / 10000 - survival_penalty
             td_error = screen_novelty + action_novelty
             exp_buffer.add(img_tensor.cpu(), mouse_tensor.cpu(), reward, td_error, screen_novelty, latent.cpu())
             policy_np = policy_mouse.cpu().numpy()[0]
@@ -793,7 +798,8 @@ class SciFiWindow(QtWidgets.QWidget):
             self.finished_signal.emit()
             return
         total_steps = config_data["learning"]["train_steps"]
-        optimizer = optim.Adam(list(ai_model.parameters()) + list(predict_action_model.parameters()) + list(policy_action_model.parameters()) + list(future_model.parameters()) + list(value_model.parameters()), lr=config_data["learning"]["learning_rate"])
+        weight_decay = config_data["learning"]["learning_rate"] * 0.1
+        optimizer = optim.Adam(list(ai_model.parameters()) + list(predict_action_model.parameters()) + list(policy_action_model.parameters()) + list(future_model.parameters()) + list(value_model.parameters()), lr=config_data["learning"]["learning_rate"], weight_decay=weight_decay)
         loss_fn = nn.MSELoss()
         for i in range(total_steps):
             if not global_running:
@@ -817,7 +823,7 @@ class SciFiWindow(QtWidgets.QWidget):
                 optimizer.zero_grad()
                 agg_batch = []
                 for latents in context_latent_list:
-                    agg = aggregate_latents([l.to(device) for l in latents])
+                    agg = aggregate_latents(latents)
                     agg_batch.append(agg)
                 aggregated_tensor = torch.cat(agg_batch, dim=0)
                 target_imgs_tensor = torch.stack(target_imgs).to(device)
@@ -832,29 +838,26 @@ class SciFiWindow(QtWidgets.QWidget):
                     pred_pos_raw, pred_status_logits = predict_action_model(aggregated_tensor)
                     policy_pos_raw, policy_status_logits = policy_action_model(aggregated_tensor)
                     pos_scale_tensor = position_scale()
-                    pred_pos = torch.zeros((target_mice_tensor.shape[0], 2), device=device)
-                    pred_pos[:, 0] = torch.tanh(pred_pos_raw[:, 0]) * pos_scale_tensor[0]
-                    pred_pos[:, 1] = torch.tanh(pred_pos_raw[:, 1]) * pos_scale_tensor[1]
-                    policy_pos = torch.zeros((target_mice_tensor.shape[0], 2), device=device)
-                    policy_pos[:, 0] = torch.tanh(policy_pos_raw[:, 0]) * pos_scale_tensor[0]
-                    policy_pos[:, 1] = torch.tanh(policy_pos_raw[:, 1]) * pos_scale_tensor[1]
+                    pred_pos_norm = torch.tanh(pred_pos_raw[:, :2])
+                    policy_pos_norm = torch.tanh(policy_pos_raw[:, :2])
                     recon = ai_model(target_imgs_tensor)
                     loss_screen = loss_fn(pred_img, target_imgs_tensor)
                     target_pos = target_mice_tensor[:, :2]
+                    target_pos_norm = torch.clamp(target_pos / pos_scale_tensor, -1.0, 1.0)
                     target_status = target_mice_tensor[:, 2].long()
-                    min_std = max(1.0, min(float(center_x), float(center_y)) * 0.002)
-                    max_std = max(float(center_x), float(center_y)) * 0.25
-                    pos_std = torch.clamp(target_pos.std(dim=0, unbiased=False).mean(), min_std, max_std) + 1e-6
-                    dist = torch.distributions.Normal(policy_pos, pos_std)
-                    log_prob_pos = dist.log_prob(target_pos).sum(dim=1)
+                    min_std = torch.clamp(target_pos_norm.abs().mean(dim=0).mean(), 0.01, 0.5)
+                    max_std = torch.clamp(target_pos_norm.std(dim=0, unbiased=False).mean(), 0.05, 0.8)
+                    pos_std = torch.clamp((min_std + max_std) * 0.5, 0.01, 0.8) + 1e-6
+                    dist = torch.distributions.Normal(policy_pos_norm, pos_std)
+                    log_prob_pos = dist.log_prob(target_pos_norm).sum(dim=1)
                     log_prob_status = F.log_softmax(policy_status_logits, dim=1).gather(1, target_status.unsqueeze(1)).squeeze(1)
                     log_prob = log_prob_pos + log_prob_status
                     values = value_model(aggregated_tensor)
                     advantage = reward_norm.detach()
                     policy_loss = -(advantage * log_prob).mean()
                     value_loss = F.mse_loss(values, reward_tensor)
-                    predict_loss = loss_fn(pred_pos, target_pos) + F.cross_entropy(pred_status_logits, target_status)
-                    policy_supervised = loss_fn(policy_pos, target_pos) + F.cross_entropy(policy_status_logits, target_status)
+                    predict_loss = loss_fn(pred_pos_norm, target_pos_norm) + F.cross_entropy(pred_status_logits, target_status)
+                    policy_supervised = loss_fn(policy_pos_norm, target_pos_norm) + F.cross_entropy(policy_status_logits, target_status)
                     loss_ae = loss_fn(recon, target_imgs_tensor) + loss_fn(target_latents_tensor, ai_model.encode(target_imgs_tensor))
                     loss = loss_screen + predict_loss + policy_supervised + loss_ae + policy_loss + value_loss
                 scaler.scale(loss).backward()
