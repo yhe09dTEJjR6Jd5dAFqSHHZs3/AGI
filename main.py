@@ -38,12 +38,12 @@ torch.backends.cudnn.benchmark = True
 nn = torch.nn
 optim = torch.optim
 F = torch.nn.functional
-autocast = import_or_install("torch.cuda.amp").autocast
-GradScaler = import_or_install("torch.cuda.amp").GradScaler
+autocast = import_or_install("torch.cuda.amp", "torch").autocast
+GradScaler = import_or_install("torch.cuda.amp", "torch").GradScaler
 QtWidgets = import_or_install("PyQt5.QtWidgets", "PyQt5")
 QtCore = import_or_install("PyQt5.QtCore", "PyQt5")
 QtGui = import_or_install("PyQt5.QtGui", "PyQt5")
-keyboard = import_or_install("pynput.keyboard")
+keyboard = import_or_install("pynput.keyboard", "pynput")
 pyautogui = import_or_install("pyautogui")
 ctypes = import_or_install("ctypes")
 platform = import_or_install("platform")
@@ -308,7 +308,7 @@ class ValuePredictor(nn.Module):
 
 class ExperienceBuffer:
     def __init__(self):
-        self.buffer = []
+        self.buffer = deque()
         self.heap = []
         self.total_bytes = 0
         self.counter = 0
@@ -355,10 +355,12 @@ class ExperienceBuffer:
         return self.total_bytes / (1024**3)
 
     def rebuild_metadata(self):
-        self.total_bytes = sum(self._sample_bytes(item) for item in self.buffer)
-        self.heap = [(item["reward"], idx) for idx, item in enumerate(self.buffer)]
+        buffer_list = list(self.buffer)
+        self.total_bytes = sum(self._sample_bytes(item) for item in buffer_list)
+        self.heap = [(item["reward"], idx) for idx, item in enumerate(buffer_list)]
         heapq.heapify(self.heap)
-        self.counter = len(self.buffer)
+        self.buffer = deque(buffer_list)
+        self.counter = len(buffer_list)
 
     def load_chunks(self):
         if not os.path.isdir(BUFFER_DIR):
@@ -381,28 +383,29 @@ class ExperienceBuffer:
             if total_bytes >= limit_bytes:
                 break
         retained.reverse()
-        self.buffer = retained
+        self.buffer = deque(retained)
         self.rebuild_metadata()
         return True
 
     def enforce_limit(self):
         removed_any = False
         while self._buffer_size_gb() > max_buffer_gb and len(self.buffer) > 0:
-            removed = self.buffer.pop(0)
+            removed = self.buffer.popleft()
             self.total_bytes -= self._sample_bytes(removed)
             removed_any = True
         if removed_any:
             self.rebuild_metadata()
 
     def sample_sequences(self, batch_size, window):
-        if len(self.buffer) <= window:
+        buffer_list = list(self.buffer)
+        if len(buffer_list) <= window:
             return []
         sequences = []
-        max_start = len(self.buffer) - window - 1
+        max_start = len(buffer_list) - window - 1
         for _ in range(batch_size):
             idx = random.randint(0, max_start)
-            context_entries = self.buffer[idx:idx + window]
-            target_entry = self.buffer[idx + window]
+            context_entries = buffer_list[idx:idx + window]
+            target_entry = buffer_list[idx + window]
             sequences.append((context_entries, target_entry))
         return sequences
 
@@ -501,7 +504,7 @@ def load_state():
     loaded = exp_buffer.load_chunks()
     if not loaded and os.path.exists(buffer_path):
         with open(buffer_path, "rb") as f:
-            exp_buffer.buffer = pickle.load(f)
+            exp_buffer.buffer = deque(pickle.load(f))
         exp_buffer.save()
         exp_buffer.rebuild_metadata()
         loaded = True
