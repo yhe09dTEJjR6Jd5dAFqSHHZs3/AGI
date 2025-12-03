@@ -11,6 +11,7 @@ import warnings
 import importlib
 import importlib.util
 import json
+import gc
 from collections import deque
 import heapq
 import bisect
@@ -444,13 +445,15 @@ class ExperienceBuffer:
         while len(data_bytes) + 8 > capacity and len(entries) > 1:
             entries = entries[:-1]
             data_bytes = pickle.dumps(entries)
-        mem = np.memmap(path, dtype=np.uint8, mode="w+", shape=(capacity,))
+        temp_path = path + ".tmp"
+        mem = np.memmap(temp_path, dtype=np.uint8, mode="w+", shape=(capacity,))
         size_bytes = len(data_bytes).to_bytes(8, "little")
         mem[:8] = np.frombuffer(size_bytes, dtype=np.uint8)
         mem[8:8 + len(data_bytes)] = np.frombuffer(data_bytes, dtype=np.uint8)
         if 8 + len(data_bytes) < capacity:
             mem[8 + len(data_bytes):] = 0
         mem.flush()
+        os.replace(temp_path, path)
 
     def _read_chunk(self, path):
         if not os.path.exists(path):
@@ -711,12 +714,12 @@ def apply_mouse_buttons(status_idx):
         mouse_right_down = target_right
 
 def move_mouse(pred_abs_x, pred_abs_y, pred_status):
-    target_x = clamp_value(pred_abs_x + center_x, 0, screen_width - 1)
-    target_y = clamp_value(center_y - pred_abs_y, 0, screen_height - 1)
+    target_x = int(clamp_value(round(pred_abs_x + center_x), 0, screen_width - 1))
+    target_y = int(clamp_value(round(center_y - pred_abs_y), 0, screen_height - 1))
     if platform.system().lower().startswith("win"):
-        ctypes.windll.user32.SetCursorPos(int(target_x), int(target_y))
+        ctypes.windll.user32.SetCursorPos(target_x, target_y)
     else:
-        pyautogui.moveTo(int(target_x), int(target_y), _pause=False)
+        pyautogui.moveTo(target_x, target_y, _pause=False)
     apply_mouse_buttons(pred_status)
 
 def aggregate_latents(latents):
@@ -765,6 +768,14 @@ class ResourceMonitor(threading.Thread):
             if torch.cuda.is_available():
                 vram_use = torch.cuda.memory_allocated() / (1024**3)
                 vram_torch = min(100.0, vram_use / max_vram_gb * 100)
+                if vram_torch > target_high:
+                    before_clear = vram_torch
+                    torch.cuda.empty_cache()
+                    after_clear = min(100.0, torch.cuda.memory_allocated() / (1024**3) / max(max_vram_gb, 1e-6) * 100)
+                    vram_torch = after_clear
+                    if after_clear >= before_clear:
+                        gc.collect()
+                        vram_torch = min(100.0, torch.cuda.memory_allocated() / (1024**3) / max(max_vram_gb, 1e-6) * 100)
             buffer_gpu_resident = torch.cuda.is_available() and vram_util < 50.0
             m_val = max(cpu, mem, gpu_util, vram_util, vram_torch)
             now = time.time()
@@ -820,7 +831,8 @@ class AgentThread(threading.Thread):
                 fps = current_fps
                 window_len = temporal_context_window
             monitor = {"top": 0, "left": 0, "width": screen_width, "height": screen_height}
-            img_np = np.array(sct.grab(monitor))
+            shot = sct.grab(monitor)
+            img_np = np.frombuffer(shot.raw, dtype=np.uint8).reshape(shot.height, shot.width, 4)
             img_np = cv2.cvtColor(img_np, cv2.COLOR_BGRA2RGB)
             target_w = VISION_WIDTH
             target_h = VISION_HEIGHT
@@ -898,6 +910,7 @@ class SciFiWindow(QtWidgets.QWidget):
     status_signal = QtCore.pyqtSignal(str)
     info_signal = QtCore.pyqtSignal(str)
     progress_signal = QtCore.pyqtSignal(int)
+    exit_signal = QtCore.pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -915,6 +928,7 @@ class SciFiWindow(QtWidgets.QWidget):
         self.status_signal.connect(self.label.setText)
         self.info_signal.connect(self.info_label.setText)
         self.progress_signal.connect(self.progress.setValue)
+        self.exit_signal.connect(self.close)
 
     def center(self):
         frame = self.frameGeometry()
@@ -1095,7 +1109,7 @@ class InputHandler:
         global global_running, global_optimizing, global_pause_recording
         if key == keyboard.Key.esc:
             global_running = False
-            QtWidgets.QApplication.quit()
+            self.gui.exit_signal.emit()
             return False
         if key == keyboard.Key.enter:
             if not global_optimizing:
