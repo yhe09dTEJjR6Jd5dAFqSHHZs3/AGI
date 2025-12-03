@@ -834,7 +834,7 @@ class ModeController(threading.Thread):
                 if time.time() - last_debug_end > 60:
                     global_mode = "sleep"
                     global_pause_recording = True
-                    self.gui.trigger_optimization()
+                    QtCore.QMetaObject.invokeMethod(self.gui, "trigger_optimization", QtCore.Qt.QueuedConnection)
             if global_mode != "sleep" and self.gui.isVisible():
                 self.gui.hide()
             time.sleep(1)
@@ -944,7 +944,7 @@ class SciFiWindow(QtWidgets.QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint)
+        self.setWindowFlags(QtCore.Qt.Window | QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
         self.resize(600, 400)
         self.center()
@@ -1041,7 +1041,8 @@ class SciFiWindow(QtWidgets.QWidget):
         global_mode = "sleep"
         global_optimizing = True
         global_pause_recording = True
-        self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.Tool)
+        self.setWindowFlags(QtCore.Qt.Window | QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.Tool)
+        self.setWindowModality(QtCore.Qt.ApplicationModal)
         self.showNormal()
         self.resize(600, 400)
         self.center()
@@ -1185,7 +1186,7 @@ class InputHandler:
             if not global_optimizing:
                 global_pause_recording = True
                 global_optimizing = True
-                self.gui.trigger_optimization()
+                QtCore.QMetaObject.invokeMethod(self.gui, "trigger_optimization", QtCore.Qt.QueuedConnection)
 
 exp_buffer = ExperienceBuffer()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
