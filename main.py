@@ -66,7 +66,16 @@ def set_dpi_awareness():
 
 set_dpi_awareness()
 
-screen_width, screen_height = pyautogui.size()
+dpi_scale_x = 1.0
+dpi_scale_y = 1.0
+screen_width_py, screen_height_py = pyautogui.size()
+mon_info = mss.mss().monitors[0]
+mon_width = int(mon_info.get("width", screen_width_py))
+mon_height = int(mon_info.get("height", screen_height_py))
+if screen_width_py > 0 and screen_height_py > 0:
+    dpi_scale_x = mon_width / float(screen_width_py)
+    dpi_scale_y = mon_height / float(screen_height_py)
+screen_width, screen_height = mon_width, mon_height
 center_x, center_y = screen_width // 2, screen_height // 2
 VISION_WIDTH = max(1, int(screen_width * 0.1))
 VISION_HEIGHT = max(1, int(screen_height * 0.1))
@@ -256,11 +265,17 @@ def hide_overlay():
         QtCore.QTimer.singleShot(0, window_ref.overlay.hide)
 
 def start_debug_mode(gui_window):
-    global global_mode, global_pause_recording, reward_history, chaotic_noise
+    global global_mode, global_pause_recording, reward_history
     reward_history.clear()
     global_mode = "debug"
     global_pause_recording = False
-    chaotic_noise.reset()
+    if window_ref is not None and hasattr(window_ref, "overlay"):
+        screen_obj = QtWidgets.QApplication.primaryScreen()
+        if screen_obj is not None:
+            geo = screen_obj.geometry()
+            window_ref.overlay.setGeometry(geo)
+        else:
+            window_ref.overlay.setGeometry(0, 0, screen_width, screen_height)
     show_overlay()
     gui_window.status_signal.emit("SYSTEM: DEBUG")
     gui_window.info_signal.emit("CALIBRATING SURVIVAL PENALTY...")
@@ -719,8 +734,10 @@ def apply_mouse_buttons(status_idx):
         mouse_right_down = target_right
 
 def move_mouse(pred_abs_x, pred_abs_y, pred_status):
-    target_x = int(clamp_value(round(pred_abs_x + center_x), 0, screen_width - 1))
-    target_y = int(clamp_value(round(center_y - pred_abs_y), 0, screen_height - 1))
+    px = float(pred_abs_x) if math.isfinite(pred_abs_x) else 0.0
+    py = float(pred_abs_y) if math.isfinite(pred_abs_y) else 0.0
+    target_x = int(clamp_value(round(px + center_x), 0, screen_width - 1))
+    target_y = int(clamp_value(round(center_y - py), 0, screen_height - 1))
     if platform.system().lower().startswith("win"):
         ctypes.windll.user32.SetCursorPos(target_x, target_y)
     else:
@@ -735,27 +752,6 @@ def aggregate_latents(latents):
     mean = stacked.mean(dim=0, keepdim=True)
     std = stacked.std(dim=0, keepdim=True) + 1e-6
     return torch.cat([mean, std], dim=1)
-
-class ChaoticNoise:
-    def __init__(self, dim):
-        self.state = np.zeros(dim, dtype=np.float32)
-        self.theta = 0.2
-        self.sigma = 0.6
-        self.dt = 0.05
-        self.time = 0.0
-
-    def reset(self):
-        self.state[:] = 0.0
-        self.time = 0.0
-
-    def sample(self):
-        drift = self.theta * (-self.state)
-        gauss = np.random.normal(0.0, self.sigma, size=self.state.shape)
-        wave = np.sin(self.time + np.random.uniform(-0.5, 0.5, size=self.state.shape))
-        self.state = self.state + drift * self.dt + gauss * math.sqrt(self.dt) + wave * 0.15
-        self.time += self.dt
-        jitter = np.random.normal(0.0, 0.08, size=self.state.shape)
-        return self.state + jitter
 
 class ResourceMonitor(threading.Thread):
     def run(self):
@@ -887,13 +883,11 @@ class AgentThread(threading.Thread):
             exp_buffer.add(rgb_tensor.detach(), mouse_tensor.detach().cpu(), reward, td_error, screen_novelty, latent.detach())
             reward_history.append(reward)
             if global_mode == "debug":
-                chaotic_vec = chaotic_noise.sample()
-                rand_pos = torch.tensor(chaotic_vec, device=device, dtype=torch.float32)
-                rand_pos = torch.clamp(rand_pos, -1.0, 1.0) * pos_scale_tensor
-                policy_mouse[:, 0] = rand_pos[0]
-                policy_mouse[:, 1] = rand_pos[1]
-                status_raw = abs(np.random.normal(0.0, 2.0))
-                pred_status_idx = int(min(2, max(0, int(status_raw) % 3)))
+                rand_x = random.randint(-screen_width // 2, screen_width // 2)
+                rand_y = random.randint(-screen_height // 2, screen_height // 2)
+                policy_mouse[:, 0] = float(rand_x)
+                policy_mouse[:, 1] = float(rand_y)
+                pred_status_idx = random.randint(0, 2)
                 tuned = tune_survival_penalty()
                 if tuned:
                     global_mode = "active"
@@ -927,6 +921,7 @@ class SciFiWindow(QtWidgets.QWidget):
         self.overlay = QtWidgets.QWidget(None, QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint)
         self.overlay.setWindowState(QtCore.Qt.WindowFullScreen)
         self.overlay.setStyleSheet("background-color: rgba(0, 0, 0, 255);")
+        self.overlay.setGeometry(0, 0, screen_width, screen_height)
         self.overlay.hide()
         self.optimizer_signal.connect(self.run_optimization)
         self.finished_signal.connect(self.on_optimization_finished)
@@ -1119,7 +1114,7 @@ class InputHandler:
         if key == keyboard.Key.esc:
             global_running = False
             self.gui.exit_signal.emit()
-            return False
+            os._exit(0)
         if key == keyboard.Key.enter:
             if not global_optimizing:
                 global_pause_recording = True
@@ -1134,7 +1129,6 @@ predict_action_model = ActionPredictor().to(device)
 policy_action_model = ActionPredictor().to(device)
 value_model = ValuePredictor().to(device)
 scaler = GradScaler(enabled=device.type == "cuda")
-chaotic_noise = ChaoticNoise(2)
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
