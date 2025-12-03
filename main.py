@@ -276,8 +276,9 @@ def start_debug_mode(gui_window):
         else:
             window_ref.overlay.setGeometry(0, 0, screen_width, screen_height)
     show_overlay()
-    gui_window.status_signal.emit("系统：调试模式")
-    gui_window.info_signal.emit("正在校准生存惩罚...")
+    gui_window.hide()
+    gui_window.status_signal.emit("系统：睡眠模式")
+    gui_window.info_signal.emit("睡眠模式准备中...")
 
 lock = threading.Lock()
 mouse_left_down = False
@@ -822,6 +823,8 @@ class ModeController(threading.Thread):
                     global_mode = "sleep"
                     global_pause_recording = True
                     self.gui.trigger_optimization()
+            if global_mode != "sleep" and self.gui.isVisible():
+                self.gui.hide()
             time.sleep(1)
 
 class AgentThread(threading.Thread):
