@@ -834,7 +834,7 @@ class ModeController(threading.Thread):
                 if time.time() - last_debug_end > 60:
                     global_mode = "sleep"
                     global_pause_recording = True
-                    QtCore.QMetaObject.invokeMethod(self.gui, "trigger_optimization", QtCore.Qt.QueuedConnection)
+                    self.gui.optimize_request_signal.emit()
             if global_mode != "sleep" and self.gui.isVisible():
                 self.gui.hide()
             time.sleep(1)
@@ -941,6 +941,7 @@ class SciFiWindow(QtWidgets.QWidget):
     info_signal = QtCore.pyqtSignal(str)
     progress_signal = QtCore.pyqtSignal(int)
     exit_signal = QtCore.pyqtSignal()
+    optimize_request_signal = QtCore.pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -957,6 +958,7 @@ class SciFiWindow(QtWidgets.QWidget):
         self.info_signal.connect(self.info_label.setText)
         self.progress_signal.connect(self.progress.setValue)
         self.exit_signal.connect(self.close)
+        self.optimize_request_signal.connect(self.trigger_optimization)
 
     def center(self):
         frame = self.frameGeometry()
@@ -1036,6 +1038,7 @@ class SciFiWindow(QtWidgets.QWidget):
             self.overlay.close()
             self.overlay = None
 
+    @QtCore.pyqtSlot()
     def trigger_optimization(self):
         global global_optimizing, global_pause_recording, global_mode
         global_mode = "sleep"
@@ -1186,7 +1189,7 @@ class InputHandler:
             if not global_optimizing:
                 global_pause_recording = True
                 global_optimizing = True
-                QtCore.QMetaObject.invokeMethod(self.gui, "trigger_optimization", QtCore.Qt.QueuedConnection)
+                self.gui.optimize_request_signal.emit()
 
 exp_buffer = ExperienceBuffer()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
