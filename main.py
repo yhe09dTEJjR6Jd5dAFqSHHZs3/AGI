@@ -480,6 +480,7 @@ class ExperienceBuffer:
         if 8 + len(data_bytes) < capacity:
             mem[8 + len(data_bytes):] = 0
         mem.flush()
+        del mem
         os.replace(temp_path, path)
 
     def _read_chunk(self, path):
@@ -487,6 +488,7 @@ class ExperienceBuffer:
             return []
         mem = np.memmap(path, dtype=np.uint8, mode="r")
         if mem.shape[0] < 8:
+            del mem
             return []
         size = int.from_bytes(bytes(mem[:8]), "little")
         limit_bytes = 20 * (1024**3)
@@ -495,6 +497,7 @@ class ExperienceBuffer:
             os.remove(path)
             return []
         data_bytes = bytes(mem[8:8 + size])
+        del mem
         return pickle.loads(data_bytes)
 
     def load_chunks(self):
@@ -805,6 +808,8 @@ class ResourceMonitor(threading.Thread):
                     fps_lower, fps_upper = config_data["capture"]["fps_bounds"]
                     context_min = r_cfg["min_context"]
                     context_max = r_cfg["max_context"]
+                    prev_fps = current_fps
+                    prev_context = temporal_context_window
                     if m_val > target_high:
                         delta = max(1, int((m_val - target_high) / 5) + 1)
                         current_fps = max(fps_lower, current_fps - delta)
@@ -814,7 +819,8 @@ class ResourceMonitor(threading.Thread):
                         current_fps = min(fps_upper, current_fps + delta)
                         temporal_context_window = min(context_max, temporal_context_window + delta)
                     last_adjust = now
-                    persist_config()
+                    if prev_fps != current_fps or prev_context != temporal_context_window:
+                        persist_config()
             time.sleep(1)
 
 class ModeController(threading.Thread):
