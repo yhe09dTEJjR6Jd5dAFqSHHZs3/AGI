@@ -175,7 +175,7 @@ global_running = True
 global_optimizing = False
 global_pause_recording = False
 buffer_gpu_resident = False
-global_mode = "active"
+global_mode = "debug"
 last_debug_end = time.time()
 reward_history = deque(maxlen=128)
 window_ref = None
@@ -1143,6 +1143,7 @@ if __name__ == "__main__":
     window = SciFiWindow()
     window_ref = window
     window.show()
+    start_debug_mode(window)
     monitor_thread = ResourceMonitor()
     monitor_thread.start()
     mode_thread = ModeController(window)
