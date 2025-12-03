@@ -187,6 +187,8 @@ buffer_gpu_resident = False
 global_mode = "debug"
 last_debug_end = time.time()
 reward_history = deque(maxlen=128)
+debug_novelty_products = []
+vram_near_limit = False
 window_ref = None
 
 def apply_config():
@@ -243,18 +245,13 @@ def persist_config():
         json.dump(config_data, f, ensure_ascii=False, indent=2)
 
 def tune_survival_penalty():
-    if len(reward_history) < 30:
+    global debug_novelty_products
+    if len(debug_novelty_products) < 30:
         return False
-    recent = list(reward_history)[-30:]
-    avg_reward = sum(recent) / len(recent)
-    target = 0.0
-    if abs(avg_reward - target) < 2.0:
-        return True
-    delta = avg_reward * 0.1
-    new_penalty = clamp_value(config_data["learning"]["survival_penalty"] + delta, 0.0, 10.0)
-    config_data["learning"]["survival_penalty"] = new_penalty
+    avg_product = sum(debug_novelty_products) / len(debug_novelty_products)
+    config_data["learning"]["survival_penalty"] = clamp_value(avg_product, 0.0, 10000.0)
     persist_config()
-    return False
+    return True
 
 def show_overlay():
     if window_ref is not None and hasattr(window_ref, "overlay"):
@@ -266,8 +263,9 @@ def hide_overlay():
         QtCore.QTimer.singleShot(0, window_ref.overlay.hide)
 
 def start_debug_mode(gui_window):
-    global global_mode, global_pause_recording, reward_history
+    global global_mode, global_pause_recording, reward_history, debug_novelty_products
     reward_history.clear()
+    debug_novelty_products = []
     global_mode = "debug"
     global_pause_recording = False
     if window_ref is not None and hasattr(window_ref, "overlay"):
@@ -483,7 +481,10 @@ class ExperienceBuffer:
         if mem.shape[0] < 8:
             return []
         size = int.from_bytes(bytes(mem[:8]), "little")
-        if size <= 0 or 8 + size > mem.shape[0]:
+        limit_bytes = 20 * (1024**3)
+        if size <= 0 or size > limit_bytes or 8 + size > mem.shape[0]:
+            del mem
+            os.remove(path)
             return []
         data_bytes = bytes(mem[8:8 + size])
         return pickle.loads(data_bytes)
@@ -694,7 +695,12 @@ def position_scale():
     return torch.tensor([float(center_x), float(center_y)], device=device)
 
 def get_mouse_state():
-    x_phys, y_phys = pyautogui.position()
+    if platform.system().lower().startswith("win") and hasattr(ctypes, "windll") and hasattr(ctypes.windll, "user32"):
+        point = ctypes.wintypes.POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
+        x_phys, y_phys = int(point.x), int(point.y)
+    else:
+        x_phys, y_phys = pyautogui.position()
     x = x_phys - center_x
     y = center_y - y_phys
     left_btn = 0
@@ -740,6 +746,10 @@ def move_mouse(pred_abs_x, pred_abs_y, pred_status):
     target_x = int(clamp_value(round(px + center_x), 0, screen_width - 1))
     target_y = int(clamp_value(round(center_y - py), 0, screen_height - 1))
     if platform.system().lower().startswith("win"):
+        width_actual = max(screen_width, int(ctypes.windll.user32.GetSystemMetrics(0)))
+        height_actual = max(screen_height, int(ctypes.windll.user32.GetSystemMetrics(1)))
+        target_x = int(clamp_value(target_x, 0, width_actual - 1))
+        target_y = int(clamp_value(target_y, 0, height_actual - 1))
         ctypes.windll.user32.SetCursorPos(target_x, target_y)
     else:
         pyautogui.moveTo(target_x, target_y, _pause=False)
@@ -756,7 +766,7 @@ def aggregate_latents(latents):
 
 class ResourceMonitor(threading.Thread):
     def run(self):
-        global current_fps, temporal_context_window, buffer_gpu_resident
+        global current_fps, temporal_context_window, buffer_gpu_resident, vram_near_limit
         r_cfg = config_data["resource"]
         cooldown = r_cfg["cooldown_seconds"]
         target_high = 61.8
@@ -770,14 +780,15 @@ class ResourceMonitor(threading.Thread):
             if torch.cuda.is_available():
                 vram_use = torch.cuda.memory_allocated() / (1024**3)
                 vram_torch = min(100.0, vram_use / max_vram_gb * 100)
-                if vram_torch > target_high:
-                    before_clear = vram_torch
+                if vram_torch >= 90.0 or vram_util >= 90.0:
+                    vram_near_limit = True
                     torch.cuda.empty_cache()
-                    after_clear = min(100.0, torch.cuda.memory_allocated() / (1024**3) / max(max_vram_gb, 1e-6) * 100)
-                    vram_torch = after_clear
-                    if after_clear >= before_clear:
-                        gc.collect()
-                        vram_torch = min(100.0, torch.cuda.memory_allocated() / (1024**3) / max(max_vram_gb, 1e-6) * 100)
+                    gc.collect()
+                    vram_torch = min(100.0, torch.cuda.memory_allocated() / (1024**3) / max(max_vram_gb, 1e-6) * 100)
+                else:
+                    vram_near_limit = False
+            else:
+                vram_near_limit = False
             buffer_gpu_resident = torch.cuda.is_available() and vram_util < 50.0
             m_val = max(cpu, mem, gpu_util, vram_util, vram_torch)
             now = time.time()
@@ -884,6 +895,9 @@ class AgentThread(threading.Thread):
             exp_buffer.add(rgb_tensor.detach(), mouse_tensor.detach().cpu(), reward, td_error, screen_novelty, latent.detach())
             reward_history.append(reward)
             if global_mode == "debug":
+                debug_novelty_products.append(screen_novelty * action_novelty)
+                if len(debug_novelty_products) > 1024:
+                    debug_novelty_products.pop(0)
                 rand_x = random.randint(-screen_width // 2, screen_width // 2)
                 rand_y = random.randint(-screen_height // 2, screen_height // 2)
                 policy_mouse[:, 0] = float(rand_x)
@@ -1078,18 +1092,23 @@ class SciFiWindow(QtWidgets.QWidget):
                     predict_loss = loss_fn(pred_pos_norm, target_pos_norm) + F.cross_entropy(pred_status_logits, target_status)
                     policy_supervised = loss_fn(policy_pos_norm, target_pos_norm) + F.cross_entropy(policy_status_logits, target_status)
                     loss_ae = loss_fn(recon, target_imgs_tensor) + loss_fn(target_latents_tensor, ai_model.encode(target_imgs_with_coords))
-                    loss = loss_screen + predict_loss + policy_supervised + loss_ae + policy_loss + value_loss
-                scaler.scale(loss).backward()
-                torch.nn.utils.clip_grad_norm_(list(ai_model.parameters()) + list(predict_action_model.parameters()) + list(policy_action_model.parameters()) + list(future_model.parameters()) + list(value_model.parameters()), config_data["learning"]["grad_clip"])
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                del loss, pred_latent_vec, pred_latent, pred_img, pred_pos_raw, pred_status_logits, policy_pos_raw, policy_status_logits, recon, aggregated_tensor, target_imgs_tensor, target_imgs_with_coords, target_mice_tensor, target_latents_tensor, reward_tensor, reward_norm, pos_scale_tensor, values, advantage, policy_loss, value_loss, predict_loss, policy_supervised, loss_screen, dist, log_prob_pos, log_prob_status, log_prob
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-            progress_val = int((i + 1) / total_steps * 100)
-            self.progress_signal.emit(progress_val)
-            time.sleep(0.01)
+                loss = loss_screen + predict_loss + policy_supervised + loss_ae + policy_loss + value_loss
+            scaler.scale(loss).backward()
+            clip_val = min(config_data["learning"]["grad_clip"], 1.0)
+            torch.nn.utils.clip_grad_norm_(list(ai_model.parameters()) + list(predict_action_model.parameters()) + list(policy_action_model.parameters()) + list(future_model.parameters()) + list(value_model.parameters()), clip_val)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            del loss, pred_latent_vec, pred_latent, pred_img, pred_pos_raw, pred_status_logits, policy_pos_raw, policy_status_logits, recon, aggregated_tensor, target_imgs_tensor, target_imgs_with_coords, target_mice_tensor, target_latents_tensor, reward_tensor, reward_norm, pos_scale_tensor, values, advantage, policy_loss, value_loss, predict_loss, policy_supervised, loss_screen, dist, log_prob_pos, log_prob_status, log_prob
+        progress_val = int((i + 1) / total_steps * 100)
+        self.progress_signal.emit(progress_val)
+        if device.type == "cuda":
+            if vram_near_limit:
+                torch.cuda.empty_cache()
+                gc.collect()
+            elif (i + 1) == total_steps:
+                torch.cuda.empty_cache()
+        time.sleep(0.01)
         save_state()
         self.finished_signal.emit()
 
