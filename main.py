@@ -900,7 +900,7 @@ class AgentThread(threading.Thread):
                     global_pause_recording = False
                     last_debug_end = time.time()
                     hide_overlay()
-            policy_np = policy_mouse.cpu().numpy()[0]
+            policy_np = np.nan_to_num(policy_mouse.cpu().numpy()[0])
             move_mouse(float(policy_np[0]), float(policy_np[1]), pred_status_idx)
             if device.type == "cuda" and time.time() - last_cache_clear > 30:
                 torch.cuda.empty_cache()
@@ -1050,7 +1050,7 @@ class SciFiWindow(QtWidgets.QWidget):
                 target_mice_tensor = torch.stack(target_mice).to(device)
                 target_latents_tensor = torch.stack(target_latents).to(device)
                 reward_tensor = torch.tensor(rewards, device=device, dtype=torch.float32)
-                reward_norm = (reward_tensor - reward_tensor.mean()) / (reward_tensor.std(unbiased=False) + 1e-6)
+                reward_norm = (reward_tensor - reward_tensor.mean()) / (reward_tensor.std(unbiased=False) + 1e-5)
                 with autocast(enabled=device.type == "cuda"):
                     pred_latent_vec = future_model(aggregated_tensor)
                     pred_latent = pred_latent_vec.view(-1, 64, latent_pool, latent_pool)
@@ -1065,9 +1065,9 @@ class SciFiWindow(QtWidgets.QWidget):
                     target_pos = target_mice_tensor[:, :2]
                     target_pos_norm = torch.clamp(target_pos / pos_scale_tensor, -1.0, 1.0)
                     target_status = target_mice_tensor[:, 2].long()
-                    min_std = torch.clamp(target_pos_norm.abs().mean(dim=0).mean(), 0.01, 0.5)
-                    max_std = torch.clamp(target_pos_norm.std(dim=0, unbiased=False).mean(), 0.05, 0.8)
-                    pos_std = torch.clamp((min_std + max_std) * 0.5, 0.01, 0.8) + 1e-6
+                    min_std = torch.clamp(target_pos_norm.abs().mean(dim=0).mean(), 0.1, 0.5)
+                    max_std = torch.clamp(target_pos_norm.std(dim=0, unbiased=False).mean(), 0.1, 0.8)
+                    pos_std = torch.clamp((min_std + max_std) * 0.5, 0.1, 0.8) + 1e-6
                     dist = torch.distributions.Normal(policy_pos_norm, pos_std)
                     log_prob_pos = dist.log_prob(target_pos_norm).sum(dim=1)
                     log_prob_status = F.log_softmax(policy_status_logits, dim=1).gather(1, target_status.unsqueeze(1)).squeeze(1)
