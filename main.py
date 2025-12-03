@@ -1036,6 +1036,7 @@ class SciFiWindow(QtWidgets.QWidget):
             self.overlay.close()
             self.overlay = None
 
+    @QtCore.pyqtSlot()
     def trigger_optimization(self):
         global global_optimizing, global_pause_recording, global_mode
         global_mode = "sleep"
