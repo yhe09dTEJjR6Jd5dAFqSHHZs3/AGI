@@ -8,7 +8,6 @@ import glob
 import math
 import random
 import warnings
-import subprocess
 import importlib
 import importlib.util
 import json
@@ -19,12 +18,6 @@ import bisect
 warnings.filterwarnings("ignore")
 
 def import_or_install(module_name, package_name=None):
-    pkg = package_name or module_name
-    spec = importlib.util.find_spec(module_name)
-    if spec is None:
-        result = subprocess.run([sys.executable, "-m", "pip", "install", pkg])
-        if result.returncode != 0:
-            sys.exit(1)
     spec = importlib.util.find_spec(module_name)
     if spec is None:
         sys.exit(1)
@@ -262,10 +255,11 @@ def hide_overlay():
         QtCore.QTimer.singleShot(0, window_ref.overlay.hide)
 
 def start_debug_mode(gui_window):
-    global global_mode, global_pause_recording, reward_history
+    global global_mode, global_pause_recording, reward_history, chaotic_noise
     reward_history.clear()
     global_mode = "debug"
     global_pause_recording = False
+    chaotic_noise.reset()
     show_overlay()
     gui_window.status_signal.emit("SYSTEM: DEBUG")
     gui_window.info_signal.emit("CALIBRATING SURVIVAL PENALTY...")
@@ -440,10 +434,51 @@ class ExperienceBuffer:
         self.buffer = deque(buffer_list)
         self.counter = len(buffer_list)
 
+    def _chunk_path(self, idx):
+        return os.path.join(BUFFER_DIR, f"chunk_{idx}.bin")
+
+    def _write_chunk(self, path, entries):
+        capacity = max(1024 * 1024, int(chunk_byte_limit))
+        data_bytes = pickle.dumps(entries)
+        while len(data_bytes) + 8 > capacity and len(entries) > 1:
+            entries = entries[:-1]
+            data_bytes = pickle.dumps(entries)
+        mem = np.memmap(path, dtype=np.uint8, mode="w+", shape=(capacity,))
+        size_bytes = len(data_bytes).to_bytes(8, "little")
+        mem[:8] = np.frombuffer(size_bytes, dtype=np.uint8)
+        mem[8:8 + len(data_bytes)] = np.frombuffer(data_bytes, dtype=np.uint8)
+        if 8 + len(data_bytes) < capacity:
+            mem[8 + len(data_bytes):] = 0
+        mem.flush()
+
+    def _read_chunk(self, path):
+        if not os.path.exists(path):
+            return []
+        mem = np.memmap(path, dtype=np.uint8, mode="r")
+        if mem.shape[0] < 8:
+            return []
+        size = int.from_bytes(bytes(mem[:8]), "little")
+        if size <= 0 or 8 + size > mem.shape[0]:
+            return []
+        data_bytes = bytes(mem[8:8 + size])
+        return pickle.loads(data_bytes)
+
     def load_chunks(self):
         if not os.path.isdir(BUFFER_DIR):
             return False
-        chunk_files = sorted(glob.glob(os.path.join(BUFFER_DIR, "chunk_*.pt")))
+        chunk_files = sorted(glob.glob(os.path.join(BUFFER_DIR, "chunk_*.bin")))
+        legacy = sorted(glob.glob(os.path.join(BUFFER_DIR, "chunk_*.pt")))
+        if not chunk_files and legacy:
+            merged = []
+            for path in legacy:
+                entries = torch.load(path, map_location="cpu")
+                merged.extend(entries)
+            self.buffer = deque(merged)
+            self.rebuild_metadata()
+            self.save()
+            for path in legacy:
+                os.remove(path)
+            chunk_files = sorted(glob.glob(os.path.join(BUFFER_DIR, "chunk_*.bin")))
         if not chunk_files:
             return False
         self.chunk_files = chunk_files
@@ -451,7 +486,7 @@ class ExperienceBuffer:
         total_bytes = 0
         limit_bytes = max_buffer_gb * (1024**3)
         for path in reversed(chunk_files):
-            entries = torch.load(path, map_location="cpu")
+            entries = self._read_chunk(path)
             for entry in reversed(entries):
                 entry_bytes = self._sample_bytes(entry)
                 if total_bytes + entry_bytes > limit_bytes:
@@ -514,27 +549,19 @@ class ExperienceBuffer:
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
         os.makedirs(temp_dir)
-        chunk = []
-        chunk_bytes = 0
-        existing = sorted(glob.glob(os.path.join(BUFFER_DIR, "chunk_*.pt")))
-        start_idx = 0
-        if existing:
-            last = os.path.splitext(os.path.basename(existing[-1]))[0].split("_")
-            if len(last) > 1 and last[-1].isdigit():
-                start_idx = int(last[-1]) + 1
-        chunk_idx = start_idx
+        chunk_idx = 0
+        chunk_entries = []
         for entry in self.buffer:
-            entry_bytes = self._sample_bytes(entry)
-            if chunk and (chunk_bytes + entry_bytes > chunk_byte_limit or len(chunk) >= chunk_entry_limit):
-                torch.save(chunk, os.path.join(temp_dir, f"chunk_{chunk_idx}.pt"))
+            chunk_entries.append(entry)
+            serialized = pickle.dumps(chunk_entries)
+            if len(serialized) + 8 > chunk_byte_limit or len(chunk_entries) >= chunk_entry_limit:
+                self._write_chunk(os.path.join(temp_dir, f"chunk_{chunk_idx}.bin"), chunk_entries[:-1])
                 chunk_idx += 1
-                chunk = []
-                chunk_bytes = 0
-            chunk.append(entry)
-            chunk_bytes += entry_bytes
-        torch.save(chunk, os.path.join(temp_dir, f"chunk_{chunk_idx}.pt"))
-        for existing in glob.glob(os.path.join(BUFFER_DIR, "chunk_*.pt")):
-            os.remove(existing)
+                chunk_entries = [chunk_entries[-1]]
+        if chunk_entries:
+            self._write_chunk(os.path.join(temp_dir, f"chunk_{chunk_idx}.bin"), chunk_entries)
+        for existing_file in glob.glob(os.path.join(BUFFER_DIR, "chunk_*.bin")):
+            os.remove(existing_file)
         for fname in os.listdir(temp_dir):
             os.replace(os.path.join(temp_dir, fname), os.path.join(BUFFER_DIR, fname))
         shutil.rmtree(temp_dir)
@@ -542,13 +569,13 @@ class ExperienceBuffer:
 
     def _disk_usage_gb(self):
         size = 0
-        for path in glob.glob(os.path.join(BUFFER_DIR, "chunk_*.pt")):
+        for path in glob.glob(os.path.join(BUFFER_DIR, "chunk_*.bin")):
             size += os.path.getsize(path)
         return size / (1024**3)
 
     def _enforce_disk_limit(self):
-        files = sorted(glob.glob(os.path.join(BUFFER_DIR, "chunk_*.pt")))
-        while self._disk_usage_gb() > 20.0 and files:
+        files = sorted(glob.glob(os.path.join(BUFFER_DIR, "chunk_*.bin")))
+        while self._disk_usage_gb() > max_buffer_gb and files:
             oldest = files.pop(0)
             os.remove(oldest)
 
@@ -560,6 +587,7 @@ predict_action_model = ActionPredictor().to(device)
 policy_action_model = ActionPredictor().to(device)
 value_model = ValuePredictor().to(device)
 scaler = GradScaler(enabled=device.type == "cuda")
+chaotic_noise = ChaoticNoise(2)
 
 def ensure_files():
     if not os.path.exists(BASE_DIR):
@@ -577,9 +605,11 @@ def ensure_files():
     if not os.path.exists(buffer_path):
         with open(buffer_path, "wb") as f:
             pickle.dump([], f)
-    chunk_files = glob.glob(os.path.join(BUFFER_DIR, "chunk_*.pt"))
+    chunk_files = glob.glob(os.path.join(BUFFER_DIR, "chunk_*.bin"))
     if not chunk_files:
-        torch.save([], os.path.join(BUFFER_DIR, "chunk_0.pt"))
+        mem = np.memmap(os.path.join(BUFFER_DIR, "chunk_0.bin"), dtype=np.uint8, mode="w+", shape=(max(1024 * 1024, int(chunk_byte_limit)),))
+        mem[:8] = np.frombuffer((0).to_bytes(8, "little"), dtype=np.uint8)
+        mem.flush()
     if not os.path.exists(model_files["autoencoder"]):
         torch.save(ai_model.state_dict(), model_files["autoencoder"])
     if not os.path.exists(model_files["mouse_output"]):
@@ -608,8 +638,10 @@ def load_state():
         exp_buffer.save()
         exp_buffer.rebuild_metadata()
         loaded = True
-    if not loaded and not glob.glob(os.path.join(BUFFER_DIR, "chunk_*.pt")):
-        torch.save([], os.path.join(BUFFER_DIR, "chunk_0.pt"))
+    if not loaded and not glob.glob(os.path.join(BUFFER_DIR, "chunk_*.bin")):
+        mem = np.memmap(os.path.join(BUFFER_DIR, "chunk_0.bin"), dtype=np.uint8, mode="w+", shape=(max(1024 * 1024, int(chunk_byte_limit)),))
+        mem[:8] = np.frombuffer((0).to_bytes(8, "little"), dtype=np.uint8)
+        mem.flush()
     if os.path.exists(model_files["autoencoder"]):
         ai_model.load_state_dict(torch.load(model_files["autoencoder"], map_location=device))
     if os.path.exists(model_files["mouse_output"]):
@@ -694,6 +726,27 @@ def aggregate_latents(latents):
     mean = stacked.mean(dim=0, keepdim=True)
     std = stacked.std(dim=0, keepdim=True) + 1e-6
     return torch.cat([mean, std], dim=1)
+
+class ChaoticNoise:
+    def __init__(self, dim):
+        self.state = np.zeros(dim, dtype=np.float32)
+        self.theta = 0.2
+        self.sigma = 0.6
+        self.dt = 0.05
+        self.time = 0.0
+
+    def reset(self):
+        self.state[:] = 0.0
+        self.time = 0.0
+
+    def sample(self):
+        drift = self.theta * (-self.state)
+        gauss = np.random.normal(0.0, self.sigma, size=self.state.shape)
+        wave = np.sin(self.time + np.random.uniform(-0.5, 0.5, size=self.state.shape))
+        self.state = self.state + drift * self.dt + gauss * math.sqrt(self.dt) + wave * 0.15
+        self.time += self.dt
+        jitter = np.random.normal(0.0, 0.08, size=self.state.shape)
+        return self.state + jitter
 
 class ResourceMonitor(threading.Thread):
     def run(self):
@@ -798,29 +851,31 @@ class AgentThread(threading.Thread):
             pos_loss = torch.mean((pred_mouse_norm - mouse_norm) ** 2)
             status_target = torch.tensor([int(mouse_val[2])], device=device, dtype=torch.long)
             status_loss = F.cross_entropy(pred_status_logits, status_target)
-            action_novelty_raw = (pos_loss + status_loss).item()
-            action_novelty = math.log1p(action_novelty_raw) * 10000
+            action_metric = (pos_loss + status_loss).item()
+            action_novelty = math.log1p(action_metric + 1e-6)
             screen_mse = criterion(predicted_img, rgb_tensor).item()
-            screen_novelty = math.log1p(screen_mse) * 10000
+            screen_novelty = math.log1p(screen_mse + 1e-6)
             policy_mouse = torch.zeros((1, 3), device=device)
             policy_mouse_norm = torch.tanh(policy_pos_raw[:, :2])
             novelty_total = screen_novelty + action_novelty
-            noise_scale = clamp_value(math.log1p(novelty_total) / 5000.0 + novelty_total / 200000.0, 0.01, 0.8)
+            noise_scale = clamp_value(math.log1p(novelty_total + 1e-6), 0.01, 0.8)
             action_noise = torch.randn_like(policy_mouse_norm) * noise_scale
             noisy_mouse_norm = torch.clamp(policy_mouse_norm + action_noise, -1.0, 1.0)
             policy_mouse[:, 0] = noisy_mouse_norm[:, 0] * pos_scale_tensor[0]
             policy_mouse[:, 1] = noisy_mouse_norm[:, 1] * pos_scale_tensor[1]
             survival_penalty = config_data["learning"]["survival_penalty"]
-            reward = (screen_novelty * action_novelty) / 10000 - survival_penalty
-            td_error = screen_novelty + action_novelty
+            reward = math.log(max(screen_novelty, 1e-9)) * math.log(max(action_novelty, 1e-9)) - survival_penalty
+            td_error = abs(reward) + novelty_total
             exp_buffer.add(rgb_tensor.detach(), mouse_tensor.detach().cpu(), reward, td_error, screen_novelty, latent.detach())
             reward_history.append(reward)
             if global_mode == "debug":
-                rand_pos = torch.rand(2) * 2 - 1
-                rand_pos = rand_pos.to(device) * pos_scale_tensor
+                chaotic_vec = chaotic_noise.sample()
+                rand_pos = torch.tensor(chaotic_vec, device=device, dtype=torch.float32)
+                rand_pos = torch.clamp(rand_pos, -1.0, 1.0) * pos_scale_tensor
                 policy_mouse[:, 0] = rand_pos[0]
                 policy_mouse[:, 1] = rand_pos[1]
-                pred_status_idx = int(random.randint(0, 2))
+                status_raw = abs(np.random.normal(0.0, 2.0))
+                pred_status_idx = int(min(2, max(0, int(status_raw) % 3)))
                 tuned = tune_survival_penalty()
                 if tuned:
                     global_mode = "active"
