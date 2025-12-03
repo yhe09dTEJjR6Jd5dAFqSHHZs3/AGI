@@ -483,17 +483,19 @@ class ExperienceBuffer:
 
     def _read_chunk(self, path):
         if not os.path.exists(path):
-            return []
+            raise RuntimeError("经验池分片不存在：" + str(path))
         mem = np.memmap(path, dtype=np.uint8, mode="r")
         if mem.shape[0] < 8:
+            size_bytes = mem.shape[0]
             del mem
-            return []
+            raise RuntimeError("经验池分片内容损坏：头部长度=" + str(size_bytes))
         size = int.from_bytes(bytes(mem[:8]), "little")
         limit_bytes = 20 * (1024**3)
         if size <= 0 or size > limit_bytes or 8 + size > mem.shape[0]:
+            bad_size = size
+            total_size = mem.shape[0]
             del mem
-            os.remove(path)
-            return []
+            raise RuntimeError("经验池分片内容异常：size=" + str(bad_size) + ", total=" + str(total_size))
         data_bytes = bytes(mem[8:8 + size])
         del mem
         return pickle.loads(data_bytes)
@@ -775,13 +777,35 @@ def move_mouse(pred_abs_x, pred_abs_y, pred_status):
         pyautogui.moveTo(target_x, target_y, _pause=False)
     apply_mouse_buttons(pred_status)
 
-def aggregate_latents(latents):
+def aggregate_history(latents, mice):
     embed_dim = 64 * latent_pool * latent_pool
-    if len(latents) == 0:
+    if len(latents) == 0 or len(mice) == 0:
         return torch.zeros(1, embed_dim * 2, device=device)
-    stacked = torch.stack([l.to(device) for l in latents]).view(len(latents), -1)
-    mean = stacked.mean(dim=0, keepdim=True)
-    std = stacked.std(dim=0, keepdim=True) + 1e-6
+    if len(latents) != len(mice):
+        raise RuntimeError("时序记忆长度不一致")
+    lat_list = []
+    mouse_list = []
+    for l in latents:
+        if isinstance(l, torch.Tensor):
+            lat_list.append(l.to(device).view(-1))
+        else:
+            lat_list.append(torch.tensor(l, dtype=torch.float32, device=device).view(-1))
+    for m in mice:
+        if isinstance(m, torch.Tensor):
+            mouse_list.append(m.to(device).view(-1))
+        else:
+            mouse_list.append(torch.tensor(m, dtype=torch.float32, device=device).view(-1))
+    lat_stack = torch.stack(lat_list)
+    mouse_stack = torch.stack(mouse_list)
+    pos_scale = position_scale()
+    pos = mouse_stack[:, :2] / pos_scale
+    status = mouse_stack[:, 2:3] / 3.0
+    mouse_feat = torch.tanh(torch.cat([pos, status], dim=1))
+    repeat_factor = embed_dim // mouse_feat.shape[1] + 1
+    mouse_expanded = mouse_feat.repeat(1, repeat_factor)[:, :embed_dim]
+    combined = lat_stack * (1.0 + 0.1 * mouse_expanded)
+    mean = combined.mean(dim=0, keepdim=True)
+    std = combined.std(dim=0, keepdim=True) + 1e-6
     return torch.cat([mean, std], dim=1)
 
 class ResourceMonitor(threading.Thread):
@@ -856,6 +880,7 @@ class AgentThread(threading.Thread):
         sct = mss.mss()
         criterion = nn.MSELoss()
         context_latents = deque(maxlen=config_data["resource"]["max_context"])
+        context_mice = deque(maxlen=config_data["resource"]["max_context"])
         last_cache_clear = time.time()
         while global_running:
             if global_mode == "sleep":
@@ -879,7 +904,9 @@ class AgentThread(threading.Thread):
             rgb_tensor = rgb_tensor.unsqueeze(0).to(device)
             img_tensor = add_coord_channels(rgb_tensor)
             with torch.no_grad():
-                aggregated = aggregate_latents(list(context_latents)[-window_len:])
+                history_latents = list(context_latents)[-window_len:]
+                history_mice = list(context_mice)[-window_len:]
+                aggregated = aggregate_history(history_latents, history_mice)
                 predicted_latent_vec = future_model(aggregated)
                 predicted_latent = predicted_latent_vec.view(1, 64, latent_pool, latent_pool)
                 predicted_img = ai_model.decode(predicted_latent, rgb_tensor.shape[2:])
@@ -889,6 +916,7 @@ class AgentThread(threading.Thread):
             with torch.no_grad():
                 latent = ai_model.encode(img_tensor)
             context_latents.append(latent.detach().cpu())
+            context_mice.append(mouse_tensor.detach().cpu())
             with torch.no_grad():
                 pred_pos_raw, pred_status_logits = predict_action_model(aggregated)
                 policy_pos_raw, policy_status_logits = policy_action_model(aggregated)
@@ -917,7 +945,8 @@ class AgentThread(threading.Thread):
             survival_penalty = config_data["learning"]["survival_penalty"]
             reward = screen_novelty * action_novelty - survival_penalty
             td_error = abs(reward) + novelty_total
-            exp_buffer.add(rgb_tensor.detach(), mouse_tensor.detach().cpu(), reward, td_error, screen_novelty, latent.detach())
+            if global_mode == "active" and not global_pause_recording:
+                exp_buffer.add(rgb_tensor.detach(), mouse_tensor.detach().cpu(), reward, td_error, screen_novelty, latent.detach())
             reward_history.append(reward)
             if global_mode == "debug":
                 debug_screen_novelties.append(screen_novelty)
@@ -1093,13 +1122,16 @@ class SciFiWindow(QtWidgets.QWidget):
             for start in batch_indices:
                 batch = samples[start:start + config_data["learning"]["mini_batch"]]
                 context_latent_list = []
+                context_mouse_list = []
                 target_imgs = []
                 target_mice = []
                 target_latents = []
                 rewards = []
                 for context_entries, target_entry in batch:
                     latents = [item["latent"].float() for item in context_entries]
+                    mice = [item["mouse"].float() for item in context_entries]
                     context_latent_list.append(latents)
+                    context_mouse_list.append(mice)
                     img_dtype = torch.float16 if device.type == "cuda" else torch.float32
                     target_imgs.append(target_entry["img"].to(dtype=img_dtype) / 255.0)
                     target_mice.append(target_entry["mouse"].float())
@@ -1107,8 +1139,8 @@ class SciFiWindow(QtWidgets.QWidget):
                     rewards.append(float(target_entry["reward"]))
                 optimizer.zero_grad(set_to_none=True)
                 agg_batch = []
-                for latents in context_latent_list:
-                    agg = aggregate_latents(latents)
+                for latents, mice in zip(context_latent_list, context_mouse_list):
+                    agg = aggregate_history(latents, mice)
                     agg_batch.append(agg)
                 aggregated_tensor = torch.cat(agg_batch, dim=0)
                 target_imgs_tensor = torch.stack(target_imgs).to(device)
