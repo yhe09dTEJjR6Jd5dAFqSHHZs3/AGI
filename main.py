@@ -178,6 +178,10 @@ global_running = True
 global_optimizing = False
 global_pause_recording = False
 buffer_gpu_resident = False
+global_mode = "active"
+last_debug_end = time.time()
+reward_history = deque(maxlen=128)
+window_ref = None
 
 screen_width, screen_height = pyautogui.size()
 center_x, center_y = screen_width // 2, screen_height // 2
@@ -234,6 +238,37 @@ def persist_config():
     config_data["capture"]["latent_pool"] = latent_pool
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config_data, f, ensure_ascii=False, indent=2)
+
+def tune_survival_penalty():
+    if len(reward_history) < 8:
+        return False
+    avg_reward = sum(reward_history) / len(reward_history)
+    target = 0.0
+    if abs(avg_reward - target) < 1e-3:
+        return True
+    delta = clamp_value(avg_reward * 0.01, -0.1, 0.1)
+    new_penalty = clamp_value(config_data["learning"]["survival_penalty"] + delta, 0.0, 10.0)
+    config_data["learning"]["survival_penalty"] = new_penalty
+    persist_config()
+    return False
+
+def show_overlay():
+    if window_ref is not None and hasattr(window_ref, "overlay"):
+        QtCore.QTimer.singleShot(0, window_ref.overlay.show)
+        QtCore.QTimer.singleShot(0, window_ref.overlay.raise_)
+
+def hide_overlay():
+    if window_ref is not None and hasattr(window_ref, "overlay"):
+        QtCore.QTimer.singleShot(0, window_ref.overlay.hide)
+
+def start_debug_mode(gui_window):
+    global global_mode, global_pause_recording, reward_history
+    reward_history.clear()
+    global_mode = "debug"
+    global_pause_recording = False
+    show_overlay()
+    gui_window.status_signal.emit("SYSTEM: DEBUG")
+    gui_window.info_signal.emit("CALIBRATING SURVIVAL PENALTY...")
 
 lock = threading.Lock()
 mouse_left_down = False
@@ -696,15 +731,33 @@ class ResourceMonitor(threading.Thread):
                     persist_config()
             time.sleep(1)
 
+class ModeController(threading.Thread):
+    def __init__(self, gui_window):
+        super().__init__()
+        self.gui = gui_window
+
+    def run(self):
+        global global_mode, global_pause_recording
+        while global_running:
+            if global_mode == "active" and not global_optimizing:
+                if time.time() - last_debug_end > 60:
+                    global_mode = "sleep"
+                    global_pause_recording = True
+                    self.gui.trigger_optimization()
+            time.sleep(1)
+
 class AgentThread(threading.Thread):
     def run(self):
-        global global_pause_recording
+        global global_pause_recording, global_mode, last_debug_end
         import random
         sct = mss.mss()
         criterion = nn.MSELoss()
         context_latents = deque(maxlen=config_data["resource"]["max_context"])
         last_cache_clear = time.time()
         while global_running:
+            if global_mode == "sleep":
+                time.sleep(0.5)
+                continue
             if global_optimizing or global_pause_recording:
                 time.sleep(0.1)
                 continue
@@ -761,6 +814,19 @@ class AgentThread(threading.Thread):
             reward = (screen_novelty * action_novelty) / 10000 - survival_penalty
             td_error = screen_novelty + action_novelty
             exp_buffer.add(rgb_tensor.detach(), mouse_tensor.detach().cpu(), reward, td_error, screen_novelty, latent.detach())
+            reward_history.append(reward)
+            if global_mode == "debug":
+                rand_pos = torch.rand(2) * 2 - 1
+                rand_pos = rand_pos.to(device) * pos_scale_tensor
+                policy_mouse[:, 0] = rand_pos[0]
+                policy_mouse[:, 1] = rand_pos[1]
+                pred_status_idx = int(random.randint(0, 2))
+                tuned = tune_survival_penalty()
+                if tuned:
+                    global_mode = "active"
+                    global_pause_recording = False
+                    last_debug_end = time.time()
+                    hide_overlay()
             policy_np = policy_mouse.cpu().numpy()[0]
             move_mouse(float(policy_np[0]), float(policy_np[1]), pred_status_idx)
             if device.type == "cuda" and time.time() - last_cache_clear > 30:
@@ -784,6 +850,10 @@ class SciFiWindow(QtWidgets.QWidget):
         self.resize(600, 400)
         self.center()
         self.initUI()
+        self.overlay = QtWidgets.QWidget(None, QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint)
+        self.overlay.setWindowState(QtCore.Qt.WindowFullScreen)
+        self.overlay.setStyleSheet("background-color: rgba(0, 0, 0, 255);")
+        self.overlay.hide()
         self.optimizer_signal.connect(self.run_optimization)
         self.finished_signal.connect(self.on_optimization_finished)
         self.status_signal.connect(self.label.setText)
@@ -851,6 +921,9 @@ class SciFiWindow(QtWidgets.QWidget):
         self.setStyleSheet(style)
 
     def trigger_optimization(self):
+        global global_optimizing, global_pause_recording
+        global_optimizing = True
+        global_pause_recording = True
         self.status_signal.emit("SYSTEM: OPTIMIZING")
         self.info_signal.emit("TRAINING NEURAL NETWORK...")
         self.progress_signal.emit(0)
@@ -954,6 +1027,7 @@ class SciFiWindow(QtWidgets.QWidget):
         global global_optimizing, global_pause_recording
         global_optimizing = False
         global_pause_recording = False
+        start_debug_mode(self)
 
 class InputHandler:
     def __init__(self, gui_window):
@@ -982,9 +1056,12 @@ if __name__ == "__main__":
     mouse_left_down = init_status in (1, 3)
     mouse_right_down = init_status in (2, 3)
     window = SciFiWindow()
+    window_ref = window
     window.show()
     monitor_thread = ResourceMonitor()
     monitor_thread.start()
+    mode_thread = ModeController(window)
+    mode_thread.start()
     agent_thread = AgentThread()
     agent_thread.start()
     input_handler = InputHandler(window)
