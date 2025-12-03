@@ -907,6 +907,8 @@ class ModeController(threading.Thread):
                     global_mode = "sleep"
                     global_pause_recording = True
                     self.gui.optimize_request_signal.emit()
+            elif global_mode == "sleep" and not global_optimizing and not global_pause_recording:
+                start_debug_mode(self.gui)
             if global_mode != "sleep" and self.gui.isVisible():
                 self.gui.hide()
             time.sleep(1)
