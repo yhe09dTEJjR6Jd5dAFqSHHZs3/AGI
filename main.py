@@ -837,7 +837,6 @@ class ModeController(threading.Thread):
                     self.gui.trigger_optimization()
             if global_mode != "sleep" and self.gui.isVisible():
                 self.gui.hide()
-                self.gui.close()
             time.sleep(1)
 
 class AgentThread(threading.Thread):
@@ -1043,6 +1042,9 @@ class SciFiWindow(QtWidgets.QWidget):
         global_optimizing = True
         global_pause_recording = True
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.Tool)
+        self.showNormal()
+        self.resize(600, 400)
+        self.center()
         self.show()
         self.raise_()
         self.activateWindow()
