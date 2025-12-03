@@ -187,7 +187,7 @@ buffer_gpu_resident = False
 global_mode = "debug"
 last_debug_end = time.time()
 reward_history = deque(maxlen=128)
-debug_novelty_products = []
+debug_screen_novelties = []
 vram_near_limit = False
 window_ref = None
 
@@ -245,40 +245,47 @@ def persist_config():
         json.dump(config_data, f, ensure_ascii=False, indent=2)
 
 def tune_survival_penalty():
-    global debug_novelty_products
-    if len(debug_novelty_products) < 30:
+    global debug_screen_novelties
+    if len(debug_screen_novelties) < 30:
         return False
-    avg_product = sum(debug_novelty_products) / len(debug_novelty_products)
-    config_data["learning"]["survival_penalty"] = clamp_value(avg_product, 0.0, 10000.0)
+    avg_screen = sum(debug_screen_novelties) / len(debug_screen_novelties)
+    config_data["learning"]["survival_penalty"] = clamp_value(avg_screen, 0.0, 100.0)
     persist_config()
     return True
 
 def show_overlay():
-    if window_ref is not None and hasattr(window_ref, "overlay"):
-        QtCore.QTimer.singleShot(0, window_ref.overlay.show)
-        QtCore.QTimer.singleShot(0, window_ref.overlay.raise_)
+    if window_ref is not None and hasattr(window_ref, "ensure_overlay"):
+        overlay_widget = window_ref.ensure_overlay()
+        overlay_widget.setGeometry(0, 0, screen_width, screen_height)
+        QtCore.QTimer.singleShot(0, overlay_widget.show)
+        QtCore.QTimer.singleShot(0, overlay_widget.raise_)
 
 def hide_overlay():
-    if window_ref is not None and hasattr(window_ref, "overlay"):
+    if window_ref is not None and hasattr(window_ref, "overlay") and window_ref.overlay is not None:
         QtCore.QTimer.singleShot(0, window_ref.overlay.hide)
 
+def destroy_overlay():
+    if window_ref is not None and hasattr(window_ref, "destroy_overlay"):
+        QtCore.QTimer.singleShot(0, window_ref.destroy_overlay)
+
 def start_debug_mode(gui_window):
-    global global_mode, global_pause_recording, reward_history, debug_novelty_products
+    global global_mode, global_pause_recording, reward_history, debug_screen_novelties
     reward_history.clear()
-    debug_novelty_products = []
+    debug_screen_novelties = []
     global_mode = "debug"
     global_pause_recording = False
-    if window_ref is not None and hasattr(window_ref, "overlay"):
+    if window_ref is not None and hasattr(window_ref, "ensure_overlay"):
+        overlay_widget = window_ref.ensure_overlay()
         screen_obj = QtWidgets.QApplication.primaryScreen()
         if screen_obj is not None:
             geo = screen_obj.geometry()
-            window_ref.overlay.setGeometry(geo)
+            overlay_widget.setGeometry(geo)
         else:
-            window_ref.overlay.setGeometry(0, 0, screen_width, screen_height)
+            overlay_widget.setGeometry(0, 0, screen_width, screen_height)
     show_overlay()
     gui_window.hide()
-    gui_window.status_signal.emit("系统：睡眠模式")
-    gui_window.info_signal.emit("睡眠模式准备中...")
+    gui_window.status_signal.emit("系统：调试模式")
+    gui_window.info_signal.emit("调试模式：黑屏覆盖，采集新颖度")
 
 lock = threading.Lock()
 mouse_left_down = False
@@ -825,6 +832,7 @@ class ModeController(threading.Thread):
                     self.gui.trigger_optimization()
             if global_mode != "sleep" and self.gui.isVisible():
                 self.gui.hide()
+                self.gui.close()
             time.sleep(1)
 
 class AgentThread(threading.Thread):
@@ -898,9 +906,9 @@ class AgentThread(threading.Thread):
             exp_buffer.add(rgb_tensor.detach(), mouse_tensor.detach().cpu(), reward, td_error, screen_novelty, latent.detach())
             reward_history.append(reward)
             if global_mode == "debug":
-                debug_novelty_products.append(screen_novelty * action_novelty)
-                if len(debug_novelty_products) > 1024:
-                    debug_novelty_products.pop(0)
+                debug_screen_novelties.append(screen_novelty)
+                if len(debug_screen_novelties) > 1024:
+                    debug_screen_novelties.pop(0)
                 rand_x = random.randint(-screen_width // 2, screen_width // 2)
                 rand_y = random.randint(-screen_height // 2, screen_height // 2)
                 policy_mouse[:, 0] = float(rand_x)
@@ -911,6 +919,7 @@ class AgentThread(threading.Thread):
                     global_mode = "active"
                     global_pause_recording = False
                     last_debug_end = time.time()
+                    destroy_overlay()
                     hide_overlay()
             policy_np = np.nan_to_num(policy_mouse.cpu().numpy()[0])
             move_mouse(float(policy_np[0]), float(policy_np[1]), pred_status_idx)
@@ -936,11 +945,8 @@ class SciFiWindow(QtWidgets.QWidget):
         self.resize(600, 400)
         self.center()
         self.initUI()
-        self.overlay = QtWidgets.QWidget(None, QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint)
-        self.overlay.setWindowState(QtCore.Qt.WindowFullScreen)
-        self.overlay.setStyleSheet("background-color: rgba(0, 0, 0, 255);")
-        self.overlay.setGeometry(0, 0, screen_width, screen_height)
-        self.overlay.hide()
+        self.overlay = None
+        self.ensure_overlay()
         self.optimizer_signal.connect(self.run_optimization)
         self.finished_signal.connect(self.on_optimization_finished)
         self.status_signal.connect(self.label.setText)
@@ -1008,6 +1014,20 @@ class SciFiWindow(QtWidgets.QWidget):
         """
         self.setStyleSheet(style)
 
+    def ensure_overlay(self):
+        if self.overlay is None:
+            self.overlay = QtWidgets.QWidget(None, QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint)
+            self.overlay.setWindowState(QtCore.Qt.WindowFullScreen)
+            self.overlay.setStyleSheet("background-color: rgba(0, 0, 0, 255);")
+            self.overlay.setGeometry(0, 0, screen_width, screen_height)
+            self.overlay.hide()
+        return self.overlay
+
+    def destroy_overlay(self):
+        if self.overlay is not None:
+            self.overlay.close()
+            self.overlay = None
+
     def trigger_optimization(self):
         global global_optimizing, global_pause_recording, global_mode
         global_mode = "sleep"
@@ -1036,13 +1056,15 @@ class SciFiWindow(QtWidgets.QWidget):
             self.finished_signal.emit()
             return
         total_steps = config_data["learning"]["train_steps"]
+        batch_indices = list(range(0, len(samples), config_data["learning"]["mini_batch"]))
+        total_iters = max(1, total_steps * max(1, len(batch_indices)))
+        iter_counter = 0
         weight_decay = config_data["learning"]["learning_rate"] * 0.1
         optimizer = optim.Adam(list(ai_model.parameters()) + list(predict_action_model.parameters()) + list(policy_action_model.parameters()) + list(future_model.parameters()) + list(value_model.parameters()), lr=config_data["learning"]["learning_rate"], weight_decay=weight_decay)
         loss_fn = nn.MSELoss()
         for i in range(total_steps):
             if not global_running:
                 break
-            batch_indices = list(range(0, len(samples), config_data["learning"]["mini_batch"]))
             for start in batch_indices:
                 batch = samples[start:start + config_data["learning"]["mini_batch"]]
                 context_latent_list = []
@@ -1099,22 +1121,24 @@ class SciFiWindow(QtWidgets.QWidget):
                     policy_supervised = loss_fn(policy_pos_norm, target_pos_norm) + F.cross_entropy(policy_status_logits, target_status)
                     loss_ae = loss_fn(recon, target_imgs_tensor) + loss_fn(target_latents_tensor, ai_model.encode(target_imgs_with_coords))
                 loss = loss_screen + predict_loss + policy_supervised + loss_ae + policy_loss + value_loss
-            scaler.scale(loss).backward()
-            clip_val = min(config_data["learning"]["grad_clip"], 1.0)
-            torch.nn.utils.clip_grad_norm_(list(ai_model.parameters()) + list(predict_action_model.parameters()) + list(policy_action_model.parameters()) + list(future_model.parameters()) + list(value_model.parameters()), clip_val)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-            del loss, pred_latent_vec, pred_latent, pred_img, pred_pos_raw, pred_status_logits, policy_pos_raw, policy_status_logits, recon, aggregated_tensor, target_imgs_tensor, target_imgs_with_coords, target_mice_tensor, target_latents_tensor, reward_tensor, reward_norm, pos_scale_tensor, values, advantage, policy_loss, value_loss, predict_loss, policy_supervised, loss_screen, dist, log_prob_pos, log_prob_status, log_prob
-            progress_val = int((i + 1) / total_steps * 100)
-            self.progress_signal.emit(progress_val)
-            if device.type == "cuda":
-                if vram_near_limit:
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                elif (i + 1) == total_steps:
-                    torch.cuda.empty_cache()
-            time.sleep(0.01)
+                scaler.scale(loss).backward()
+                clip_val = min(config_data["learning"]["grad_clip"], 1.0)
+                torch.nn.utils.clip_grad_norm_(list(ai_model.parameters()) + list(predict_action_model.parameters()) + list(policy_action_model.parameters()) + list(future_model.parameters()) + list(value_model.parameters()), clip_val)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                del loss, pred_latent_vec, pred_latent, pred_img, pred_pos_raw, pred_status_logits, policy_pos_raw, policy_status_logits, recon, aggregated_tensor, target_imgs_tensor, target_imgs_with_coords, target_mice_tensor, target_latents_tensor, reward_tensor, reward_norm, pos_scale_tensor, values, advantage, policy_loss, value_loss, predict_loss, policy_supervised, loss_screen, dist, log_prob_pos, log_prob_status, log_prob
+                iter_counter += 1
+                progress_val = int(iter_counter / total_iters * 100)
+                self.progress_signal.emit(progress_val)
+                if device.type == "cuda":
+                    if vram_near_limit:
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                    elif (i + 1) == total_steps and start == batch_indices[-1]:
+                        torch.cuda.empty_cache()
+                time.sleep(0.01)
+        self.progress_signal.emit(100)
         save_state()
         self.finished_signal.emit()
 
@@ -1122,7 +1146,6 @@ class SciFiWindow(QtWidgets.QWidget):
         QtWidgets.QMessageBox.information(self, "系统", "优化完成。\n数据已保存。")
         self.label.setText("系统：在线")
         self.info_label.setText("智能体运行中...")
-        self.progress.setValue(0)
         global global_optimizing, global_pause_recording
         global_optimizing = False
         global_pause_recording = False
