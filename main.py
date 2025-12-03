@@ -66,11 +66,13 @@ def set_dpi_awareness():
 
 set_dpi_awareness()
 
+screen_width, screen_height = pyautogui.size()
+center_x, center_y = screen_width // 2, screen_height // 2
+VISION_WIDTH = max(1, int(screen_width * 0.1))
+VISION_HEIGHT = max(1, int(screen_height * 0.1))
+
 def clamp_value(val, lower, upper):
     return max(lower, min(upper, val))
-
-VISION_WIDTH = 256
-VISION_HEIGHT = 160
 
 def default_config():
     fps_bounds = [1, 100]
@@ -177,9 +179,6 @@ global_mode = "active"
 last_debug_end = time.time()
 reward_history = deque(maxlen=128)
 window_ref = None
-
-screen_width, screen_height = pyautogui.size()
-center_x, center_y = screen_width // 2, screen_height // 2
 
 def apply_config():
     global current_fps, current_scale, resolution_factor, temporal_context_window
@@ -367,6 +366,7 @@ class ExperienceBuffer:
         self.total_bytes = 0
         self.counter = 0
         self.chunk_files = []
+        self.lock = threading.Lock()
         temp_dir = os.path.join(BUFFER_DIR, ".tmp")
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
@@ -409,14 +409,15 @@ class ExperienceBuffer:
             "novelty": screen_novelty,
             "latent": latent_store
         }
-        self.buffer.append(data)
-        entry_bytes = self._sample_bytes(data)
-        self.total_bytes += entry_bytes
-        idx = len(self.buffer) - 1
-        self.counter += 1
-        priority = self._priority_value(data)
-        heapq.heappush(self.heap, (-priority, idx))
-        self.enforce_limit()
+        with self.lock:
+            self.buffer.append(data)
+            entry_bytes = self._sample_bytes(data)
+            self.total_bytes += entry_bytes
+            idx = len(self.buffer) - 1
+            self.counter += 1
+            priority = self._priority_value(data)
+            heapq.heappush(self.heap, (-priority, idx))
+            self._enforce_limit_locked()
 
     def _sample_bytes(self, entry):
         img_size = entry["img"].element_size() * entry["img"].nelement()
@@ -429,6 +430,10 @@ class ExperienceBuffer:
         return self.total_bytes / (1024**3)
 
     def rebuild_metadata(self):
+        with self.lock:
+            self._rebuild_metadata_locked()
+
+    def _rebuild_metadata_locked(self):
         buffer_list = list(self.buffer)
         self.total_bytes = sum(self._sample_bytes(item) for item in buffer_list)
         self.heap = [(-self._priority_value(item), idx) for idx, item in enumerate(buffer_list)]
@@ -477,8 +482,9 @@ class ExperienceBuffer:
             for path in legacy:
                 entries = torch.load(path, map_location="cpu")
                 merged.extend(entries)
-            self.buffer = deque(merged)
-            self.rebuild_metadata()
+            with self.lock:
+                self.buffer = deque(merged)
+                self._rebuild_metadata_locked()
             self.save()
             for path in legacy:
                 os.remove(path)
@@ -500,29 +506,36 @@ class ExperienceBuffer:
             if total_bytes >= limit_bytes:
                 break
         retained.reverse()
-        self.buffer = deque(retained)
-        self.rebuild_metadata()
+        with self.lock:
+            self.buffer = deque(retained)
+            self._rebuild_metadata_locked()
         return True
 
     def enforce_limit(self):
+        with self.lock:
+            self._enforce_limit_locked()
+
+    def _enforce_limit_locked(self):
         removed_any = False
         while self._buffer_size_gb() > max_buffer_gb and len(self.buffer) > 0:
             removed = self.buffer.popleft()
             self.total_bytes -= self._sample_bytes(removed)
             removed_any = True
         if removed_any:
-            self.rebuild_metadata()
+            self._rebuild_metadata_locked()
 
     def sample_sequences(self, batch_size, window):
-        buffer_list = list(self.buffer)
+        with self.lock:
+            buffer_list = list(self.buffer)
+            heap_snapshot = list(self.heap)
         if len(buffer_list) <= window:
             return []
         sequences = []
         max_start = len(buffer_list) - window - 1
         top_candidates = []
-        if self.heap:
+        if heap_snapshot:
             top_count = max(1, batch_size // 4)
-            top_entries = heapq.nsmallest(top_count, self.heap)
+            top_entries = heapq.nsmallest(top_count, heap_snapshot)
             for _, idx in top_entries:
                 start_idx = min(max(idx - window, 0), max_start)
                 top_candidates.append(start_idx)
@@ -549,13 +562,15 @@ class ExperienceBuffer:
         return sequences
 
     def save(self):
+        with self.lock:
+            snapshot = list(self.buffer)
         temp_dir = os.path.join(BUFFER_DIR, ".tmp")
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
         os.makedirs(temp_dir)
         chunk_idx = 0
         chunk_entries = []
-        for entry in self.buffer:
+        for entry in snapshot:
             chunk_entries.append(entry)
             serialized = pickle.dumps(chunk_entries)
             if len(serialized) + 8 > chunk_byte_limit or len(chunk_entries) >= chunk_entry_limit:
@@ -582,16 +597,6 @@ class ExperienceBuffer:
         while self._disk_usage_gb() > max_buffer_gb and files:
             oldest = files.pop(0)
             os.remove(oldest)
-
-exp_buffer = ExperienceBuffer()
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ai_model = Autoencoder().to(device)
-future_model = FuturePredictor().to(device)
-predict_action_model = ActionPredictor().to(device)
-policy_action_model = ActionPredictor().to(device)
-value_model = ValuePredictor().to(device)
-scaler = GradScaler(enabled=device.type == "cuda")
-chaotic_noise = ChaoticNoise(2)
 
 def ensure_files():
     if not os.path.exists(BASE_DIR):
@@ -865,19 +870,19 @@ class AgentThread(threading.Thread):
             status_target = torch.tensor([int(mouse_val[2])], device=device, dtype=torch.long)
             status_loss = F.cross_entropy(pred_status_logits, status_target)
             action_metric = (pos_loss + status_loss).item()
-            action_novelty = math.log1p(action_metric + 1e-6)
+            action_novelty = clamp_value(math.tanh(action_metric) * 100.0, 0.0, 100.0)
             screen_mse = criterion(predicted_img, rgb_tensor).item()
-            screen_novelty = math.log1p(screen_mse + 1e-6)
+            screen_novelty = clamp_value(screen_mse * 100.0, 0.0, 100.0)
             policy_mouse = torch.zeros((1, 3), device=device)
             policy_mouse_norm = torch.tanh(policy_pos_raw[:, :2])
             novelty_total = screen_novelty + action_novelty
-            noise_scale = clamp_value(math.log1p(novelty_total + 1e-6), 0.01, 0.8)
+            noise_scale = clamp_value(math.log1p(novelty_total / 100.0 + 1e-6), 0.01, 0.8)
             action_noise = torch.randn_like(policy_mouse_norm) * noise_scale
             noisy_mouse_norm = torch.clamp(policy_mouse_norm + action_noise, -1.0, 1.0)
             policy_mouse[:, 0] = noisy_mouse_norm[:, 0] * pos_scale_tensor[0]
             policy_mouse[:, 1] = noisy_mouse_norm[:, 1] * pos_scale_tensor[1]
             survival_penalty = config_data["learning"]["survival_penalty"]
-            reward = math.log(max(screen_novelty, 1e-9)) * math.log(max(action_novelty, 1e-9)) - survival_penalty
+            reward = screen_novelty * action_novelty - survival_penalty
             td_error = abs(reward) + novelty_total
             exp_buffer.add(rgb_tensor.detach(), mouse_tensor.detach().cpu(), reward, td_error, screen_novelty, latent.detach())
             reward_history.append(reward)
@@ -1116,6 +1121,16 @@ class InputHandler:
                 global_pause_recording = True
                 global_optimizing = True
                 self.gui.trigger_optimization()
+
+exp_buffer = ExperienceBuffer()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ai_model = Autoencoder().to(device)
+future_model = FuturePredictor().to(device)
+predict_action_model = ActionPredictor().to(device)
+policy_action_model = ActionPredictor().to(device)
+value_model = ValuePredictor().to(device)
+scaler = GradScaler(enabled=device.type == "cuda")
+chaotic_noise = ChaoticNoise(2)
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
