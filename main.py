@@ -21,8 +21,7 @@ warnings.filterwarnings("ignore")
 def import_or_install(module_name):
     spec = importlib.util.find_spec(module_name)
     if spec is None:
-        print(f"缺少依赖：{module_name}")
-        sys.exit(1)
+        raise RuntimeError("缺少依赖：" + str(module_name))
     return importlib.import_module(module_name)
 
 psutil = import_or_install("psutil")
@@ -555,20 +554,31 @@ class ExperienceBuffer:
         with self.lock:
             buffer_list = list(self.buffer)
             heap_snapshot = list(self.heap)
-        if len(buffer_list) <= window:
+        n = len(buffer_list)
+        if n == 0:
             return []
+        if n == 1:
+            entry = buffer_list[0]
+            return [([entry], entry) for _ in range(batch_size)]
+        effective_window = max(1, min(window, n - 1))
         sequences = []
-        max_start = len(buffer_list) - window - 1
+        max_start = n - effective_window - 1
         top_candidates = []
-        if heap_snapshot:
+        if heap_snapshot and max_start >= 0:
             top_count = max(1, batch_size // 4)
             top_entries = heapq.nsmallest(top_count, heap_snapshot)
             for _, idx in top_entries:
-                start_idx = min(max(idx - window, 0), max_start)
+                start_idx = min(max(idx - effective_window, 0), max_start)
                 top_candidates.append(start_idx)
+        if max_start < 0:
+            first_entry = buffer_list[0]
+            last_entry = buffer_list[-1]
+            for _ in range(batch_size):
+                sequences.append(([first_entry], last_entry))
+            return sequences
         priorities = []
         for start in range(max_start + 1):
-            target_entry = buffer_list[start + window]
+            target_entry = buffer_list[start + effective_window]
             priorities.append(self._priority_value(target_entry))
         cumulative = []
         total = 0.0
@@ -583,8 +593,8 @@ class ExperienceBuffer:
                 idx = bisect.bisect_left(cumulative, r)
             else:
                 idx = random.randint(0, max_start)
-            context_entries = buffer_list[idx:idx + window]
-            target_entry = buffer_list[idx + window]
+            context_entries = buffer_list[idx:idx + effective_window]
+            target_entry = buffer_list[idx + effective_window]
             sequences.append((context_entries, target_entry))
         return sequences
 
@@ -1174,7 +1184,7 @@ class InputHandler:
         self.listener_k.start()
 
     def on_press(self, key):
-        global global_running, global_optimizing, global_pause_recording
+        global global_running, global_optimizing, global_pause_recording, global_mode
         if key == keyboard.Key.esc:
             global_running = False
             global_pause_recording = True
@@ -1185,11 +1195,6 @@ class InputHandler:
                 app_instance.quit()
             self.gui.exit_signal.emit()
             os._exit(0)
-        if key == keyboard.Key.enter:
-            if not global_optimizing:
-                global_pause_recording = True
-                global_optimizing = True
-                self.gui.optimize_request_signal.emit()
 
 exp_buffer = ExperienceBuffer()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
