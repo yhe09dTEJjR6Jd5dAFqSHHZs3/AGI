@@ -256,8 +256,7 @@ def tune_survival_penalty():
 def show_overlay():
     if window_ref is not None and hasattr(window_ref, "ensure_overlay"):
         overlay_widget = window_ref.ensure_overlay()
-        overlay_widget.setGeometry(0, 0, screen_width, screen_height)
-        QtCore.QTimer.singleShot(0, overlay_widget.show)
+        QtCore.QTimer.singleShot(0, overlay_widget.showFullScreen)
         QtCore.QTimer.singleShot(0, overlay_widget.raise_)
 
 def hide_overlay():
@@ -279,7 +278,7 @@ def start_debug_mode(gui_window):
         screen_obj = QtWidgets.QApplication.primaryScreen()
         if screen_obj is not None:
             geo = screen_obj.geometry()
-            overlay_widget.setGeometry(geo)
+            overlay_widget.setGeometry(geo.x(), geo.y(), geo.width(), geo.height())
         else:
             overlay_widget.setGeometry(0, 0, screen_width, screen_height)
     show_overlay()
@@ -1021,12 +1020,16 @@ class SciFiWindow(QtWidgets.QWidget):
         self.setStyleSheet(style)
 
     def ensure_overlay(self):
+        target_geometry = QtWidgets.QApplication.primaryScreen().geometry() if QtWidgets.QApplication.primaryScreen() is not None else None
         if self.overlay is None:
             self.overlay = QtWidgets.QWidget(None, QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint)
-            self.overlay.setWindowState(QtCore.Qt.WindowFullScreen)
             self.overlay.setStyleSheet("background-color: rgba(0, 0, 0, 255);")
+        if target_geometry is not None:
+            self.overlay.setGeometry(target_geometry.x(), target_geometry.y(), target_geometry.width(), target_geometry.height())
+        else:
             self.overlay.setGeometry(0, 0, screen_width, screen_height)
-            self.overlay.hide()
+        self.overlay.setWindowState(QtCore.Qt.WindowFullScreen)
+        self.overlay.hide()
         return self.overlay
 
     def destroy_overlay(self):
