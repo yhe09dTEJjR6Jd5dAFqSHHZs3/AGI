@@ -17,27 +17,28 @@ import bisect
 
 warnings.filterwarnings("ignore")
 
-def import_or_install(module_name, package_name=None):
+def import_or_install(module_name):
     spec = importlib.util.find_spec(module_name)
     if spec is None:
+        print(f"缺少依赖：{module_name}")
         sys.exit(1)
     return importlib.import_module(module_name)
 
 psutil = import_or_install("psutil")
 np = import_or_install("numpy")
-cv2 = import_or_install("cv2", "opencv-python")
+cv2 = import_or_install("cv2")
 mss = import_or_install("mss")
 torch = import_or_install("torch")
 torch.backends.cudnn.benchmark = True
 nn = torch.nn
 optim = torch.optim
 F = torch.nn.functional
-autocast = import_or_install("torch.cuda.amp", "torch").autocast
-GradScaler = import_or_install("torch.cuda.amp", "torch").GradScaler
-QtWidgets = import_or_install("PyQt5.QtWidgets", "PyQt5")
-QtCore = import_or_install("PyQt5.QtCore", "PyQt5")
-QtGui = import_or_install("PyQt5.QtGui", "PyQt5")
-keyboard = import_or_install("pynput.keyboard", "pynput")
+autocast = import_or_install("torch.cuda.amp").autocast
+GradScaler = import_or_install("torch.cuda.amp").GradScaler
+QtWidgets = import_or_install("PyQt5.QtWidgets")
+QtCore = import_or_install("PyQt5.QtCore")
+QtGui = import_or_install("PyQt5.QtGui")
+keyboard = import_or_install("pynput.keyboard")
 pyautogui = import_or_install("pyautogui")
 ctypes = import_or_install("ctypes")
 platform = import_or_install("platform")
