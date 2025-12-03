@@ -1010,8 +1010,11 @@ class SciFiWindow(QtWidgets.QWidget):
         global_mode = "sleep"
         global_optimizing = True
         global_pause_recording = True
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.Tool)
         self.show()
         self.raise_()
+        self.activateWindow()
+        self.setFocus(QtCore.Qt.ActiveWindowFocusReason)
         self.status_signal.emit("SYSTEM: OPTIMIZING")
         self.info_signal.emit("TRAINING NEURAL NETWORK...")
         self.progress_signal.emit(0)
@@ -1133,6 +1136,12 @@ class InputHandler:
         global global_running, global_optimizing, global_pause_recording
         if key == keyboard.Key.esc:
             global_running = False
+            global_pause_recording = True
+            global_optimizing = False
+            hide_overlay()
+            app_instance = QtWidgets.QApplication.instance()
+            if app_instance is not None:
+                app_instance.quit()
             self.gui.exit_signal.emit()
             os._exit(0)
         if key == keyboard.Key.enter:
