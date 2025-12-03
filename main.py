@@ -243,13 +243,14 @@ def persist_config():
         json.dump(config_data, f, ensure_ascii=False, indent=2)
 
 def tune_survival_penalty():
-    if len(reward_history) < 8:
+    if len(reward_history) < 30:
         return False
-    avg_reward = sum(reward_history) / len(reward_history)
+    recent = list(reward_history)[-30:]
+    avg_reward = sum(recent) / len(recent)
     target = 0.0
-    if abs(avg_reward - target) < 1e-3:
+    if abs(avg_reward - target) < 2.0:
         return True
-    delta = clamp_value(avg_reward * 0.01, -0.1, 0.1)
+    delta = avg_reward * 0.1
     new_penalty = clamp_value(config_data["learning"]["survival_penalty"] + delta, 0.0, 10.0)
     config_data["learning"]["survival_penalty"] = new_penalty
     persist_config()
