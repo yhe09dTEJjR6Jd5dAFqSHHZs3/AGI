@@ -276,8 +276,8 @@ def start_debug_mode(gui_window):
         else:
             window_ref.overlay.setGeometry(0, 0, screen_width, screen_height)
     show_overlay()
-    gui_window.status_signal.emit("SYSTEM: DEBUG")
-    gui_window.info_signal.emit("CALIBRATING SURVIVAL PENALTY...")
+    gui_window.status_signal.emit("系统：调试模式")
+    gui_window.info_signal.emit("正在校准生存惩罚...")
 
 lock = threading.Lock()
 mouse_left_down = False
@@ -959,13 +959,13 @@ class SciFiWindow(QtWidgets.QWidget):
         card_layout = QtWidgets.QVBoxLayout()
         card_layout.setContentsMargins(30, 30, 30, 30)
         card_layout.setSpacing(20)
-        self.label = QtWidgets.QLabel("SYSTEM: ONLINE")
+        self.label = QtWidgets.QLabel("系统：在线")
         self.label.setAlignment(QtCore.Qt.AlignCenter)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setValue(0)
         self.progress.setTextVisible(True)
         self.progress.setFormat("%p%")
-        self.info_label = QtWidgets.QLabel("AI AGENT RUNNING...")
+        self.info_label = QtWidgets.QLabel("智能体运行中...")
         self.info_label.setAlignment(QtCore.Qt.AlignCenter)
         card_layout.addWidget(self.label)
         card_layout.addStretch()
@@ -1015,8 +1015,8 @@ class SciFiWindow(QtWidgets.QWidget):
         self.raise_()
         self.activateWindow()
         self.setFocus(QtCore.Qt.ActiveWindowFocusReason)
-        self.status_signal.emit("SYSTEM: OPTIMIZING")
-        self.info_signal.emit("TRAINING NEURAL NETWORK...")
+        self.status_signal.emit("睡眠模式：优化中")
+        self.info_signal.emit("正在训练神经网络...")
         self.progress_signal.emit(0)
         self.optimizer_signal.emit()
 
@@ -1103,22 +1103,22 @@ class SciFiWindow(QtWidgets.QWidget):
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             del loss, pred_latent_vec, pred_latent, pred_img, pred_pos_raw, pred_status_logits, policy_pos_raw, policy_status_logits, recon, aggregated_tensor, target_imgs_tensor, target_imgs_with_coords, target_mice_tensor, target_latents_tensor, reward_tensor, reward_norm, pos_scale_tensor, values, advantage, policy_loss, value_loss, predict_loss, policy_supervised, loss_screen, dist, log_prob_pos, log_prob_status, log_prob
-        progress_val = int((i + 1) / total_steps * 100)
-        self.progress_signal.emit(progress_val)
-        if device.type == "cuda":
-            if vram_near_limit:
-                torch.cuda.empty_cache()
-                gc.collect()
-            elif (i + 1) == total_steps:
-                torch.cuda.empty_cache()
-        time.sleep(0.01)
+            progress_val = int((i + 1) / total_steps * 100)
+            self.progress_signal.emit(progress_val)
+            if device.type == "cuda":
+                if vram_near_limit:
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                elif (i + 1) == total_steps:
+                    torch.cuda.empty_cache()
+            time.sleep(0.01)
         save_state()
         self.finished_signal.emit()
 
     def on_optimization_finished(self):
-        QtWidgets.QMessageBox.information(self, "SYSTEM", "OPTIMIZATION COMPLETE.\nDATA SAVED.")
-        self.label.setText("SYSTEM: ONLINE")
-        self.info_label.setText("AI AGENT RUNNING...")
+        QtWidgets.QMessageBox.information(self, "系统", "优化完成。\n数据已保存。")
+        self.label.setText("系统：在线")
+        self.info_label.setText("智能体运行中...")
         self.progress.setValue(0)
         global global_optimizing, global_pause_recording
         global_optimizing = False
