@@ -18,6 +18,21 @@ import bisect
 
 warnings.filterwarnings("ignore")
 
+def global_exception_hook(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        os._exit(0)
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+    os._exit(1)
+
+sys.excepthook = global_exception_hook
+
+def thread_exception_hook(args):
+    global_exception_hook(args.exc_type, args.exc_value, args.exc_traceback)
+
+if hasattr(threading, "excepthook"):
+    threading.excepthook = thread_exception_hook
+
+
 def import_or_install(module_name):
     spec = importlib.util.find_spec(module_name)
     if spec is None:
@@ -491,7 +506,10 @@ class ExperienceBuffer:
             raise RuntimeError("经验池分片内容损坏：头部长度=" + str(size_bytes))
         size = int.from_bytes(bytes(mem[:8]), "little")
         limit_bytes = 20 * (1024**3)
-        if size <= 0 or size > limit_bytes or 8 + size > mem.shape[0]:
+        if size == 0:
+            del mem
+            return []
+        if size < 0 or size > limit_bytes or 8 + size > mem.shape[0]:
             bad_size = size
             total_size = mem.shape[0]
             del mem
@@ -655,9 +673,19 @@ def ensure_files():
             pickle.dump([], f)
     chunk_files = glob.glob(os.path.join(BUFFER_DIR, "chunk_*.bin"))
     if not chunk_files:
-        mem = np.memmap(os.path.join(BUFFER_DIR, "chunk_0.bin"), dtype=np.uint8, mode="w+", shape=(max(1024 * 1024, int(chunk_byte_limit)),))
-        mem[:8] = np.frombuffer((0).to_bytes(8, "little"), dtype=np.uint8)
+        capacity = max(1024 * 1024, int(chunk_byte_limit))
+        temp_path = os.path.join(BUFFER_DIR, "chunk_0.bin")
+        empty_entries = []
+        data_bytes = pickle.dumps(empty_entries)
+        size_bytes = len(data_bytes).to_bytes(8, "little")
+        mem = np.memmap(temp_path, dtype=np.uint8, mode="w+", shape=(capacity,))
+        mem[:8] = np.frombuffer(size_bytes, dtype=np.uint8)
+        mem[8:8 + len(data_bytes)] = np.frombuffer(data_bytes, dtype=np.uint8)
+        if 8 + len(data_bytes) < capacity:
+            mem[8 + len(data_bytes):] = 0
         mem.flush()
+        del mem
+
     if not os.path.exists(model_files["autoencoder"]):
         torch.save(ai_model.state_dict(), model_files["autoencoder"])
     if not os.path.exists(model_files["mouse_output"]):
@@ -687,9 +715,19 @@ def load_state():
         exp_buffer.rebuild_metadata()
         loaded = True
     if not loaded and not glob.glob(os.path.join(BUFFER_DIR, "chunk_*.bin")):
-        mem = np.memmap(os.path.join(BUFFER_DIR, "chunk_0.bin"), dtype=np.uint8, mode="w+", shape=(max(1024 * 1024, int(chunk_byte_limit)),))
-        mem[:8] = np.frombuffer((0).to_bytes(8, "little"), dtype=np.uint8)
+        capacity = max(1024 * 1024, int(chunk_byte_limit))
+        temp_path = os.path.join(BUFFER_DIR, "chunk_0.bin")
+        empty_entries = []
+        data_bytes = pickle.dumps(empty_entries)
+        size_bytes = len(data_bytes).to_bytes(8, "little")
+        mem = np.memmap(temp_path, dtype=np.uint8, mode="w+", shape=(capacity,))
+        mem[:8] = np.frombuffer(size_bytes, dtype=np.uint8)
+        mem[8:8 + len(data_bytes)] = np.frombuffer(data_bytes, dtype=np.uint8)
+        if 8 + len(data_bytes) < capacity:
+            mem[8 + len(data_bytes):] = 0
         mem.flush()
+        del mem
+
     if os.path.exists(model_files["autoencoder"]):
         ai_model.load_state_dict(torch.load(model_files["autoencoder"], map_location=device))
     if os.path.exists(model_files["mouse_output"]):
