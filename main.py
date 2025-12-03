@@ -996,9 +996,12 @@ class SciFiWindow(QtWidgets.QWidget):
         self.setStyleSheet(style)
 
     def trigger_optimization(self):
-        global global_optimizing, global_pause_recording
+        global global_optimizing, global_pause_recording, global_mode
+        global_mode = "sleep"
         global_optimizing = True
         global_pause_recording = True
+        self.show()
+        self.raise_()
         self.status_signal.emit("SYSTEM: OPTIMIZING")
         self.info_signal.emit("TRAINING NEURAL NETWORK...")
         self.progress_signal.emit(0)
@@ -1103,6 +1106,7 @@ class SciFiWindow(QtWidgets.QWidget):
         global_optimizing = False
         global_pause_recording = False
         start_debug_mode(self)
+        self.hide()
 
 class InputHandler:
     def __init__(self, gui_window):
@@ -1142,7 +1146,6 @@ if __name__ == "__main__":
     mouse_right_down = init_status in (2, 3)
     window = SciFiWindow()
     window_ref = window
-    window.show()
     start_debug_mode(window)
     monitor_thread = ResourceMonitor()
     monitor_thread.start()
