@@ -26,6 +26,12 @@ from flask import Flask, request, jsonify
 
 warnings.filterwarnings("ignore")
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+except Exception:
+    pass
+pyautogui.PAUSE = 0
+pyautogui.FAILSAFE = False
 
 def panic(msg):
     ctypes.windll.user32.MessageBoxW(0, str(msg), "Error", 0x10)
@@ -255,6 +261,39 @@ def worker_thread():
     hidden_state = None
     criterion = nn.CrossEntropyLoss()
 
+    def align_episode(steps):
+        ordered = sorted(steps, key=lambda s: s.get('timestamp', s.get('start_time', time.time())))
+        frames = [f for f in ordered if f.get('type') == 'frame']
+        clicks = [c for c in ordered if c.get('type') == 'click']
+        frames.sort(key=lambda f: f.get('timestamp', time.time()))
+        for f in frames:
+            if 'action' not in f:
+                f['action'] = 2 if f.get('button', 0) == 1 else 0
+        for c in clicks:
+            st = c.get('start_time', c.get('timestamp'))
+            et = c.get('end_time', st)
+            if st is None or et is None:
+                continue
+            rel = [(i, f) for i, f in enumerate(frames) if f.get('timestamp') is not None and f.get('timestamp') >= st and f.get('timestamp') <= et]
+            if not rel:
+                continue
+            start_idx = min(rel, key=lambda p: abs(p[1].get('timestamp') - st))[0]
+            end_idx = min(rel, key=lambda p: abs(p[1].get('timestamp') - et))[0]
+            if start_idx <= end_idx:
+                frames[start_idx]['action'] = 1
+                frames[start_idx]['button'] = 1
+                for j in range(start_idx + 1, end_idx):
+                    frames[j]['action'] = 2
+                    frames[j]['button'] = 1
+                frames[end_idx]['action'] = 0
+                frames[end_idx]['button'] = 0
+            else:
+                frames[end_idx]['action'] = 0
+                frames[end_idx]['button'] = 0
+                frames[start_idx]['action'] = 1
+                frames[start_idx]['button'] = 1
+        return frames
+
     while state.is_running:
         try:
             with state.lock:
@@ -266,17 +305,29 @@ def worker_thread():
                     state.ai_button_down = False
 
             if esc:
-                with state.lock:
-                    state.prev_mode = state.mode
-                    state.mode = "PAUSED"
-                    state.esc_pressed = False
-                set_window_state(minimize=False)
+                if current_mode == "PRACTICAL":
+                    pyautogui.mouseUp()
+                    with state.lock:
+                        state.prev_mode = state.mode
+                    save_buffer("INTERRUPTED")
+                    with state.lock:
+                        state.buffer = []
+                        state.mode = "IDLE"
+                        state.esc_pressed = False
+                        state.ai_button_down = False
+                    set_window_state(minimize=False)
+                else:
+                    with state.lock:
+                        state.prev_mode = state.mode
+                        state.mode = "PAUSED"
+                        state.esc_pressed = False
+                    set_window_state(minimize=False)
                 continue
 
             if current_mode == "LEARNING":
                 start_time = time.time()
                 img = np.array(sct.grab(sct.monitors[1]))
-                img_small = cv2.resize(img, (260, 160))
+                img_small = cv2.resize(img, (256, 160))
                 img_bytes = encode_image(img_small)
                 with state.lock:
                     state.last_screen = img_bytes
@@ -301,7 +352,7 @@ def worker_thread():
             elif current_mode in ["TRAINING", "PRACTICAL"]:
                 start_time = time.time()
                 img = np.array(sct.grab(sct.monitors[1]))
-                img_small = cv2.resize(img, (260, 160))
+                img_small = cv2.resize(img, (256, 160))
                 img_bytes = encode_image(img_small)
                 with state.lock:
                     state.last_screen = img_bytes
@@ -389,11 +440,11 @@ def worker_thread():
                 seq_len = max(1, state.seq_len)
                 for ep in episodes:
                     steps = ep.get('steps', [])
-                    ordered = sorted(steps, key=lambda s: s.get('timestamp', s.get('start_time', time.time())))
-                    if len(ordered) < seq_len:
+                    aligned = align_episode(steps)
+                    if len(aligned) < seq_len:
                         continue
-                    for i in range(len(ordered) - seq_len + 1):
-                        seg = ordered[i:i+seq_len]
+                    for i in range(len(aligned) - seq_len + 1):
+                        seg = aligned[i:i+seq_len]
                         if all(('screen_jpg' in step or 'screen' in step) for step in seg):
                             sequences.append((seg, ep.get('result', "UNKNOWN")))
 
@@ -437,7 +488,7 @@ def worker_thread():
                         tx = 0.5
                         ty = 0.5
 
-                    action_label = 1 if target_step.get('type') == 'click' else target_step.get('action', 2 if target_step.get('button', 0) == 1 else 0)
+                    action_label = target_step.get('action', 2 if target_step.get('button', 0) == 1 else 0)
                     res_map = {"WIN": 1, "LOSS": 2}
                     res_label = res_map.get(seq_res, 0)
 
