@@ -3,6 +3,7 @@ import sys
 import subprocess
 import importlib
 import importlib.util
+import queue
 packages = {"numpy": "numpy", "cv2": "opencv-python", "mss": "mss", "torch": "torch", "psutil": "psutil", "pyautogui": "pyautogui", "pynput": "pynput", "flask": "flask", "pynvml": "nvidia-ml-py", "nvidia_ml_py": "nvidia-ml-py"}
 for mod, pkg in packages.items():
     if not importlib.util.find_spec(mod):
@@ -57,12 +58,20 @@ if nvml_module:
         nvml_module = None
         gpu_handle = None
 
-desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+def get_desktop_path():
+    if os.name == "nt":
+        buf = ctypes.create_unicode_buffer(260)
+        if ctypes.windll.shell32.SHGetFolderPathW(None, 0, None, 0, buf) == 0 and buf.value:
+            return buf.value
+    return os.path.join(os.path.expanduser("~"), "Desktop")
+
+desktop_path = get_desktop_path()
 root_dir = os.path.join(desktop_path, "AAA")
 exp_pool_dir = os.path.join(root_dir, "ExperiencePool")
 model_dir = os.path.join(root_dir, "Models")
+template_dir = os.path.join(root_dir, "Templates")
 
-for d in [root_dir, exp_pool_dir, model_dir]:
+for d in [root_dir, exp_pool_dir, model_dir, template_dir]:
     if not os.path.exists(d):
         os.makedirs(d)
 
@@ -92,6 +101,10 @@ class SharedState:
         self.prev_frame = None
         self.last_change_time = time.time()
         self.last_static_check = 0
+        self.move_plan = None
+        self.encode_queue = queue.Queue()
+        self.encode_pending = 0
+        self.templates = []
 
 state = SharedState()
 
@@ -140,19 +153,35 @@ def normalize_image(img):
     tensor = torch.FloatTensor(img).permute(2, 0, 1) / 255.0
     return (tensor - mean_tensor) / std_tensor
 
-def move_bezier(start_pos, end_pos, duration=0.15, steps=20):
-    sx, sy = start_pos
+def schedule_move(end_pos, duration=0.15, steps=20):
+    sx, sy = pyautogui.position()
     ex, ey = end_pos
     steps = max(2, steps)
     cp1 = (sx + (ex - sx) * 0.3 + random.uniform(-20, 20), sy + (ey - sy) * 0.3 + random.uniform(-20, 20))
     cp2 = (sx + (ex - sx) * 0.7 + random.uniform(-20, 20), sy + (ey - sy) * 0.7 + random.uniform(-20, 20))
-    interval = duration / steps
-    for i in range(steps + 1):
-        t = i / steps
-        x = (1 - t) ** 3 * sx + 3 * (1 - t) ** 2 * t * cp1[0] + 3 * (1 - t) * t ** 2 * cp2[0] + t ** 3 * ex
-        y = (1 - t) ** 3 * sy + 3 * (1 - t) ** 2 * t * cp1[1] + 3 * (1 - t) * t ** 2 * cp2[1] + t ** 3 * ey
-        pyautogui.moveTo(int(x), int(y))
-        time.sleep(interval)
+    with state.lock:
+        state.move_plan = {"start": (sx, sy), "end": (ex, ey), "cp1": cp1, "cp2": cp2, "duration": duration, "start_time": time.time(), "steps": steps}
+    return advance_move()
+
+def advance_move():
+    with state.lock:
+        plan = state.move_plan
+    if not plan:
+        return pyautogui.position()
+    now = time.time()
+    t = (now - plan['start_time']) / plan['duration']
+    t = max(0, min(1, t))
+    sx, sy = plan['start']
+    ex, ey = plan['end']
+    cp1 = plan['cp1']
+    cp2 = plan['cp2']
+    x = (1 - t) ** 3 * sx + 3 * (1 - t) ** 2 * t * cp1[0] + 3 * (1 - t) * t ** 2 * cp2[0] + t ** 3 * ex
+    y = (1 - t) ** 3 * sy + 3 * (1 - t) ** 2 * t * cp1[1] + 3 * (1 - t) * t ** 2 * cp2[1] + t ** 3 * ey
+    pyautogui.moveTo(int(x), int(y))
+    with state.lock:
+        if t >= 1:
+            state.move_plan = None
+    return (int(x), int(y))
 
 def get_window_handle():
     user32 = ctypes.windll.user32
@@ -209,8 +238,100 @@ def encode_image(img):
     return buf.tobytes() if ok else b''
 
 def decode_image(buf):
+    if isinstance(buf, np.ndarray):
+        return buf
     arr = np.frombuffer(buf, dtype=np.uint8)
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+def extract_roi(img):
+    h, w = img.shape[:2]
+    cx, cy = w // 2, h // 2
+    rx, ry = int(w * 0.25), int(h * 0.25)
+    return img[max(0, cy - ry):min(h, cy + ry), max(0, cx - rx):min(w, cx + rx)]
+
+def calc_histogram(img):
+    roi = extract_roi(img)
+    hist = []
+    for ch in range(3):
+        h = cv2.calcHist([roi], [ch], None, [32], [0, 256])
+        hist.append(cv2.normalize(h, h).flatten())
+    return np.concatenate(hist)
+
+def load_templates():
+    templates = []
+    for f in glob.glob(os.path.join(template_dir, '*.pkl')):
+        try:
+            with open(f, 'rb') as fb:
+                data = pickle.load(fb)
+                if isinstance(data, dict) and 'label' in data and 'hist' in data:
+                    templates.append(data)
+        except Exception:
+            continue
+    with state.lock:
+        state.templates = templates
+
+load_templates()
+
+def save_template(label):
+    img_bytes = None
+    with state.lock:
+        img_bytes = state.last_screen
+    if img_bytes is None:
+        return
+    img = decode_image(img_bytes) if isinstance(img_bytes, (bytes, bytearray)) else img_bytes
+    if img is None:
+        return
+    hist = calc_histogram(img)
+    data = {"label": label, "hist": hist, "id": str(uuid.uuid4())}
+    fpath = os.path.join(template_dir, f"template_{data['id']}.pkl")
+    try:
+        with open(fpath, 'wb') as f:
+            pickle.dump(data, f)
+        with state.lock:
+            state.templates.append(data)
+    except Exception:
+        return
+
+def detect_result(img):
+    hist = calc_histogram(img)
+    best = None
+    best_score = -1
+    with state.lock:
+        templates = list(state.templates)
+    for tpl in templates:
+        tpl_hist = tpl.get('hist')
+        if tpl_hist is None:
+            continue
+        score = cv2.compareHist(hist.astype('float32'), np.array(tpl_hist, dtype='float32'), cv2.HISTCMP_CORREL)
+        if score > best_score:
+            best_score = score
+            best = tpl.get('label')
+    if best_score >= 0.3:
+        return best
+    mean_intensity = img.mean()
+    if mean_intensity > 180:
+        return "WIN"
+    if mean_intensity < 70:
+        return "LOSS"
+    return "DRAW"
+
+def enqueue_encoding(step, img):
+    with state.lock:
+        state.encode_pending += 1
+    state.encode_queue.put((step, img))
+
+def encoding_worker():
+    while state.is_running:
+        try:
+            step, img = state.encode_queue.get()
+            if step is None:
+                break
+            step['screen_jpg'] = encode_image(img)
+            with state.lock:
+                state.encode_pending = max(0, state.encode_pending - 1)
+        except Exception:
+            with state.lock:
+                state.encode_pending = max(0, state.encode_pending - 1)
 
 def flush_buffer_to_temp():
     with state.lock:
@@ -228,6 +349,12 @@ def flush_buffer_to_temp():
     check_disk_space()
 
 def collect_steps():
+    while True:
+        with state.lock:
+            pending = state.encode_pending
+        if pending <= 0:
+            break
+        time.sleep(0.005)
     steps = []
     with state.lock:
         tmp_files = state.temp_files
@@ -399,7 +526,7 @@ def worker_thread():
             pos = f.get('pos') or f.get('start_pos') or (0, 0)
             if btn or (act is not None and act != 0):
                 if cur_event is None:
-                    cur_event = {'start_time': ts, 'end_time': ts, 'start_pos': tuple(pos), 'end_pos': tuple(pos), 'button': btn or 1}
+                    cur_event = {'start_time': ts, 'end_time': ts, 'start_pos': tuple(pos), 'end_pos': tuple(pos), 'button': btn or 1, 'trajectory': []}
                 else:
                     cur_event['end_time'] = ts
                     cur_event['end_pos'] = tuple(pos)
@@ -411,6 +538,16 @@ def worker_thread():
             ai_events.append(cur_event)
         events.extend(ai_events)
         events.sort(key=lambda x: x.get('start_time', 0))
+        for ev in events:
+            ev['trajectory'] = []
+        for f in frames:
+            ts = f.get('timestamp', 0)
+            pos = f.get('pos') or f.get('start_pos') or (0, 0)
+            for ev in events:
+                st = ev.get('start_time', 0)
+                et = ev.get('end_time', st)
+                if st <= ts <= et:
+                    ev['trajectory'].append((ts, tuple(pos)))
         enriched = []
         for f in frames:
             ts = f.get('timestamp', 0)
@@ -428,18 +565,19 @@ def worker_thread():
             if matched:
                 st = matched.get('start_time', ts)
                 et = matched.get('end_time', st)
-                ratio = 0 if et == st else min(1, max(0, (ts - st) / (et - st)))
-                sp = matched.get('start_pos', pos) or pos
-                ep = matched.get('end_pos', pos) or pos
-                ix = int(sp[0] + (ep[0] - sp[0]) * ratio)
-                iy = int(sp[1] + (ep[1] - sp[1]) * ratio)
-                pos = (ix, iy)
-                traj = [sp, ep]
+                recorded = [p[1] for p in matched.get('trajectory', [])]
+                if recorded:
+                    traj = recorded
+                    pos = recorded[-1] if ts >= matched.get('end_time', ts) else recorded[0]
+                else:
+                    sp = matched.get('start_pos', pos) or pos
+                    ep = matched.get('end_pos', pos) or pos
+                    traj = [sp, ep]
                 btn_flag = matched.get('button', 1)
                 if et - st > 0.2:
-                    if ratio < 0.1:
+                    if ts - st < 0.1:
                         action_flag = 1
-                    elif ratio > 0.9:
+                    elif et - ts < 0.1:
                         action_flag = 0
                     else:
                         action_flag = 2
@@ -483,16 +621,17 @@ def worker_thread():
                 start_time = time.time()
                 img = np.array(sct.grab(sct.monitors[1]))
                 img_small = cv2.resize(img, (256, 160))
-                img_bytes = encode_image(img_small)
                 ts = time.time()
                 action_flag, btn_flag = get_mouse_action(ts)
                 with state.lock:
-                    state.last_screen = img_bytes
+                    state.last_screen = img_small
                     if not state.current_episode_id:
                         state.current_episode_id = str(uuid.uuid4())
                     x, y = pyautogui.position()
                     press_time = state.mouse_state["start_time"] if btn_flag else None
-                add_step({"type": "frame", "timestamp": ts, "pos": (x, y), "button": btn_flag, "press_time": press_time, "mouse_pressed": state.mouse_state["pressed"], "mouse_start_pos": state.mouse_state["start_pos"], "mouse_start_time": state.mouse_state["start_time"], "screen_jpg": img_bytes, "source": "HUMAN", "episode": state.current_episode_id, "action": action_flag})
+                step = {"type": "frame", "timestamp": ts, "pos": (x, y), "button": btn_flag, "press_time": press_time, "mouse_pressed": state.mouse_state["pressed"], "mouse_start_pos": state.mouse_state["start_pos"], "mouse_start_time": state.mouse_state["start_time"], "screen_jpg": None, "source": "HUMAN", "episode": state.current_episode_id, "action": action_flag}
+                enqueue_encoding(step, img_small)
+                add_step(step)
                 elapsed = time.time() - start_time
                 sleep_time = max(0, (1.0 / state.fps) - elapsed)
                 time.sleep(sleep_time)
@@ -501,9 +640,8 @@ def worker_thread():
                 start_time = time.time()
                 img = np.array(sct.grab(sct.monitors[1]))
                 img_small = cv2.resize(img, (256, 160))
-                img_bytes = encode_image(img_small)
                 with state.lock:
-                    state.last_screen = img_bytes
+                    state.last_screen = img_small
                     if not state.current_episode_id:
                         state.current_episode_id = str(uuid.uuid4())
 
@@ -528,7 +666,7 @@ def worker_thread():
                             state.mouse_state["pressed"] = True
                             state.mouse_state["start_pos"] = current_pos
                             state.mouse_state["start_time"] = now_time
-                    move_bezier(current_pos, (mx, my), duration=0.12)
+                    current_pos = schedule_move((mx, my), duration=0.12)
                 elif action == 1:
                     with state.lock:
                         holding = state.ai_button_down
@@ -537,7 +675,7 @@ def worker_thread():
                         with state.lock:
                             state.ai_button_down = False
                             state.mouse_state["pressed"] = False
-                    move_bezier(current_pos, (mx, my), duration=0.12)
+                    current_pos = schedule_move((mx, my), duration=0.12)
                     pyautogui.click()
                     with state.lock:
                         state.mouse_state["pressed"] = False
@@ -546,7 +684,7 @@ def worker_thread():
                 else:
                     with state.lock:
                         holding = state.ai_button_down
-                    move_bezier(current_pos, (mx, my), duration=0.12)
+                    current_pos = schedule_move((mx, my), duration=0.12)
                     if holding:
                         pyautogui.mouseUp()
                     with state.lock:
@@ -568,14 +706,10 @@ def worker_thread():
                     fallback = None
                     if static_time >= 5 and time.time() - state.last_static_check > 1:
                         state.last_static_check = time.time()
-                        mean_intensity = img_small.mean()
-                        if mean_intensity > 180:
-                            fallback = "WIN"
-                        elif mean_intensity < 70:
-                            fallback = "LOSS"
-                        else:
-                            fallback = "DRAW"
-                add_step({"type": "frame", "timestamp": ts, "pos": (mx, my), "action": action, "button": btn_flag, "mouse_pressed": btn_flag, "mouse_start_pos": state.mouse_state.get("start_pos"), "mouse_start_time": state.mouse_state.get("start_time"), "screen_jpg": img_bytes, "source": "AI", "episode": state.current_episode_id})
+                        fallback = detect_result(img_small)
+                step = {"type": "frame", "timestamp": ts, "pos": (mx, my), "action": action, "button": btn_flag, "mouse_pressed": btn_flag, "mouse_start_pos": state.mouse_state.get("start_pos"), "mouse_start_time": state.mouse_state.get("start_time"), "screen_jpg": None, "source": "AI", "episode": state.current_episode_id}
+                enqueue_encoding(step, img_small)
+                add_step(step)
 
                 if current_mode == "PRACTICAL":
                     res_map = {1: "WIN", 2: "LOSS"}
@@ -870,6 +1004,8 @@ def submit_result():
             state.prev_mode = "IDLE"
             set_window_state(minimize=False)
         else:
+            if res in ["WIN", "LOSS", "DRAW"] and (state.prev_mode == "LEARNING" or state.mode == "LEARNING"):
+                save_template(res)
             save_buffer(res)
             state.buffer = []
             state.temp_files = []
@@ -885,6 +1021,7 @@ def submit_result():
 
 if __name__ == "__main__":
     threading.Thread(target=monitor_resources, daemon=True).start()
+    threading.Thread(target=encoding_worker, daemon=True).start()
     threading.Thread(target=listener_thread, daemon=True).start()
     threading.Thread(target=worker_thread, daemon=True).start()
     try:
