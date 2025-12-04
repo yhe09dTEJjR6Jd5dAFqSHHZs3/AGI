@@ -17,6 +17,13 @@ from pynput import mouse, keyboard
 import tkinter as tk
 from tkinter import ttk
 
+try:
+    import pynvml
+    _has_pynvml = True
+except:
+    pynvml = None
+    _has_pynvml = False
+
 def main():
     try:
         pyautogui.FAILSAFE = False
@@ -24,19 +31,80 @@ def main():
         torch.backends.cudnn.benchmark = True
         desktop = os.path.join(os.path.expanduser("~"), "Desktop")
         base_dir = os.path.join(desktop, "AAA")
-        pool_dir = os.path.join(base_dir, "experience_pool")
+        pool_dir = os.path.join(base_dir, "经验池")
+        old_pool_dir = os.path.join(base_dir, "experience_pool")
         model_dir = os.path.join(base_dir, "ai_models")
-        for d in [base_dir, pool_dir, model_dir]:
+        for d in [base_dir, pool_dir, old_pool_dir, model_dir]:
             os.makedirs(d, exist_ok=True)
+        size_file = os.path.join(base_dir, "pool_size.txt")
         screen_w, screen_h = pyautogui.size()
         t_w = max(1, int(screen_w * 0.1))
         t_h = max(1, int(screen_h * 0.1))
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        nvml_inited = False
+        nvml_handle = None
+        if _has_pynvml and torch.cuda.is_available():
+            try:
+                pynvml.nvmlInit()
+                nvml_inited = True
+                nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            except:
+                nvml_inited = False
+                nvml_handle = None
+        vram_limit_bytes = 4 * 1024 * 1024 * 1024
+        total_vram = 0
         if device.type == "cuda":
             props = torch.cuda.get_device_properties(0)
-            if props.total_memory > 4 * 1024 ** 3:
-                fraction = (4 * 1024 ** 3) / float(props.total_memory)
+            total_vram = props.total_memory
+            if total_vram > vram_limit_bytes and hasattr(torch.cuda, "set_per_process_memory_fraction"):
+                fraction = float(vram_limit_bytes) / float(total_vram)
                 torch.cuda.set_per_process_memory_fraction(fraction, 0)
+        mem_limit_bytes = 16 * 1024 * 1024 * 1024
+        pool_limit_bytes = 20 * 1024 * 1024 * 1024
+        proc = psutil.Process(os.getpid())
+        def list_pool_files():
+            files = []
+            for d in [pool_dir, old_pool_dir]:
+                if os.path.isdir(d):
+                    for name in os.listdir(d):
+                        if name.endswith(".pkl"):
+                            path = os.path.join(d, name)
+                            ctime = os.path.getctime(path)
+                            files.append((ctime, path))
+            files.sort(key=lambda x: x[0])
+            return [p for _, p in files]
+        def compute_pool_size():
+            total = 0
+            for path in list_pool_files():
+                total += os.path.getsize(path)
+            return total
+        pool_size_bytes = compute_pool_size()
+        with open(size_file, "w") as f:
+            f.write(str(pool_size_bytes))
+        ctx = {
+            "mode": "LEARNING",
+            "last_act": time.time(),
+            "act_start": 0.0,
+            "stop": False,
+            "m": {"x": 0.0, "y": 0.0, "dx": 0.0, "dy": 0.0, "l": 0.0, "r": 0.0, "dl": 0.0, "dr": 0.0},
+            "pool_size": pool_size_bytes
+        }
+        def update_size_file():
+            with open(size_file, "w") as f:
+                f.write(str(ctx["pool_size"]))
+        def trim_pool_if_needed():
+            if ctx["pool_size"] <= pool_limit_bytes:
+                return
+            files = list_pool_files()
+            for path in files:
+                if ctx["stop"]:
+                    break
+                size = os.path.getsize(path)
+                os.remove(path)
+                ctx["pool_size"] -= size
+                update_size_file()
+                if ctx["pool_size"] <= pool_limit_bytes:
+                    break
         class Net(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -79,14 +147,9 @@ def main():
             opt.load_state_dict(c["o"])
         else:
             torch.save({"n": net.state_dict(), "o": opt.state_dict()}, m_path)
-        ctx = {
-            "mode": "LEARNING",
-            "last_act": time.time(),
-            "act_start": 0.0,
-            "stop": False,
-            "m": {"x": 0.0, "y": 0.0, "dx": 0.0, "dy": 0.0, "l": 0.0, "r": 0.0, "dl": 0.0, "dr": 0.0}
-        }
         def on_mov(x, y):
+            if ctx["stop"]:
+                return
             dx = x - ctx["m"]["x"]
             dy = y - ctx["m"]["y"]
             ctx["m"]["dx"] = dx
@@ -97,6 +160,8 @@ def main():
             if ctx["mode"] == "ACTIVE" and (abs(dx) > 2 or abs(dy) > 2):
                 ctx["mode"] = "LEARNING"
         def on_clk(x, y, b, p):
+            if ctx["stop"]:
+                return
             ctx["last_act"] = time.time()
             v = 1.0 if p else 0.0
             if b == mouse.Button.left:
@@ -129,23 +194,34 @@ def main():
         def optimize_model():
             root = tk.Tk()
             root.attributes("-topmost", True)
-            root.geometry("360x90")
             root.overrideredirect(True)
+            root.geometry("360x90")
             text_var = tk.StringVar()
             label = ttk.Label(root, textvariable=text_var)
             label.pack(pady=5)
             pb = ttk.Progressbar(root, length=320, mode="determinate", maximum=100)
             pb.pack(pady=5)
             text_var.set("优化中 0%")
+            def on_escape(event):
+                ctx["stop"] = True
+                root.quit()
+            root.bind("<Escape>", on_escape)
+            root.update_idletasks()
+            root.update()
             try:
-                files = sorted(glob.glob(os.path.join(pool_dir, "*.pkl")))
+                files = list_pool_files()
                 samples = []
                 if files:
                     max_files = min(len(files), 200)
                     indices = np.random.choice(len(files), max_files, replace=False)
                     for index in indices:
-                        with open(files[index], "rb") as f:
+                        if ctx["stop"]:
+                            break
+                        path = files[index]
+                        with open(path, "rb") as f:
                             samples.append(pickle.load(f))
+                if ctx["stop"]:
+                    return
                 if samples:
                     samples.sort(key=lambda x: x["t"])
                     while len(samples) <= seq_len + 1:
@@ -182,34 +258,36 @@ def main():
                         opt.step()
                 net.eval()
                 torch.save({"n": net.state_dict(), "o": opt.state_dict()}, m_path)
-                all_files = sorted(glob.glob(os.path.join(pool_dir, "*.pkl")), key=os.path.getctime)
-                size_bytes = 0
-                for path in all_files:
-                    size_bytes += os.path.getsize(path)
-                limit_bytes = 20 * 1024 * 1024 * 1024
-                index = 0
-                while size_bytes > limit_bytes and index < len(all_files):
-                    path = all_files[index]
-                    file_size = os.path.getsize(path)
-                    os.remove(path)
-                    size_bytes -= file_size
-                    index += 1
+                ctx["pool_size"] = compute_pool_size()
+                update_size_file()
+                trim_pool_if_needed()
             finally:
-                try:
-                    root.destroy()
-                except:
-                    pass
+                root.destroy()
         while not ctx["stop"]:
             loop_start = time.time()
+            if ctx["stop"]:
+                break
+            mem_bytes = proc.memory_info().rss
+            if mem_bytes > mem_limit_bytes:
+                raise RuntimeError("Memory limit exceeded")
             cpu = psutil.cpu_percent()
-            mem = psutil.virtual_memory().percent
-            vram = 0.0
+            mem_percent = psutil.virtual_memory().percent
+            gpu_util = 0.0
+            if nvml_inited and nvml_handle is not None:
+                try:
+                    util = pynvml.nvmlDeviceGetUtilizationRates(nvml_handle)
+                    gpu_util = float(util.gpu)
+                except:
+                    gpu_util = 0.0
+            vram_percent = 0.0
             if torch.cuda.is_available():
-                total_vram = float(torch.cuda.get_device_properties(0).total_memory)
-                if total_vram > 0:
-                    allocated = float(torch.cuda.memory_allocated(0))
-                    vram = allocated / total_vram * 100.0
-            load = max(cpu, mem, vram)
+                allocated = float(torch.cuda.memory_allocated(0))
+                total = float(torch.cuda.get_device_properties(0).total_memory)
+                if total > 0:
+                    vram_percent = allocated / total * 100.0
+                if allocated > vram_limit_bytes:
+                    raise RuntimeError("VRAM limit exceeded")
+            load = max(cpu, mem_percent, gpu_util, vram_percent)
             if load > 61.8:
                 if freq > 1:
                     freq -= 1
@@ -237,6 +315,8 @@ def main():
                 last_pred = None
                 prev_loss = None
             else:
+                if ctx["stop"]:
+                    break
                 s_raw = np.array(pyautogui.screenshot())
                 s_s = cv2.resize(cv2.cvtColor(s_raw, cv2.COLOR_RGB2BGR), (t_w, t_h))
                 nx = float(screen_w) if screen_w > 0 else 1.0
@@ -263,9 +343,13 @@ def main():
                             rew = -1.0
                         prev_loss = diff
                 pkt = {"t": time.time(), "r": rew, "s": s_s, "m": m_vec}
-                file_path = os.path.join(pool_dir, f"{time.time_ns()}.pkl")
+                file_path = os.path.join(pool_dir, str(time.time_ns()) + ".pkl")
                 with open(file_path, "wb") as f:
                     pickle.dump(pkt, f)
+                size = os.path.getsize(file_path)
+                ctx["pool_size"] += size
+                update_size_file()
+                trim_pool_if_needed()
                 buf_img.append(s_s)
                 buf_mouse.append(m_vec)
                 if len(buf_img) > seq_len:
@@ -277,10 +361,20 @@ def main():
                     with torch.no_grad():
                         last_pred, pm = net(seq_s, seq_m)
                     if ctx["mode"] == "ACTIVE":
+                        if ctx["stop"]:
+                            break
                         cx = pm[0, 0].item()
                         cy = pm[0, 1].item()
-                        tx = max(0, min(screen_w - 1, int(cx * screen_w)))
-                        ty = max(0, min(screen_h - 1, int(cy * screen_h)))
+                        tx = int(cx * screen_w)
+                        ty = int(cy * screen_h)
+                        if tx < 0:
+                            tx = 0
+                        if tx > screen_w - 1:
+                            tx = screen_w - 1
+                        if ty < 0:
+                            ty = 0
+                        if ty > screen_h - 1:
+                            ty = screen_h - 1
                         noise_x = random.gauss(0.0, 5.0)
                         noise_y = random.gauss(0.0, 5.0)
                         pyautogui.moveTo(tx + noise_x, ty + noise_y, duration=0.01)
@@ -296,9 +390,19 @@ def main():
                 freq = 1
             sleep_time = 1.0 / float(freq)
             if elapsed < sleep_time:
-                time.sleep(sleep_time - elapsed)
+                end_time = time.time() + (sleep_time - elapsed)
+                while not ctx["stop"] and time.time() < end_time:
+                    remaining = end_time - time.time()
+                    if remaining <= 0:
+                        break
+                    interval = 0.01
+                    if remaining < interval:
+                        interval = remaining
+                    time.sleep(interval)
         ml.stop()
         kl.stop()
+        if nvml_inited:
+            pynvml.nvmlShutdown()
     except Exception:
         traceback.print_exc()
         sys.exit(1)
