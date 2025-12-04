@@ -31,9 +31,8 @@ def main():
         desktop = os.path.join(os.path.expanduser("~"), "Desktop")
         base_dir = os.path.join(desktop, "AAA")
         pool_dir = os.path.join(base_dir, "经验池")
-        old_pool_dir = os.path.join(base_dir, "experience_pool")
         model_dir = os.path.join(base_dir, "ai_models")
-        for d in [base_dir, pool_dir, old_pool_dir, model_dir]:
+        for d in [base_dir, pool_dir, model_dir]:
             os.makedirs(d, exist_ok=True)
         size_file = os.path.join(base_dir, "pool_size.txt")
         screen_w, screen_h = pyautogui.size()
@@ -63,13 +62,12 @@ def main():
         proc = psutil.Process(os.getpid())
         def list_pool_files():
             files = []
-            for d in [pool_dir, old_pool_dir]:
-                if os.path.isdir(d):
-                    for name in os.listdir(d):
-                        if name.endswith(".pkl"):
-                            path = os.path.join(d, name)
-                            ctime = os.path.getctime(path)
-                            files.append((ctime, path))
+            if os.path.isdir(pool_dir):
+                for name in os.listdir(pool_dir):
+                    if name.endswith(".pkl"):
+                        path = os.path.join(pool_dir, name)
+                        ctime = os.path.getctime(path)
+                        files.append((ctime, path))
             files.sort(key=lambda x: x[0])
             return [p for _, p in files]
         def compute_pool_size():
@@ -104,19 +102,37 @@ def main():
                 update_size_file()
                 if ctx["pool_size"] <= pool_limit_bytes:
                     break
-        def normalize_m(sample, base_time):
-            raw_m = sample.get("m", [])
-            reward_norm = (float(sample.get("r", 0.0)) + 1.0) / 2.0
-            time_raw = float(sample.get("t", base_time)) - base_time
-            if time_raw < 0:
-                time_raw = 0.0
-            time_norm = min(1.0, time_raw / 600.0)
-            core = list(raw_m[:8])
-            if len(core) < 8:
-                core.extend([0.0] * (8 - len(core)))
-            core.extend([reward_norm, time_norm])
-            return core[:m_dim]
-        m_dim = 10
+        def normalize_seq(samples, seq_start=None, seq_end=None):
+            if not samples:
+                return []
+            start = float(seq_start) if seq_start is not None else float(samples[0].get("t", 0.0))
+            end = float(seq_end) if seq_end is not None else float(samples[-1].get("t", start))
+            duration = max(end - start, 1e-6)
+            out = []
+            for s in samples:
+                m = s.get("m", {})
+                reward_norm = (float(s.get("r", 0.0)) + 1.0) / 2.0
+                time_raw = float(s.get("t", start))
+                time_norm = (time_raw - start) / duration
+                if time_norm < 0.0:
+                    time_norm = 0.0
+                if time_norm > 1.0:
+                    time_norm = 1.0
+                out.append([
+                    float(m.get("x", 0.0)),
+                    float(m.get("y", 0.0)),
+                    float(m.get("dx", 0.0)),
+                    float(m.get("dy", 0.0)),
+                    float(m.get("speed", 0.0)),
+                    float(m.get("l", 0.0)),
+                    float(m.get("r", 0.0)),
+                    float(m.get("dl", 0.0)),
+                    float(m.get("dr", 0.0)),
+                    reward_norm,
+                    time_norm
+                ])
+            return out
+        m_dim = 11
         class Net(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -159,6 +175,8 @@ def main():
             opt.load_state_dict(c["o"])
         else:
             torch.save({"n": net.state_dict(), "o": opt.state_dict()}, m_path)
+        root = tk.Tk()
+        root.withdraw()
         def on_mov(x, y):
             if ctx["stop"]:
                 return
@@ -197,50 +215,48 @@ def main():
         kl = keyboard.Listener(on_press=on_key)
         ml.start()
         kl.start()
-        start_time = time.time()
         freq = 10
         seq_len = 5
-        buf_img = []
-        buf_mouse = []
+        buf_samples = []
         last_pred = None
         prev_loss = None
+        chunk_buffer = []
+        chunk_target = random.randint(100, 500)
+        chunk_start = None
         def optimize_model():
-            root = tk.Tk()
-            root.attributes("-topmost", True)
-            root.overrideredirect(True)
-            root.geometry("360x90")
+            top = tk.Toplevel(root)
+            top.attributes("-topmost", True)
+            top.overrideredirect(True)
+            top.geometry("360x90")
             text_var = tk.StringVar()
-            label = ttk.Label(root, textvariable=text_var)
+            label = ttk.Label(top, textvariable=text_var)
             label.pack(pady=5)
-            pb = ttk.Progressbar(root, length=320, mode="determinate", maximum=100)
+            pb = ttk.Progressbar(top, length=320, mode="determinate", maximum=100)
             pb.pack(pady=5)
             text_var.set("优化中 0%")
             def on_escape(event):
                 ctx["stop"] = True
-                root.quit()
-            root.bind("<Escape>", on_escape)
-            root.update_idletasks()
-            root.update()
+                top.quit()
+            top.bind("<Escape>", on_escape)
+            top.update_idletasks()
+            top.update()
             try:
                 files = list_pool_files()
-                samples = []
+                samples = None
                 if files:
-                    max_files = min(len(files), 200)
-                    indices = np.random.choice(len(files), max_files, replace=False)
-                    for index in indices:
-                        if ctx["stop"]:
-                            break
-                        path = files[index]
-                        with open(path, "rb") as f:
-                            sample = pickle.load(f)
-                            sample["m"] = normalize_m(sample, start_time)
-                            samples.append(sample)
+                    path = random.choice(files)
+                    with open(path, "rb") as f:
+                        data = pickle.load(f)
+                        seq = data.get("samples", [])
+                        if seq:
+                            samples = seq
                 if ctx["stop"]:
                     return
                 if samples:
-                    samples.sort(key=lambda x: x["t"])
-                    while len(samples) <= seq_len + 1:
-                        samples.extend(samples)
+                    m_norm = normalize_seq(samples, data.get("start"), data.get("end"))
+                    if len(samples) > 1:
+                        if len(samples) != len(m_norm):
+                            m_norm = normalize_seq(samples, data.get("start"), data.get("end"))
                     net.train()
                     total_epochs = 5
                     for ep in range(total_epochs):
@@ -249,21 +265,20 @@ def main():
                         progress = int((ep + 1) * 100 / total_epochs)
                         pb["value"] = progress
                         text_var.set("优化中 " + str(progress) + "%")
-                        root.update_idletasks()
-                        root.update()
+                        top.update_idletasks()
+                        top.update()
                         if ctx["stop"]:
                             break
-                        max_start = len(samples) - seq_len - 1
-                        if max_start <= 0:
-                            start_index = 0
-                        else:
-                            start_index = random.randint(0, max_start)
-                        s_data = samples[start_index:start_index + seq_len]
-                        t_data = samples[start_index + seq_len]
-                        seq_s = torch.tensor(np.array([x["s"] for x in s_data]), dtype=torch.float32).permute(0, 3, 1, 2).unsqueeze(0).to(device) / 255.0
-                        seq_m = torch.tensor(np.array([x["m"] for x in s_data]), dtype=torch.float32).unsqueeze(0).to(device)
-                        target_s = torch.tensor(t_data["s"], dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device) / 255.0
-                        target_m = torch.tensor(t_data["m"], dtype=torch.float32).unsqueeze(0).to(device)
+                        if len(samples) < 2:
+                            continue
+                        seq_images = [x.get("s") for x in samples[:-1]]
+                        seq_mouse = m_norm[:-1]
+                        target_sample = samples[-1]
+                        target_mouse = m_norm[-1]
+                        seq_s = torch.tensor(np.array(seq_images), dtype=torch.float32).permute(0, 3, 1, 2).unsqueeze(0).to(device) / 255.0
+                        seq_m = torch.tensor(np.array(seq_mouse), dtype=torch.float32).unsqueeze(0).to(device)
+                        target_s = torch.tensor(target_sample["s"], dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device) / 255.0
+                        target_m = torch.tensor(np.array(target_mouse), dtype=torch.float32).unsqueeze(0).to(device)
                         opt.zero_grad()
                         pred_s, pred_m = net(seq_s, seq_m)
                         loss_s = nn.MSELoss()(pred_s, target_s)
@@ -277,8 +292,10 @@ def main():
                 ctx["pool_size"] = compute_pool_size()
                 update_size_file()
                 trim_pool_if_needed()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             finally:
-                root.destroy()
+                top.destroy()
         while not ctx["stop"]:
             loop_start = time.time()
             if ctx["stop"]:
@@ -326,8 +343,7 @@ def main():
                     break
                 ctx["mode"] = "ACTIVE"
                 ctx["act_start"] = time.time()
-                buf_img = []
-                buf_mouse = []
+                buf_samples = []
                 last_pred = None
                 prev_loss = None
             else:
@@ -358,25 +374,33 @@ def main():
                             rew = -1.0
                         prev_loss = diff
                 cur_time = time.time()
-                m_vec = normalize_m({"m": [mx, my, mdx, mdy, mlp, mrp, both_down, both_up], "r": rew, "t": cur_time}, start_time)
-                pkt = {"t": cur_time, "r": rew, "s": s_s, "m": m_vec}
-                file_path = os.path.join(pool_dir, str(time.time_ns()) + ".pkl")
-                with open(file_path, "wb") as f:
-                    pickle.dump(pkt, f)
-                size = os.path.getsize(file_path)
-                ctx["pool_size"] += size
-                update_size_file()
-                trim_pool_if_needed()
-                buf_img.append(s_s)
-                buf_mouse.append(m_vec)
-                if len(buf_img) > seq_len:
-                    buf_img.pop(0)
-                    buf_mouse.pop(0)
-                if len(buf_img) == seq_len:
-                    seq_s = torch.tensor(np.array(buf_img), dtype=torch.float32).permute(0, 3, 1, 2).unsqueeze(0).to(device) / 255.0
-                    seq_m = torch.tensor(np.array(buf_mouse), dtype=torch.float32).unsqueeze(0).to(device)
+                speed = (mdx ** 2 + mdy ** 2) ** 0.5
+                sample = {"t": cur_time, "r": rew, "s": s_s, "m": {"x": mx, "y": my, "dx": mdx, "dy": mdy, "speed": speed, "l": mlp, "r": mrp, "dl": both_down, "dr": both_up}}
+                if chunk_start is None:
+                    chunk_start = cur_time
+                chunk_buffer.append(sample)
+                if len(chunk_buffer) >= chunk_target:
+                    chunk_data = {"start": chunk_start, "end": chunk_buffer[-1]["t"], "samples": list(chunk_buffer)}
+                    file_path = os.path.join(pool_dir, str(time.time_ns()) + ".pkl")
+                    with open(file_path, "wb") as f:
+                        pickle.dump(chunk_data, f)
+                    size = os.path.getsize(file_path)
+                    ctx["pool_size"] += size
+                    update_size_file()
+                    trim_pool_if_needed()
+                    chunk_buffer.clear()
+                    chunk_target = random.randint(100, 500)
+                    chunk_start = None
+                buf_samples.append(sample)
+                if len(buf_samples) > seq_len:
+                    buf_samples = buf_samples[-seq_len:]
+                if len(buf_samples) >= 1 and len(buf_samples) >= seq_len:
+                    seq_window = buf_samples[-max(1, seq_len):]
+                    seq_m = normalize_seq(seq_window)
+                    seq_s = torch.tensor(np.array([x["s"] for x in seq_window]), dtype=torch.float32).permute(0, 3, 1, 2).unsqueeze(0).to(device) / 255.0
+                    seq_m_t = torch.tensor(np.array(seq_m), dtype=torch.float32).unsqueeze(0).to(device)
                     with torch.no_grad():
-                        last_pred, pm = net(seq_s, seq_m)
+                        last_pred, pm = net(seq_s, seq_m_t)
                     if ctx["mode"] == "ACTIVE":
                         if ctx["stop"]:
                             break
@@ -395,9 +419,9 @@ def main():
                             ty = screen_h - 1
                         noise_x = random.gauss(0.0, 5.0)
                         noise_y = random.gauss(0.0, 5.0)
-                        pyautogui.moveTo(tx + noise_x, ty + noise_y, duration=0.01)
-                        lp = pm_mapped[4].item()
-                        rp = pm_mapped[5].item()
+                        pyautogui.moveTo(tx + noise_x, ty + noise_y)
+                        lp = pm_mapped[5].item()
+                        rp = pm_mapped[6].item()
                         if lp > 0.5:
                             pyautogui.mouseDown()
                             pyautogui.mouseUp()
@@ -417,6 +441,15 @@ def main():
                     if remaining < interval:
                         interval = remaining
                     time.sleep(interval)
+        if chunk_buffer:
+            chunk_data = {"start": chunk_start if chunk_start is not None else time.time(), "end": chunk_buffer[-1]["t"], "samples": list(chunk_buffer)}
+            file_path = os.path.join(pool_dir, str(time.time_ns()) + ".pkl")
+            with open(file_path, "wb") as f:
+                pickle.dump(chunk_data, f)
+            size = os.path.getsize(file_path)
+            ctx["pool_size"] += size
+            update_size_file()
+            trim_pool_if_needed()
         ml.stop()
         kl.stop()
         if nvml_inited:
