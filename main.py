@@ -204,6 +204,7 @@ reward_history = deque(maxlen=128)
 debug_screen_novelties = []
 vram_near_limit = False
 window_ref = None
+preheat_deadline = time.time()
 
 def apply_config():
     global current_fps, current_scale, resolution_factor, temporal_context_window
@@ -260,9 +261,11 @@ def persist_config():
 
 def tune_survival_penalty():
     global debug_screen_novelties
-    if len(debug_screen_novelties) < 30:
+    with mode_lock:
+        novelties_snapshot = list(debug_screen_novelties)
+    if len(novelties_snapshot) < 30:
         return False
-    avg_screen = sum(debug_screen_novelties) / len(debug_screen_novelties)
+    avg_screen = sum(novelties_snapshot) / len(novelties_snapshot)
     config_data["learning"]["survival_penalty"] = clamp_value(avg_screen, 0.0, 100.0)
     persist_config()
     return True
@@ -282,14 +285,17 @@ def destroy_overlay():
         QtCore.QTimer.singleShot(0, window_ref.destroy_overlay)
 
 def start_debug_mode():
-    global global_mode, global_pause_recording, reward_history, debug_screen_novelties
-    reward_history.clear()
-    debug_screen_novelties = []
-    global_mode = "debug"
-    global_pause_recording = False
+    global global_mode, global_pause_recording, reward_history, debug_screen_novelties, preheat_deadline
+    with mode_lock:
+        reward_history.clear()
+        debug_screen_novelties = []
+        preheat_deadline = time.time() + 10.0
+        global_mode = "preheat"
+        global_pause_recording = True
     gc.collect()
 
 lock = threading.Lock()
+mode_lock = threading.Lock()
 mouse_left_down = False
 mouse_right_down = False
 
@@ -891,14 +897,20 @@ class ModeController(threading.Thread):
     def run(self):
         global global_mode, global_pause_recording
         while global_running:
-            if global_mode == "active" and not global_optimizing:
-                if time.time() - last_debug_end > 60:
-                    global_mode = "sleep"
-                    global_pause_recording = True
+            with mode_lock:
+                mode_snapshot = global_mode
+                pause_snapshot = global_pause_recording
+                optimizing_snapshot = global_optimizing
+                debug_elapsed = time.time() - last_debug_end
+            if mode_snapshot == "active" and not optimizing_snapshot:
+                if debug_elapsed > 60:
+                    with mode_lock:
+                        global_mode = "sleep"
+                        global_pause_recording = True
                     self.gui.optimize_request_signal.emit()
-            elif global_mode == "sleep" and not global_optimizing and not global_pause_recording:
+            elif mode_snapshot == "sleep" and not optimizing_snapshot and not pause_snapshot:
                 self.gui.debug_mode_signal.emit()
-            if global_mode != "sleep" and self.gui.isVisible():
+            if mode_snapshot != "sleep" and self.gui.isVisible():
                 self.gui.hide()
             time.sleep(1)
 
@@ -912,10 +924,27 @@ class AgentThread(threading.Thread):
         context_mice = deque(maxlen=config_data["resource"]["max_context"])
         last_cache_clear = time.time()
         while global_running:
-            if global_mode == "sleep":
+            with mode_lock:
+                mode_snapshot = global_mode
+                pause_snapshot = global_pause_recording
+                preheat_snapshot = preheat_deadline
+            if mode_snapshot == "sleep":
                 time.sleep(0.5)
                 continue
-            if global_optimizing or global_pause_recording:
+            if global_optimizing or pause_snapshot:
+                if mode_snapshot == "preheat" and time.time() >= preheat_snapshot:
+                    with mode_lock:
+                        global_mode = "debug"
+                        global_pause_recording = False
+                    continue
+                if mode_snapshot == "preheat":
+                    with lock:
+                        fps = current_fps
+                    rand_x = random.randint(-screen_width // 2, screen_width // 2)
+                    rand_y = random.randint(-screen_height // 2, screen_height // 2)
+                    move_mouse(float(rand_x), float(rand_y), random.randint(0, 2))
+                    time.sleep(max(0, (1.0 / max(1, fps))))
+                    continue
                 time.sleep(0.1)
                 continue
             start_time = time.time()
@@ -979,13 +1008,18 @@ class AgentThread(threading.Thread):
             survival_penalty = config_data["learning"]["survival_penalty"]
             reward = screen_novelty * action_novelty - survival_penalty
             td_error = abs(reward) + novelty_total
-            if global_mode == "active" and not global_pause_recording:
+            with mode_lock:
+                active_snapshot = global_mode == "active" and not global_pause_recording
+                debug_snapshot = global_mode == "debug"
+            if active_snapshot:
                 exp_buffer.add(rgb_tensor.detach(), mouse_tensor.detach().cpu(), reward, td_error, screen_novelty, latent.detach())
-            reward_history.append(reward)
-            if global_mode == "debug":
-                debug_screen_novelties.append(screen_novelty)
-                if len(debug_screen_novelties) > 1024:
-                    debug_screen_novelties.pop(0)
+            with mode_lock:
+                reward_history.append(reward)
+            if debug_snapshot:
+                with mode_lock:
+                    debug_screen_novelties.append(screen_novelty)
+                    if len(debug_screen_novelties) > 1024:
+                        debug_screen_novelties.pop(0)
                 rand_x = random.randint(-screen_width // 2, screen_width // 2)
                 rand_y = random.randint(-screen_height // 2, screen_height // 2)
                 policy_mouse[:, 0] = float(rand_x)
@@ -993,9 +1027,10 @@ class AgentThread(threading.Thread):
                 pred_status_idx = random.randint(0, 2)
                 tuned = tune_survival_penalty()
                 if tuned:
-                    global_mode = "active"
-                    global_pause_recording = False
-                    last_debug_end = time.time()
+                    with mode_lock:
+                        global_mode = "active"
+                        global_pause_recording = False
+                        last_debug_end = time.time()
                     destroy_overlay()
                     hide_overlay()
             policy_np = np.nan_to_num(policy_mouse.cpu().numpy()[0])
@@ -1116,6 +1151,7 @@ class SciFiWindow(QtWidgets.QWidget):
     @QtCore.pyqtSlot()
     def enter_debug_mode(self):
         start_debug_mode()
+        self.destroy_overlay()
         overlay_widget = self.ensure_overlay()
         screen_obj = QtWidgets.QApplication.primaryScreen()
         if screen_obj is not None:
