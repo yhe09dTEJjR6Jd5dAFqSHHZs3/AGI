@@ -281,24 +281,13 @@ def destroy_overlay():
     if window_ref is not None and hasattr(window_ref, "destroy_overlay"):
         QtCore.QTimer.singleShot(0, window_ref.destroy_overlay)
 
-def start_debug_mode(gui_window):
+def start_debug_mode():
     global global_mode, global_pause_recording, reward_history, debug_screen_novelties
     reward_history.clear()
     debug_screen_novelties = []
     global_mode = "debug"
     global_pause_recording = False
-    if window_ref is not None and hasattr(window_ref, "ensure_overlay"):
-        overlay_widget = window_ref.ensure_overlay()
-        screen_obj = QtWidgets.QApplication.primaryScreen()
-        if screen_obj is not None:
-            geo = screen_obj.geometry()
-            overlay_widget.setGeometry(geo.x(), geo.y(), geo.width(), geo.height())
-        else:
-            overlay_widget.setGeometry(0, 0, screen_width, screen_height)
-    show_overlay()
-    gui_window.hide()
-    gui_window.status_signal.emit("系统：调试模式")
-    gui_window.info_signal.emit("调试模式：黑屏覆盖，采集新颖度")
+    gc.collect()
 
 lock = threading.Lock()
 mouse_left_down = False
@@ -908,7 +897,7 @@ class ModeController(threading.Thread):
                     global_pause_recording = True
                     self.gui.optimize_request_signal.emit()
             elif global_mode == "sleep" and not global_optimizing and not global_pause_recording:
-                start_debug_mode(self.gui)
+                self.gui.debug_mode_signal.emit()
             if global_mode != "sleep" and self.gui.isVisible():
                 self.gui.hide()
             time.sleep(1)
@@ -934,7 +923,12 @@ class AgentThread(threading.Thread):
                 fps = current_fps
                 window_len = temporal_context_window
             monitor = {"top": 0, "left": 0, "width": screen_width, "height": screen_height}
-            shot = sct.grab(monitor)
+            try:
+                shot = sct.grab(monitor)
+            except Exception:
+                sct = mss.mss()
+                time.sleep(0.05)
+                continue
             img_np = np.frombuffer(shot.raw, dtype=np.uint8).reshape(shot.height, shot.width, 4)
             img_np = cv2.cvtColor(img_np, cv2.COLOR_BGRA2RGB)
             target_w = VISION_WIDTH
@@ -1021,6 +1015,7 @@ class SciFiWindow(QtWidgets.QWidget):
     progress_signal = QtCore.pyqtSignal(int)
     exit_signal = QtCore.pyqtSignal()
     optimize_request_signal = QtCore.pyqtSignal()
+    debug_mode_signal = QtCore.pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -1038,6 +1033,7 @@ class SciFiWindow(QtWidgets.QWidget):
         self.progress_signal.connect(self.progress.setValue)
         self.exit_signal.connect(self.close)
         self.optimize_request_signal.connect(self.trigger_optimization)
+        self.debug_mode_signal.connect(self.enter_debug_mode)
 
     def center(self):
         frame = self.frameGeometry()
@@ -1116,6 +1112,23 @@ class SciFiWindow(QtWidgets.QWidget):
         if self.overlay is not None:
             self.overlay.close()
             self.overlay = None
+
+    @QtCore.pyqtSlot()
+    def enter_debug_mode(self):
+        start_debug_mode()
+        overlay_widget = self.ensure_overlay()
+        screen_obj = QtWidgets.QApplication.primaryScreen()
+        if screen_obj is not None:
+            geo = screen_obj.geometry()
+            overlay_widget.setGeometry(geo.x(), geo.y(), geo.width(), geo.height())
+        else:
+            overlay_widget.setGeometry(0, 0, screen_width, screen_height)
+        overlay_widget.showFullScreen()
+        overlay_widget.raise_()
+        overlay_widget.activateWindow()
+        self.hide()
+        self.status_signal.emit("系统：调试模式")
+        self.info_signal.emit("调试模式：黑屏覆盖，采集新颖度")
 
     @QtCore.pyqtSlot()
     def trigger_optimization(self):
@@ -1246,7 +1259,7 @@ class SciFiWindow(QtWidgets.QWidget):
         global global_optimizing, global_pause_recording
         global_optimizing = False
         global_pause_recording = False
-        start_debug_mode(self)
+        self.enter_debug_mode()
         self.hide()
 
 class InputHandler:
@@ -1287,7 +1300,7 @@ if __name__ == "__main__":
     mouse_right_down = init_status in (2, 3)
     window = SciFiWindow()
     window_ref = window
-    start_debug_mode(window)
+    window.enter_debug_mode()
     monitor_thread = ResourceMonitor()
     monitor_thread.start()
     mode_thread = ModeController(window)
