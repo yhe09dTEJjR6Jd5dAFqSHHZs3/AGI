@@ -50,6 +50,7 @@ if importlib.util.find_spec("nvidia_ml_py"):
 elif importlib.util.find_spec("pynvml"):
     nvml_module = importlib.import_module("pynvml")
 gpu_handle = None
+nvml_failures = 0
 if nvml_module:
     try:
         nvml_module.nvmlInit()
@@ -146,14 +147,18 @@ if os.path.exists(os.path.join(model_dir, "latest.pth")):
     except: pass
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 scaler = GradScaler(enabled=(device.type=="cuda"))
-mean_tensor = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-std_tensor = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-
 def normalize_image(img):
-    tensor = torch.FloatTensor(img).permute(2, 0, 1) / 255.0
-    return (tensor - mean_tensor) / std_tensor
+    return torch.FloatTensor(img).permute(2, 0, 1) / 255.0
 
 def schedule_move(end_pos, duration=0.15, steps=20):
+    with state.lock:
+        plan = state.move_plan
+    if plan:
+        remaining = (time.time() - plan["start_time"]) < plan["duration"]
+        dx = plan["end"][0] - end_pos[0]
+        dy = plan["end"][1] - end_pos[1]
+        if remaining and (dx * dx + dy * dy) ** 0.5 < 50:
+            return advance_move()
     sx, sy = pyautogui.position()
     ex, ey = end_pos
     steps = max(2, steps)
@@ -282,7 +287,9 @@ def save_template(label):
     if img is None:
         return
     hist = calc_histogram(img)
-    data = {"label": label, "hist": hist, "id": str(uuid.uuid4())}
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    thumb = cv2.resize(gray, (32, 32))
+    data = {"label": label, "hist": hist, "thumb": thumb, "id": str(uuid.uuid4())}
     fpath = os.path.join(template_dir, f"template_{data['id']}.pkl")
     try:
         with open(fpath, 'wb') as f:
@@ -294,8 +301,11 @@ def save_template(label):
 
 def detect_result(img):
     hist = calc_histogram(img)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    thumb = cv2.resize(gray, (32, 32))
     best = None
     best_score = -1
+    best_mse = None
     with state.lock:
         templates = list(state.templates)
     for tpl in templates:
@@ -303,11 +313,21 @@ def detect_result(img):
         if tpl_hist is None:
             continue
         score = cv2.compareHist(hist.astype('float32'), np.array(tpl_hist, dtype='float32'), cv2.HISTCMP_CORREL)
-        if score > best_score:
-            best_score = score
+        tpl_thumb = tpl.get('thumb')
+        mse = None
+        if tpl_thumb is not None:
+            tpl_arr = np.array(tpl_thumb, dtype=np.float32)
+            mse = float(np.mean((tpl_arr - thumb.astype(np.float32)) ** 2))
+        combined = score if mse is None else score - mse / 5000.0
+        if combined > best_score:
+            best_score = combined
             best = tpl.get('label')
-    if best_score >= 0.3:
-        return best
+            best_mse = mse
+    if best is not None:
+        if best_mse is None and best_score >= 0.3:
+            return best
+        if best_mse is not None and best_score >= 0.1 and best_mse < 2000:
+            return best
     mean_intensity = img.mean()
     if mean_intensity > 180:
         return "WIN"
@@ -412,22 +432,39 @@ def get_mouse_action(ts):
                     action = 2
                 break
     with state.lock:
-        state.mouse_events = [ev for ev in state.mouse_events if ev.get("end_time", ts) >= ts - 5]
+        state.mouse_events = [ev for ev in state.mouse_events if (ev.get("end_time") if ev.get("end_time") is not None else ts) >= ts - 5]
     return action, btn
 
 def monitor_resources():
+    global nvml_failures, nvml_module, gpu_handle
     while state.is_running:
         try:
             cpu = psutil.cpu_percent()
             mem = psutil.virtual_memory().percent
+            gpu = 0
+            vram = 0
             if nvml_module and gpu_handle:
-                nv_info = nvml_module.nvmlDeviceGetUtilizationRates(gpu_handle)
-                mem_info = nvml_module.nvmlDeviceGetMemoryInfo(gpu_handle)
-                gpu = nv_info.gpu
-                vram = (mem_info.used / mem_info.total) * 100
-            else:
-                gpu = 0
-                vram = 0
+                try:
+                    nv_info = nvml_module.nvmlDeviceGetUtilizationRates(gpu_handle)
+                    mem_info = nvml_module.nvmlDeviceGetMemoryInfo(gpu_handle)
+                    gpu = nv_info.gpu
+                    vram = (mem_info.used / mem_info.total) * 100
+                    nvml_failures = 0
+                except Exception:
+                    nvml_failures += 1
+                    if nvml_failures > 3:
+                        nvml_failures = 0
+                        gpu = 0
+                        vram = 0
+                        try:
+                            nvml_module.nvmlShutdown()
+                        except Exception:
+                            pass
+                        nvml_module = None
+                        gpu_handle = None
+                    else:
+                        gpu = 0
+                        vram = 0
             M = max(cpu, mem, gpu, vram)
             with state.lock:
                 state.resource_stats = {"cpu": cpu, "mem": mem, "gpu": gpu, "vram": vram, "fps": state.fps, "seq": state.seq_len}
