@@ -22,6 +22,7 @@ import numpy as np
 import cv2
 import mss
 import torch
+from torch.cuda.amp import autocast, GradScaler
 import torch.nn as nn
 import torch.optim as optim
 import psutil
@@ -131,12 +132,27 @@ if os.path.exists(os.path.join(model_dir, "latest.pth")):
         model.load_state_dict(torch.load(os.path.join(model_dir, "latest.pth")))
     except: pass
 optimizer = optim.Adam(model.parameters(), lr=0.001)
+scaler = GradScaler(enabled=(device.type=="cuda"))
 mean_tensor = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 std_tensor = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
 def normalize_image(img):
     tensor = torch.FloatTensor(img).permute(2, 0, 1) / 255.0
     return (tensor - mean_tensor) / std_tensor
+
+def move_bezier(start_pos, end_pos, duration=0.15, steps=20):
+    sx, sy = start_pos
+    ex, ey = end_pos
+    steps = max(2, steps)
+    cp1 = (sx + (ex - sx) * 0.3 + random.uniform(-20, 20), sy + (ey - sy) * 0.3 + random.uniform(-20, 20))
+    cp2 = (sx + (ex - sx) * 0.7 + random.uniform(-20, 20), sy + (ey - sy) * 0.7 + random.uniform(-20, 20))
+    interval = duration / steps
+    for i in range(steps + 1):
+        t = i / steps
+        x = (1 - t) ** 3 * sx + 3 * (1 - t) ** 2 * t * cp1[0] + 3 * (1 - t) * t ** 2 * cp2[0] + t ** 3 * ex
+        y = (1 - t) ** 3 * sy + 3 * (1 - t) ** 2 * t * cp1[1] + 3 * (1 - t) * t ** 2 * cp2[1] + t ** 3 * ey
+        pyautogui.moveTo(int(x), int(y))
+        time.sleep(interval)
 
 def get_window_handle():
     user32 = ctypes.windll.user32
@@ -363,7 +379,74 @@ def worker_thread():
     criterion = nn.CrossEntropyLoss()
 
     def align_episode(steps):
-        return steps
+        frames = []
+        events = []
+        for st in steps:
+            if st.get('type') == 'frame':
+                frames.append(st)
+            elif st.get('type') == 'click':
+                st_time = st.get('start_time') or st.get('timestamp') or st.get('end_time') or 0
+                ed_time = st.get('end_time') or st_time
+                events.append({**st, 'start_time': st_time, 'end_time': ed_time})
+        frames.sort(key=lambda x: x.get('timestamp', 0))
+        events.sort(key=lambda x: x.get('start_time', 0))
+        ai_events = []
+        cur_event = None
+        for f in frames:
+            ts = f.get('timestamp', 0)
+            act = f.get('action')
+            btn = f.get('button', 0)
+            pos = f.get('pos') or f.get('start_pos') or (0, 0)
+            if btn or (act is not None and act != 0):
+                if cur_event is None:
+                    cur_event = {'start_time': ts, 'end_time': ts, 'start_pos': tuple(pos), 'end_pos': tuple(pos), 'button': btn or 1}
+                else:
+                    cur_event['end_time'] = ts
+                    cur_event['end_pos'] = tuple(pos)
+            else:
+                if cur_event:
+                    ai_events.append(cur_event)
+                    cur_event = None
+        if cur_event:
+            ai_events.append(cur_event)
+        events.extend(ai_events)
+        events.sort(key=lambda x: x.get('start_time', 0))
+        enriched = []
+        for f in frames:
+            ts = f.get('timestamp', 0)
+            matched = None
+            for ev in events:
+                st = ev.get('start_time', 0)
+                et = ev.get('end_time', st)
+                if st <= ts <= et:
+                    matched = ev
+                    break
+            btn_flag = f.get('button', 0)
+            action_flag = f.get('action', 0)
+            pos = f.get('pos') or (0, 0)
+            traj = f.get('trajectory') if f.get('trajectory') is not None else []
+            if matched:
+                st = matched.get('start_time', ts)
+                et = matched.get('end_time', st)
+                ratio = 0 if et == st else min(1, max(0, (ts - st) / (et - st)))
+                sp = matched.get('start_pos', pos) or pos
+                ep = matched.get('end_pos', pos) or pos
+                ix = int(sp[0] + (ep[0] - sp[0]) * ratio)
+                iy = int(sp[1] + (ep[1] - sp[1]) * ratio)
+                pos = (ix, iy)
+                traj = [sp, ep]
+                btn_flag = matched.get('button', 1)
+                if et - st > 0.2:
+                    if ratio < 0.1:
+                        action_flag = 1
+                    elif ratio > 0.9:
+                        action_flag = 0
+                    else:
+                        action_flag = 2
+                else:
+                    action_flag = 1
+            enriched.append({**f, 'pos': pos, 'button': btn_flag, 'action': action_flag, 'trajectory': traj})
+        return enriched
 
     while state.is_running:
         try:
@@ -409,7 +492,7 @@ def worker_thread():
                         state.current_episode_id = str(uuid.uuid4())
                     x, y = pyautogui.position()
                     press_time = state.mouse_state["start_time"] if btn_flag else None
-                add_step({"type": "frame", "timestamp": ts, "pos": (x, y), "button": btn_flag, "press_time": press_time, "screen_jpg": img_bytes, "source": "HUMAN", "episode": state.current_episode_id, "action": action_flag})
+                add_step({"type": "frame", "timestamp": ts, "pos": (x, y), "button": btn_flag, "press_time": press_time, "mouse_pressed": state.mouse_state["pressed"], "mouse_start_pos": state.mouse_state["start_pos"], "mouse_start_time": state.mouse_state["start_time"], "screen_jpg": img_bytes, "source": "HUMAN", "episode": state.current_episode_id, "action": action_flag})
                 elapsed = time.time() - start_time
                 sleep_time = max(0, (1.0 / state.fps) - elapsed)
                 time.sleep(sleep_time)
@@ -433,19 +516,44 @@ def worker_thread():
                 action = torch.argmax(act).item()
                 pred_result = torch.argmax(res).item()
 
-                pyautogui.moveTo(mx, my)
-                if action == 1:
+                current_pos = pyautogui.position()
+                now_time = time.time()
+                if action == 2:
+                    with state.lock:
+                        holding = state.ai_button_down
+                    if not holding:
+                        pyautogui.mouseDown()
+                        with state.lock:
+                            state.ai_button_down = True
+                            state.mouse_state["pressed"] = True
+                            state.mouse_state["start_pos"] = current_pos
+                            state.mouse_state["start_time"] = now_time
+                    move_bezier(current_pos, (mx, my), duration=0.12)
+                elif action == 1:
+                    with state.lock:
+                        holding = state.ai_button_down
+                    if holding:
+                        pyautogui.mouseUp()
+                        with state.lock:
+                            state.ai_button_down = False
+                            state.mouse_state["pressed"] = False
+                    move_bezier(current_pos, (mx, my), duration=0.12)
                     pyautogui.click()
                     with state.lock:
-                        state.ai_button_down = False
-                elif action == 2:
-                    pyautogui.mouseDown()
-                    with state.lock:
-                        state.ai_button_down = True
+                        state.mouse_state["pressed"] = False
+                        state.mouse_state["start_pos"] = (mx, my)
+                        state.mouse_state["start_time"] = now_time
                 else:
-                    pyautogui.mouseUp()
+                    with state.lock:
+                        holding = state.ai_button_down
+                    move_bezier(current_pos, (mx, my), duration=0.12)
+                    if holding:
+                        pyautogui.mouseUp()
                     with state.lock:
                         state.ai_button_down = False
+                        state.mouse_state["pressed"] = False
+                        state.mouse_state["start_pos"] = None
+                        state.mouse_state["start_time"] = None
 
                 with state.lock:
                     btn_flag = 1 if state.ai_button_down else 0
@@ -467,7 +575,7 @@ def worker_thread():
                             fallback = "LOSS"
                         else:
                             fallback = "DRAW"
-                add_step({"type": "frame", "timestamp": ts, "pos": (mx, my), "action": action, "button": btn_flag, "screen_jpg": img_bytes, "source": "AI", "episode": state.current_episode_id})
+                add_step({"type": "frame", "timestamp": ts, "pos": (mx, my), "action": action, "button": btn_flag, "mouse_pressed": btn_flag, "mouse_start_pos": state.mouse_state.get("start_pos"), "mouse_start_time": state.mouse_state.get("start_time"), "screen_jpg": img_bytes, "source": "AI", "episode": state.current_episode_id})
 
                 if current_mode == "PRACTICAL":
                     res_map = {1: "WIN", 2: "LOSS"}
@@ -551,29 +659,28 @@ def worker_thread():
                     if not frames:
                         continue
                     data_tensor = torch.stack(frames).unsqueeze(0).to(device)
-                    mx_pred, my_pred, act_pred, res_pred, _ = model(data_tensor)
-
-                    target_step = seq_data[-1]
-                    if 'pos' in target_step:
-                        tx = target_step['pos'][0] / screen_w
-                        ty = target_step['pos'][1] / screen_h
-                    elif 'start_pos' in target_step:
-                        tx = target_step['start_pos'][0] / screen_w
-                        ty = target_step['start_pos'][1] / screen_h
-                    else:
-                        tx = 0.5
-                        ty = 0.5
-
-                    action_label = target_step.get('action', 2 if target_step.get('button', 0) == 1 else 0)
-                    res_map = {"WIN": 1, "LOSS": 2}
-                    res_label = res_map.get(seq_res, 0)
-
-                    pos_loss = ((mx_pred - torch.tensor([[tx]], device=device)) ** 2 + (my_pred - torch.tensor([[ty]], device=device)) ** 2).mean()
-                    act_loss = criterion(act_pred, torch.tensor([action_label], device=device))
-                    res_loss = criterion(res_pred, torch.tensor([res_label], device=device))
-                    loss = pos_loss + act_loss + res_loss
-                    loss.backward()
-                    optimizer.step()
+                    with autocast(enabled=(device.type=="cuda")):
+                        mx_pred, my_pred, act_pred, res_pred, _ = model(data_tensor)
+                        target_step = seq_data[-1]
+                        if 'pos' in target_step:
+                            tx = target_step['pos'][0] / screen_w
+                            ty = target_step['pos'][1] / screen_h
+                        elif 'start_pos' in target_step:
+                            tx = target_step['start_pos'][0] / screen_w
+                            ty = target_step['start_pos'][1] / screen_h
+                        else:
+                            tx = 0.5
+                            ty = 0.5
+                        action_label = target_step.get('action', 2 if target_step.get('button', 0) == 1 else 0)
+                        res_map = {"WIN": 1, "LOSS": 2}
+                        res_label = res_map.get(seq_res, 0)
+                        pos_loss = ((mx_pred - torch.tensor([[tx]], device=device)) ** 2 + (my_pred - torch.tensor([[ty]], device=device)) ** 2).mean()
+                        act_loss = criterion(act_pred, torch.tensor([action_label], device=device))
+                        res_loss = criterion(res_pred, torch.tensor([res_label], device=device))
+                        loss = pos_loss + act_loss + res_loss
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
 
                     with state.lock:
                         state.optimization_progress = int((i / batch_count) * 100)
