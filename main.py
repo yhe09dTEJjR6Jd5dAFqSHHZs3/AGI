@@ -275,16 +275,16 @@ def tune_survival_penalty():
 def show_overlay():
     if window_ref is not None and hasattr(window_ref, "ensure_overlay"):
         overlay_widget = window_ref.ensure_overlay()
-        QtCore.QTimer.singleShot(0, overlay_widget.showFullScreen)
-        QtCore.QTimer.singleShot(0, overlay_widget.raise_)
+        QtCore.QMetaObject.invokeMethod(overlay_widget, "showFullScreen", QtCore.Qt.QueuedConnection)
+        QtCore.QMetaObject.invokeMethod(overlay_widget, "raise_", QtCore.Qt.QueuedConnection)
 
 def hide_overlay():
     if window_ref is not None and hasattr(window_ref, "overlay") and window_ref.overlay is not None:
-        QtCore.QTimer.singleShot(0, window_ref.overlay.hide)
+        QtCore.QMetaObject.invokeMethod(window_ref.overlay, "hide", QtCore.Qt.QueuedConnection)
 
 def destroy_overlay():
     if window_ref is not None and hasattr(window_ref, "destroy_overlay"):
-        QtCore.QTimer.singleShot(0, window_ref.destroy_overlay)
+        QtCore.QMetaObject.invokeMethod(window_ref, "destroy_overlay", QtCore.Qt.QueuedConnection)
 
 def schedule_preheat(target_mode):
     global preheat_deadline, global_mode, global_pause_recording, next_mode
