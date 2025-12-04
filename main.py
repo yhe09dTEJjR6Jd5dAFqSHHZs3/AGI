@@ -11,6 +11,8 @@ import threading
 import webbrowser
 import warnings
 import logging
+import importlib
+import importlib.util
 import numpy as np
 import cv2
 import mss
@@ -18,7 +20,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import psutil
-import pynvml
 import pyautogui
 from pynput import mouse, keyboard
 from flask import Flask, request, jsonify
@@ -30,11 +31,19 @@ def panic(msg):
     ctypes.windll.user32.MessageBoxW(0, str(msg), "Error", 0x10)
     os._exit(1)
 
-try:
-    pynvml.nvmlInit()
-    gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-except Exception as e:
-    panic(f"GPU Init Failed: {e}")
+nvml_module = None
+if importlib.util.find_spec("nvidia_ml_py"):
+    nvml_module = importlib.import_module("nvidia_ml_py")
+elif importlib.util.find_spec("pynvml"):
+    nvml_module = importlib.import_module("pynvml")
+gpu_handle = None
+if nvml_module:
+    try:
+        nvml_module.nvmlInit()
+        gpu_handle = nvml_module.nvmlDeviceGetHandleByIndex(0)
+    except Exception:
+        nvml_module = None
+        gpu_handle = None
 
 desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
 root_dir = os.path.join(desktop_path, "AAA")
@@ -64,6 +73,8 @@ class SharedState:
         self.lock = threading.Lock()
         self.esc_pressed = False
         self.window_handle = None
+        self.is_boosting = False
+        self.ai_button_down = False
 
 state = SharedState()
 
@@ -106,6 +117,12 @@ if os.path.exists(os.path.join(model_dir, "latest.pth")):
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
 def get_window_handle():
+    if importlib.util.find_spec("pygetwindow"):
+        gw = importlib.import_module("pygetwindow")
+        wins = gw.getWindowsWithTitle("AI AGENT HUD")
+        for w in wins:
+            if w.title:
+                return int(w._hWnd)
     return ctypes.windll.user32.GetForegroundWindow()
 
 def set_window_state(minimize=True):
@@ -135,25 +152,42 @@ def check_disk_space():
     except Exception as e:
         panic(f"Disk Check Failed: {e}")
 
+def encode_image(img):
+    ok, buf = cv2.imencode('.jpg', img)
+    return buf.tobytes() if ok else b''
+
+def decode_image(buf):
+    arr = np.frombuffer(buf, dtype=np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
 def monitor_resources():
     while state.is_running:
         try:
             cpu = psutil.cpu_percent()
             mem = psutil.virtual_memory().percent
-            nv_info = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
-            mem_info = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
-            gpu = nv_info.gpu
-            vram = (mem_info.used / mem_info.total) * 100
+            if nvml_module and gpu_handle:
+                nv_info = nvml_module.nvmlDeviceGetUtilizationRates(gpu_handle)
+                mem_info = nvml_module.nvmlDeviceGetMemoryInfo(gpu_handle)
+                gpu = nv_info.gpu
+                vram = (mem_info.used / mem_info.total) * 100
+            else:
+                gpu = 0
+                vram = 0
             M = max(cpu, mem, gpu, vram)
             with state.lock:
                 state.resource_stats = {"cpu": cpu, "mem": mem, "gpu": gpu, "vram": vram, "fps": state.fps, "seq": state.seq_len}
                 if M > 90:
+                    state.is_boosting = False
                     if state.fps > 1: state.fps -= 1
                     if state.seq_len > 1: state.seq_len -= 1
-                elif M < 10:
-                    if M < 40: 
-                         if state.fps < 100: state.fps += 1
-                         if state.seq_len < 100: state.seq_len += 1
+                if M < 10:
+                    state.is_boosting = True
+                if state.is_boosting:
+                    if M < 40:
+                        if state.fps < 100: state.fps += 1
+                        if state.seq_len < 100: state.seq_len += 1
+                    else:
+                        state.is_boosting = False
         except Exception as e:
             panic(f"Monitor Failed: {e}")
         time.sleep(1)
@@ -174,8 +208,10 @@ def on_click(x, y, button, pressed):
                         "start_time": state.mouse_state["start_time"],
                         "end_pos": (x, y),
                         "end_time": t,
-                        "screen": state.last_screen,
-                        "source": "HUMAN" if state.mode == "LEARNING" else "AI"
+                        "screen_jpg": state.last_screen,
+                        "source": "HUMAN" if state.mode == "LEARNING" else "AI",
+                        "button": 0,
+                        "episode": state.current_episode_id
                     }
                     if state.mode in ["LEARNING", "TRAINING", "PRACTICAL"]:
                         state.buffer.append(data_point)
@@ -200,22 +236,35 @@ def save_buffer(result_label):
     fname = f"{int(time.time())}_{result_label}.pkl"
     fpath = os.path.join(exp_pool_dir, fname)
     try:
+        payload = {
+            "episode_id": state.current_episode_id or str(uuid.uuid4()),
+            "result": result_label,
+            "mode": state.prev_mode if state.prev_mode else state.mode,
+            "steps": state.buffer
+        }
         with open(fpath, 'wb') as f:
-            pickle.dump(state.buffer, f)
-    except: pass
+            pickle.dump(payload, f)
+    except Exception as e:
+        panic(f"Save Failed: {e}")
+    state.current_episode_id = None
     check_disk_space()
 
 def worker_thread():
     sct = mss.mss()
     screen_w, screen_h = pyautogui.size()
     hidden_state = None
-    
+    criterion = nn.CrossEntropyLoss()
+
     while state.is_running:
         try:
             with state.lock:
                 current_mode = state.mode
                 esc = state.esc_pressed
-            
+            if current_mode not in ["TRAINING", "PRACTICAL"]:
+                hidden_state = None
+                with state.lock:
+                    state.ai_button_down = False
+
             if esc:
                 with state.lock:
                     state.prev_mode = state.mode
@@ -227,18 +276,24 @@ def worker_thread():
             if current_mode == "LEARNING":
                 start_time = time.time()
                 img = np.array(sct.grab(sct.monitors[1]))
-                img_small = cv2.resize(img, (260, 160)) 
+                img_small = cv2.resize(img, (260, 160))
+                img_bytes = encode_image(img_small)
                 with state.lock:
-                    state.last_screen = img_small
-                    if not state.mouse_state["pressed"]:
-                        x, y = pyautogui.position()
-                        state.buffer.append({
-                            "type": "hover",
-                            "timestamp": time.time(),
-                            "pos": (x, y),
-                            "screen": img_small,
-                            "source": "HUMAN"
-                        })
+                    state.last_screen = img_bytes
+                    if not state.current_episode_id:
+                        state.current_episode_id = str(uuid.uuid4())
+                    x, y = pyautogui.position()
+                    btn_flag = 1 if state.mouse_state["pressed"] else 0
+                    state.buffer.append({
+                        "type": "frame",
+                        "timestamp": time.time(),
+                        "pos": (x, y),
+                        "button": btn_flag,
+                        "press_time": state.mouse_state["start_time"] if btn_flag else None,
+                        "screen_jpg": img_bytes,
+                        "source": "HUMAN",
+                        "episode": state.current_episode_id
+                    })
                 elapsed = time.time() - start_time
                 sleep_time = max(0, (1.0 / state.fps) - elapsed)
                 time.sleep(sleep_time)
@@ -247,33 +302,48 @@ def worker_thread():
                 start_time = time.time()
                 img = np.array(sct.grab(sct.monitors[1]))
                 img_small = cv2.resize(img, (260, 160))
+                img_bytes = encode_image(img_small)
                 with state.lock:
-                    state.last_screen = img_small
-                
+                    state.last_screen = img_bytes
+                    if not state.current_episode_id:
+                        state.current_episode_id = str(uuid.uuid4())
+
                 img_tensor = torch.FloatTensor(img_small).permute(2, 0, 1).unsqueeze(0).unsqueeze(0).to(device) / 255.0
                 with torch.no_grad():
                     mx, my, act, res, hidden_state = model(img_tensor, hidden_state)
-                
+
                 mx = int(mx.item() * screen_w)
                 my = int(my.item() * screen_h)
                 action = torch.argmax(act).item()
-                pred_result = torch.argmax(res).item() 
-                
+                pred_result = torch.argmax(res).item()
+
                 pyautogui.moveTo(mx, my)
-                if action == 1: pyautogui.click()
-                elif action == 2: pyautogui.mouseDown()
-                else: pyautogui.mouseUp()
-                
+                if action == 1:
+                    pyautogui.click()
+                    with state.lock:
+                        state.ai_button_down = False
+                elif action == 2:
+                    pyautogui.mouseDown()
+                    with state.lock:
+                        state.ai_button_down = True
+                else:
+                    pyautogui.mouseUp()
+                    with state.lock:
+                        state.ai_button_down = False
+
                 with state.lock:
+                    btn_flag = 1 if state.ai_button_down else 0
                     state.buffer.append({
-                        "type": "ai_action",
+                        "type": "frame",
                         "timestamp": time.time(),
                         "pos": (mx, my),
                         "action": action,
-                        "screen": img_small,
-                        "source": "AI"
+                        "button": btn_flag,
+                        "screen_jpg": img_bytes,
+                        "source": "AI",
+                        "episode": state.current_episode_id
                     })
-                
+
                 if current_mode == "PRACTICAL" and pred_result != 0:
                     res_map = {1: "WIN", 2: "LOSS"}
                     final_res = res_map.get(pred_result, "DRAW")
@@ -294,47 +364,93 @@ def worker_thread():
                         state.mode = "IDLE"
                         state.optimization_status = "无数据"
                     continue
-                
+
                 state.optimization_status = "优化中..."
                 model.train()
-                data_cache = []
+                episodes = []
                 for f in files[-10:]:
                     try:
                         with open(f, 'rb') as fb:
-                            data_cache.extend(pickle.load(fb))
-                    except: pass
-                
-                if not data_cache:
+                            loaded = pickle.load(fb)
+                            if isinstance(loaded, dict) and 'steps' in loaded:
+                                episodes.append(loaded)
+                            elif isinstance(loaded, list):
+                                episodes.append({"episode_id": str(uuid.uuid4()), "result": "UNKNOWN", "steps": loaded})
+                    except Exception:
+                        pass
+
+                if not episodes:
                     with state.lock:
                         state.mode = "IDLE"
                         state.optimization_status = "数据损坏"
                     continue
 
-                if len(data_cache) < 50: data_cache = data_cache * 50
-                
+                sequences = []
+                seq_len = max(1, state.seq_len)
+                for ep in episodes:
+                    steps = ep.get('steps', [])
+                    ordered = sorted(steps, key=lambda s: s.get('timestamp', s.get('start_time', time.time())))
+                    if len(ordered) < seq_len:
+                        continue
+                    for i in range(len(ordered) - seq_len + 1):
+                        seg = ordered[i:i+seq_len]
+                        if all(('screen_jpg' in step or 'screen' in step) for step in seg):
+                            sequences.append((seg, ep.get('result', "UNKNOWN")))
+
+                if not sequences:
+                    with state.lock:
+                        state.mode = "IDLE"
+                        state.optimization_status = "数据不足"
+                    continue
+
+                if len(sequences) < 10:
+                    sequences = sequences * max(1, 10 // len(sequences))
+
                 batch_count = 100
                 for i in range(batch_count):
                     optimizer.zero_grad()
-                    sample = random.choice(data_cache)
-                    if 'screen' not in sample: continue
-                    
-                    img = torch.FloatTensor(sample['screen']).permute(2, 0, 1).unsqueeze(0).unsqueeze(0).to(device) / 255.0
-                    mx, my, act, res, _ = model(img)
-                    
-                    if 'pos' in sample:
-                        tx, ty = sample['pos'][0]/screen_w, sample['pos'][1]/screen_h
-                    elif 'start_pos' in sample:
-                        tx, ty = sample['start_pos'][0]/screen_w, sample['start_pos'][1]/screen_h
-                    else:
-                        tx, ty = 0.5, 0.5
+                    seq_data, seq_res = random.choice(sequences)
+                    frames = []
+                    for step in seq_data:
+                        img_data = step.get('screen_jpg') if step.get('screen_jpg') is not None else step.get('screen')
+                        if img_data is None:
+                            frames = []
+                            break
+                        img_arr = decode_image(img_data) if isinstance(img_data, (bytes, bytearray)) else img_data
+                        if img_arr is None:
+                            frames = []
+                            break
+                        frames.append(torch.FloatTensor(img_arr).permute(2, 0, 1))
+                    if not frames:
+                        continue
+                    data_tensor = torch.stack(frames).unsqueeze(0).to(device) / 255.0
+                    mx_pred, my_pred, act_pred, res_pred, _ = model(data_tensor)
 
-                    loss = (mx - tx)**2 + (my - ty)**2
+                    target_step = seq_data[-1]
+                    if 'pos' in target_step:
+                        tx = target_step['pos'][0] / screen_w
+                        ty = target_step['pos'][1] / screen_h
+                    elif 'start_pos' in target_step:
+                        tx = target_step['start_pos'][0] / screen_w
+                        ty = target_step['start_pos'][1] / screen_h
+                    else:
+                        tx = 0.5
+                        ty = 0.5
+
+                    action_label = 1 if target_step.get('type') == 'click' else target_step.get('action', 2 if target_step.get('button', 0) == 1 else 0)
+                    res_map = {"WIN": 1, "LOSS": 2}
+                    res_label = res_map.get(seq_res, 0)
+
+                    pos_loss = ((mx_pred - torch.tensor([[tx]], device=device)) ** 2 + (my_pred - torch.tensor([[ty]], device=device)) ** 2).mean()
+                    act_loss = criterion(act_pred, torch.tensor([action_label], device=device))
+                    res_loss = criterion(res_pred, torch.tensor([res_label], device=device))
+                    loss = pos_loss + act_loss + res_loss
                     loss.backward()
                     optimizer.step()
-                    
+
                     with state.lock:
                         state.optimization_progress = int((i / batch_count) * 100)
-                
+
                 torch.save(model.state_dict(), os.path.join(model_dir, "latest.pth"))
                 with state.lock:
                     state.mode = "IDLE"
@@ -343,7 +459,6 @@ def worker_thread():
                 time.sleep(0.1)
         except Exception as e:
             panic(f"Worker Failed: {e}")
-
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -453,6 +568,8 @@ def start_learn():
         if state.mode == "IDLE":
             state.mode = "LEARNING"
             state.buffer = []
+            state.current_episode_id = str(uuid.uuid4())
+            state.ai_button_down = False
             state.window_handle = get_window_handle()
             set_window_state(minimize=True)
     return jsonify({})
@@ -463,6 +580,8 @@ def start_train():
         if state.mode == "IDLE":
             state.mode = "TRAINING"
             state.buffer = []
+            state.current_episode_id = str(uuid.uuid4())
+            state.ai_button_down = False
             state.window_handle = get_window_handle()
             set_window_state(minimize=True)
     return jsonify({})
@@ -473,6 +592,8 @@ def start_practical():
         if state.mode == "IDLE":
             state.mode = "PRACTICAL"
             state.buffer = []
+            state.current_episode_id = str(uuid.uuid4())
+            state.ai_button_down = False
             state.window_handle = get_window_handle()
             set_window_state(minimize=True)
     return jsonify({})
