@@ -86,6 +86,9 @@ def main():
             "m": {"x": 0.0, "y": 0.0, "dx": 0.0, "dy": 0.0, "l": 0.0, "r": 0.0, "dl": 0.0, "dr": 0.0},
             "pool_size": pool_size_bytes
         }
+        m_check_interval = 1.0
+        last_m_check = 0.0
+        cached_M = 0.0
         def update_size_file():
             with open(size_file, "w") as f:
                 f.write(str(ctx["pool_size"]))
@@ -171,10 +174,19 @@ def main():
         m_path = os.path.join(model_dir, "core.pth")
         if os.path.exists(m_path):
             c = torch.load(m_path, map_location=device)
-            net.load_state_dict(c["n"])
-            opt.load_state_dict(c["o"])
+            saved_res = c.get("res")
+            loaded = False
+            if saved_res is None or saved_res == (t_w, t_h):
+                try:
+                    net.load_state_dict(c["n"])
+                    opt.load_state_dict(c["o"])
+                    loaded = True
+                except:
+                    loaded = False
+            if not loaded:
+                torch.save({"n": net.state_dict(), "o": opt.state_dict(), "res": (t_w, t_h)}, m_path)
         else:
-            torch.save({"n": net.state_dict(), "o": opt.state_dict()}, m_path)
+            torch.save({"n": net.state_dict(), "o": opt.state_dict(), "res": (t_w, t_h)}, m_path)
         root = tk.Tk()
         root.withdraw()
         def on_mov(x, y):
@@ -223,6 +235,27 @@ def main():
         chunk_buffer = []
         chunk_target = random.randint(100, 500)
         chunk_start = None
+        def encode_image(img):
+            ok, buf = cv2.imencode(".jpg", img)
+            if not ok:
+                buf = cv2.imencode(".jpg", np.zeros((t_h, t_w, 3), dtype=np.uint8))[1]
+            return buf.tobytes()
+        def decode_image(data):
+            if isinstance(data, bytes):
+                arr = np.frombuffer(data, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            else:
+                img = np.array(data, copy=False)
+            if img is None:
+                img = np.zeros((t_h, t_w, 3), dtype=np.uint8)
+            if img.shape[1] != t_w or img.shape[0] != t_h:
+                img = cv2.resize(img, (t_w, t_h))
+            return img
+        def decode_samples(seq):
+            out = []
+            for s in seq:
+                out.append({"t": float(s.get("t", 0.0)), "r": float(s.get("r", 0.0)), "s": decode_image(s.get("s")), "m": s.get("m", {})})
+            return out
         def optimize_model():
             top = tk.Toplevel(root)
             top.attributes("-topmost", True)
@@ -247,7 +280,7 @@ def main():
                     path = random.choice(files)
                     with open(path, "rb") as f:
                         data = pickle.load(f)
-                        seq = data.get("samples", [])
+                        seq = decode_samples(data.get("samples", []))
                         if seq:
                             samples = seq
                 if ctx["stop"]:
@@ -287,8 +320,9 @@ def main():
                         loss = loss_s + loss_m
                         loss.backward()
                         opt.step()
+                        top.update()
                 net.eval()
-                torch.save({"n": net.state_dict(), "o": opt.state_dict()}, m_path)
+                torch.save({"n": net.state_dict(), "o": opt.state_dict(), "res": (t_w, t_h)}, m_path)
                 ctx["pool_size"] = compute_pool_size()
                 update_size_file()
                 trim_pool_if_needed()
@@ -298,39 +332,40 @@ def main():
                 top.destroy()
         while not ctx["stop"]:
             loop_start = time.time()
-            if ctx["stop"]:
-                break
             mem_bytes = proc.memory_info().rss
             if mem_bytes > mem_limit_bytes:
                 raise RuntimeError("Memory limit exceeded")
-            cpu = psutil.cpu_percent()
-            mem_percent = psutil.virtual_memory().percent
-            gpu_util = 0.0
-            if nvml_inited and nvml_handle is not None:
-                try:
-                    util = pynvml.nvmlDeviceGetUtilizationRates(nvml_handle)
-                    gpu_util = float(util.gpu)
-                except:
-                    gpu_util = 0.0
-            vram_percent = 0.0
-            if torch.cuda.is_available():
-                allocated = float(torch.cuda.memory_allocated(0))
-                total = float(torch.cuda.get_device_properties(0).total_memory)
-                if total > 0:
-                    vram_percent = allocated / total * 100.0
-                if allocated > vram_limit_bytes:
-                    raise RuntimeError("VRAM limit exceeded")
-            M = max(cpu, mem_percent, gpu_util, vram_percent)
-            if M > 61.8:
-                if freq > 1:
-                    freq = max(1, freq - 1)
-                if seq_len > 1:
-                    seq_len = max(1, seq_len - 1)
-            elif M < 38.2:
-                if freq < 100:
-                    freq = min(100, freq + 1)
-                if seq_len < 100:
-                    seq_len = min(100, seq_len + 1)
+            now = time.time()
+            if last_m_check == 0.0 or now - last_m_check >= m_check_interval:
+                cpu = psutil.cpu_percent()
+                mem_percent = psutil.virtual_memory().percent
+                gpu_util = 0.0
+                if nvml_inited and nvml_handle is not None:
+                    try:
+                        util = pynvml.nvmlDeviceGetUtilizationRates(nvml_handle)
+                        gpu_util = float(util.gpu)
+                    except:
+                        gpu_util = 0.0
+                vram_percent = 0.0
+                if torch.cuda.is_available():
+                    allocated = float(torch.cuda.memory_allocated(0))
+                    total = float(torch.cuda.get_device_properties(0).total_memory)
+                    if total > 0:
+                        vram_percent = allocated / total * 100.0
+                    if allocated > vram_limit_bytes:
+                        raise RuntimeError("VRAM limit exceeded")
+                cached_M = max(cpu, mem_percent, gpu_util, vram_percent)
+                last_m_check = now
+                if cached_M > 61.8:
+                    if freq > 1:
+                        freq = max(1, freq - 1)
+                    if seq_len > 1:
+                        seq_len = max(1, seq_len - 1)
+                elif cached_M < 38.2:
+                    if freq < 100:
+                        freq = min(100, freq + 1)
+                    if seq_len < 100:
+                        seq_len = min(100, seq_len + 1)
             now = time.time()
             if ctx["mode"] == "LEARNING" and now - ctx["last_act"] > 10.0:
                 ctx["mode"] = "ACTIVE"
@@ -353,8 +388,18 @@ def main():
                 s_s = cv2.resize(cv2.cvtColor(s_raw, cv2.COLOR_RGB2BGR), (t_w, t_h))
                 nx = float(screen_w) if screen_w > 0 else 1.0
                 ny = float(screen_h) if screen_h > 0 else 1.0
-                mx = ctx["m"]["x"] / nx
-                my = ctx["m"]["y"] / ny
+                clamped_x = ctx["m"]["x"]
+                clamped_y = ctx["m"]["y"]
+                if clamped_x < 0.0:
+                    clamped_x = 0.0
+                if clamped_x > screen_w:
+                    clamped_x = float(screen_w)
+                if clamped_y < 0.0:
+                    clamped_y = 0.0
+                if clamped_y > screen_h:
+                    clamped_y = float(screen_h)
+                mx = clamped_x / nx
+                my = clamped_y / ny
                 mdx = ctx["m"]["dx"] / nx
                 mdy = ctx["m"]["dy"] / ny
                 mlp = float(ctx["m"]["l"])
@@ -380,7 +425,10 @@ def main():
                     chunk_start = cur_time
                 chunk_buffer.append(sample)
                 if len(chunk_buffer) >= chunk_target:
-                    chunk_data = {"start": chunk_start, "end": chunk_buffer[-1]["t"], "samples": list(chunk_buffer)}
+                    chunk_samples = []
+                    for s in chunk_buffer:
+                        chunk_samples.append({"t": s["t"], "r": s["r"], "s": encode_image(s["s"]), "m": s["m"]})
+                    chunk_data = {"start": chunk_start, "end": chunk_buffer[-1]["t"], "samples": chunk_samples}
                     file_path = os.path.join(pool_dir, str(time.time_ns()) + ".pkl")
                     with open(file_path, "wb") as f:
                         pickle.dump(chunk_data, f)
@@ -442,7 +490,10 @@ def main():
                         interval = remaining
                     time.sleep(interval)
         if chunk_buffer:
-            chunk_data = {"start": chunk_start if chunk_start is not None else time.time(), "end": chunk_buffer[-1]["t"], "samples": list(chunk_buffer)}
+            chunk_samples = []
+            for s in chunk_buffer:
+                chunk_samples.append({"t": s["t"], "r": s["r"], "s": encode_image(s["s"]), "m": s["m"]})
+            chunk_data = {"start": chunk_start if chunk_start is not None else time.time(), "end": chunk_buffer[-1]["t"], "samples": chunk_samples}
             file_path = os.path.join(pool_dir, str(time.time_ns()) + ".pkl")
             with open(file_path, "wb") as f:
                 pickle.dump(chunk_data, f)
