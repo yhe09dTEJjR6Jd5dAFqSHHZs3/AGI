@@ -1,513 +1,563 @@
-import sys
 import os
+import sys
 import time
-import random
+import json
+import uuid
+import glob
+import shutil
+import ctypes
 import pickle
-import psutil
-import cv2
+import random
+import threading
+import webbrowser
+import warnings
+import logging
 import numpy as np
+import cv2
+import mss
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
+import psutil
+import pynvml
 import pyautogui
-import traceback
 from pynput import mouse, keyboard
-import tkinter as tk
-from tkinter import ttk
+from flask import Flask, request, jsonify
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 try:
-    import pynvml
-    _has_pynvml = True
-except:
-    pynvml = None
-    _has_pynvml = False
+    pynvml.nvmlInit()
+    gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+except Exception:
+    sys.exit(1)
 
-def main():
-    try:
-        pyautogui.FAILSAFE = False
-        pyautogui.PAUSE = 0
-        torch.backends.cudnn.benchmark = True
-        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-        base_dir = os.path.join(desktop, "AAA")
-        pool_dir = os.path.join(base_dir, "经验池")
-        model_dir = os.path.join(base_dir, "ai_models")
-        for d in [base_dir, pool_dir, model_dir]:
-            os.makedirs(d, exist_ok=True)
-        size_file = os.path.join(base_dir, "pool_size.txt")
-        screen_w, screen_h = pyautogui.size()
-        t_w = max(1, int(screen_w * 0.1))
-        t_h = max(1, int(screen_h * 0.1))
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        nvml_inited = False
-        nvml_handle = None
-        if _has_pynvml and torch.cuda.is_available():
-            try:
-                pynvml.nvmlInit()
-                nvml_inited = True
-                nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            except:
-                nvml_inited = False
-                nvml_handle = None
-        vram_limit_bytes = 4 * 1024 * 1024 * 1024
-        total_vram = 0
-        if device.type == "cuda":
-            props = torch.cuda.get_device_properties(0)
-            total_vram = props.total_memory
-            if total_vram > vram_limit_bytes and hasattr(torch.cuda, "set_per_process_memory_fraction"):
-                fraction = float(vram_limit_bytes) / float(total_vram)
-                torch.cuda.set_per_process_memory_fraction(fraction, 0)
-        mem_limit_bytes = 16 * 1024 * 1024 * 1024
-        pool_limit_bytes = 20 * 1024 * 1024 * 1024
-        proc = psutil.Process(os.getpid())
-        def list_pool_files():
-            files = []
-            if os.path.isdir(pool_dir):
-                for name in os.listdir(pool_dir):
-                    if name.endswith(".pkl"):
-                        path = os.path.join(pool_dir, name)
-                        ctime = os.path.getctime(path)
-                        files.append((ctime, path))
-            files.sort(key=lambda x: x[0])
-            return [p for _, p in files]
-        def compute_pool_size():
-            total = 0
-            for path in list_pool_files():
-                total += os.path.getsize(path)
-            return total
-        pool_size_bytes = compute_pool_size()
-        with open(size_file, "w") as f:
-            f.write(str(pool_size_bytes))
-        ctx = {
-            "mode": "LEARNING",
-            "last_act": time.time(),
-            "act_start": 0.0,
-            "stop": False,
-            "m": {"x": 0.0, "y": 0.0, "dx": 0.0, "dy": 0.0, "l": 0.0, "r": 0.0, "dl": 0.0, "dr": 0.0},
-            "pool_size": pool_size_bytes
-        }
-        m_check_interval = 1.0
-        last_m_check = 0.0
-        cached_M = 0.0
-        def update_size_file():
-            with open(size_file, "w") as f:
-                f.write(str(ctx["pool_size"]))
-        def trim_pool_if_needed():
-            if ctx["pool_size"] <= pool_limit_bytes:
-                return
-            files = list_pool_files()
-            for path in files:
-                if ctx["stop"]:
-                    break
-                size = os.path.getsize(path)
-                os.remove(path)
-                ctx["pool_size"] -= size
-                update_size_file()
-                if ctx["pool_size"] <= pool_limit_bytes:
-                    break
-        def normalize_seq(samples, seq_start=None, seq_end=None):
-            if not samples:
-                return []
-            start = float(seq_start) if seq_start is not None else float(samples[0].get("t", 0.0))
-            end = float(seq_end) if seq_end is not None else float(samples[-1].get("t", start))
-            duration = max(end - start, 1e-6)
-            out = []
-            for s in samples:
-                m = s.get("m", {})
-                reward_norm = (float(s.get("r", 0.0)) + 1.0) / 2.0
-                time_raw = float(s.get("t", start))
-                time_norm = (time_raw - start) / duration
-                if time_norm < 0.0:
-                    time_norm = 0.0
-                if time_norm > 1.0:
-                    time_norm = 1.0
-                out.append([
-                    float(m.get("x", 0.0)),
-                    float(m.get("y", 0.0)),
-                    float(m.get("dx", 0.0)),
-                    float(m.get("dy", 0.0)),
-                    float(m.get("speed", 0.0)),
-                    float(m.get("l", 0.0)),
-                    float(m.get("r", 0.0)),
-                    float(m.get("dl", 0.0)),
-                    float(m.get("dr", 0.0)),
-                    reward_norm,
-                    time_norm
-                ])
-            return out
-        m_dim = 11
-        class Net(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.enc = nn.Sequential(
-                    nn.Conv2d(3, 16, 3, 2, 1),
-                    nn.ReLU(),
-                    nn.Conv2d(16, 32, 3, 2, 1),
-                    nn.ReLU(),
-                    nn.Flatten()
-                )
+desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+root_dir = os.path.join(desktop_path, "AAA")
+exp_pool_dir = os.path.join(root_dir, "ExperiencePool")
+model_dir = os.path.join(root_dir, "Models")
+
+for d in [root_dir, exp_pool_dir, model_dir]:
+    if not os.path.exists(d):
+        os.makedirs(d)
+
+app = Flask(__name__)
+
+class SharedState:
+    def __init__(self):
+        self.mode = "IDLE"
+        self.prev_mode = "IDLE"
+        self.is_running = True
+        self.fps = 30
+        self.seq_len = 10
+        self.buffer = []
+        self.mouse_state = {"pressed": False, "start_pos": None, "start_time": None}
+        self.current_episode_id = None
+        self.last_screen = None
+        self.resource_stats = {"cpu": 0, "mem": 0, "gpu": 0, "vram": 0, "fps": 30, "seq": 10}
+        self.optimization_progress = 0
+        self.optimization_status = "就绪"
+        self.lock = threading.Lock()
+        self.esc_pressed = False
+        self.window_handle = None
+
+state = SharedState()
+
+class AIModel(nn.Module):
+    def __init__(self):
+        super(AIModel, self).__init__()
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=5, stride=2)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=5, stride=2)
+        self.fc1 = nn.Linear(32 * 63 * 99, 256)
+        self.lstm = nn.LSTM(256, 128, batch_first=True)
+        self.fc_mouse_x = nn.Linear(128, 1)
+        self.fc_mouse_y = nn.Linear(128, 1)
+        self.fc_action = nn.Linear(128, 3)
+
+    def forward(self, x, hidden=None):
+        batch_size, seq_len, c, h, w = x.size()
+        x = x.view(batch_size * seq_len, c, h, w)
+        x = torch.relu(self.conv1(x))
+        x = torch.relu(self.conv2(x))
+        x = x.view(batch_size * seq_len, -1)
+        x = torch.relu(self.fc1(x))
+        x = x.view(batch_size, seq_len, -1)
+        out, hidden = self.lstm(x, hidden)
+        out = out[:, -1, :]
+        mx = torch.sigmoid(self.fc_mouse_x(out))
+        my = torch.sigmoid(self.fc_mouse_y(out))
+        act = torch.softmax(self.fc_action(out), dim=1)
+        return mx, my, act, hidden
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = AIModel().to(device)
+if os.path.exists(os.path.join(model_dir, "latest.pth")):
+    model.load_state_dict(torch.load(os.path.join(model_dir, "latest.pth")))
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+def get_window_handle():
+    return ctypes.windll.user32.GetForegroundWindow()
+
+def set_window_state(minimize=True):
+    if state.window_handle:
+        CMD_SHOW = 5
+        CMD_MINIMIZE = 6
+        cmd = CMD_MINIMIZE if minimize else CMD_SHOW
+        ctypes.windll.user32.ShowWindow(state.window_handle, cmd)
+        if not minimize:
+            ctypes.windll.user32.SetForegroundWindow(state.window_handle)
+
+def check_disk_space():
+    total_size = 0
+    files = []
+    for f in glob.glob(os.path.join(exp_pool_dir, "*.pkl")):
+        s = os.path.getsize(f)
+        total_size += s
+        files.append((f, os.path.getctime(f)))
+    
+    files.sort(key=lambda x: x[1])
+    
+    limit = 20 * 1024 * 1024 * 1024
+    while total_size > limit and files:
+        f_path, _ = files.pop(0)
+        s = os.path.getsize(f_path)
+        try:
+            os.remove(f_path)
+            total_size -= s
+        except:
+            pass
+
+def monitor_resources():
+    while state.is_running:
+        try:
+            cpu = psutil.cpu_percent()
+            mem = psutil.virtual_memory().percent
+            nv_info = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
+            gpu = nv_info.gpu
+            vram = (mem_info.used / mem_info.total) * 100
+            
+            M = max(cpu, mem, gpu, vram)
+            
+            with state.lock:
+                state.resource_stats = {"cpu": cpu, "mem": mem, "gpu": gpu, "vram": vram, "fps": state.fps, "seq": state.seq_len}
+                
+                if M > 90:
+                    if state.fps > 1: state.fps -= 1
+                    if state.seq_len > 1: state.seq_len -= 1
+                elif M < 10:
+                    M_low = max(cpu, mem, gpu, vram)
+                    if M_low < 40:
+                         if state.fps < 100: state.fps += 1
+                         if state.seq_len < 100: state.seq_len += 1
+                    
+        except Exception as e:
+            sys.exit(1)
+        time.sleep(1)
+
+def on_click(x, y, button, pressed):
+    if button == mouse.Button.left:
+        t = time.time()
+        with state.lock:
+            if pressed:
+                state.mouse_state["pressed"] = True
+                state.mouse_state["start_pos"] = (x, y)
+                state.mouse_state["start_time"] = t
+            else:
+                if state.mouse_state["pressed"]:
+                    data_point = {
+                        "type": "click",
+                        "start_pos": state.mouse_state["start_pos"],
+                        "start_time": state.mouse_state["start_time"],
+                        "end_pos": (x, y),
+                        "end_time": t,
+                        "screen": state.last_screen
+                    }
+                    if state.mode in ["LEARNING", "TRAINING", "PRACTICAL"]:
+                        state.buffer.append(data_point)
+                state.mouse_state["pressed"] = False
+
+def on_press(key):
+    if key == keyboard.Key.esc:
+        with state.lock:
+            if state.mode in ["LEARNING", "TRAINING", "PRACTICAL"]:
+                state.esc_pressed = True
+
+def listener_thread():
+    with mouse.Listener(on_click=on_click) as m_listener, \
+         keyboard.Listener(on_press=on_press) as k_listener:
+        try:
+            m_listener.join()
+            k_listener.join()
+        except:
+            sys.exit(1)
+
+def worker_thread():
+    sct = mss.mss()
+    screen_w, screen_h = pyautogui.size()
+    
+    while state.is_running:
+        try:
+            with state.lock:
+                current_mode = state.mode
+                esc = state.esc_pressed
+            
+            if esc:
+                with state.lock:
+                    state.prev_mode = state.mode
+                    state.mode = "PAUSED"
+                    state.esc_pressed = False
+                set_window_state(minimize=False)
+                continue
+
+            if current_mode == "LEARNING":
+                start_time = time.time()
+                img = np.array(sct.grab(sct.monitors[1]))
+                img_small = cv2.resize(img, (260, 160)) 
+                
+                with state.lock:
+                    state.last_screen = img_small
+                    if not state.mouse_state["pressed"]:
+                        x, y = pyautogui.position()
+                        state.buffer.append({
+                            "type": "hover",
+                            "timestamp": time.time(),
+                            "pos": (x, y),
+                            "screen": img_small,
+                            "source": "HUMAN"
+                        })
+                
+                elapsed = time.time() - start_time
+                sleep_time = max(0, (1.0 / state.fps) - elapsed)
+                time.sleep(sleep_time)
+
+            elif current_mode in ["TRAINING", "PRACTICAL"]:
+                start_time = time.time()
+                img = np.array(sct.grab(sct.monitors[1]))
+                img_small = cv2.resize(img, (260, 160))
+                
+                with state.lock:
+                    state.last_screen = img_small
+                
+                img_tensor = torch.FloatTensor(img_small).permute(2, 0, 1).unsqueeze(0).unsqueeze(0).to(device) / 255.0
+                
                 with torch.no_grad():
-                    d = torch.zeros(1, 3, t_h, t_w)
-                    o = self.enc(d).shape[1]
-                self.lstm = nn.LSTM(o + m_dim, 256, batch_first=True)
-                self.dec_h = max(1, t_h // 4)
-                self.dec_w = max(1, t_w // 4)
-                self.fc_s = nn.Linear(256, 32 * self.dec_h * self.dec_w)
-                self.dec = nn.Sequential(
-                    nn.ConvTranspose2d(32, 16, 3, 2, 1, 1),
-                    nn.ReLU(),
-                    nn.ConvTranspose2d(16, 3, 3, 2, 1, 1),
-                    nn.Sigmoid()
-                )
-                self.head_m = nn.Sequential(nn.Linear(256, m_dim), nn.Tanh())
-            def forward(self, img, m):
-                b, s, c, h, w = img.size()
-                e = self.enc(img.view(b * s, c, h, w)).view(b, s, -1)
-                o, _ = self.lstm(torch.cat([e, m], 2))
-                l = o[:, -1, :]
-                scr = self.dec(self.fc_s(l).view(-1, 32, self.dec_h, self.dec_w))
-                if scr.shape[2] != t_h or scr.shape[3] != t_w:
-                    scr = F.interpolate(scr, (t_h, t_w), mode="bilinear", align_corners=False)
-                return scr, self.head_m(l)
-        net = Net().to(device)
-        opt = optim.Adam(net.parameters(), lr=1e-4)
-        m_path = os.path.join(model_dir, "core.pth")
-        if os.path.exists(m_path):
-            c = torch.load(m_path, map_location=device)
-            saved_res = c.get("res")
-            loaded = False
-            if saved_res is None or saved_res == (t_w, t_h):
-                try:
-                    net.load_state_dict(c["n"])
-                    opt.load_state_dict(c["o"])
-                    loaded = True
-                except:
-                    loaded = False
-            if not loaded:
-                torch.save({"n": net.state_dict(), "o": opt.state_dict(), "res": (t_w, t_h)}, m_path)
-        else:
-            torch.save({"n": net.state_dict(), "o": opt.state_dict(), "res": (t_w, t_h)}, m_path)
-        root = tk.Tk()
-        root.withdraw()
-        def on_mov(x, y):
-            if ctx["stop"]:
-                return
-            dx = x - ctx["m"]["x"]
-            dy = y - ctx["m"]["y"]
-            ctx["m"]["dx"] = dx
-            ctx["m"]["dy"] = dy
-            ctx["m"]["x"] = x
-            ctx["m"]["y"] = y
-            ctx["last_act"] = time.time()
-            if ctx["mode"] == "ACTIVE" and (abs(dx) > 2 or abs(dy) > 2):
-                ctx["mode"] = "LEARNING"
-        def on_clk(x, y, b, p):
-            if ctx["stop"]:
-                return
-            ctx["last_act"] = time.time()
-            v = 1.0 if p else 0.0
-            if b == mouse.Button.left:
-                ctx["m"]["l"] = v
-            elif b == mouse.Button.right:
-                ctx["m"]["r"] = v
-            l = ctx["m"]["l"]
-            r = ctx["m"]["r"]
-            ctx["m"]["dl"] = 1.0 if l > 0.5 and r > 0.5 else 0.0
-            ctx["m"]["dr"] = 1.0 if l < 0.5 and r < 0.5 else 0.0
-            if ctx["mode"] == "ACTIVE":
-                ctx["mode"] = "LEARNING"
-        def on_key(k):
-            ctx["last_act"] = time.time()
-            if k == keyboard.Key.esc:
-                ctx["stop"] = True
-                return False
-            if ctx["mode"] == "ACTIVE":
-                ctx["mode"] = "LEARNING"
-        ml = mouse.Listener(on_move=on_mov, on_click=on_clk, on_scroll=lambda x, y, dx, dy: on_clk(x, y, mouse.Button.middle, True))
-        kl = keyboard.Listener(on_press=on_key)
-        ml.start()
-        kl.start()
-        freq = 10
-        seq_len = 5
-        buf_samples = []
-        last_pred = None
-        prev_loss = None
-        chunk_buffer = []
-        chunk_target = random.randint(100, 500)
-        chunk_start = None
-        def encode_image(img):
-            ok, buf = cv2.imencode(".jpg", img)
-            if not ok:
-                buf = cv2.imencode(".jpg", np.zeros((t_h, t_w, 3), dtype=np.uint8))[1]
-            return buf.tobytes()
-        def decode_image(data):
-            if isinstance(data, bytes):
-                arr = np.frombuffer(data, dtype=np.uint8)
-                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            else:
-                img = np.array(data, copy=False)
-            if img is None:
-                img = np.zeros((t_h, t_w, 3), dtype=np.uint8)
-            if img.shape[1] != t_w or img.shape[0] != t_h:
-                img = cv2.resize(img, (t_w, t_h))
-            return img
-        def decode_samples(seq):
-            out = []
-            for s in seq:
-                out.append({"t": float(s.get("t", 0.0)), "r": float(s.get("r", 0.0)), "s": decode_image(s.get("s")), "m": s.get("m", {})})
-            return out
-        def optimize_model():
-            top = tk.Toplevel(root)
-            top.attributes("-topmost", True)
-            top.overrideredirect(True)
-            top.geometry("360x90")
-            text_var = tk.StringVar()
-            label = ttk.Label(top, textvariable=text_var)
-            label.pack(pady=5)
-            pb = ttk.Progressbar(top, length=320, mode="determinate", maximum=100)
-            pb.pack(pady=5)
-            text_var.set("优化中 0%")
-            def on_escape(event):
-                ctx["stop"] = True
-                top.quit()
-            top.bind("<Escape>", on_escape)
-            top.update_idletasks()
-            top.update()
-            try:
-                files = list_pool_files()
-                samples = None
-                if files:
-                    path = random.choice(files)
-                    with open(path, "rb") as f:
-                        data = pickle.load(f)
-                        seq = decode_samples(data.get("samples", []))
-                        if seq:
-                            samples = seq
-                if ctx["stop"]:
-                    return
-                if samples:
-                    m_norm = normalize_seq(samples, data.get("start"), data.get("end"))
-                    if len(samples) > 1:
-                        if len(samples) != len(m_norm):
-                            m_norm = normalize_seq(samples, data.get("start"), data.get("end"))
-                    net.train()
-                    total_epochs = 5
-                    for ep in range(total_epochs):
-                        if ctx["stop"]:
-                            break
-                        progress = int((ep + 1) * 100 / total_epochs)
-                        pb["value"] = progress
-                        text_var.set("优化中 " + str(progress) + "%")
-                        top.update_idletasks()
-                        top.update()
-                        if ctx["stop"]:
-                            break
-                        if len(samples) < 2:
-                            continue
-                        seq_images = [x.get("s") for x in samples[:-1]]
-                        seq_mouse = m_norm[:-1]
-                        target_sample = samples[-1]
-                        target_mouse = m_norm[-1]
-                        seq_s = torch.tensor(np.array(seq_images), dtype=torch.float32).permute(0, 3, 1, 2).unsqueeze(0).to(device) / 255.0
-                        seq_m = torch.tensor(np.array(seq_mouse), dtype=torch.float32).unsqueeze(0).to(device)
-                        target_s = torch.tensor(target_sample["s"], dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device) / 255.0
-                        target_m = torch.tensor(np.array(target_mouse), dtype=torch.float32).unsqueeze(0).to(device)
-                        opt.zero_grad()
-                        pred_s, pred_m = net(seq_s, seq_m)
-                        loss_s = nn.MSELoss()(pred_s, target_s)
-                        pred_m_mapped = (pred_m + 1.0) / 2.0
-                        loss_m = nn.MSELoss()(pred_m_mapped, target_m)
-                        loss = loss_s + loss_m
-                        loss.backward()
-                        opt.step()
-                        top.update()
-                net.eval()
-                torch.save({"n": net.state_dict(), "o": opt.state_dict(), "res": (t_w, t_h)}, m_path)
-                ctx["pool_size"] = compute_pool_size()
-                update_size_file()
-                trim_pool_if_needed()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            finally:
-                top.destroy()
-        while not ctx["stop"]:
-            loop_start = time.time()
-            mem_bytes = proc.memory_info().rss
-            if mem_bytes > mem_limit_bytes:
-                raise RuntimeError("Memory limit exceeded")
-            now = time.time()
-            if last_m_check == 0.0 or now - last_m_check >= m_check_interval:
-                cpu = psutil.cpu_percent()
-                mem_percent = psutil.virtual_memory().percent
-                gpu_util = 0.0
-                if nvml_inited and nvml_handle is not None:
+                    mx, my, act, _ = model(img_tensor)
+                
+                mx = int(mx.item() * screen_w)
+                my = int(my.item() * screen_h)
+                action = torch.argmax(act).item()
+                
+                pyautogui.moveTo(mx, my)
+                if action == 1: 
+                    pyautogui.click()
+                elif action == 2:
+                    pyautogui.mouseDown()
+                else:
+                    pyautogui.mouseUp()
+                
+                with state.lock:
+                    state.buffer.append({
+                        "type": "ai_action",
+                        "timestamp": time.time(),
+                        "pos": (mx, my),
+                        "action": action,
+                        "screen": img_small,
+                        "source": "AI"
+                    })
+                
+                if current_mode == "PRACTICAL":
+                    pass
+
+                elapsed = time.time() - start_time
+                sleep_time = max(0, (1.0 / state.fps) - elapsed)
+                time.sleep(sleep_time)
+
+            elif current_mode == "OPTIMIZING":
+                files = glob.glob(os.path.join(exp_pool_dir, "*.pkl"))
+                if not files:
+                    with state.lock:
+                        state.mode = "IDLE"
+                        state.optimization_status = "数据不足"
+                    continue
+                
+                state.optimization_status = "训练中..."
+                model.train()
+                
+                data_cache = []
+                for f in files[-5:]:
                     try:
-                        util = pynvml.nvmlDeviceGetUtilizationRates(nvml_handle)
-                        gpu_util = float(util.gpu)
-                    except:
-                        gpu_util = 0.0
-                vram_percent = 0.0
-                if torch.cuda.is_available():
-                    allocated = float(torch.cuda.memory_allocated(0))
-                    total = float(torch.cuda.get_device_properties(0).total_memory)
-                    if total > 0:
-                        vram_percent = allocated / total * 100.0
-                    if allocated > vram_limit_bytes:
-                        raise RuntimeError("VRAM limit exceeded")
-                cached_M = max(cpu, mem_percent, gpu_util, vram_percent)
-                last_m_check = now
-                if cached_M > 61.8:
-                    if freq > 1:
-                        freq = max(1, freq - 1)
-                    if seq_len > 1:
-                        seq_len = max(1, seq_len - 1)
-                elif cached_M < 38.2:
-                    if freq < 100:
-                        freq = min(100, freq + 1)
-                    if seq_len < 100:
-                        seq_len = min(100, seq_len + 1)
-            now = time.time()
-            if ctx["mode"] == "LEARNING" and now - ctx["last_act"] > 10.0:
-                ctx["mode"] = "ACTIVE"
-                ctx["act_start"] = now
-            if ctx["mode"] == "ACTIVE" and ctx["act_start"] > 0 and now - ctx["act_start"] > 60.0:
-                ctx["mode"] = "SLEEP"
-            if ctx["mode"] == "SLEEP":
-                optimize_model()
-                if ctx["stop"]:
-                    break
-                ctx["mode"] = "ACTIVE"
-                ctx["act_start"] = time.time()
-                buf_samples = []
-                last_pred = None
-                prev_loss = None
-            else:
-                if ctx["stop"]:
-                    break
-                s_raw = np.array(pyautogui.screenshot())
-                s_s = cv2.resize(cv2.cvtColor(s_raw, cv2.COLOR_RGB2BGR), (t_w, t_h))
-                nx = float(screen_w) if screen_w > 0 else 1.0
-                ny = float(screen_h) if screen_h > 0 else 1.0
-                clamped_x = ctx["m"]["x"]
-                clamped_y = ctx["m"]["y"]
-                if clamped_x < 0.0:
-                    clamped_x = 0.0
-                if clamped_x > screen_w:
-                    clamped_x = float(screen_w)
-                if clamped_y < 0.0:
-                    clamped_y = 0.0
-                if clamped_y > screen_h:
-                    clamped_y = float(screen_h)
-                mx = clamped_x / nx
-                my = clamped_y / ny
-                mdx = ctx["m"]["dx"] / nx
-                mdy = ctx["m"]["dy"] / ny
-                mlp = float(ctx["m"]["l"])
-                mrp = float(ctx["m"]["r"])
-                both_down = float(ctx["m"]["dl"])
-                both_up = float(ctx["m"]["dr"])
-                cur_t = torch.tensor(s_s, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device) / 255.0
-                rew = 0.0
-                if last_pred is not None:
-                    diff = torch.mean(torch.abs(last_pred - cur_t)).item()
-                    if prev_loss is None:
-                        prev_loss = diff
+                        with open(f, 'rb') as fb:
+                            data_cache.extend(pickle.load(fb))
+                    except: pass
+                
+                if not data_cache:
+                    with state.lock:
+                        state.mode = "IDLE"
+                        state.optimization_status = "数据无效"
+                    continue
+
+                if len(data_cache) < 50:
+                    data_cache = data_cache * 50
+                
+                batch_count = 100
+                for i in range(batch_count):
+                    optimizer.zero_grad()
+                    sample = random.choice(data_cache)
+                    if 'screen' not in sample: continue
+                    
+                    img = torch.FloatTensor(sample['screen']).permute(2, 0, 1).unsqueeze(0).unsqueeze(0).to(device) / 255.0
+                    mx, my, act, _ = model(img)
+                    
+                    if 'pos' in sample:
+                        tx = sample['pos'][0] / screen_w
+                        ty = sample['pos'][1] / screen_h
+                    elif 'start_pos' in sample:
+                        tx = sample['start_pos'][0] / screen_w
+                        ty = sample['start_pos'][1] / screen_h
                     else:
-                        if diff < prev_loss:
-                            rew = 1.0
-                        elif diff > prev_loss:
-                            rew = -1.0
-                        prev_loss = diff
-                cur_time = time.time()
-                speed = (mdx ** 2 + mdy ** 2) ** 0.5
-                sample = {"t": cur_time, "r": rew, "s": s_s, "m": {"x": mx, "y": my, "dx": mdx, "dy": mdy, "speed": speed, "l": mlp, "r": mrp, "dl": both_down, "dr": both_up}}
-                if chunk_start is None:
-                    chunk_start = cur_time
-                chunk_buffer.append(sample)
-                if len(chunk_buffer) >= chunk_target:
-                    chunk_samples = []
-                    for s in chunk_buffer:
-                        chunk_samples.append({"t": s["t"], "r": s["r"], "s": encode_image(s["s"]), "m": s["m"]})
-                    chunk_data = {"start": chunk_start, "end": chunk_buffer[-1]["t"], "samples": chunk_samples}
-                    file_path = os.path.join(pool_dir, str(time.time_ns()) + ".pkl")
-                    with open(file_path, "wb") as f:
-                        pickle.dump(chunk_data, f)
-                    size = os.path.getsize(file_path)
-                    ctx["pool_size"] += size
-                    update_size_file()
-                    trim_pool_if_needed()
-                    chunk_buffer.clear()
-                    chunk_target = random.randint(100, 500)
-                    chunk_start = None
-                buf_samples.append(sample)
-                if len(buf_samples) > seq_len:
-                    buf_samples = buf_samples[-seq_len:]
-                if len(buf_samples) >= 1 and len(buf_samples) >= seq_len:
-                    seq_window = buf_samples[-max(1, seq_len):]
-                    seq_m = normalize_seq(seq_window)
-                    seq_s = torch.tensor(np.array([x["s"] for x in seq_window]), dtype=torch.float32).permute(0, 3, 1, 2).unsqueeze(0).to(device) / 255.0
-                    seq_m_t = torch.tensor(np.array(seq_m), dtype=torch.float32).unsqueeze(0).to(device)
-                    with torch.no_grad():
-                        last_pred, pm = net(seq_s, seq_m_t)
-                    if ctx["mode"] == "ACTIVE":
-                        if ctx["stop"]:
-                            break
-                        pm_mapped = (pm[0] + 1.0) / 2.0
-                        cx = pm_mapped[0].item()
-                        cy = pm_mapped[1].item()
-                        tx = int(cx * screen_w)
-                        ty = int(cy * screen_h)
-                        if tx < 0:
-                            tx = 0
-                        if tx > screen_w - 1:
-                            tx = screen_w - 1
-                        if ty < 0:
-                            ty = 0
-                        if ty > screen_h - 1:
-                            ty = screen_h - 1
-                        noise_x = random.gauss(0.0, 5.0)
-                        noise_y = random.gauss(0.0, 5.0)
-                        pyautogui.moveTo(tx + noise_x, ty + noise_y)
-                        lp = pm_mapped[5].item()
-                        rp = pm_mapped[6].item()
-                        if lp > 0.5:
-                            pyautogui.mouseDown()
-                            pyautogui.mouseUp()
-                        if rp > 0.5:
-                            pyautogui.click(button="right")
-            elapsed = time.time() - loop_start
-            if freq < 1:
-                freq = 1
-            sleep_time = 1.0 / float(freq)
-            if elapsed < sleep_time:
-                end_time = time.time() + (sleep_time - elapsed)
-                while not ctx["stop"] and time.time() < end_time:
-                    remaining = end_time - time.time()
-                    if remaining <= 0:
-                        break
-                    interval = 0.01
-                    if remaining < interval:
-                        interval = remaining
-                    time.sleep(interval)
-        if chunk_buffer:
-            chunk_samples = []
-            for s in chunk_buffer:
-                chunk_samples.append({"t": s["t"], "r": s["r"], "s": encode_image(s["s"]), "m": s["m"]})
-            chunk_data = {"start": chunk_start if chunk_start is not None else time.time(), "end": chunk_buffer[-1]["t"], "samples": chunk_samples}
-            file_path = os.path.join(pool_dir, str(time.time_ns()) + ".pkl")
-            with open(file_path, "wb") as f:
-                pickle.dump(chunk_data, f)
-            size = os.path.getsize(file_path)
-            ctx["pool_size"] += size
-            update_size_file()
-            trim_pool_if_needed()
-        ml.stop()
-        kl.stop()
-        if nvml_inited:
-            pynvml.nvmlShutdown()
-    except Exception:
-        traceback.print_exc()
-        sys.exit(1)
+                        tx, ty = 0.5, 0.5
+
+                    loss = (mx - tx)**2 + (my - ty)**2
+                    loss.backward()
+                    optimizer.step()
+                    
+                    with state.lock:
+                        state.optimization_progress = int((i / batch_count) * 100)
+                
+                torch.save(model.state_dict(), os.path.join(model_dir, "latest.pth"))
+                with state.lock:
+                    state.mode = "IDLE"
+                    state.optimization_status = "完成"
+            
+            else:
+                time.sleep(0.1)
+
+        except Exception:
+            sys.exit(1)
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>智能控制终端</title>
+    <style>
+        body { background-color: #050505; color: #00ffcc; font-family: 'Microsoft YaHei', sans-serif; margin: 0; overflow: hidden; }
+        .container { display: flex; flex-direction: column; height: 100vh; padding: 20px; box-sizing: border-box; }
+        .hud-header { border-bottom: 2px solid #00ffcc; padding-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
+        .hud-title { font-size: 24px; letter-spacing: 2px; text-shadow: 0 0 10px #00ffcc; font-weight: bold; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; flex-grow: 1; padding-top: 20px; }
+        .panel { border: 1px solid #003333; background: rgba(0, 20, 20, 0.8); padding: 15px; position: relative; }
+        .panel::after { content: ''; position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: 1px solid transparent; box-shadow: inset 0 0 20px rgba(0, 255, 204, 0.1); pointer-events: none; }
+        .btn { background: transparent; border: 1px solid #00ffcc; color: #00ffcc; padding: 15px 30px; font-size: 18px; cursor: pointer; transition: 0.3s; margin: 5px; width: 100%; font-family: 'Microsoft YaHei'; font-weight: bold; }
+        .btn:hover { background: #00ffcc; color: #000; box-shadow: 0 0 15px #00ffcc; }
+        .btn:disabled { border-color: #333; color: #333; cursor: not-allowed; box-shadow: none; }
+        .stat-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; }
+        .bar-container { background: #111; height: 10px; width: 60%; position: relative; display: flex; align-items: center; }
+        .bar-fill { background: #00ffcc; height: 100%; width: 0%; transition: width 0.5s; box-shadow: 0 0 5px #00ffcc; }
+        
+        #modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 1000; justify-content: center; align-items: center; }
+        .modal-content { border: 2px solid #00ffcc; padding: 40px; background: #000; text-align: center; box-shadow: 0 0 30px #00ffcc; width: 400px; }
+        .modal-title { font-size: 30px; margin-bottom: 30px; color: #fff; }
+    </style>
+</head>
+<body>
+    <div id="modal">
+        <div class="modal-content">
+            <div class="modal-title">任务中断</div>
+            <button class="btn" onclick="submitResult('WIN')">胜利</button>
+            <button class="btn" onclick="submitResult('DRAW')">平局</button>
+            <button class="btn" onclick="submitResult('LOSS')">失败</button>
+            <button class="btn" onclick="submitResult('CONTINUE')">继续</button>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="hud-header">
+            <div class="hud-title">智能控制终端</div>
+            <div id="status-display">状态: 待机</div>
+        </div>
+        
+        <div class="grid">
+            <div class="panel">
+                <h3>系统监控</h3>
+                <div id="stats-container"></div>
+                <div style="margin-top: 20px;">
+                    <div class="stat-row"><span>采样频率:</span> <span id="val-fps">30</span> Hz</div>
+                    <div class="stat-row"><span>记忆深度:</span> <span id="val-seq">10</span> Frames</div>
+                </div>
+            </div>
+            
+            <div class="panel" style="display: flex; flex-direction: column; justify-content: center;">
+                <button class="btn" id="btn-learn" onclick="startMode('learn')">开始学习</button>
+                <button class="btn" id="btn-train" onclick="startMode('train')">开始训练</button>
+                <button class="btn" id="btn-prac" onclick="startMode('practical')">开始实操</button>
+                <button class="btn" id="btn-opt" onclick="startOpt()">优化模型</button>
+                <div id="opt-progress-container" style="display:none; margin-top: 15px;">
+                    <div>优化进度 <span id="opt-text">0%</span></div>
+                    <div class="bar-container" style="width: 100%; margin-top: 5px;"><div id="opt-bar" class="bar-fill"></div></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function updateStats() {
+            fetch('/status').then(r => r.json()).then(data => {
+                const modeMap = {
+                    'IDLE': '待机', 'LEARNING': '学习模式', 'TRAINING': '训练模式', 
+                    'PRACTICAL': '实操模式', 'OPTIMIZING': '优化中', 'PAUSED': '暂停'
+                };
+                document.getElementById('status-display').innerText = '状态: ' + (modeMap[data.mode] || data.mode);
+                document.getElementById('val-fps').innerText = data.stats.fps;
+                document.getElementById('val-seq').innerText = data.stats.seq;
+                
+                let html = '';
+                ['cpu', 'mem', 'gpu', 'vram'].forEach(k => {
+                    html += `<div class="stat-row"><span>${k.toUpperCase()}</span><div class="bar-container"><div class="bar-fill" style="width:${data.stats[k]}%"></div></div><span>${Math.round(data.stats[k])}%</span></div>`;
+                });
+                document.getElementById('stats-container').innerHTML = html;
+
+                if (data.mode === 'OPTIMIZING') {
+                    document.getElementById('opt-progress-container').style.display = 'block';
+                    document.getElementById('opt-bar').style.width = data.opt_progress + '%';
+                    document.getElementById('opt-text').innerText = data.opt_progress + '%';
+                } else {
+                    document.getElementById('opt-progress-container').style.display = 'none';
+                }
+
+                if (data.mode === 'PAUSED') {
+                    document.getElementById('modal').style.display = 'flex';
+                } else {
+                    document.getElementById('modal').style.display = 'none';
+                }
+                
+                const btns = ['btn-learn', 'btn-train', 'btn-prac', 'btn-opt'];
+                btns.forEach(b => document.getElementById(b).disabled = (data.mode !== 'IDLE'));
+            }).catch(() => {});
+        }
+
+        function startMode(mode) {
+            fetch('/start_' + mode, {method: 'POST'});
+        }
+
+        function startOpt() {
+            fetch('/optimize', {method: 'POST'});
+        }
+
+        function submitResult(res) {
+            fetch('/submit_result', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({result: res})
+            });
+        }
+
+        setInterval(updateStats, 1000);
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return HTML_TEMPLATE
+
+@app.route('/status')
+def status():
+    with state.lock:
+        return jsonify({
+            "mode": state.mode,
+            "stats": state.resource_stats,
+            "opt_progress": state.optimization_progress,
+            "opt_status": state.optimization_status
+        })
+
+@app.route('/start_learn', methods=['POST'])
+def start_learn():
+    with state.lock:
+        if state.mode == "IDLE":
+            state.mode = "LEARNING"
+            state.current_episode_id = str(uuid.uuid4())
+            state.buffer = []
+            state.window_handle = get_window_handle()
+            set_window_state(minimize=True)
+    return jsonify({"status": "ok"})
+
+@app.route('/start_train', methods=['POST'])
+def start_train():
+    with state.lock:
+        if state.mode == "IDLE":
+            state.mode = "TRAINING"
+            state.current_episode_id = str(uuid.uuid4())
+            state.buffer = []
+            state.window_handle = get_window_handle()
+            set_window_state(minimize=True)
+    return jsonify({"status": "ok"})
+
+@app.route('/start_practical', methods=['POST'])
+def start_practical():
+    with state.lock:
+        if state.mode == "IDLE":
+            state.mode = "PRACTICAL"
+            state.current_episode_id = str(uuid.uuid4())
+            state.buffer = []
+            state.window_handle = get_window_handle()
+            set_window_state(minimize=True)
+    return jsonify({"status": "ok"})
+
+@app.route('/optimize', methods=['POST'])
+def optimize():
+    with state.lock:
+        if state.mode == "IDLE":
+            state.mode = "OPTIMIZING"
+            state.optimization_progress = 0
+            return jsonify({"status": "started"})
+    return jsonify({"status": "busy"})
+
+@app.route('/submit_result', methods=['POST'])
+def submit_result():
+    data = request.json
+    res = data.get('result')
+    
+    with state.lock:
+        if res == "CONTINUE":
+            state.mode = state.prev_mode
+            set_window_state(minimize=True)
+        else:
+            fname = f"{int(time.time())}_{res}.pkl"
+            fpath = os.path.join(exp_pool_dir, fname)
+            try:
+                with open(fpath, 'wb') as f:
+                    pickle.dump(state.buffer, f)
+            except:
+                pass
+            
+            check_disk_space()
+            
+            state.buffer = []
+            state.mode = "IDLE"
+            set_window_state(minimize=False)
+            
+    return jsonify({"status": "ok"})
+
+def run_app():
+    webbrowser.open("http://127.0.0.1:5000")
+    app.run(port=5000, use_reloader=False)
 
 if __name__ == "__main__":
-    main()
+    t_res = threading.Thread(target=monitor_resources, daemon=True)
+    t_res.start()
+    
+    t_list = threading.Thread(target=listener_thread, daemon=True)
+    t_list.start()
+    
+    t_work = threading.Thread(target=worker_thread, daemon=True)
+    t_work.start()
+    
+    try:
+        run_app()
+    except:
+        sys.exit(1)
