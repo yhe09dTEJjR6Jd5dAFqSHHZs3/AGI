@@ -957,7 +957,7 @@ class AgentThread(threading.Thread):
                 move_mouse(float(rand_x), float(rand_y), random.randint(0, 2))
                 time.sleep(max(0, (1.0 / max(1, fps))))
                 continue
-            if global_optimizing or pause_snapshot:
+            if global_optimizing or (pause_snapshot and mode_snapshot != "debug"):
                 time.sleep(0.1)
                 continue
             start_time = time.time()
