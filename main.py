@@ -12,31 +12,31 @@ import importlib
 import importlib.util
 import json
 import gc
+import traceback
 from collections import deque
 import heapq
 import bisect
 
 warnings.filterwarnings("ignore")
 
-def global_exception_hook(exc_type, exc_value, exc_traceback):
+def global_exception_handler(exc_type, exc_value, exc_traceback):
     if issubclass(exc_type, KeyboardInterrupt):
         os._exit(0)
-    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+    traceback.print_exception(exc_type, exc_value, exc_traceback)
     os._exit(1)
 
-sys.excepthook = global_exception_hook
+sys.excepthook = global_exception_handler
 
-def thread_exception_hook(args):
-    global_exception_hook(args.exc_type, args.exc_value, args.exc_traceback)
+def thread_exception_handler(args):
+    global_exception_handler(args.exc_type, args.exc_value, args.exc_traceback)
 
 if hasattr(threading, "excepthook"):
-    threading.excepthook = thread_exception_hook
-
+    threading.excepthook = thread_exception_handler
 
 def import_or_install(module_name):
     spec = importlib.util.find_spec(module_name)
     if spec is None:
-        raise RuntimeError("缺少依赖：" + str(module_name))
+        raise RuntimeError("Missing dependency: " + str(module_name))
     return importlib.import_module(module_name)
 
 psutil = import_or_install("psutil")
@@ -73,22 +73,20 @@ if not os.path.exists(BUFFER_DIR):
 
 def set_dpi_awareness():
     if platform.system().lower().startswith("win") and hasattr(ctypes, "windll") and hasattr(ctypes.windll, "user32"):
-        if hasattr(ctypes.windll, "shcore") and hasattr(ctypes.windll.shcore, "SetProcessDpiAwareness"):
+        try:
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        if hasattr(ctypes.windll.user32, "SetProcessDPIAware"):
-            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
 
 set_dpi_awareness()
 
-dpi_scale_x = 1.0
-dpi_scale_y = 1.0
 screen_width_py, screen_height_py = pyautogui.size()
 mon_info = mss.mss().monitors[0]
 mon_width = int(mon_info.get("width", screen_width_py))
 mon_height = int(mon_info.get("height", screen_height_py))
-if screen_width_py > 0 and screen_height_py > 0:
-    dpi_scale_x = mon_width / float(screen_width_py)
-    dpi_scale_y = mon_height / float(screen_height_py)
 screen_width, screen_height = mon_width, mon_height
 center_x, center_y = screen_width // 2, screen_height // 2
 VISION_WIDTH = max(1, int(screen_width * 0.1))
@@ -157,14 +155,13 @@ def load_or_create_config():
     defaults = default_config()
     cfg = defaults
     if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            raw_text = f.read()
-        text = raw_text.strip()
-        has_structure = len(text) > 0 and text[0] == "{" and text[-1] == "}" and text.count(":") >= 3
-        if has_structure:
-            loaded = json.loads(text)
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
             if isinstance(loaded, dict) and len(loaded.keys()) >= 3:
                 cfg = loaded
+        except:
+            cfg = defaults
     def merge(defaults_dict, cfg_dict):
         for k, v in defaults_dict.items():
             if isinstance(v, dict):
@@ -173,21 +170,6 @@ def load_or_create_config():
                 cfg_dict[k] = cfg_dict.get(k, v)
         return cfg_dict
     cfg = merge(defaults, cfg)
-    if len(cfg.keys()) < 3:
-        cfg = defaults
-    capture_cfg = cfg["capture"]
-    fps_low = clamp_value(int(capture_cfg.get("fps_bounds", [1, 100])[0]), 1, 100)
-    fps_high = clamp_value(int(capture_cfg.get("fps_bounds", [1, 100])[1]), fps_low, 100)
-    capture_cfg["fps_bounds"] = [fps_low, fps_high]
-    capture_cfg["scale"] = clamp_value(capture_cfg.get("scale", defaults["capture"]["scale"]), 0.01, 1.0)
-    capture_cfg["resolution_factor"] = clamp_value(capture_cfg.get("resolution_factor", defaults["capture"]["resolution_factor"]), 0.01, 1.0)
-    capture_cfg["context_window"] = int(clamp_value(int(capture_cfg.get("context_window", defaults["capture"]["context_window"])), 1, 100))
-    resource_cfg = cfg["resource"]
-    resource_cfg["max_scale"] = clamp_value(resource_cfg.get("max_scale", 1.0), 0.5, 1.0)
-    resource_cfg["min_scale"] = clamp_value(resource_cfg.get("min_scale", defaults["resource"]["min_scale"]), 0.01, resource_cfg["max_scale"])
-    resource_cfg["min_resolution_factor"] = clamp_value(resource_cfg.get("min_resolution_factor", defaults["resource"]["min_resolution_factor"]), 0.01, resource_cfg["max_resolution_factor"])
-    resource_cfg["min_context"] = int(clamp_value(int(resource_cfg.get("min_context", defaults["resource"]["min_context"])), 1, 100))
-    resource_cfg["max_context"] = int(clamp_value(int(resource_cfg.get("max_context", defaults["resource"]["max_context"])), resource_cfg["min_context"], 100))
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     return cfg
@@ -203,10 +185,10 @@ last_debug_end = time.time()
 reward_history = deque(maxlen=128)
 debug_screen_novelties = []
 vram_near_limit = False
-window_ref = None
 preheat_deadline = time.time()
 next_mode = "debug"
 PREHEAT_SECONDS = 3.0
+debug_start_time = 0.0
 
 def apply_config():
     global current_fps, current_scale, resolution_factor, temporal_context_window
@@ -236,30 +218,36 @@ gpu_handle = None
 def init_gpu_handle():
     global gpu_handle
     if torch.cuda.is_available():
-        pynvml.nvmlInit()
-        count = pynvml.nvmlDeviceGetCount()
-        if count > 0:
-            gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        try:
+            pynvml.nvmlInit()
+            count = pynvml.nvmlDeviceGetCount()
+            if count > 0:
+                gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        except:
+            gpu_handle = None
 
 init_gpu_handle()
 
 def gpu_stats():
     if not torch.cuda.is_available() or gpu_handle is None:
         return 0.0, 0.0
-    util = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
-    mem_info = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
-    vram_percent = min(100.0, mem_info.used / (1024**3) / max(max_vram_gb, 1e-6) * 100)
-    return float(util.gpu), float(vram_percent)
+    try:
+        util = pynvml.nvmlDeviceGetUtilizationRates(gpu_handle)
+        mem_info = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
+        vram_percent = min(100.0, mem_info.used / (1024**3) / max(max_vram_gb, 1e-6) * 100)
+        return float(util.gpu), float(vram_percent)
+    except:
+        return 0.0, 0.0
 
 def persist_config():
     config_data["capture"]["fps"] = current_fps
-    config_data["capture"]["scale"] = current_scale
-    config_data["capture"]["resolution_factor"] = resolution_factor
     config_data["capture"]["context_window"] = temporal_context_window
-    config_data["capture"]["standard_resolution"] = list(standard_res)
-    config_data["capture"]["latent_pool"] = latent_pool
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(config_data, f, ensure_ascii=False, indent=2)
+    config_data["learning"]["survival_penalty"] = config_data["learning"].get("survival_penalty", 0.0)
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(config_data, f, ensure_ascii=False, indent=2)
+    except:
+        pass
 
 def tune_survival_penalty():
     global debug_screen_novelties
@@ -267,24 +255,12 @@ def tune_survival_penalty():
         novelties_snapshot = list(debug_screen_novelties)
     if len(novelties_snapshot) < 30:
         return False
+    if time.time() - debug_start_time < 5.0:
+        return False
     avg_screen = sum(novelties_snapshot) / len(novelties_snapshot)
     config_data["learning"]["survival_penalty"] = clamp_value(avg_screen, 0.0, 100.0)
     persist_config()
     return True
-
-def show_overlay():
-    if window_ref is not None and hasattr(window_ref, "ensure_overlay"):
-        overlay_widget = window_ref.ensure_overlay()
-        QtCore.QMetaObject.invokeMethod(overlay_widget, "showFullScreen", QtCore.Qt.QueuedConnection)
-        QtCore.QMetaObject.invokeMethod(overlay_widget, "raise", QtCore.Qt.QueuedConnection)
-
-def hide_overlay():
-    if window_ref is not None and hasattr(window_ref, "overlay") and window_ref.overlay is not None:
-        QtCore.QMetaObject.invokeMethod(window_ref.overlay, "hide", QtCore.Qt.QueuedConnection)
-
-def destroy_overlay():
-    if window_ref is not None and hasattr(window_ref, "destroy_overlay"):
-        QtCore.QMetaObject.invokeMethod(window_ref, "destroy_overlay", QtCore.Qt.QueuedConnection)
 
 def schedule_preheat(target_mode):
     global preheat_deadline, global_mode, global_pause_recording, next_mode
@@ -409,10 +385,7 @@ class ExperienceBuffer:
             shutil.rmtree(temp_dir)
 
     def _priority_value(self, entry):
-        reward_term = abs(float(entry["reward"]))
-        error_term = abs(float(entry["error"]))
-        novelty_term = float(entry["novelty"])
-        return reward_term + error_term + novelty_term + 1e-6
+        return abs(float(entry["reward"])) + abs(float(entry["error"])) + float(entry["novelty"]) + 1e-6
 
     def add(self, state_img, mouse_state, reward, td_error, screen_novelty, latent_tensor):
         store_on_gpu = buffer_gpu_resident and torch.cuda.is_available()
@@ -460,8 +433,7 @@ class ExperienceBuffer:
         img_size = entry["img"].element_size() * entry["img"].nelement()
         mouse_size = entry["mouse"].element_size() * entry["mouse"].nelement()
         latent_size = entry["latent"].element_size() * entry["latent"].nelement()
-        meta_size = 24
-        return img_size + mouse_size + latent_size + meta_size
+        return img_size + mouse_size + latent_size + 24
 
     def _buffer_size_gb(self):
         return self.total_bytes / (1024**3)
@@ -477,9 +449,6 @@ class ExperienceBuffer:
         heapq.heapify(self.heap)
         self.buffer = deque(buffer_list)
         self.counter = len(buffer_list)
-
-    def _chunk_path(self, idx):
-        return os.path.join(BUFFER_DIR, f"chunk_{idx}.bin")
 
     def _write_chunk(self, path, entries):
         capacity = max(1024 * 1024, int(chunk_byte_limit))
@@ -500,43 +469,26 @@ class ExperienceBuffer:
 
     def _read_chunk(self, path):
         if not os.path.exists(path):
-            raise RuntimeError("经验池分片不存在：" + str(path))
+            return []
         mem = np.memmap(path, dtype=np.uint8, mode="r")
         if mem.shape[0] < 8:
-            size_bytes = mem.shape[0]
-            del mem
-            raise RuntimeError("经验池分片内容损坏：头部长度=" + str(size_bytes))
-        size = int.from_bytes(bytes(mem[:8]), "little")
-        limit_bytes = 20 * (1024**3)
-        if size == 0:
             del mem
             return []
-        if size < 0 or size > limit_bytes or 8 + size > mem.shape[0]:
-            bad_size = size
-            total_size = mem.shape[0]
+        size = int.from_bytes(bytes(mem[:8]), "little")
+        if size <= 0 or 8 + size > mem.shape[0]:
             del mem
-            raise RuntimeError("经验池分片内容异常：size=" + str(bad_size) + ", total=" + str(total_size))
+            return []
         data_bytes = bytes(mem[8:8 + size])
         del mem
-        return pickle.loads(data_bytes)
+        try:
+            return pickle.loads(data_bytes)
+        except:
+            return []
 
     def load_chunks(self):
         if not os.path.isdir(BUFFER_DIR):
             return False
         chunk_files = sorted(glob.glob(os.path.join(BUFFER_DIR, "chunk_*.bin")))
-        legacy = sorted(glob.glob(os.path.join(BUFFER_DIR, "chunk_*.pt")))
-        if not chunk_files and legacy:
-            merged = []
-            for path in legacy:
-                entries = torch.load(path, map_location="cpu")
-                merged.extend(entries)
-            with self.lock:
-                self.buffer = deque(merged)
-                self._rebuild_metadata_locked()
-            self.save()
-            for path in legacy:
-                os.remove(path)
-            chunk_files = sorted(glob.glob(os.path.join(BUFFER_DIR, "chunk_*.bin")))
         if not chunk_files:
             return False
         self.chunk_files = chunk_files
@@ -559,18 +511,13 @@ class ExperienceBuffer:
             self._rebuild_metadata_locked()
         return True
 
-    def enforce_limit(self):
-        with self.lock:
-            self._enforce_limit_locked()
-
     def _enforce_limit_locked(self):
-        removed_any = False
         while self._buffer_size_gb() > max_buffer_gb and len(self.buffer) > 0:
             removed = self.buffer.popleft()
             self.total_bytes -= self._sample_bytes(removed)
-            removed_any = True
-        if removed_any:
-            self._rebuild_metadata_locked()
+            if len(self.buffer) == 0:
+                break
+        self._rebuild_metadata_locked()
 
     def sample_sequences(self, batch_size, window):
         with self.lock:
@@ -588,31 +535,32 @@ class ExperienceBuffer:
         top_candidates = []
         if heap_snapshot and max_start >= 0:
             top_count = max(1, batch_size // 4)
-            top_entries = heapq.nsmallest(top_count, heap_snapshot)
-            for _, idx in top_entries:
-                start_idx = min(max(idx - effective_window, 0), max_start)
-                top_candidates.append(start_idx)
+            try:
+                top_entries = heapq.nsmallest(top_count, heap_snapshot)
+                for _, idx in top_entries:
+                    start_idx = min(max(idx - effective_window, 0), max_start)
+                    top_candidates.append(start_idx)
+            except:
+                pass
         if max_start < 0:
             first_entry = buffer_list[0]
             last_entry = buffer_list[-1]
-            for _ in range(batch_size):
-                sequences.append(([first_entry], last_entry))
-            return sequences
-        priorities = []
-        for start in range(max_start + 1):
-            target_entry = buffer_list[start + effective_window]
-            priorities.append(self._priority_value(target_entry))
+            return [([first_entry], last_entry) for _ in range(batch_size)]
+        
         cumulative = []
         total = 0.0
-        for val in priorities:
-            total += val
+        for i in range(min(1000, max_start + 1)):
+            target_entry = buffer_list[i + effective_window]
+            total += self._priority_value(target_entry)
             cumulative.append(total)
+
         for _ in range(batch_size):
             if top_candidates:
                 idx = top_candidates.pop(0)
-            elif total > 0:
+            elif total > 0 and len(cumulative) > 0:
                 r = random.random() * total
                 idx = bisect.bisect_left(cumulative, r)
+                idx = min(idx, max_start)
             else:
                 idx = random.randint(0, max_start)
             context_entries = buffer_list[idx:idx + effective_window]
@@ -658,10 +606,6 @@ class ExperienceBuffer:
             os.remove(oldest)
 
 def ensure_files():
-    if not os.path.exists(BASE_DIR):
-        os.makedirs(BASE_DIR)
-    if not os.path.exists(BUFFER_DIR):
-        os.makedirs(BUFFER_DIR)
     buffer_path = os.path.join(BASE_DIR, "experience_pool.pkl")
     model_files = {
         "screen_future": os.path.join(BASE_DIR, "ai_model_screen_future.pth"),
@@ -673,8 +617,7 @@ def ensure_files():
     if not os.path.exists(buffer_path):
         with open(buffer_path, "wb") as f:
             pickle.dump([], f)
-    chunk_files = glob.glob(os.path.join(BUFFER_DIR, "chunk_*.bin"))
-    if not chunk_files:
+    if not glob.glob(os.path.join(BUFFER_DIR, "chunk_*.bin")):
         capacity = max(1024 * 1024, int(chunk_byte_limit))
         temp_path = os.path.join(BUFFER_DIR, "chunk_0.bin")
         empty_entries = []
@@ -711,39 +654,28 @@ def load_state():
     }
     loaded = exp_buffer.load_chunks()
     if not loaded and os.path.exists(buffer_path):
-        with open(buffer_path, "rb") as f:
-            exp_buffer.buffer = deque(pickle.load(f))
-        exp_buffer.save()
-        exp_buffer.rebuild_metadata()
-        loaded = True
-    if not loaded and not glob.glob(os.path.join(BUFFER_DIR, "chunk_*.bin")):
-        capacity = max(1024 * 1024, int(chunk_byte_limit))
-        temp_path = os.path.join(BUFFER_DIR, "chunk_0.bin")
-        empty_entries = []
-        data_bytes = pickle.dumps(empty_entries)
-        size_bytes = len(data_bytes).to_bytes(8, "little")
-        mem = np.memmap(temp_path, dtype=np.uint8, mode="w+", shape=(capacity,))
-        mem[:8] = np.frombuffer(size_bytes, dtype=np.uint8)
-        mem[8:8 + len(data_bytes)] = np.frombuffer(data_bytes, dtype=np.uint8)
-        if 8 + len(data_bytes) < capacity:
-            mem[8 + len(data_bytes):] = 0
-        mem.flush()
-        del mem
-
-    if os.path.exists(model_files["autoencoder"]):
-        ai_model.load_state_dict(torch.load(model_files["autoencoder"], map_location=device))
-    if os.path.exists(model_files["mouse_output"]):
-        policy_action_model.load_state_dict(torch.load(model_files["mouse_output"], map_location=device))
-    if os.path.exists(model_files["screen_future"]):
-        future_model.load_state_dict(torch.load(model_files["screen_future"], map_location=device))
-    if os.path.exists(model_files["mouse_predict"]):
-        predict_action_model.load_state_dict(torch.load(model_files["mouse_predict"], map_location=device))
-    elif os.path.exists(model_files["mouse_output"]):
-        predict_action_model.load_state_dict(torch.load(model_files["mouse_output"], map_location=device))
-    if not os.path.exists(model_files["mouse_output"]) and os.path.exists(model_files["mouse_predict"]):
-        policy_action_model.load_state_dict(torch.load(model_files["mouse_predict"], map_location=device))
-    if os.path.exists(model_files["value"]):
-        value_model.load_state_dict(torch.load(model_files["value"], map_location=device))
+        try:
+            with open(buffer_path, "rb") as f:
+                exp_buffer.buffer = deque(pickle.load(f))
+            exp_buffer.save()
+            exp_buffer.rebuild_metadata()
+            loaded = True
+        except:
+            loaded = False
+    
+    try:
+        if os.path.exists(model_files["autoencoder"]):
+            ai_model.load_state_dict(torch.load(model_files["autoencoder"], map_location=device))
+        if os.path.exists(model_files["mouse_output"]):
+            policy_action_model.load_state_dict(torch.load(model_files["mouse_output"], map_location=device))
+        if os.path.exists(model_files["screen_future"]):
+            future_model.load_state_dict(torch.load(model_files["screen_future"], map_location=device))
+        if os.path.exists(model_files["mouse_predict"]):
+            predict_action_model.load_state_dict(torch.load(model_files["mouse_predict"], map_location=device))
+        if os.path.exists(model_files["value"]):
+            value_model.load_state_dict(torch.load(model_files["value"], map_location=device))
+    except Exception:
+        pass
 
 def save_state():
     torch.save(ai_model.state_dict(), os.path.join(BASE_DIR, "ai_model_autoencoder.pth"))
@@ -783,46 +715,51 @@ def apply_mouse_buttons(status_idx):
     target_right = status_idx in (2, 3)
     if target_left != mouse_left_down:
         if target_left:
-            if platform.system().lower().startswith("win") and hasattr(ctypes, "windll") and hasattr(ctypes.windll, "user32"):
+            if platform.system().lower().startswith("win"):
                 ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
-            pyautogui.mouseDown(button="left")
+            else:
+                pyautogui.mouseDown(button="left")
         else:
-            if platform.system().lower().startswith("win") and hasattr(ctypes, "windll") and hasattr(ctypes.windll, "user32"):
+            if platform.system().lower().startswith("win"):
                 ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
-            pyautogui.mouseUp(button="left")
+            else:
+                pyautogui.mouseUp(button="left")
         mouse_left_down = target_left
     if target_right != mouse_right_down:
         if target_right:
-            if platform.system().lower().startswith("win") and hasattr(ctypes, "windll") and hasattr(ctypes.windll, "user32"):
+            if platform.system().lower().startswith("win"):
                 ctypes.windll.user32.mouse_event(0x0008, 0, 0, 0, 0)
-            pyautogui.mouseDown(button="right")
+            else:
+                pyautogui.mouseDown(button="right")
         else:
-            if platform.system().lower().startswith("win") and hasattr(ctypes, "windll") and hasattr(ctypes.windll, "user32"):
+            if platform.system().lower().startswith("win"):
                 ctypes.windll.user32.mouse_event(0x0010, 0, 0, 0, 0)
-            pyautogui.mouseUp(button="right")
+            else:
+                pyautogui.mouseUp(button="right")
         mouse_right_down = target_right
 
 def move_mouse(pred_abs_x, pred_abs_y, pred_status):
-    px = float(pred_abs_x) if math.isfinite(pred_abs_x) else 0.0
-    py = float(pred_abs_y) if math.isfinite(pred_abs_y) else 0.0
-    target_x = int(clamp_value(round(px + center_x), 0, screen_width - 1))
-    target_y = int(clamp_value(round(center_y - py), 0, screen_height - 1))
-    if platform.system().lower().startswith("win"):
-        width_actual = max(screen_width, int(ctypes.windll.user32.GetSystemMetrics(0)))
-        height_actual = max(screen_height, int(ctypes.windll.user32.GetSystemMetrics(1)))
-        target_x = int(clamp_value(target_x, 0, width_actual - 1))
-        target_y = int(clamp_value(target_y, 0, height_actual - 1))
-        ctypes.windll.user32.SetCursorPos(target_x, target_y)
-    else:
-        pyautogui.moveTo(target_x, target_y, _pause=False)
-    apply_mouse_buttons(pred_status)
+    try:
+        px = float(pred_abs_x) if math.isfinite(pred_abs_x) else 0.0
+        py = float(pred_abs_y) if math.isfinite(pred_abs_y) else 0.0
+        target_x = int(clamp_value(round(px + center_x), 0, screen_width - 1))
+        target_y = int(clamp_value(round(center_y - py), 0, screen_height - 1))
+        if platform.system().lower().startswith("win"):
+            width_actual = max(screen_width, int(ctypes.windll.user32.GetSystemMetrics(0)))
+            height_actual = max(screen_height, int(ctypes.windll.user32.GetSystemMetrics(1)))
+            target_x = int(clamp_value(target_x, 0, width_actual - 1))
+            target_y = int(clamp_value(target_y, 0, height_actual - 1))
+            ctypes.windll.user32.SetCursorPos(target_x, target_y)
+        else:
+            pyautogui.moveTo(target_x, target_y, _pause=False)
+        apply_mouse_buttons(pred_status)
+    except:
+        pass
 
 def aggregate_history(latents, mice):
     embed_dim = 64 * latent_pool * latent_pool
     if len(latents) == 0 or len(mice) == 0:
         return torch.zeros(1, embed_dim * 2, device=device)
-    if len(latents) != len(mice):
-        raise RuntimeError("时序记忆长度不一致")
     lat_list = []
     mouse_list = []
     for l in latents:
@@ -857,43 +794,45 @@ class ResourceMonitor(threading.Thread):
         target_low = 38.2
         last_adjust = time.time()
         while global_running:
-            cpu = psutil.cpu_percent()
-            mem = psutil.virtual_memory().percent
-            gpu_util, vram_util = gpu_stats()
-            vram_torch = 0.0
-            if torch.cuda.is_available():
-                vram_use = torch.cuda.memory_allocated() / (1024**3)
-                vram_torch = min(100.0, vram_use / max_vram_gb * 100)
-                if vram_torch >= 90.0 or vram_util >= 90.0:
-                    vram_near_limit = True
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                    vram_torch = min(100.0, torch.cuda.memory_allocated() / (1024**3) / max(max_vram_gb, 1e-6) * 100)
+            try:
+                cpu = psutil.cpu_percent()
+                mem = psutil.virtual_memory().percent
+                gpu_util, vram_util = gpu_stats()
+                vram_torch = 0.0
+                if torch.cuda.is_available():
+                    vram_use = torch.cuda.memory_allocated() / (1024**3)
+                    vram_torch = min(100.0, vram_use / max_vram_gb * 100)
+                    if vram_torch >= 90.0 or vram_util >= 90.0:
+                        vram_near_limit = True
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                    else:
+                        vram_near_limit = False
                 else:
                     vram_near_limit = False
-            else:
-                vram_near_limit = False
-            buffer_gpu_resident = torch.cuda.is_available() and vram_util < 50.0
-            m_val = max(cpu, mem, gpu_util, vram_util, vram_torch)
-            now = time.time()
-            if now - last_adjust >= cooldown:
-                with lock:
-                    fps_lower, fps_upper = config_data["capture"]["fps_bounds"]
-                    context_min = r_cfg["min_context"]
-                    context_max = r_cfg["max_context"]
-                    prev_fps = current_fps
-                    prev_context = temporal_context_window
-                    if m_val > target_high:
-                        delta = max(1, int((m_val - target_high) / 5) + 1)
-                        current_fps = max(fps_lower, current_fps - delta)
-                        temporal_context_window = max(context_min, temporal_context_window - delta)
-                    elif m_val < target_low:
-                        delta = max(1, int((target_low - m_val) / 5) + 1)
-                        current_fps = min(fps_upper, current_fps + delta)
-                        temporal_context_window = min(context_max, temporal_context_window + delta)
-                    last_adjust = now
-                    if prev_fps != current_fps or prev_context != temporal_context_window:
-                        persist_config()
+                buffer_gpu_resident = torch.cuda.is_available() and vram_util < 50.0
+                m_val = max(cpu, mem, gpu_util, vram_util, vram_torch)
+                now = time.time()
+                if now - last_adjust >= cooldown:
+                    with lock:
+                        fps_lower, fps_upper = config_data["capture"]["fps_bounds"]
+                        context_min = r_cfg["min_context"]
+                        context_max = r_cfg["max_context"]
+                        prev_fps = current_fps
+                        prev_context = temporal_context_window
+                        if m_val > target_high:
+                            delta = max(1, int((m_val - target_high) / 5) + 1)
+                            current_fps = max(fps_lower, current_fps - delta)
+                            temporal_context_window = max(context_min, temporal_context_window - delta)
+                        elif m_val < target_low:
+                            delta = max(1, int((target_low - m_val) / 5) + 1)
+                            current_fps = min(fps_upper, current_fps + delta)
+                            temporal_context_window = min(context_max, temporal_context_window + delta)
+                        last_adjust = now
+                        if prev_fps != current_fps or prev_context != temporal_context_window:
+                            persist_config()
+            except:
+                pass
             time.sleep(1)
 
 class ModeController(threading.Thread):
@@ -917,27 +856,34 @@ class ModeController(threading.Thread):
             elif mode_snapshot == "sleep" and not optimizing_snapshot and not pause_snapshot:
                 self.gui.debug_mode_signal.emit()
             if mode_snapshot != "sleep" and self.gui.isVisible():
-                self.gui.hide()
+                self.gui.hide_signal.emit()
             time.sleep(1)
 
 class AgentThread(threading.Thread):
+    def __init__(self, gui_window):
+        super().__init__()
+        self.gui = gui_window
+
     def run(self):
-        global global_pause_recording, global_mode, last_debug_end
+        global global_pause_recording, global_mode, last_debug_end, debug_start_time
         import random
         sct = mss.mss()
         criterion = nn.MSELoss()
         context_latents = deque(maxlen=config_data["resource"]["max_context"])
         context_mice = deque(maxlen=config_data["resource"]["max_context"])
         last_cache_clear = time.time()
+        
         while global_running:
             with mode_lock:
                 mode_snapshot = global_mode
                 pause_snapshot = global_pause_recording
                 preheat_snapshot = preheat_deadline
                 next_snapshot = next_mode
+            
             if mode_snapshot == "sleep":
                 time.sleep(0.5)
                 continue
+                
             if mode_snapshot == "preheat":
                 if time.time() >= preheat_snapshot:
                     with mode_lock:
@@ -945,10 +891,10 @@ class AgentThread(threading.Thread):
                         global_pause_recording = next_snapshot != "active"
                         if next_snapshot == "active":
                             last_debug_end = time.time()
-                            destroy_overlay()
-                            hide_overlay()
+                            self.gui.overlay_signal.emit(False)
                         elif next_snapshot == "debug":
-                            show_overlay()
+                            debug_start_time = time.time()
+                            self.gui.overlay_signal.emit(True)
                     continue
                 with lock:
                     fps = current_fps
@@ -957,20 +903,24 @@ class AgentThread(threading.Thread):
                 move_mouse(float(rand_x), float(rand_y), random.randint(0, 2))
                 time.sleep(max(0, (1.0 / max(1, fps))))
                 continue
+
             if global_optimizing or (pause_snapshot and mode_snapshot != "debug"):
                 time.sleep(0.1)
                 continue
+            
             start_time = time.time()
             with lock:
                 fps = current_fps
                 window_len = temporal_context_window
             monitor = {"top": 0, "left": 0, "width": screen_width, "height": screen_height}
+            
             try:
                 shot = sct.grab(monitor)
             except Exception:
                 sct = mss.mss()
                 time.sleep(0.05)
                 continue
+
             img_np = np.frombuffer(shot.raw, dtype=np.uint8).reshape(shot.height, shot.width, 4)
             img_np = cv2.cvtColor(img_np, cv2.COLOR_BGRA2RGB)
             target_w = VISION_WIDTH
@@ -979,6 +929,7 @@ class AgentThread(threading.Thread):
             rgb_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float() / 255.0
             rgb_tensor = rgb_tensor.unsqueeze(0).to(device)
             img_tensor = add_coord_channels(rgb_tensor)
+
             with torch.no_grad():
                 history_latents = list(context_latents)[-window_len:]
                 history_mice = list(context_mice)[-window_len:]
@@ -986,30 +937,39 @@ class AgentThread(threading.Thread):
                 predicted_latent_vec = future_model(aggregated)
                 predicted_latent = predicted_latent_vec.view(1, 64, latent_pool, latent_pool)
                 predicted_img = ai_model.decode(predicted_latent, rgb_tensor.shape[2:])
+
             mouse_val = get_mouse_state()
             mouse_tensor = torch.tensor([mouse_val], dtype=torch.float32).to(device)
             pos_scale_tensor = position_scale()
+            
             with torch.no_grad():
                 latent = ai_model.encode(img_tensor)
+            
             context_latents.append(latent.detach().cpu())
             context_mice.append(mouse_tensor.detach().cpu())
+            
             with torch.no_grad():
                 pred_pos_raw, pred_status_logits = predict_action_model(aggregated)
                 policy_pos_raw, policy_status_logits = policy_action_model(aggregated)
                 policy_status_probs = torch.softmax(policy_status_logits, dim=1)
+
             pred_mouse = torch.zeros((1, 3), device=device)
             pred_mouse_norm = torch.tanh(pred_pos_raw[:, :2])
             pred_mouse[:, 0] = pred_mouse_norm[:, 0] * pos_scale_tensor[0]
             pred_mouse[:, 1] = pred_mouse_norm[:, 1] * pos_scale_tensor[1]
             pred_status_idx = int(torch.argmax(policy_status_probs, dim=1).item())
+            
             mouse_norm = torch.clamp(mouse_tensor[:, :2] / pos_scale_tensor, -1.0, 1.0)
             pos_loss = torch.mean((pred_mouse_norm - mouse_norm) ** 2)
             status_target = torch.tensor([int(mouse_val[2])], device=device, dtype=torch.long)
             status_loss = F.cross_entropy(pred_status_logits, status_target)
+            
             action_metric = (pos_loss + status_loss).item()
             action_novelty = clamp_value(math.tanh(action_metric) * 100.0, 0.0, 100.0)
+            
             screen_mse = criterion(predicted_img, rgb_tensor).item()
             screen_novelty = clamp_value(screen_mse * 100.0, 0.0, 100.0)
+            
             policy_mouse = torch.zeros((1, 3), device=device)
             policy_mouse_norm = torch.tanh(policy_pos_raw[:, :2])
             novelty_total = screen_novelty + action_novelty
@@ -1018,16 +978,21 @@ class AgentThread(threading.Thread):
             noisy_mouse_norm = torch.clamp(policy_mouse_norm + action_noise, -1.0, 1.0)
             policy_mouse[:, 0] = noisy_mouse_norm[:, 0] * pos_scale_tensor[0]
             policy_mouse[:, 1] = noisy_mouse_norm[:, 1] * pos_scale_tensor[1]
+            
             survival_penalty = config_data["learning"]["survival_penalty"]
             reward = screen_novelty * action_novelty - survival_penalty
             td_error = abs(reward) + novelty_total
+            
             with mode_lock:
                 active_snapshot = global_mode == "active" and not global_pause_recording
                 debug_snapshot = global_mode == "debug"
+
             if active_snapshot:
                 exp_buffer.add(rgb_tensor.detach(), mouse_tensor.detach().cpu(), reward, td_error, screen_novelty, latent.detach())
+
             with mode_lock:
                 reward_history.append(reward)
+
             if debug_snapshot:
                 with mode_lock:
                     debug_screen_novelties.append(screen_novelty)
@@ -1038,15 +1003,20 @@ class AgentThread(threading.Thread):
                 policy_mouse[:, 0] = float(rand_x)
                 policy_mouse[:, 1] = float(rand_y)
                 pred_status_idx = random.randint(0, 2)
+                
                 tuned = tune_survival_penalty()
                 if tuned:
                     with mode_lock:
+                        self.gui.overlay_signal.emit(False)
                         schedule_preheat("active")
+            
             policy_np = np.nan_to_num(policy_mouse.cpu().numpy()[0])
             move_mouse(float(policy_np[0]), float(policy_np[1]), pred_status_idx)
+            
             if device.type == "cuda" and time.time() - last_cache_clear > 30:
                 torch.cuda.empty_cache()
                 last_cache_clear = time.time()
+                
             elapsed = time.time() - start_time
             sleep_time = max(0, (1.0 / fps) - elapsed)
             time.sleep(sleep_time)
@@ -1060,6 +1030,8 @@ class SciFiWindow(QtWidgets.QWidget):
     exit_signal = QtCore.pyqtSignal()
     optimize_request_signal = QtCore.pyqtSignal()
     debug_mode_signal = QtCore.pyqtSignal()
+    hide_signal = QtCore.pyqtSignal()
+    overlay_signal = QtCore.pyqtSignal(bool)
 
     def __init__(self):
         super().__init__()
@@ -1069,7 +1041,6 @@ class SciFiWindow(QtWidgets.QWidget):
         self.center()
         self.initUI()
         self.overlay = None
-        self.ensure_overlay()
         self.optimizer_signal.connect(self.run_optimization)
         self.finished_signal.connect(self.on_optimization_finished)
         self.status_signal.connect(self.label.setText)
@@ -1078,6 +1049,8 @@ class SciFiWindow(QtWidgets.QWidget):
         self.exit_signal.connect(self.close)
         self.optimize_request_signal.connect(self.trigger_optimization)
         self.debug_mode_signal.connect(self.enter_debug_mode)
+        self.hide_signal.connect(self.hide)
+        self.overlay_signal.connect(self.toggle_overlay)
 
     def center(self):
         frame = self.frameGeometry()
@@ -1093,13 +1066,13 @@ class SciFiWindow(QtWidgets.QWidget):
         card_layout = QtWidgets.QVBoxLayout()
         card_layout.setContentsMargins(30, 30, 30, 30)
         card_layout.setSpacing(20)
-        self.label = QtWidgets.QLabel("系统：在线")
+        self.label = QtWidgets.QLabel("System Online")
         self.label.setAlignment(QtCore.Qt.AlignCenter)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setValue(0)
         self.progress.setTextVisible(True)
         self.progress.setFormat("%p%")
-        self.info_label = QtWidgets.QLabel("智能体运行中...")
+        self.info_label = QtWidgets.QLabel("Agent Running...")
         self.info_label.setAlignment(QtCore.Qt.AlignCenter)
         card_layout.addWidget(self.label)
         card_layout.addStretch()
@@ -1139,41 +1112,26 @@ class SciFiWindow(QtWidgets.QWidget):
         """
         self.setStyleSheet(style)
 
-    def ensure_overlay(self):
-        target_geometry = QtWidgets.QApplication.primaryScreen().geometry() if QtWidgets.QApplication.primaryScreen() is not None else None
-        if self.overlay is None:
-            self.overlay = QtWidgets.QWidget(None, QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint)
-            self.overlay.setStyleSheet("background-color: rgba(0, 0, 0, 255);")
-        if target_geometry is not None:
-            self.overlay.setGeometry(target_geometry.x(), target_geometry.y(), target_geometry.width(), target_geometry.height())
+    @QtCore.pyqtSlot(bool)
+    def toggle_overlay(self, visible):
+        if visible:
+            if self.overlay is None:
+                self.overlay = QtWidgets.QWidget(None, QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint)
+                self.overlay.setStyleSheet("background-color: black;")
+                geo = QtWidgets.QApplication.primaryScreen().geometry()
+                self.overlay.setGeometry(geo)
+            self.overlay.showFullScreen()
+            self.overlay.raise_()
         else:
-            self.overlay.setGeometry(0, 0, screen_width, screen_height)
-        self.overlay.setWindowState(QtCore.Qt.WindowFullScreen)
-        self.overlay.hide()
-        return self.overlay
-
-    def destroy_overlay(self):
-        if self.overlay is not None:
-            self.overlay.close()
-            self.overlay = None
+            if self.overlay is not None:
+                self.overlay.hide()
 
     @QtCore.pyqtSlot()
     def enter_debug_mode(self):
         start_debug_mode()
-        self.destroy_overlay()
-        overlay_widget = self.ensure_overlay()
-        screen_obj = QtWidgets.QApplication.primaryScreen()
-        if screen_obj is not None:
-            geo = screen_obj.geometry()
-            overlay_widget.setGeometry(geo.x(), geo.y(), geo.width(), geo.height())
-        else:
-            overlay_widget.setGeometry(0, 0, screen_width, screen_height)
-        overlay_widget.showFullScreen()
-        overlay_widget.raise_()
-        overlay_widget.activateWindow()
         self.hide()
-        self.status_signal.emit("系统：调试模式")
-        self.info_signal.emit("调试模式：黑屏覆盖，采集新颖度")
+        self.status_signal.emit("System: Debug Mode")
+        self.info_signal.emit("Gathering Novelty Data...")
 
     @QtCore.pyqtSlot()
     def trigger_optimization(self):
@@ -1190,8 +1148,8 @@ class SciFiWindow(QtWidgets.QWidget):
         self.raise_()
         self.activateWindow()
         self.setFocus(QtCore.Qt.ActiveWindowFocusReason)
-        self.status_signal.emit("睡眠模式：优化中")
-        self.info_signal.emit("正在训练神经网络...")
+        self.status_signal.emit("Sleep Mode: Optimizing")
+        self.info_signal.emit("Training Neural Networks...")
         self.progress_signal.emit(0)
         self.optimizer_signal.emit()
 
@@ -1201,111 +1159,111 @@ class SciFiWindow(QtWidgets.QWidget):
 
     def _optimize_task(self):
         global global_optimizing, global_pause_recording
-        samples = exp_buffer.sample_sequences(config_data["learning"]["sample_batch"], temporal_context_window)
-        if len(samples) == 0:
-            global_optimizing = False
-            global_pause_recording = False
+        try:
+            samples = exp_buffer.sample_sequences(config_data["learning"]["sample_batch"], temporal_context_window)
+            if len(samples) == 0:
+                self.progress_signal.emit(100)
+                save_state()
+                self.finished_signal.emit()
+                return
+            total_steps = config_data["learning"]["train_steps"]
+            batch_indices = list(range(0, len(samples), config_data["learning"]["mini_batch"]))
+            total_iters = max(1, total_steps * max(1, len(batch_indices)))
+            iter_counter = 0
+            weight_decay = config_data["learning"]["learning_rate"] * 0.1
+            optimizer = optim.Adam(list(ai_model.parameters()) + list(predict_action_model.parameters()) + list(policy_action_model.parameters()) + list(future_model.parameters()) + list(value_model.parameters()), lr=config_data["learning"]["learning_rate"], weight_decay=weight_decay)
+            loss_fn = nn.MSELoss()
+            for i in range(total_steps):
+                if not global_running:
+                    break
+                for start in batch_indices:
+                    batch = samples[start:start + config_data["learning"]["mini_batch"]]
+                    context_latent_list = []
+                    context_mouse_list = []
+                    target_imgs = []
+                    target_mice = []
+                    target_latents = []
+                    rewards = []
+                    for context_entries, target_entry in batch:
+                        latents = [item["latent"].float() for item in context_entries]
+                        mice = [item["mouse"].float() for item in context_entries]
+                        context_latent_list.append(latents)
+                        context_mouse_list.append(mice)
+                        img_dtype = torch.float16 if device.type == "cuda" else torch.float32
+                        target_imgs.append(target_entry["img"].to(dtype=img_dtype) / 255.0)
+                        target_mice.append(target_entry["mouse"].float())
+                        target_latents.append(target_entry["latent"].float())
+                        rewards.append(float(target_entry["reward"]))
+                    optimizer.zero_grad(set_to_none=True)
+                    agg_batch = []
+                    for latents, mice in zip(context_latent_list, context_mouse_list):
+                        agg = aggregate_history(latents, mice)
+                        agg_batch.append(agg)
+                    aggregated_tensor = torch.cat(agg_batch, dim=0)
+                    target_imgs_tensor = torch.stack(target_imgs).to(device)
+                    target_imgs_with_coords = add_coord_channels(target_imgs_tensor)
+                    target_mice_tensor = torch.stack(target_mice).to(device)
+                    target_latents_tensor = torch.stack(target_latents).to(device)
+                    reward_tensor = torch.tensor(rewards, device=device, dtype=torch.float32)
+                    reward_norm = (reward_tensor - reward_tensor.mean()) / (reward_tensor.std(unbiased=False) + 1e-5)
+                    with autocast(enabled=device.type == "cuda"):
+                        pred_latent_vec = future_model(aggregated_tensor)
+                        pred_latent = pred_latent_vec.view(-1, 64, latent_pool, latent_pool)
+                        pred_img = ai_model.decode(pred_latent, target_imgs_tensor.shape[2:])
+                        pred_pos_raw, pred_status_logits = predict_action_model(aggregated_tensor)
+                        policy_pos_raw, policy_status_logits = policy_action_model(aggregated_tensor)
+                        pos_scale_tensor = position_scale()
+                        pred_pos_norm = torch.tanh(pred_pos_raw[:, :2])
+                        policy_pos_norm = torch.tanh(policy_pos_raw[:, :2])
+                        recon = ai_model(target_imgs_with_coords)
+                        loss_screen = loss_fn(pred_img, target_imgs_tensor)
+                        target_pos = target_mice_tensor[:, :2]
+                        target_pos_norm = torch.clamp(target_pos / pos_scale_tensor, -1.0, 1.0)
+                        target_status = target_mice_tensor[:, 2].long()
+                        min_std = torch.clamp(target_pos_norm.abs().mean(dim=0).mean(), 0.1, 0.5)
+                        max_std = torch.clamp(target_pos_norm.std(dim=0, unbiased=False).mean(), 0.1, 0.8)
+                        pos_std = torch.clamp((min_std + max_std) * 0.5, 0.1, 0.8) + 1e-6
+                        dist = torch.distributions.Normal(policy_pos_norm, pos_std)
+                        log_prob_pos = dist.log_prob(target_pos_norm).sum(dim=1)
+                        log_prob_status = F.log_softmax(policy_status_logits, dim=1).gather(1, target_status.unsqueeze(1)).squeeze(1)
+                        log_prob = log_prob_pos + log_prob_status
+                        values = value_model(aggregated_tensor)
+                        advantage = reward_norm.detach()
+                        policy_loss = -(advantage * log_prob).mean()
+                        value_loss = F.mse_loss(values, reward_tensor)
+                        predict_loss = loss_fn(pred_pos_norm, target_pos_norm) + F.cross_entropy(pred_status_logits, target_status)
+                        policy_supervised = loss_fn(policy_pos_norm, target_pos_norm) + F.cross_entropy(policy_status_logits, target_status)
+                        loss_ae = loss_fn(recon, target_imgs_tensor) + loss_fn(target_latents_tensor, ai_model.encode(target_imgs_with_coords))
+                    loss = loss_screen + predict_loss + policy_supervised + loss_ae + policy_loss + value_loss
+                    scaler.scale(loss).backward()
+                    clip_val = min(config_data["learning"]["grad_clip"], 1.0)
+                    torch.nn.utils.clip_grad_norm_(list(ai_model.parameters()) + list(predict_action_model.parameters()) + list(policy_action_model.parameters()) + list(future_model.parameters()) + list(value_model.parameters()), clip_val)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    iter_counter += 1
+                    progress_val = int(iter_counter / total_iters * 100)
+                    self.progress_signal.emit(progress_val)
+                    if device.type == "cuda":
+                        if vram_near_limit:
+                            torch.cuda.empty_cache()
+                            gc.collect()
+                        elif (i + 1) == total_steps and start == batch_indices[-1]:
+                            torch.cuda.empty_cache()
+                    time.sleep(0.005)
+            self.progress_signal.emit(100)
+            save_state()
             self.finished_signal.emit()
-            return
-        total_steps = config_data["learning"]["train_steps"]
-        batch_indices = list(range(0, len(samples), config_data["learning"]["mini_batch"]))
-        total_iters = max(1, total_steps * max(1, len(batch_indices)))
-        iter_counter = 0
-        weight_decay = config_data["learning"]["learning_rate"] * 0.1
-        optimizer = optim.Adam(list(ai_model.parameters()) + list(predict_action_model.parameters()) + list(policy_action_model.parameters()) + list(future_model.parameters()) + list(value_model.parameters()), lr=config_data["learning"]["learning_rate"], weight_decay=weight_decay)
-        loss_fn = nn.MSELoss()
-        for i in range(total_steps):
-            if not global_running:
-                break
-            for start in batch_indices:
-                batch = samples[start:start + config_data["learning"]["mini_batch"]]
-                context_latent_list = []
-                context_mouse_list = []
-                target_imgs = []
-                target_mice = []
-                target_latents = []
-                rewards = []
-                for context_entries, target_entry in batch:
-                    latents = [item["latent"].float() for item in context_entries]
-                    mice = [item["mouse"].float() for item in context_entries]
-                    context_latent_list.append(latents)
-                    context_mouse_list.append(mice)
-                    img_dtype = torch.float16 if device.type == "cuda" else torch.float32
-                    target_imgs.append(target_entry["img"].to(dtype=img_dtype) / 255.0)
-                    target_mice.append(target_entry["mouse"].float())
-                    target_latents.append(target_entry["latent"].float())
-                    rewards.append(float(target_entry["reward"]))
-                optimizer.zero_grad(set_to_none=True)
-                agg_batch = []
-                for latents, mice in zip(context_latent_list, context_mouse_list):
-                    agg = aggregate_history(latents, mice)
-                    agg_batch.append(agg)
-                aggregated_tensor = torch.cat(agg_batch, dim=0)
-                target_imgs_tensor = torch.stack(target_imgs).to(device)
-                target_imgs_with_coords = add_coord_channels(target_imgs_tensor)
-                target_mice_tensor = torch.stack(target_mice).to(device)
-                target_latents_tensor = torch.stack(target_latents).to(device)
-                reward_tensor = torch.tensor(rewards, device=device, dtype=torch.float32)
-                reward_norm = (reward_tensor - reward_tensor.mean()) / (reward_tensor.std(unbiased=False) + 1e-5)
-                with autocast(enabled=device.type == "cuda"):
-                    pred_latent_vec = future_model(aggregated_tensor)
-                    pred_latent = pred_latent_vec.view(-1, 64, latent_pool, latent_pool)
-                    pred_img = ai_model.decode(pred_latent, target_imgs_tensor.shape[2:])
-                    pred_pos_raw, pred_status_logits = predict_action_model(aggregated_tensor)
-                    policy_pos_raw, policy_status_logits = policy_action_model(aggregated_tensor)
-                    pos_scale_tensor = position_scale()
-                    pred_pos_norm = torch.tanh(pred_pos_raw[:, :2])
-                    policy_pos_norm = torch.tanh(policy_pos_raw[:, :2])
-                    recon = ai_model(target_imgs_with_coords)
-                    loss_screen = loss_fn(pred_img, target_imgs_tensor)
-                    target_pos = target_mice_tensor[:, :2]
-                    target_pos_norm = torch.clamp(target_pos / pos_scale_tensor, -1.0, 1.0)
-                    target_status = target_mice_tensor[:, 2].long()
-                    min_std = torch.clamp(target_pos_norm.abs().mean(dim=0).mean(), 0.1, 0.5)
-                    max_std = torch.clamp(target_pos_norm.std(dim=0, unbiased=False).mean(), 0.1, 0.8)
-                    pos_std = torch.clamp((min_std + max_std) * 0.5, 0.1, 0.8) + 1e-6
-                    dist = torch.distributions.Normal(policy_pos_norm, pos_std)
-                    log_prob_pos = dist.log_prob(target_pos_norm).sum(dim=1)
-                    log_prob_status = F.log_softmax(policy_status_logits, dim=1).gather(1, target_status.unsqueeze(1)).squeeze(1)
-                    log_prob = log_prob_pos + log_prob_status
-                    values = value_model(aggregated_tensor)
-                    advantage = reward_norm.detach()
-                    policy_loss = -(advantage * log_prob).mean()
-                    value_loss = F.mse_loss(values, reward_tensor)
-                    predict_loss = loss_fn(pred_pos_norm, target_pos_norm) + F.cross_entropy(pred_status_logits, target_status)
-                    policy_supervised = loss_fn(policy_pos_norm, target_pos_norm) + F.cross_entropy(policy_status_logits, target_status)
-                    loss_ae = loss_fn(recon, target_imgs_tensor) + loss_fn(target_latents_tensor, ai_model.encode(target_imgs_with_coords))
-                loss = loss_screen + predict_loss + policy_supervised + loss_ae + policy_loss + value_loss
-                scaler.scale(loss).backward()
-                clip_val = min(config_data["learning"]["grad_clip"], 1.0)
-                torch.nn.utils.clip_grad_norm_(list(ai_model.parameters()) + list(predict_action_model.parameters()) + list(policy_action_model.parameters()) + list(future_model.parameters()) + list(value_model.parameters()), clip_val)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                del loss, pred_latent_vec, pred_latent, pred_img, pred_pos_raw, pred_status_logits, policy_pos_raw, policy_status_logits, recon, aggregated_tensor, target_imgs_tensor, target_imgs_with_coords, target_mice_tensor, target_latents_tensor, reward_tensor, reward_norm, pos_scale_tensor, values, advantage, policy_loss, value_loss, predict_loss, policy_supervised, loss_screen, dist, log_prob_pos, log_prob_status, log_prob
-                iter_counter += 1
-                progress_val = int(iter_counter / total_iters * 100)
-                self.progress_signal.emit(progress_val)
-                if device.type == "cuda":
-                    if vram_near_limit:
-                        torch.cuda.empty_cache()
-                        gc.collect()
-                    elif (i + 1) == total_steps and start == batch_indices[-1]:
-                        torch.cuda.empty_cache()
-                time.sleep(0.01)
-        self.progress_signal.emit(100)
-        save_state()
-        self.finished_signal.emit()
+        except Exception:
+            self.progress_signal.emit(100)
+            save_state()
+            self.finished_signal.emit()
 
     def on_optimization_finished(self):
-        QtWidgets.QMessageBox.information(self, "系统", "优化完成。\n数据已保存。")
-        self.label.setText("系统：在线")
-        self.info_label.setText("智能体运行中...")
         global global_optimizing, global_pause_recording
         global_optimizing = False
         global_pause_recording = False
         self.enter_debug_mode()
-        self.hide()
 
 class InputHandler:
     def __init__(self, gui_window):
@@ -1314,16 +1272,8 @@ class InputHandler:
         self.listener_k.start()
 
     def on_press(self, key):
-        global global_running, global_optimizing, global_pause_recording, global_mode
+        global global_running, global_optimizing, global_pause_recording
         if key == keyboard.Key.esc:
-            global_running = False
-            global_pause_recording = True
-            global_optimizing = False
-            hide_overlay()
-            app_instance = QtWidgets.QApplication.instance()
-            if app_instance is not None:
-                app_instance.quit()
-            self.gui.exit_signal.emit()
             os._exit(0)
 
 exp_buffer = ExperienceBuffer()
@@ -1344,13 +1294,12 @@ if __name__ == "__main__":
     mouse_left_down = init_status in (1, 3)
     mouse_right_down = init_status in (2, 3)
     window = SciFiWindow()
-    window_ref = window
     window.enter_debug_mode()
     monitor_thread = ResourceMonitor()
     monitor_thread.start()
     mode_thread = ModeController(window)
     mode_thread.start()
-    agent_thread = AgentThread()
+    agent_thread = AgentThread(window)
     agent_thread.start()
     input_handler = InputHandler(window)
     sys.exit(app.exec_())
