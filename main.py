@@ -276,7 +276,7 @@ def show_overlay():
     if window_ref is not None and hasattr(window_ref, "ensure_overlay"):
         overlay_widget = window_ref.ensure_overlay()
         QtCore.QMetaObject.invokeMethod(overlay_widget, "showFullScreen", QtCore.Qt.QueuedConnection)
-        QtCore.QMetaObject.invokeMethod(overlay_widget, "raise_", QtCore.Qt.QueuedConnection)
+        QtCore.QMetaObject.invokeMethod(overlay_widget, "raise", QtCore.Qt.QueuedConnection)
 
 def hide_overlay():
     if window_ref is not None and hasattr(window_ref, "overlay") and window_ref.overlay is not None:
