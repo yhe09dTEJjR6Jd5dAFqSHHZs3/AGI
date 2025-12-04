@@ -45,3 +45,6 @@
 显示器分辨率：2560×1600
 GPU：NVIDIA GeForce RTX 3050 Ti
 当经验池大小＞20GB时，删除最旧数据，直到经验池大小＜20GB。
+
+需要避免的报错：
+FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead.
