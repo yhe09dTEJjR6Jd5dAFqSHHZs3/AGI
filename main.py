@@ -198,13 +198,15 @@ global_running = True
 global_optimizing = False
 global_pause_recording = False
 buffer_gpu_resident = False
-global_mode = "debug"
+global_mode = "init"
 last_debug_end = time.time()
 reward_history = deque(maxlen=128)
 debug_screen_novelties = []
 vram_near_limit = False
 window_ref = None
 preheat_deadline = time.time()
+next_mode = "debug"
+PREHEAT_SECONDS = 3.0
 
 def apply_config():
     global current_fps, current_scale, resolution_factor, temporal_context_window
@@ -284,14 +286,19 @@ def destroy_overlay():
     if window_ref is not None and hasattr(window_ref, "destroy_overlay"):
         QtCore.QTimer.singleShot(0, window_ref.destroy_overlay)
 
+def schedule_preheat(target_mode):
+    global preheat_deadline, global_mode, global_pause_recording, next_mode
+    preheat_deadline = time.time() + PREHEAT_SECONDS
+    next_mode = target_mode
+    global_mode = "preheat"
+    global_pause_recording = True
+
 def start_debug_mode():
-    global global_mode, global_pause_recording, reward_history, debug_screen_novelties, preheat_deadline
+    global global_mode, global_pause_recording, reward_history, debug_screen_novelties
     with mode_lock:
         reward_history.clear()
         debug_screen_novelties = []
-        preheat_deadline = time.time() + 10.0
-        global_mode = "preheat"
-        global_pause_recording = True
+        schedule_preheat("debug")
     gc.collect()
 
 lock = threading.Lock()
@@ -905,8 +912,7 @@ class ModeController(threading.Thread):
             if mode_snapshot == "active" and not optimizing_snapshot:
                 if debug_elapsed > 60:
                     with mode_lock:
-                        global_mode = "sleep"
-                        global_pause_recording = True
+                        schedule_preheat("sleep")
                     self.gui.optimize_request_signal.emit()
             elif mode_snapshot == "sleep" and not optimizing_snapshot and not pause_snapshot:
                 self.gui.debug_mode_signal.emit()
@@ -928,23 +934,30 @@ class AgentThread(threading.Thread):
                 mode_snapshot = global_mode
                 pause_snapshot = global_pause_recording
                 preheat_snapshot = preheat_deadline
+                next_snapshot = next_mode
             if mode_snapshot == "sleep":
                 time.sleep(0.5)
                 continue
-            if global_optimizing or pause_snapshot:
-                if mode_snapshot == "preheat" and time.time() >= preheat_snapshot:
+            if mode_snapshot == "preheat":
+                if time.time() >= preheat_snapshot:
                     with mode_lock:
-                        global_mode = "debug"
-                        global_pause_recording = False
+                        global_mode = next_snapshot
+                        global_pause_recording = next_snapshot != "active"
+                        if next_snapshot == "active":
+                            last_debug_end = time.time()
+                            destroy_overlay()
+                            hide_overlay()
+                        elif next_snapshot == "debug":
+                            show_overlay()
                     continue
-                if mode_snapshot == "preheat":
-                    with lock:
-                        fps = current_fps
-                    rand_x = random.randint(-screen_width // 2, screen_width // 2)
-                    rand_y = random.randint(-screen_height // 2, screen_height // 2)
-                    move_mouse(float(rand_x), float(rand_y), random.randint(0, 2))
-                    time.sleep(max(0, (1.0 / max(1, fps))))
-                    continue
+                with lock:
+                    fps = current_fps
+                rand_x = random.randint(-screen_width // 2, screen_width // 2)
+                rand_y = random.randint(-screen_height // 2, screen_height // 2)
+                move_mouse(float(rand_x), float(rand_y), random.randint(0, 2))
+                time.sleep(max(0, (1.0 / max(1, fps))))
+                continue
+            if global_optimizing or pause_snapshot:
                 time.sleep(0.1)
                 continue
             start_time = time.time()
@@ -1028,11 +1041,7 @@ class AgentThread(threading.Thread):
                 tuned = tune_survival_penalty()
                 if tuned:
                     with mode_lock:
-                        global_mode = "active"
-                        global_pause_recording = False
-                        last_debug_end = time.time()
-                    destroy_overlay()
-                    hide_overlay()
+                        schedule_preheat("active")
             policy_np = np.nan_to_num(policy_mouse.cpu().numpy()[0])
             move_mouse(float(policy_np[0]), float(policy_np[1]), pred_status_idx)
             if device.type == "cuda" and time.time() - last_cache_clear > 30:
