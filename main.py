@@ -4,7 +4,6 @@ import time
 import json
 import uuid
 import glob
-import shutil
 import ctypes
 import pickle
 import random
@@ -24,14 +23,18 @@ import pyautogui
 from pynput import mouse, keyboard
 from flask import Flask, request, jsonify
 
-warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore")
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
+def panic(msg):
+    ctypes.windll.user32.MessageBoxW(0, str(msg), "Error", 0x10)
+    os._exit(1)
 
 try:
     pynvml.nvmlInit()
     gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-except Exception:
-    sys.exit(1)
+except Exception as e:
+    panic(f"GPU Init Failed: {e}")
 
 desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
 root_dir = os.path.join(desktop_path, "AAA")
@@ -69,17 +72,20 @@ class AIModel(nn.Module):
         super(AIModel, self).__init__()
         self.conv1 = nn.Conv2d(3, 16, kernel_size=5, stride=2)
         self.conv2 = nn.Conv2d(16, 32, kernel_size=5, stride=2)
-        self.fc1 = nn.Linear(32 * 63 * 99, 256)
+        self.pool = nn.AdaptiveAvgPool2d((5, 5))
+        self.fc1 = nn.Linear(32 * 5 * 5, 256)
         self.lstm = nn.LSTM(256, 128, batch_first=True)
         self.fc_mouse_x = nn.Linear(128, 1)
         self.fc_mouse_y = nn.Linear(128, 1)
         self.fc_action = nn.Linear(128, 3)
+        self.fc_result = nn.Linear(128, 3)
 
     def forward(self, x, hidden=None):
         batch_size, seq_len, c, h, w = x.size()
         x = x.view(batch_size * seq_len, c, h, w)
         x = torch.relu(self.conv1(x))
         x = torch.relu(self.conv2(x))
+        x = self.pool(x)
         x = x.view(batch_size * seq_len, -1)
         x = torch.relu(self.fc1(x))
         x = x.view(batch_size, seq_len, -1)
@@ -88,12 +94,15 @@ class AIModel(nn.Module):
         mx = torch.sigmoid(self.fc_mouse_x(out))
         my = torch.sigmoid(self.fc_mouse_y(out))
         act = torch.softmax(self.fc_action(out), dim=1)
-        return mx, my, act, hidden
+        res = torch.softmax(self.fc_result(out), dim=1)
+        return mx, my, act, res, hidden
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = AIModel().to(device)
 if os.path.exists(os.path.join(model_dir, "latest.pth")):
-    model.load_state_dict(torch.load(os.path.join(model_dir, "latest.pth")))
+    try:
+        model.load_state_dict(torch.load(os.path.join(model_dir, "latest.pth")))
+    except: pass
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
 def get_window_handle():
@@ -109,24 +118,22 @@ def set_window_state(minimize=True):
             ctypes.windll.user32.SetForegroundWindow(state.window_handle)
 
 def check_disk_space():
-    total_size = 0
-    files = []
-    for f in glob.glob(os.path.join(exp_pool_dir, "*.pkl")):
-        s = os.path.getsize(f)
-        total_size += s
-        files.append((f, os.path.getctime(f)))
-    
-    files.sort(key=lambda x: x[1])
-    
-    limit = 20 * 1024 * 1024 * 1024
-    while total_size > limit and files:
-        f_path, _ = files.pop(0)
-        s = os.path.getsize(f_path)
-        try:
+    try:
+        total_size = 0
+        files = []
+        for f in glob.glob(os.path.join(exp_pool_dir, "*.pkl")):
+            s = os.path.getsize(f)
+            total_size += s
+            files.append((f, os.path.getctime(f)))
+        files.sort(key=lambda x: x[1])
+        limit = 20 * 1024 * 1024 * 1024
+        while total_size > limit and files:
+            f_path, _ = files.pop(0)
+            s = os.path.getsize(f_path)
             os.remove(f_path)
             total_size -= s
-        except:
-            pass
+    except Exception as e:
+        panic(f"Disk Check Failed: {e}")
 
 def monitor_resources():
     while state.is_running:
@@ -137,23 +144,18 @@ def monitor_resources():
             mem_info = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
             gpu = nv_info.gpu
             vram = (mem_info.used / mem_info.total) * 100
-            
             M = max(cpu, mem, gpu, vram)
-            
             with state.lock:
                 state.resource_stats = {"cpu": cpu, "mem": mem, "gpu": gpu, "vram": vram, "fps": state.fps, "seq": state.seq_len}
-                
                 if M > 90:
                     if state.fps > 1: state.fps -= 1
                     if state.seq_len > 1: state.seq_len -= 1
                 elif M < 10:
-                    M_low = max(cpu, mem, gpu, vram)
-                    if M_low < 40:
+                    if M < 40: 
                          if state.fps < 100: state.fps += 1
                          if state.seq_len < 100: state.seq_len += 1
-                    
         except Exception as e:
-            sys.exit(1)
+            panic(f"Monitor Failed: {e}")
         time.sleep(1)
 
 def on_click(x, y, button, pressed):
@@ -172,7 +174,8 @@ def on_click(x, y, button, pressed):
                         "start_time": state.mouse_state["start_time"],
                         "end_pos": (x, y),
                         "end_time": t,
-                        "screen": state.last_screen
+                        "screen": state.last_screen,
+                        "source": "HUMAN" if state.mode == "LEARNING" else "AI"
                     }
                     if state.mode in ["LEARNING", "TRAINING", "PRACTICAL"]:
                         state.buffer.append(data_point)
@@ -190,12 +193,22 @@ def listener_thread():
         try:
             m_listener.join()
             k_listener.join()
-        except:
-            sys.exit(1)
+        except Exception as e:
+            panic(f"Input Listener Failed: {e}")
+
+def save_buffer(result_label):
+    fname = f"{int(time.time())}_{result_label}.pkl"
+    fpath = os.path.join(exp_pool_dir, fname)
+    try:
+        with open(fpath, 'wb') as f:
+            pickle.dump(state.buffer, f)
+    except: pass
+    check_disk_space()
 
 def worker_thread():
     sct = mss.mss()
     screen_w, screen_h = pyautogui.size()
+    hidden_state = None
     
     while state.is_running:
         try:
@@ -215,7 +228,6 @@ def worker_thread():
                 start_time = time.time()
                 img = np.array(sct.grab(sct.monitors[1]))
                 img_small = cv2.resize(img, (260, 160)) 
-                
                 with state.lock:
                     state.last_screen = img_small
                     if not state.mouse_state["pressed"]:
@@ -227,7 +239,6 @@ def worker_thread():
                             "screen": img_small,
                             "source": "HUMAN"
                         })
-                
                 elapsed = time.time() - start_time
                 sleep_time = max(0, (1.0 / state.fps) - elapsed)
                 time.sleep(sleep_time)
@@ -236,26 +247,22 @@ def worker_thread():
                 start_time = time.time()
                 img = np.array(sct.grab(sct.monitors[1]))
                 img_small = cv2.resize(img, (260, 160))
-                
                 with state.lock:
                     state.last_screen = img_small
                 
                 img_tensor = torch.FloatTensor(img_small).permute(2, 0, 1).unsqueeze(0).unsqueeze(0).to(device) / 255.0
-                
                 with torch.no_grad():
-                    mx, my, act, _ = model(img_tensor)
+                    mx, my, act, res, hidden_state = model(img_tensor, hidden_state)
                 
                 mx = int(mx.item() * screen_w)
                 my = int(my.item() * screen_h)
                 action = torch.argmax(act).item()
+                pred_result = torch.argmax(res).item() 
                 
                 pyautogui.moveTo(mx, my)
-                if action == 1: 
-                    pyautogui.click()
-                elif action == 2:
-                    pyautogui.mouseDown()
-                else:
-                    pyautogui.mouseUp()
+                if action == 1: pyautogui.click()
+                elif action == 2: pyautogui.mouseDown()
+                else: pyautogui.mouseUp()
                 
                 with state.lock:
                     state.buffer.append({
@@ -267,8 +274,14 @@ def worker_thread():
                         "source": "AI"
                     })
                 
-                if current_mode == "PRACTICAL":
-                    pass
+                if current_mode == "PRACTICAL" and pred_result != 0:
+                    res_map = {1: "WIN", 2: "LOSS"}
+                    final_res = res_map.get(pred_result, "DRAW")
+                    save_buffer(final_res)
+                    with state.lock:
+                        state.buffer = []
+                        state.mode = "IDLE"
+                    set_window_state(minimize=False)
 
                 elapsed = time.time() - start_time
                 sleep_time = max(0, (1.0 / state.fps) - elapsed)
@@ -279,14 +292,13 @@ def worker_thread():
                 if not files:
                     with state.lock:
                         state.mode = "IDLE"
-                        state.optimization_status = "数据不足"
+                        state.optimization_status = "无数据"
                     continue
                 
-                state.optimization_status = "训练中..."
+                state.optimization_status = "优化中..."
                 model.train()
-                
                 data_cache = []
-                for f in files[-5:]:
+                for f in files[-10:]:
                     try:
                         with open(f, 'rb') as fb:
                             data_cache.extend(pickle.load(fb))
@@ -295,11 +307,10 @@ def worker_thread():
                 if not data_cache:
                     with state.lock:
                         state.mode = "IDLE"
-                        state.optimization_status = "数据无效"
+                        state.optimization_status = "数据损坏"
                     continue
 
-                if len(data_cache) < 50:
-                    data_cache = data_cache * 50
+                if len(data_cache) < 50: data_cache = data_cache * 50
                 
                 batch_count = 100
                 for i in range(batch_count):
@@ -308,14 +319,12 @@ def worker_thread():
                     if 'screen' not in sample: continue
                     
                     img = torch.FloatTensor(sample['screen']).permute(2, 0, 1).unsqueeze(0).unsqueeze(0).to(device) / 255.0
-                    mx, my, act, _ = model(img)
+                    mx, my, act, res, _ = model(img)
                     
                     if 'pos' in sample:
-                        tx = sample['pos'][0] / screen_w
-                        ty = sample['pos'][1] / screen_h
+                        tx, ty = sample['pos'][0]/screen_w, sample['pos'][1]/screen_h
                     elif 'start_pos' in sample:
-                        tx = sample['start_pos'][0] / screen_w
-                        ty = sample['start_pos'][1] / screen_h
+                        tx, ty = sample['start_pos'][0]/screen_w, sample['start_pos'][1]/screen_h
                     else:
                         tx, ty = 0.5, 0.5
 
@@ -330,183 +339,143 @@ def worker_thread():
                 with state.lock:
                     state.mode = "IDLE"
                     state.optimization_status = "完成"
-            
             else:
                 time.sleep(0.1)
-
-        except Exception:
-            sys.exit(1)
+        except Exception as e:
+            panic(f"Worker Failed: {e}")
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>智能控制终端</title>
+    <title>AI AGENT HUD</title>
     <style>
-        body { background-color: #050505; color: #00ffcc; font-family: 'Microsoft YaHei', sans-serif; margin: 0; overflow: hidden; }
-        .container { display: flex; flex-direction: column; height: 100vh; padding: 20px; box-sizing: border-box; }
-        .hud-header { border-bottom: 2px solid #00ffcc; padding-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
-        .hud-title { font-size: 24px; letter-spacing: 2px; text-shadow: 0 0 10px #00ffcc; font-weight: bold; }
-        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; flex-grow: 1; padding-top: 20px; }
-        .panel { border: 1px solid #003333; background: rgba(0, 20, 20, 0.8); padding: 15px; position: relative; }
-        .panel::after { content: ''; position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: 1px solid transparent; box-shadow: inset 0 0 20px rgba(0, 255, 204, 0.1); pointer-events: none; }
-        .btn { background: transparent; border: 1px solid #00ffcc; color: #00ffcc; padding: 15px 30px; font-size: 18px; cursor: pointer; transition: 0.3s; margin: 5px; width: 100%; font-family: 'Microsoft YaHei'; font-weight: bold; }
-        .btn:hover { background: #00ffcc; color: #000; box-shadow: 0 0 15px #00ffcc; }
-        .btn:disabled { border-color: #333; color: #333; cursor: not-allowed; box-shadow: none; }
-        .stat-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; }
-        .bar-container { background: #111; height: 10px; width: 60%; position: relative; display: flex; align-items: center; }
-        .bar-fill { background: #00ffcc; height: 100%; width: 0%; transition: width 0.5s; box-shadow: 0 0 5px #00ffcc; }
-        
-        #modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 1000; justify-content: center; align-items: center; }
-        .modal-content { border: 2px solid #00ffcc; padding: 40px; background: #000; text-align: center; box-shadow: 0 0 30px #00ffcc; width: 400px; }
-        .modal-title { font-size: 30px; margin-bottom: 30px; color: #fff; }
+        body { background-color: #0a0a12; color: #00f3ff; font-family: 'Segoe UI', sans-serif; margin: 0; overflow: hidden; user-select: none; }
+        .container { display: flex; flex-direction: column; height: 100vh; padding: 20px; box-sizing: border-box; background: radial-gradient(circle at center, #1a1a2e 0%, #000 100%); }
+        .header { border-bottom: 1px solid #00f3ff; padding-bottom: 15px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 5px 15px rgba(0, 243, 255, 0.1); }
+        .title { font-size: 28px; letter-spacing: 4px; text-shadow: 0 0 15px #00f3ff; font-weight: 800; }
+        .status { font-size: 18px; color: #fff; text-shadow: 0 0 5px #fff; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 30px; flex-grow: 1; padding-top: 30px; }
+        .panel { background: rgba(0, 20, 40, 0.6); border: 1px solid rgba(0, 243, 255, 0.3); padding: 20px; border-radius: 5px; position: relative; backdrop-filter: blur(5px); }
+        .panel::before { content: ''; position: absolute; top: -1px; left: -1px; width: 10px; height: 10px; border-top: 2px solid #00f3ff; border-left: 2px solid #00f3ff; }
+        .panel::after { content: ''; position: absolute; bottom: -1px; right: -1px; width: 10px; height: 10px; border-bottom: 2px solid #00f3ff; border-right: 2px solid #00f3ff; }
+        .btn { background: rgba(0, 243, 255, 0.1); border: 1px solid #00f3ff; color: #00f3ff; padding: 15px; font-size: 16px; cursor: pointer; transition: 0.2s; margin-bottom: 15px; width: 100%; font-weight: bold; letter-spacing: 1px; text-transform: uppercase; }
+        .btn:hover { background: #00f3ff; color: #000; box-shadow: 0 0 20px #00f3ff; }
+        .btn:disabled { border-color: #444; color: #444; cursor: not-allowed; background: transparent; box-shadow: none; }
+        .stat-row { display: flex; justify-content: space-between; margin-bottom: 12px; font-size: 14px; align-items: center; }
+        .bar-bg { background: #222; height: 8px; flex-grow: 1; margin: 0 15px; border-radius: 4px; overflow: hidden; }
+        .bar-fill { background: #00f3ff; height: 100%; width: 0%; transition: width 0.3s; box-shadow: 0 0 8px #00f3ff; }
+        #modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); z-index: 999; justify-content: center; align-items: center; backdrop-filter: blur(8px); }
+        .modal-box { border: 1px solid #00f3ff; padding: 40px; background: #000; text-align: center; box-shadow: 0 0 50px rgba(0, 243, 255, 0.3); width: 300px; }
+        .modal-title { font-size: 24px; margin-bottom: 30px; color: #fff; letter-spacing: 2px; }
     </style>
 </head>
 <body>
     <div id="modal">
-        <div class="modal-content">
-            <div class="modal-title">任务中断</div>
+        <div class="modal-box">
+            <div class="modal-title">任务暂停</div>
             <button class="btn" onclick="submitResult('WIN')">胜利</button>
             <button class="btn" onclick="submitResult('DRAW')">平局</button>
             <button class="btn" onclick="submitResult('LOSS')">失败</button>
-            <button class="btn" onclick="submitResult('CONTINUE')">继续</button>
+            <button class="btn" onclick="submitResult('CONTINUE')">继续任务</button>
         </div>
     </div>
-
     <div class="container">
-        <div class="hud-header">
-            <div class="hud-title">智能控制终端</div>
-            <div id="status-display">状态: 待机</div>
+        <div class="header">
+            <div class="title">NEURAL LINK</div>
+            <div class="status" id="status-display">SYSTEM: STANDBY</div>
         </div>
-        
         <div class="grid">
             <div class="panel">
-                <h3>系统监控</h3>
+                <h3 style="margin-top:0; border-bottom:1px solid #333; padding-bottom:10px;">RESOURCE MONITOR</h3>
                 <div id="stats-container"></div>
-                <div style="margin-top: 20px;">
-                    <div class="stat-row"><span>采样频率:</span> <span id="val-fps">30</span> Hz</div>
-                    <div class="stat-row"><span>记忆深度:</span> <span id="val-seq">10</span> Frames</div>
+                <div style="margin-top: 20px; border-top: 1px solid #333; padding-top: 15px;">
+                    <div class="stat-row"><span>SAMPLING RATE</span> <span id="val-fps" style="color:#fff">30</span> Hz</div>
+                    <div class="stat-row"><span>MEMORY DEPTH</span> <span id="val-seq" style="color:#fff">10</span> Frames</div>
                 </div>
             </div>
-            
             <div class="panel" style="display: flex; flex-direction: column; justify-content: center;">
-                <button class="btn" id="btn-learn" onclick="startMode('learn')">开始学习</button>
-                <button class="btn" id="btn-train" onclick="startMode('train')">开始训练</button>
-                <button class="btn" id="btn-prac" onclick="startMode('practical')">开始实操</button>
-                <button class="btn" id="btn-opt" onclick="startOpt()">优化模型</button>
-                <div id="opt-progress-container" style="display:none; margin-top: 15px;">
-                    <div>优化进度 <span id="opt-text">0%</span></div>
-                    <div class="bar-container" style="width: 100%; margin-top: 5px;"><div id="opt-bar" class="bar-fill"></div></div>
+                <button class="btn" id="btn-learn" onclick="post('/start_learn')">开始学习 [LEARN]</button>
+                <button class="btn" id="btn-train" onclick="post('/start_train')">开始训练 [TRAIN]</button>
+                <button class="btn" id="btn-prac" onclick="post('/start_practical')">开始实操 [AUTO]</button>
+                <button class="btn" id="btn-opt" onclick="post('/optimize')">优化模型 [OPTIMIZE]</button>
+                <div id="opt-ui" style="display:none; margin-top: 10px;">
+                    <div style="display:flex; justify-content:space-between; font-size:12px;"><span>OPTIMIZING...</span><span id="opt-text">0%</span></div>
+                    <div class="bar-bg"><div id="opt-bar" class="bar-fill"></div></div>
                 </div>
             </div>
         </div>
     </div>
-
     <script>
-        function updateStats() {
-            fetch('/status').then(r => r.json()).then(data => {
-                const modeMap = {
-                    'IDLE': '待机', 'LEARNING': '学习模式', 'TRAINING': '训练模式', 
-                    'PRACTICAL': '实操模式', 'OPTIMIZING': '优化中', 'PAUSED': '暂停'
-                };
-                document.getElementById('status-display').innerText = '状态: ' + (modeMap[data.mode] || data.mode);
-                document.getElementById('val-fps').innerText = data.stats.fps;
-                document.getElementById('val-seq').innerText = data.stats.seq;
-                
-                let html = '';
+        function update() {
+            fetch('/status').then(r => r.json()).then(d => {
+                const m = {'IDLE':'待机', 'LEARNING':'学习中', 'TRAINING':'训练中', 'PRACTICAL':'实操中', 'OPTIMIZING':'优化中', 'PAUSED':'暂停'};
+                document.getElementById('status-display').innerText = 'SYSTEM: ' + (m[d.mode] || d.mode);
+                document.getElementById('val-fps').innerText = d.stats.fps;
+                document.getElementById('val-seq').innerText = d.stats.seq;
+                let h = '';
                 ['cpu', 'mem', 'gpu', 'vram'].forEach(k => {
-                    html += `<div class="stat-row"><span>${k.toUpperCase()}</span><div class="bar-container"><div class="bar-fill" style="width:${data.stats[k]}%"></div></div><span>${Math.round(data.stats[k])}%</span></div>`;
+                    h += `<div class="stat-row"><span>${k.toUpperCase()}</span><div class="bar-bg"><div class="bar-fill" style="width:${d.stats[k]}%"></div></div><span>${Math.round(d.stats[k])}%</span></div>`;
                 });
-                document.getElementById('stats-container').innerHTML = html;
-
-                if (data.mode === 'OPTIMIZING') {
-                    document.getElementById('opt-progress-container').style.display = 'block';
-                    document.getElementById('opt-bar').style.width = data.opt_progress + '%';
-                    document.getElementById('opt-text').innerText = data.opt_progress + '%';
-                } else {
-                    document.getElementById('opt-progress-container').style.display = 'none';
+                document.getElementById('stats-container').innerHTML = h;
+                const isOpt = d.mode === 'OPTIMIZING';
+                document.getElementById('opt-ui').style.display = isOpt ? 'block' : 'none';
+                if(isOpt) {
+                    document.getElementById('opt-bar').style.width = d.opt_progress + '%';
+                    document.getElementById('opt-text').innerText = d.opt_progress + '%';
                 }
-
-                if (data.mode === 'PAUSED') {
-                    document.getElementById('modal').style.display = 'flex';
-                } else {
-                    document.getElementById('modal').style.display = 'none';
-                }
-                
-                const btns = ['btn-learn', 'btn-train', 'btn-prac', 'btn-opt'];
-                btns.forEach(b => document.getElementById(b).disabled = (data.mode !== 'IDLE'));
-            }).catch(() => {});
+                document.getElementById('modal').style.display = (d.mode === 'PAUSED') ? 'flex' : 'none';
+                ['btn-learn', 'btn-train', 'btn-prac', 'btn-opt'].forEach(b => document.getElementById(b).disabled = (d.mode !== 'IDLE'));
+            }).catch(()=>{});
         }
-
-        function startMode(mode) {
-            fetch('/start_' + mode, {method: 'POST'});
+        function post(u) { fetch(u, {method:'POST'}); }
+        function submitResult(r) {
+            fetch('/submit_result', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({result:r})});
         }
-
-        function startOpt() {
-            fetch('/optimize', {method: 'POST'});
-        }
-
-        function submitResult(res) {
-            fetch('/submit_result', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({result: res})
-            });
-        }
-
-        setInterval(updateStats, 1000);
+        setInterval(update, 1000);
     </script>
 </body>
 </html>
 """
 
 @app.route('/')
-def index():
-    return HTML_TEMPLATE
+def index(): return HTML_TEMPLATE
 
 @app.route('/status')
 def status():
     with state.lock:
-        return jsonify({
-            "mode": state.mode,
-            "stats": state.resource_stats,
-            "opt_progress": state.optimization_progress,
-            "opt_status": state.optimization_status
-        })
+        return jsonify({"mode": state.mode, "stats": state.resource_stats, "opt_progress": state.optimization_progress})
 
 @app.route('/start_learn', methods=['POST'])
 def start_learn():
     with state.lock:
         if state.mode == "IDLE":
             state.mode = "LEARNING"
-            state.current_episode_id = str(uuid.uuid4())
             state.buffer = []
             state.window_handle = get_window_handle()
             set_window_state(minimize=True)
-    return jsonify({"status": "ok"})
+    return jsonify({})
 
 @app.route('/start_train', methods=['POST'])
 def start_train():
     with state.lock:
         if state.mode == "IDLE":
             state.mode = "TRAINING"
-            state.current_episode_id = str(uuid.uuid4())
             state.buffer = []
             state.window_handle = get_window_handle()
             set_window_state(minimize=True)
-    return jsonify({"status": "ok"})
+    return jsonify({})
 
 @app.route('/start_practical', methods=['POST'])
 def start_practical():
     with state.lock:
         if state.mode == "IDLE":
             state.mode = "PRACTICAL"
-            state.current_episode_id = str(uuid.uuid4())
             state.buffer = []
             state.window_handle = get_window_handle()
             set_window_state(minimize=True)
-    return jsonify({"status": "ok"})
+    return jsonify({})
 
 @app.route('/optimize', methods=['POST'])
 def optimize():
@@ -514,50 +483,28 @@ def optimize():
         if state.mode == "IDLE":
             state.mode = "OPTIMIZING"
             state.optimization_progress = 0
-            return jsonify({"status": "started"})
-    return jsonify({"status": "busy"})
+    return jsonify({})
 
 @app.route('/submit_result', methods=['POST'])
 def submit_result():
-    data = request.json
-    res = data.get('result')
-    
+    res = request.json.get('result')
     with state.lock:
         if res == "CONTINUE":
             state.mode = state.prev_mode
             set_window_state(minimize=True)
         else:
-            fname = f"{int(time.time())}_{res}.pkl"
-            fpath = os.path.join(exp_pool_dir, fname)
-            try:
-                with open(fpath, 'wb') as f:
-                    pickle.dump(state.buffer, f)
-            except:
-                pass
-            
-            check_disk_space()
-            
+            save_buffer(res)
             state.buffer = []
             state.mode = "IDLE"
             set_window_state(minimize=False)
-            
-    return jsonify({"status": "ok"})
-
-def run_app():
-    webbrowser.open("http://127.0.0.1:5000")
-    app.run(port=5000, use_reloader=False)
+    return jsonify({})
 
 if __name__ == "__main__":
-    t_res = threading.Thread(target=monitor_resources, daemon=True)
-    t_res.start()
-    
-    t_list = threading.Thread(target=listener_thread, daemon=True)
-    t_list.start()
-    
-    t_work = threading.Thread(target=worker_thread, daemon=True)
-    t_work.start()
-    
+    threading.Thread(target=monitor_resources, daemon=True).start()
+    threading.Thread(target=listener_thread, daemon=True).start()
+    threading.Thread(target=worker_thread, daemon=True).start()
     try:
-        run_app()
-    except:
-        sys.exit(1)
+        webbrowser.open("http://127.0.0.1:5000")
+        app.run(port=5000, use_reloader=False)
+    except Exception as e:
+        panic(f"App Start Failed: {e}")
