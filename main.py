@@ -2,7 +2,6 @@ import sys
 import os
 import time
 import random
-import glob
 import pickle
 import psutil
 import cv2
@@ -105,6 +104,19 @@ def main():
                 update_size_file()
                 if ctx["pool_size"] <= pool_limit_bytes:
                     break
+        def normalize_m(sample, base_time):
+            raw_m = sample.get("m", [])
+            reward_norm = (float(sample.get("r", 0.0)) + 1.0) / 2.0
+            time_raw = float(sample.get("t", base_time)) - base_time
+            if time_raw < 0:
+                time_raw = 0.0
+            time_norm = min(1.0, time_raw / 600.0)
+            core = list(raw_m[:8])
+            if len(core) < 8:
+                core.extend([0.0] * (8 - len(core)))
+            core.extend([reward_norm, time_norm])
+            return core[:m_dim]
+        m_dim = 10
         class Net(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -118,7 +130,7 @@ def main():
                 with torch.no_grad():
                     d = torch.zeros(1, 3, t_h, t_w)
                     o = self.enc(d).shape[1]
-                self.lstm = nn.LSTM(o + 8, 256, batch_first=True)
+                self.lstm = nn.LSTM(o + m_dim, 256, batch_first=True)
                 self.dec_h = max(1, t_h // 4)
                 self.dec_w = max(1, t_w // 4)
                 self.fc_s = nn.Linear(256, 32 * self.dec_h * self.dec_w)
@@ -128,7 +140,7 @@ def main():
                     nn.ConvTranspose2d(16, 3, 3, 2, 1, 1),
                     nn.Sigmoid()
                 )
-                self.head_m = nn.Sequential(nn.Linear(256, 8), nn.Tanh())
+                self.head_m = nn.Sequential(nn.Linear(256, m_dim), nn.Tanh())
             def forward(self, img, m):
                 b, s, c, h, w = img.size()
                 e = self.enc(img.view(b * s, c, h, w)).view(b, s, -1)
@@ -185,6 +197,7 @@ def main():
         kl = keyboard.Listener(on_press=on_key)
         ml.start()
         kl.start()
+        start_time = time.time()
         freq = 10
         seq_len = 5
         buf_img = []
@@ -219,7 +232,9 @@ def main():
                             break
                         path = files[index]
                         with open(path, "rb") as f:
-                            samples.append(pickle.load(f))
+                            sample = pickle.load(f)
+                            sample["m"] = normalize_m(sample, start_time)
+                            samples.append(sample)
                 if ctx["stop"]:
                     return
                 if samples:
@@ -252,7 +267,8 @@ def main():
                         opt.zero_grad()
                         pred_s, pred_m = net(seq_s, seq_m)
                         loss_s = nn.MSELoss()(pred_s, target_s)
-                        loss_m = nn.MSELoss()(pred_m, target_m)
+                        pred_m_mapped = (pred_m + 1.0) / 2.0
+                        loss_m = nn.MSELoss()(pred_m_mapped, target_m)
                         loss = loss_s + loss_m
                         loss.backward()
                         opt.step()
@@ -287,17 +303,17 @@ def main():
                     vram_percent = allocated / total * 100.0
                 if allocated > vram_limit_bytes:
                     raise RuntimeError("VRAM limit exceeded")
-            load = max(cpu, mem_percent, gpu_util, vram_percent)
-            if load > 61.8:
+            M = max(cpu, mem_percent, gpu_util, vram_percent)
+            if M > 61.8:
                 if freq > 1:
-                    freq -= 1
+                    freq = max(1, freq - 1)
                 if seq_len > 1:
-                    seq_len -= 1
-            elif load < 38.2:
+                    seq_len = max(1, seq_len - 1)
+            elif M < 38.2:
                 if freq < 100:
-                    freq += 1
+                    freq = min(100, freq + 1)
                 if seq_len < 100:
-                    seq_len += 1
+                    seq_len = min(100, seq_len + 1)
             now = time.time()
             if ctx["mode"] == "LEARNING" and now - ctx["last_act"] > 10.0:
                 ctx["mode"] = "ACTIVE"
@@ -329,7 +345,6 @@ def main():
                 mrp = float(ctx["m"]["r"])
                 both_down = float(ctx["m"]["dl"])
                 both_up = float(ctx["m"]["dr"])
-                m_vec = [mx, my, mdx, mdy, mlp, mrp, both_down, both_up]
                 cur_t = torch.tensor(s_s, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device) / 255.0
                 rew = 0.0
                 if last_pred is not None:
@@ -342,7 +357,9 @@ def main():
                         elif diff > prev_loss:
                             rew = -1.0
                         prev_loss = diff
-                pkt = {"t": time.time(), "r": rew, "s": s_s, "m": m_vec}
+                cur_time = time.time()
+                m_vec = normalize_m({"m": [mx, my, mdx, mdy, mlp, mrp, both_down, both_up], "r": rew, "t": cur_time}, start_time)
+                pkt = {"t": cur_time, "r": rew, "s": s_s, "m": m_vec}
                 file_path = os.path.join(pool_dir, str(time.time_ns()) + ".pkl")
                 with open(file_path, "wb") as f:
                     pickle.dump(pkt, f)
@@ -363,8 +380,9 @@ def main():
                     if ctx["mode"] == "ACTIVE":
                         if ctx["stop"]:
                             break
-                        cx = pm[0, 0].item()
-                        cy = pm[0, 1].item()
+                        pm_mapped = (pm[0] + 1.0) / 2.0
+                        cx = pm_mapped[0].item()
+                        cy = pm_mapped[1].item()
                         tx = int(cx * screen_w)
                         ty = int(cy * screen_h)
                         if tx < 0:
@@ -378,8 +396,8 @@ def main():
                         noise_x = random.gauss(0.0, 5.0)
                         noise_y = random.gauss(0.0, 5.0)
                         pyautogui.moveTo(tx + noise_x, ty + noise_y, duration=0.01)
-                        lp = pm[0, 4].item()
-                        rp = pm[0, 5].item()
+                        lp = pm_mapped[4].item()
+                        rp = pm_mapped[5].item()
                         if lp > 0.5:
                             pyautogui.mouseDown()
                             pyautogui.mouseUp()
