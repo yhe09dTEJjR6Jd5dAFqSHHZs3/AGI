@@ -13,13 +13,20 @@ import bisect
 from collections import deque
 
 def install_requirements():
-    required = [
-        "torch", "torchvision", "numpy", "opencv-python", "mss", 
-        "pynput", "psutil", "nvidia-ml-py3", "pillow"
-    ]
-    for package in required:
+    package_map = {
+        "torch": "torch",
+        "torchvision": "torchvision",
+        "numpy": "numpy",
+        "opencv-python": "cv2",
+        "mss": "mss",
+        "pynput": "pynput",
+        "psutil": "psutil",
+        "nvidia-ml-py3": "pynvml",
+        "pillow": "PIL"
+    }
+    for package, import_name in package_map.items():
         try:
-            __import__(package.split("==")[0].replace("-", "_").replace("nvidia_ml_py3", "pynvml").replace("pillow", "PIL"))
+            __import__(import_name)
         except ImportError:
             print(f"Installing {package}...")
             try:
@@ -132,14 +139,6 @@ class UniversalAI(nn.Module):
 
         action = torch.sigmoid(self.fc_action(out))
         return action, hidden
-
-def maybe_compile(model):
-    if hasattr(torch, "compile"):
-        try:
-            model = torch.compile(model)
-        except Exception:
-            pass
-    return model
 
 def ensure_initial_model():
     try:
@@ -488,76 +487,86 @@ def sample_trajectory(traj, ts_now, max_points=10, window=0.1, fallback_pos=(0, 
     return flat
 
 def optimize_ai():
-    print("Starting Optimization...")
-    model_path = os.path.join(model_dir, "ai_model.pth")
-    model = UniversalAI().to(device)
-    if os.path.exists(model_path):
-        try:
-            model.load_state_dict(torch.load(model_path, map_location=device))
-        except:
-            pass
-    model = maybe_compile(model)
-
-    model.train()
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    criterion = nn.MSELoss()
-    scaler = GradScaler("cuda", enabled=device.type == "cuda")
-
-    files = []
-    for pattern in ["*.npy", "*.npz"]:
-        for f in glob.glob(os.path.join(data_dir, pattern)):
+    try:
+        torch.cuda.empty_cache()
+        print("Starting Optimization...")
+        model_path = os.path.join(model_dir, "ai_model.pth")
+        model = UniversalAI().to(device)
+        if os.path.exists(model_path):
             try:
-                if os.path.getsize(f) > 0:
-                    files.append(f)
+                model.load_state_dict(torch.load(model_path, map_location=device))
             except:
+                pass
+
+        model.train()
+        optimizer = optim.Adam(model.parameters(), lr=1e-4)
+        criterion = nn.MSELoss()
+        scaler = GradScaler("cuda", enabled=device.type == "cuda")
+
+        files = []
+        for pattern in ["*.npy", "*.npz"]:
+            for f in glob.glob(os.path.join(data_dir, pattern)):
+                try:
+                    if os.path.getsize(f) > 0:
+                        files.append(f)
+                except:
+                    continue
+        if not files:
+            print("No data to train.")
+            torch.cuda.empty_cache()
+            return
+
+        random.shuffle(files)
+        batch_files = [files[i:i+5] for i in range(0, len(files), 5)]
+
+        datasets = []
+        total_samples = 0
+        for bf in batch_files:
+            dataset = GameDataset(bf)
+            if len(dataset) == 0:
                 continue
-    if not files:
-        print("No data to train.")
-        return
+            datasets.append(dataset)
+            total_samples += len(dataset)
 
-    random.shuffle(files)
-    batch_files = [files[i:i+5] for i in range(0, len(files), 5)]
+        if not datasets:
+            print("No data to train.")
+            torch.cuda.empty_cache()
+            return
 
-    datasets = []
-    total_samples = 0
-    for bf in batch_files:
-        dataset = GameDataset(bf)
-        if len(dataset) == 0:
-            continue
-        datasets.append(dataset)
-        total_samples += len(dataset)
+        epochs = 1
+        if total_samples and total_samples < 50:
+            epochs = min(10, max(3, int(50 / max(1, total_samples))))
 
-    if not datasets:
-        print("No data to train.")
-        return
+        for dataset in datasets:
+            loader = DataLoader(dataset, batch_size=4, shuffle=True, drop_last=False, num_workers=0, pin_memory=True)
 
-    epochs = 1
-    if total_samples and total_samples < 50:
-        epochs = min(10, max(3, int(50 / max(1, total_samples))))
+            for _ in range(epochs):
+                for imgs, mins, labels in loader:
+                    imgs = imgs.to(device)
+                    mins = mins.to(device)
+                    labels = labels.to(device)
 
-    for dataset in datasets:
-        loader = DataLoader(dataset, batch_size=4, shuffle=True, drop_last=False, num_workers=4, pin_memory=True)
+                    optimizer.zero_grad()
+                    with autocast(device_type="cuda", enabled=device.type == "cuda"):
+                        out, _ = model(imgs, mins)
+                        loss = criterion(out[:, -1, :], labels)
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
 
-        for _ in range(epochs):
-            for imgs, mins, labels in loader:
-                imgs = imgs.to(device)
-                mins = mins.to(device)
-                labels = labels.to(device)
-
-                optimizer.zero_grad()
-                with autocast(device_type="cuda", enabled=device.type == "cuda"):
-                    out, _ = model(imgs, mins)
-                    loss = criterion(out[:, -1, :], labels)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-
-    temp_path = os.path.join(model_dir, "ai_model_temp.pth")
-    torch.save(model.state_dict(), temp_path)
-    if os.path.exists(model_path):
-        os.remove(model_path)
-    os.rename(temp_path, model_path)
-    print("Optimization Complete (Safe Save).")
+        temp_path = os.path.join(model_dir, "ai_model_temp.pth")
+        torch.save(model.state_dict(), temp_path)
+        if os.path.exists(model_path):
+            os.remove(model_path)
+        os.rename(temp_path, model_path)
+        print("Optimization Complete (Safe Save).")
+        torch.cuda.empty_cache()
+    except Exception as e:
+        print(f"Critical Optimization Error: {e}")
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 def start_training_mode():
     global stop_training_flag, current_mode
@@ -578,7 +587,6 @@ def start_training_mode():
         model.load_state_dict(torch.load(model_path, map_location=device))
     except Exception as e:
         print(f"Model load error: {e}")
-    model = maybe_compile(model)
     model.eval()
     
     mouse_ctrl = mouse.Controller()
