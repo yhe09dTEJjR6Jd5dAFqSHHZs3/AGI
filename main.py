@@ -39,6 +39,11 @@ except Exception:
     pass
 pyautogui.PAUSE = 0
 pyautogui.FAILSAFE = False
+try:
+    if os.name == "nt":
+        psutil.Process(os.getpid()).nice(psutil.ABOVE_NORMAL_PRIORITY_CLASS)
+except Exception:
+    pass
 
 def panic(msg):
     ctypes.windll.user32.MessageBoxW(0, str(msg), "Error", 0x10)
@@ -47,6 +52,8 @@ def panic(msg):
 nvml_module = None
 if importlib.util.find_spec("nvidia_ml_py"):
     nvml_module = importlib.import_module("nvidia_ml_py")
+    if hasattr(nvml_module, "nvml"):
+        nvml_module = nvml_module.nvml
 elif importlib.util.find_spec("pynvml"):
     nvml_module = importlib.import_module("pynvml")
 gpu_handle = None
@@ -83,13 +90,13 @@ class SharedState:
         self.mode = "IDLE"
         self.prev_mode = "IDLE"
         self.is_running = True
-        self.fps = 30
+        self.fps = 15
         self.seq_len = 10
         self.buffer = []
         self.mouse_state = {"pressed": False, "start_pos": None, "start_time": None}
         self.current_episode_id = None
         self.last_screen = None
-        self.resource_stats = {"cpu": 0, "mem": 0, "gpu": 0, "vram": 0, "fps": 30, "seq": 10}
+        self.resource_stats = {"cpu": 0, "mem": 0, "gpu": 0, "vram": 0, "fps": 15, "seq": 10}
         self.optimization_progress = 0
         self.optimization_status = "就绪"
         self.lock = threading.Lock()
@@ -220,6 +227,7 @@ def set_window_state(minimize=True):
         cmd = CMD_MINIMIZE if minimize else CMD_SHOW
         ctypes.windll.user32.ShowWindow(state.window_handle, cmd)
         if not minimize:
+            ctypes.windll.user32.ShowWindow(state.window_handle, 9)
             ctypes.windll.user32.SetForegroundWindow(state.window_handle)
 
 def check_disk_space():
@@ -427,7 +435,7 @@ def add_step(step):
     flush_needed = False
     with state.lock:
         state.buffer.append(step)
-        flush_needed = len(state.buffer) > 1000
+        flush_needed = len(state.buffer) > 150
     if flush_needed:
         flush_buffer_to_temp()
 
@@ -661,6 +669,14 @@ def worker_thread():
                     state.ai_button_down = False
 
             if esc:
+                try:
+                    snap = sct.grab(sct.monitors[1])
+                    snap_arr = np.frombuffer(snap.rgb, dtype=np.uint8).reshape(snap.height, snap.width, 3)
+                    snap_small = cv2.resize(snap_arr, (256, 160))
+                    with state.lock:
+                        state.last_screen = snap_small
+                except Exception:
+                    pass
                 if current_mode == "PRACTICAL":
                     pyautogui.mouseUp()
                     with state.lock:
@@ -684,7 +700,8 @@ def worker_thread():
 
             if current_mode == "LEARNING":
                 start_time = time.time()
-                img = np.array(sct.grab(sct.monitors[1]))
+                shot = sct.grab(sct.monitors[1])
+                img = np.frombuffer(shot.rgb, dtype=np.uint8).reshape(shot.height, shot.width, 3)
                 img_small = cv2.resize(img, (256, 160))
                 ts = time.time()
                 action_flag, btn_flag = get_mouse_action(ts)
@@ -703,7 +720,8 @@ def worker_thread():
 
             elif current_mode in ["TRAINING", "PRACTICAL"]:
                 start_time = time.time()
-                img = np.array(sct.grab(sct.monitors[1]))
+                shot = sct.grab(sct.monitors[1])
+                img = np.frombuffer(shot.rgb, dtype=np.uint8).reshape(shot.height, shot.width, 3)
                 img_small = cv2.resize(img, (256, 160))
                 with state.lock:
                     state.last_screen = img_small
