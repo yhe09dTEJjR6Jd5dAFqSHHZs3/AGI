@@ -12,6 +12,18 @@ import glob
 import bisect
 from collections import deque
 
+def progress_bar(prefix, current, total, suffix=""):
+    total = max(total, 1)
+    ratio = current / total
+    bar_len = 30
+    filled = int(bar_len * ratio)
+    bar = "█" * filled + "-" * (bar_len - filled)
+    percent = int(ratio * 100)
+    sys.stdout.write(f"\r{prefix} [{bar}] {percent}% {suffix}")
+    sys.stdout.flush()
+    if current >= total:
+        sys.stdout.write("\n")
+
 def install_requirements():
     package_map = {
         "torch": "torch",
@@ -504,13 +516,21 @@ def optimize_ai():
         scaler = GradScaler("cuda", enabled=device.type == "cuda")
 
         files = []
+        candidates = []
         for pattern in ["*.npy", "*.npz"]:
-            for f in glob.glob(os.path.join(data_dir, pattern)):
-                try:
-                    if os.path.getsize(f) > 0:
-                        files.append(f)
-                except:
-                    continue
+            candidates.extend(glob.glob(os.path.join(data_dir, pattern)))
+        total_scan = len(candidates)
+        scanned = 0
+        print("Scanning data files...")
+        torch.cuda.empty_cache()
+        for f in candidates:
+            scanned += 1
+            progress_bar("数据扫描阶段", scanned, total_scan)
+            try:
+                if os.path.getsize(f) > 0:
+                    files.append(f)
+            except:
+                continue
         if not files:
             print("No data to train.")
             torch.cuda.empty_cache()
@@ -521,8 +541,14 @@ def optimize_ai():
 
         datasets = []
         total_samples = 0
+        init_total = len(batch_files)
+        init_done = 0
+        print("Dataset Init")
+        torch.cuda.empty_cache()
         for bf in batch_files:
             dataset = GameDataset(bf)
+            init_done += 1
+            progress_bar("Dataset Init", init_done, init_total)
             if len(dataset) == 0:
                 continue
             datasets.append(dataset)
@@ -537,9 +563,15 @@ def optimize_ai():
         if total_samples and total_samples < 50:
             epochs = min(10, max(3, int(50 / max(1, total_samples))))
 
+        loaders = []
         for dataset in datasets:
             loader = DataLoader(dataset, batch_size=4, shuffle=True, drop_last=False, num_workers=0, pin_memory=True)
+            loaders.append(loader)
 
+        total_steps = sum(len(loader) for loader in loaders) * epochs
+        current_step = 0
+        torch.cuda.empty_cache()
+        for loader in loaders:
             for _ in range(epochs):
                 for imgs, mins, labels in loader:
                     imgs = imgs.to(device)
@@ -553,6 +585,8 @@ def optimize_ai():
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
                     scaler.update()
+                    current_step += 1
+                    progress_bar("模型训练阶段", current_step, total_steps, f"Loss: {loss.item():.4f}")
 
         temp_path = os.path.join(model_dir, "ai_model_temp.pth")
         torch.save(model.state_dict(), temp_path)
