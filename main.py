@@ -74,6 +74,18 @@ mouse_state = {
     "scroll": 0
 }
 mouse_lock = threading.Lock()
+temp_trajectory = []
+frame_lock = threading.Lock()
+latest_frame = {"img": None, "ts": 0.0}
+
+def update_latest_frame(img, ts):
+    with frame_lock:
+        latest_frame["img"] = img
+        latest_frame["ts"] = ts
+
+def get_latest_frame():
+    with frame_lock:
+        return latest_frame["img"], latest_frame["ts"]
 
 data_queue = queue.Queue()
 
@@ -174,10 +186,25 @@ def resource_monitor():
             print(f"Resource Monitor Error: {e}")
             time.sleep(1)
 
+def frame_generator_loop():
+    try:
+        with mss.mss() as sct:
+            while True:
+                start = time.time()
+                img = np.array(sct.grab({"top": 0, "left": 0, "width": screen_w, "height": screen_h}))
+                update_latest_frame(img, start)
+                desired = max(30, capture_freq * 2)
+                wait = (1.0 / desired) - (time.time() - start)
+                if wait > 0:
+                    time.sleep(wait)
+    except Exception as e:
+        print(f"Frame Generator Error: {e}")
+
 def on_move(x, y):
     with mouse_lock:
         mouse_state["x"] = x
         mouse_state["y"] = y
+        temp_trajectory.append((x, y, time.time()))
 
 def on_click(x, y, button, pressed):
     with mouse_lock:
@@ -291,7 +318,12 @@ class GameDataset(Dataset):
             m_ins = []
 
             for item in slice_data:
-                img = item["screen"]
+                img_data = item["screen"]
+                if isinstance(img_data, bytes):
+                    img_array = np.frombuffer(img_data, dtype=np.uint8)
+                    img = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
+                else:
+                    img = img_data
                 img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
                 img = img.transpose(2, 0, 1) / 255.0
                 imgs.append(img)
@@ -387,6 +419,8 @@ def optimize_ai():
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
     
     torch.save(model.state_dict(), model_path)
     print("Optimization Complete.")
@@ -415,15 +449,16 @@ def start_training_mode():
     input_buffer_img = []
     input_buffer_mouse = []
     
-    sct = mss.mss()
-    
     with torch.no_grad():
         while not stop_training_flag:
             start_time = time.time()
-            
+
             try:
-                img = np.array(sct.grab({"top": 0, "left": 0, "width": screen_w, "height": screen_h}))
-                img_small = cv2.resize(img, (target_w, target_h))
+                frame_img, frame_ts = get_latest_frame()
+                if frame_img is None:
+                    time.sleep(0.01)
+                    continue
+                img_small = cv2.resize(frame_img, (target_w, target_h))
                 
                 with mouse_lock:
                     curr_x, curr_y = mouse_state["x"], mouse_state["y"]
@@ -489,7 +524,6 @@ def start_training_mode():
     print("Exited Training Mode. Back to Learning.")
 
 def record_data_loop():
-    sct = mss.mss()
     buffer = []
     last_pos = (0, 0)
 
@@ -497,17 +531,21 @@ def record_data_loop():
         if current_mode == MODE_LEARNING or current_mode == MODE_TRAINING:
             try:
                 start_time = time.time()
-                
-                img = np.array(sct.grab({"top": 0, "left": 0, "width": screen_w, "height": screen_h}))
-                img_small = cv2.resize(img, (target_w, target_h))
-                
+                frame_img, frame_ts = get_latest_frame()
+                if frame_img is None:
+                    time.sleep(0.01)
+                    continue
+                img_small = cv2.resize(frame_img, (target_w, target_h))
+
                 with mouse_lock:
                     c_state = mouse_state.copy()
                     mouse_state["scroll"] = 0
+                    traj = temp_trajectory[:]
+                    temp_trajectory.clear()
                 
                 entry = {
-                    "ts": start_time,
-                    "screen": img_small,
+                    "ts": frame_ts if frame_ts else start_time,
+                    "screen": cv2.imencode(".png", img_small)[1].tobytes(),
                     "mouse_x": c_state["x"],
                     "mouse_y": c_state["y"],
                     "l_down": c_state["l_down"],
@@ -521,6 +559,7 @@ def record_data_loop():
                     "scroll": c_state["scroll"],
                     "delta_x": c_state["x"] - last_pos[0],
                     "delta_y": c_state["y"] - last_pos[1],
+                    "trajectory": traj,
                     "source": "AI" if current_mode == MODE_TRAINING else "Human"
                 }
 
@@ -590,7 +629,11 @@ if __name__ == "__main__":
     t_res = threading.Thread(target=resource_monitor)
     t_res.daemon = True
     t_res.start()
-    
+
+    t_frame = threading.Thread(target=frame_generator_loop)
+    t_frame.daemon = True
+    t_frame.start()
+
     t_rec = threading.Thread(target=record_data_loop)
     t_rec.daemon = True
     t_rec.start()
