@@ -58,6 +58,8 @@ MODE_SLEEP = "SLEEP"
 MODE_TRAINING = "TRAINING"
 current_mode = MODE_LEARNING
 stop_training_flag = False
+flush_event = threading.Event()
+flush_done_event = threading.Event()
 
 capture_freq = 10
 seq_len = 5
@@ -216,8 +218,11 @@ def check_disk_space():
         limit = 20 * 1024 * 1024 * 1024
         if total_size > limit:
             files.sort(key=lambda x: x[1])
+            now = time.time()
             while total_size > limit and files:
-                f, _ = files.pop(0)
+                f, mtime = files.pop(0)
+                if now - mtime < 2:
+                    continue
                 try:
                     s = os.path.getsize(f)
                     os.remove(f)
@@ -241,7 +246,7 @@ class GameDataset(Dataset):
             try:
                 arr = np.load(f, allow_pickle=True, mmap_mode='r')
                 length = len(arr)
-                total_valid = max(0, length - self.seq_len + 1)
+                total_valid = max(1, length - self.seq_len + 1)
                 if total_valid > 0:
                     self.file_list.append(f)
                     self.file_lengths.append(length)
@@ -276,9 +281,12 @@ class GameDataset(Dataset):
             file_pos = bisect.bisect_left(self.valid_prefix, idx)
             start_idx = idx if file_pos == 0 else idx - self.valid_prefix[file_pos - 1]
             data = self._get_file(file_pos)
-            if start_idx + self.seq_len > self.file_lengths[file_pos]:
-                return torch.zeros((self.seq_len, 3, target_h, target_w)), torch.zeros((self.seq_len, 10)), torch.zeros(4)
-            slice_data = [data[start_idx + i] for i in range(self.seq_len)]
+            slice_data = []
+            for i in range(self.seq_len):
+                idx_in_file = start_idx + i
+                if idx_in_file >= self.file_lengths[file_pos]:
+                    idx_in_file = self.file_lengths[file_pos] - 1
+                slice_data.append(data[idx_in_file])
             imgs = []
             m_ins = []
 
@@ -331,31 +339,54 @@ def optimize_ai():
     criterion = nn.MSELoss()
     scaler = GradScaler(enabled=device.type == "cuda")
     
-    files = glob.glob(os.path.join(data_dir, "*.npy"))
+    files = []
+    now = time.time()
+    for f in glob.glob(os.path.join(data_dir, "*.npy")):
+        try:
+            if now - os.path.getmtime(f) > 1:
+                files.append(f)
+        except:
+            continue
     if not files:
         print("No data to train.")
         return
 
     random.shuffle(files)
     batch_files = [files[i:i+5] for i in range(0, len(files), 5)]
-    
+
+    datasets = []
+    total_samples = 0
     for bf in batch_files:
         dataset = GameDataset(bf)
-        if len(dataset) == 0: continue
+        if len(dataset) == 0:
+            continue
+        datasets.append(dataset)
+        total_samples += len(dataset)
+
+    if not datasets:
+        print("No data to train.")
+        return
+
+    epochs = 1
+    if total_samples and total_samples < 50:
+        epochs = min(10, max(3, int(50 / max(1, total_samples))))
+
+    for dataset in datasets:
         loader = DataLoader(dataset, batch_size=4, shuffle=True, drop_last=False)
 
-        for imgs, mins, labels in loader:
-            imgs = imgs.to(device)
-            mins = mins.to(device)
-            labels = labels.to(device)
+        for _ in range(epochs):
+            for imgs, mins, labels in loader:
+                imgs = imgs.to(device)
+                mins = mins.to(device)
+                labels = labels.to(device)
 
-            optimizer.zero_grad()
-            with autocast(enabled=device.type == "cuda"):
-                out, _ = model(imgs, mins)
-                loss = criterion(out[:, -1, :], labels)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+                optimizer.zero_grad()
+                with autocast(enabled=device.type == "cuda"):
+                    out, _ = model(imgs, mins)
+                    loss = criterion(out[:, -1, :], labels)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
     
     torch.save(model.state_dict(), model_path)
     print("Optimization Complete.")
@@ -508,7 +539,23 @@ def record_data_loop():
                     time.sleep(wait)
             except Exception as e:
                 print(f"Recording Error: {e}")
+            if flush_event.is_set():
+                if buffer:
+                    fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npy")
+                    np.save(fname, buffer)
+                    buffer = []
+                    check_disk_space()
+                flush_event.clear()
+                flush_done_event.set()
         else:
+            if flush_event.is_set():
+                if buffer:
+                    fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npy")
+                    np.save(fname, buffer)
+                    buffer = []
+                    check_disk_space()
+                flush_event.clear()
+                flush_done_event.set()
             time.sleep(1)
 
 def input_loop():
@@ -517,6 +564,9 @@ def input_loop():
         cmd = input().strip()
         if cmd == "睡眠":
             if current_mode == MODE_LEARNING:
+                flush_done_event.clear()
+                flush_event.set()
+                flush_done_event.wait(timeout=3)
                 current_mode = MODE_SLEEP
                 optimize_ai()
                 current_mode = MODE_LEARNING
