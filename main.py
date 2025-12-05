@@ -106,6 +106,8 @@ class SharedState:
         self.encode_queue = queue.Queue()
         self.encode_pending = 0
         self.templates = []
+        self.persist_queue = queue.Queue()
+        self.persist_pending = 0
 
 state = SharedState()
 
@@ -354,6 +356,15 @@ def encoding_worker():
                 state.encode_pending = max(0, state.encode_pending - 1)
 
 def flush_buffer_to_temp():
+    while True:
+        with state.lock:
+            pending = state.encode_pending
+            has_buffer = bool(state.buffer)
+        if not has_buffer:
+            return
+        if pending <= 0:
+            break
+        time.sleep(0.001)
     with state.lock:
         if not state.buffer:
             return
@@ -364,15 +375,15 @@ def flush_buffer_to_temp():
         fname = f"temp_{state.current_episode_id}_{int(time.time()*1000)}.pkl"
         fpath = os.path.join(exp_pool_dir, fname)
         state.temp_files.append(fpath)
-    with open(fpath, 'wb') as f:
-        pickle.dump(data, f)
-    check_disk_space()
+        state.persist_pending += 1
+    state.persist_queue.put((fpath, data))
 
 def collect_steps():
     while True:
         with state.lock:
-            pending = state.encode_pending
-        if pending <= 0:
+            pending_enc = state.encode_pending
+            pending_persist = state.persist_pending
+        if pending_enc <= 0 and pending_persist <= 0:
             break
         time.sleep(0.005)
     steps = []
@@ -395,6 +406,22 @@ def collect_steps():
             pass
     steps.extend(buf)
     return steps
+
+def persistence_worker():
+    while state.is_running:
+        try:
+            item = state.persist_queue.get()
+            if item is None:
+                break
+            fpath, data = item
+            with open(fpath, 'wb') as f:
+                pickle.dump(data, f)
+            check_disk_space()
+            with state.lock:
+                state.persist_pending = max(0, state.persist_pending - 1)
+        except Exception:
+            with state.lock:
+                state.persist_pending = max(0, state.persist_pending - 1)
 
 def add_step(step):
     flush_needed = False
@@ -652,6 +679,7 @@ def worker_thread():
                         state.mode = "PAUSED"
                         state.esc_pressed = False
                     set_window_state(minimize=False)
+                time.sleep(0.02)
                 continue
 
             if current_mode == "LEARNING":
@@ -955,6 +983,8 @@ HTML_TEMPLATE = """
             fetch('/submit_result', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({result:r})});
         }
         setInterval(update, 1000);
+        document.addEventListener('visibilitychange', function() { if (!document.hidden) { update(); } });
+        window.onfocus = function() { update(); };
     </script>
 </body>
 </html>
@@ -1059,6 +1089,7 @@ def submit_result():
 if __name__ == "__main__":
     threading.Thread(target=monitor_resources, daemon=True).start()
     threading.Thread(target=encoding_worker, daemon=True).start()
+    threading.Thread(target=persistence_worker, daemon=True).start()
     threading.Thread(target=listener_thread, daemon=True).start()
     threading.Thread(target=worker_thread, daemon=True).start()
     try:
