@@ -87,16 +87,19 @@ class UniversalAI(nn.Module):
             nn.ReLU(),
             nn.Flatten()
         )
-        
-        self.fc_input_dim = 64 * 17 * 29
-        self.mouse_dim = 10 
-        
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, target_h, target_w)
+            conv_out = self.conv(dummy)
+            self.fc_input_dim = conv_out.view(1, -1).size(1)
+        self.mouse_dim = 10
+
         self.lstm = nn.LSTM(input_size=self.fc_input_dim + self.mouse_dim, hidden_size=512, batch_first=True)
-        
+
         self.fc_action = nn.Sequential(
             nn.Linear(512, 256),
             nn.ReLU(),
-            nn.Linear(256, 4) 
+            nn.Linear(256, 4)
         )
 
     def forward(self, img, mouse_input, hidden=None):
@@ -109,7 +112,7 @@ class UniversalAI(nn.Module):
         
         out, hidden = self.lstm(combined, hidden)
 
-        action = self.fc_action(out)
+        action = torch.sigmoid(self.fc_action(out))
         return action, hidden
 
 def ensure_initial_model():
@@ -144,17 +147,22 @@ def get_sys_usage():
 
 def resource_monitor():
     global capture_freq, seq_len
+    last_cooldown = 0
     while True:
         try:
             m = get_sys_usage()
-            if m > 90:
-                capture_freq = max(1, int(capture_freq * 0.9))
-                seq_len = max(1, int(seq_len * 0.9))
+            now = time.time()
+            if m > 90 and now - last_cooldown >= 5:
+                capture_freq = max(1, int(capture_freq * 0.5))
+                seq_len = max(1, int(seq_len * 0.5))
+                last_cooldown = now
+                time.sleep(7)
+                continue
             elif m < 10:
                 capture_freq = min(100, int(capture_freq * 1.1) + 1)
                 seq_len = min(100, int(seq_len * 1.1) + 1)
             elif m >= 40 and m <= 60:
-                pass 
+                pass
             elif m < 40 and capture_freq < 100: 
                  capture_freq = min(100, int(capture_freq * 1.05) + 1)
                  seq_len = min(100, int(seq_len * 1.05) + 1)
@@ -220,48 +228,66 @@ def check_disk_space():
         print(f"Disk clean error: {e}")
 
 class GameDataset(Dataset):
-    def __init__(self, file_list):
-        self.data = []
-        self.lengths = []
-        self.total_len = 0
+    def __init__(self, file_list, cache_size=3):
+        self.file_list = []
+        self.file_lengths = []
+        self.valid_prefix = []
+        self.seq_len = seq_len
+        self.cache_size = cache_size
+        self.cache = {}
+        self.cache_order = []
+        total = 0
         for f in file_list:
             try:
                 arr = np.load(f, allow_pickle=True, mmap_mode='r')
-                self.data.append(arr)
-                self.total_len += len(arr)
-                self.lengths.append(self.total_len)
+                length = len(arr)
+                total_valid = max(0, length - self.seq_len + 1)
+                if total_valid > 0:
+                    self.file_list.append(f)
+                    self.file_lengths.append(length)
+                    total += total_valid
+                    self.valid_prefix.append(total)
             except Exception as e:
                 print(f"Load error: {e}")
 
     def __len__(self):
-        if self.total_len == 0: return 0
-        return max(1, self.total_len - seq_len + 1)
+        if not self.valid_prefix:
+            return 0
+        return self.valid_prefix[-1]
 
-    def _get_item(self, idx):
-        pos = bisect.bisect_right(self.lengths, idx)
-        offset = idx if pos == 0 else idx - self.lengths[pos - 1]
-        return self.data[pos][offset]
+    def _get_file(self, file_idx):
+        path = self.file_list[file_idx]
+        if path in self.cache:
+            self.cache_order.remove(path)
+            self.cache_order.append(path)
+            return self.cache[path]
+        if len(self.cache_order) >= self.cache_size:
+            old_path = self.cache_order.pop(0)
+            del self.cache[old_path]
+        arr = np.load(path, allow_pickle=True, mmap_mode='r')
+        self.cache[path] = arr
+        self.cache_order.append(path)
+        return arr
 
     def __getitem__(self, idx):
         try:
-            if self.total_len == 0:
-                return torch.zeros((seq_len, 3, target_h, target_w)), torch.zeros((seq_len, 10)), torch.zeros(4)
-            slice_data = []
-            for i in range(seq_len):
-                target_idx = idx + i
-                if target_idx >= self.total_len:
-                    target_idx = self.total_len - 1
-                slice_data.append(self._get_item(target_idx))
+            if not self.valid_prefix:
+                return torch.zeros((self.seq_len, 3, target_h, target_w)), torch.zeros((self.seq_len, 10)), torch.zeros(4)
+            file_pos = bisect.bisect_left(self.valid_prefix, idx)
+            start_idx = idx if file_pos == 0 else idx - self.valid_prefix[file_pos - 1]
+            data = self._get_file(file_pos)
+            if start_idx + self.seq_len > self.file_lengths[file_pos]:
+                return torch.zeros((self.seq_len, 3, target_h, target_w)), torch.zeros((self.seq_len, 10)), torch.zeros(4)
+            slice_data = [data[start_idx + i] for i in range(self.seq_len)]
             imgs = []
             m_ins = []
-            labels = []
-            
+
             for item in slice_data:
                 img = item["screen"]
                 img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
                 img = img.transpose(2, 0, 1) / 255.0
                 imgs.append(img)
-                
+
                 mx = item["mouse_x"] / screen_w
                 my = item["mouse_y"] / screen_h
                 m_vec = [
@@ -274,8 +300,8 @@ class GameDataset(Dataset):
                 m_ins.append(m_vec)
 
             last_item = slice_data[-1]
-            if idx + seq_len < self.total_len:
-                next_item = self._get_item(idx + seq_len)
+            if start_idx + self.seq_len < self.file_lengths[file_pos]:
+                next_item = data[start_idx + self.seq_len]
                 target_x = next_item["mouse_x"] / screen_w
                 target_y = next_item["mouse_y"] / screen_h
 
@@ -288,7 +314,7 @@ class GameDataset(Dataset):
             return torch.FloatTensor(np.array(imgs)), torch.FloatTensor(np.array(m_ins)), torch.FloatTensor(np.array(labels))
         except Exception as e:
             print(f"Data load error: {e}")
-            return torch.zeros((seq_len, 3, target_h, target_w)), torch.zeros((seq_len, 10)), torch.zeros(4)
+            return torch.zeros((self.seq_len, 3, target_h, target_w)), torch.zeros((self.seq_len, 10)), torch.zeros(4)
 
 def optimize_ai():
     print("Starting Optimization...")
