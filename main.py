@@ -9,7 +9,6 @@ import shutil
 import ctypes
 import random
 import glob
-import bisect
 from collections import deque
 
 def progress_bar(prefix, current, total, suffix=""):
@@ -33,7 +32,7 @@ def install_requirements():
         "mss": "mss",
         "pynput": "pynput",
         "psutil": "psutil",
-        "nvidia-ml-py3": "pynvml",
+        "nvidia-ml-py": "pynvml",
         "pillow": "PIL"
     }
     for package, import_name in package_map.items():
@@ -51,7 +50,7 @@ install_requirements()
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import IterableDataset, DataLoader
 from torch.amp import autocast, GradScaler
 import numpy as np
 import cv2
@@ -81,6 +80,11 @@ current_mode = MODE_LEARNING
 stop_training_flag = False
 flush_event = threading.Event()
 flush_done_event = threading.Event()
+
+def flush_buffers(timeout=3):
+    flush_done_event.clear()
+    flush_event.set()
+    flush_done_event.wait(timeout=timeout)
 
 capture_freq = 10
 seq_len = 5
@@ -149,7 +153,10 @@ class UniversalAI(nn.Module):
 
         out, hidden = self.lstm(combined, hidden)
 
-        action = torch.sigmoid(self.fc_action(out))
+        raw_action = self.fc_action(out)
+        delta = torch.tanh(raw_action[:, :, :2])
+        buttons = torch.sigmoid(raw_action[:, :, 2:])
+        action = torch.cat((delta, buttons), dim=2)
         return action, hidden
 
 def ensure_initial_model():
@@ -287,202 +294,179 @@ def check_disk_space():
     except Exception as e:
         print(f"Disk clean error: {e}")
 
-class GameDataset(Dataset):
-    def __init__(self, file_list, cache_size=3):
-        self.file_list = []
-        self.file_lengths = []
-        self.valid_prefix = []
+class StreamingGameDataset(IterableDataset):
+    def __init__(self, file_list):
+        self.file_list = list(file_list)
         self.seq_len = seq_len
-        self.cache_size = cache_size
-        self.cache = {}
-        self.cache_order = []
-        total = 0
-        for f in file_list:
+
+    def _prepare_item(self, slice_data, next_entry, structured, structured_npz):
+        imgs = []
+        m_ins = []
+
+        for item in slice_data:
+            if structured:
+                img = item['image'] if hasattr(item, 'dtype') else item[0]
+                action = item['action'] if hasattr(item, 'dtype') else item[1]
+                action_len = len(action)
+
+                def aval(idx, default=0.0):
+                    return float(action[idx]) if idx < action_len else default
+
+                ts_now = aval(0)
+                mx = aval(1) / screen_w
+                my = aval(2) / screen_h
+                l_down = aval(3)
+                r_down = aval(4)
+                scroll = aval(5)
+                delta_x = aval(16) / screen_w
+                delta_y = aval(17) / screen_h
+                l_down_x = aval(7) / screen_w
+                l_down_y = aval(8) / screen_h
+                l_up_x = aval(10) / screen_w
+                l_up_y = aval(11) / screen_h
+                r_down_x = aval(13) / screen_w
+                r_down_y = aval(14) / screen_h
+                r_up_x = aval(18) / screen_w
+                r_up_y = aval(19) / screen_h
+                traj_vals = []
+                for ti in range(20, 40, 2):
+                    traj_vals.append(aval(ti) / screen_w)
+                    traj_vals.append(aval(ti + 1) / screen_h)
+                time_since_l_down = max(0.0, ts_now - aval(6)) if aval(6) > 0 else 0.0
+                time_since_l_up = max(0.0, ts_now - aval(9)) if aval(9) > 0 else 0.0
+                time_since_r_down = max(0.0, ts_now - aval(12)) if aval(12) > 0 else 0.0
+                time_since_r_up = max(0.0, ts_now - aval(15)) if aval(15) > 0 else 0.0
+                is_ai = aval(40)
+            else:
+                img_data = item["screen"]
+                if isinstance(img_data, bytes):
+                    img_array = np.frombuffer(img_data, dtype=np.uint8)
+                    img = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
+                else:
+                    img = img_data
+                ts_now = item.get("ts", 0.0)
+                mx = item["mouse_x"] / screen_w
+                my = item["mouse_y"] / screen_h
+                l_down = 1.0 if item["l_down"] else 0.0
+                r_down = 1.0 if item["r_down"] else 0.0
+                scroll = item["scroll"]
+                delta_x = item.get("delta_x", 0.0) / screen_w
+                delta_y = item.get("delta_y", 0.0) / screen_h
+                l_down_pos = item.get("l_down_pos", (0.0, 0.0))
+                l_up_pos = item.get("l_up_pos", (0.0, 0.0))
+                r_down_pos = item.get("r_down_pos", (0.0, 0.0))
+                r_up_pos = item.get("r_up_pos", (0.0, 0.0))
+                l_down_x = l_down_pos[0] / screen_w
+                l_down_y = l_down_pos[1] / screen_h
+                l_up_x = l_up_pos[0] / screen_w
+                l_up_y = l_up_pos[1] / screen_h
+                r_down_x = r_down_pos[0] / screen_w
+                r_down_y = r_down_pos[1] / screen_h
+                r_up_x = r_up_pos[0] / screen_w
+                r_up_y = r_up_pos[1] / screen_h
+                raw_traj = item.get("trajectory", [])
+                if raw_traj:
+                    traj_values = raw_traj
+                else:
+                    traj_values = [item["mouse_x"], item["mouse_y"]] * 10
+                traj_vals = []
+                for i in range(0, min(len(traj_values), 20), 2):
+                    traj_vals.append(traj_values[i] / screen_w)
+                    if i + 1 < len(traj_values):
+                        traj_vals.append(traj_values[i + 1] / screen_h)
+                while len(traj_vals) < 20:
+                    traj_vals.append(mx)
+                    traj_vals.append(my)
+                time_since_l_down = max(0.0, ts_now - item.get("l_down_ts", 0.0)) if item.get("l_down_ts", 0.0) > 0 else 0.0
+                time_since_l_up = max(0.0, ts_now - item.get("l_up_ts", 0.0)) if item.get("l_up_ts", 0.0) > 0 else 0.0
+                time_since_r_down = max(0.0, ts_now - item.get("r_down_ts", 0.0)) if item.get("r_down_ts", 0.0) > 0 else 0.0
+                time_since_r_up = max(0.0, ts_now - item.get("r_up_ts", 0.0)) if item.get("r_up_ts", 0.0) > 0 else 0.0
+                is_ai = item.get("is_ai", 0.0)
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB) if img.shape[2] == 4 else img
+            img = img.transpose(2, 0, 1) / 255.0
+            imgs.append(img)
+
+            m_vec = [
+                mx, my,
+                l_down,
+                r_down,
+                scroll,
+                delta_x,
+                delta_y,
+                time_since_l_down,
+                time_since_r_down,
+                time_since_l_up,
+                time_since_r_up,
+                l_down_x,
+                l_down_y,
+                l_up_x,
+                l_up_y,
+                r_down_x,
+                r_down_y,
+                r_up_x,
+                r_up_y
+            ]
+            m_vec.extend(traj_vals)
+            m_vec.append(is_ai)
+            m_ins.append(m_vec)
+
+        if next_entry is not None:
+            if structured:
+                next_action = next_entry if hasattr(next_entry, 'dtype') else next_entry
+                action_len = len(next_action)
+
+                def nval(idx, default=0.0):
+                    return float(next_action[idx]) if idx < action_len else default
+
+                labels = [
+                    nval(16) / screen_w,
+                    nval(17) / screen_h,
+                    nval(3),
+                    nval(4)
+                ]
+            else:
+                labels = [
+                    next_entry.get("delta_x", 0.0) / screen_w,
+                    next_entry.get("delta_y", 0.0) / screen_h,
+                    1.0 if next_entry.get("l_down", False) else 0.0,
+                    1.0 if next_entry.get("r_down", False) else 0.0
+                ]
+        else:
+            labels = [0.0, 0.0, 0.0, 0.0]
+
+        return torch.FloatTensor(np.array(imgs)), torch.FloatTensor(np.array(m_ins)), torch.FloatTensor(np.array(labels))
+
+    def __iter__(self):
+        for path in self.file_list:
             try:
                 with file_lock:
-                    arr = np.load(f, allow_pickle=True, mmap_mode="r")
-                length = len(arr['action']) if isinstance(arr, np.lib.npyio.NpzFile) or (hasattr(arr, 'dtype') and arr.dtype.names and 'action' in arr.dtype.names) else len(arr)
-                total_valid = max(1, length - self.seq_len + 1)
-                if total_valid > 0:
-                    self.file_list.append(f)
-                    self.file_lengths.append(length)
-                    total += total_valid
-                    self.valid_prefix.append(total)
-            except Exception as e:
-                print(f"Load error: {e}")
-
-    def __len__(self):
-        if not self.valid_prefix:
-            return 0
-        return self.valid_prefix[-1]
-
-    def _get_file(self, file_idx):
-        path = self.file_list[file_idx]
-        if path in self.cache:
-            self.cache_order.remove(path)
-            self.cache_order.append(path)
-            return self.cache[path]
-        if len(self.cache_order) >= self.cache_size:
-            old_path = self.cache_order.pop(0)
-            del self.cache[old_path]
-        with file_lock:
-            arr = np.load(path, allow_pickle=True, mmap_mode="r")
-        self.cache[path] = arr
-        self.cache_order.append(path)
-        return arr
-
-    def __getitem__(self, idx):
-        try:
-            if not self.valid_prefix:
-                return torch.zeros((self.seq_len, 3, target_h, target_w)), torch.zeros((self.seq_len, mouse_feature_dim)), torch.zeros(4)
-            file_pos = bisect.bisect_left(self.valid_prefix, idx)
-            start_idx = idx if file_pos == 0 else idx - self.valid_prefix[file_pos - 1]
-            data = self._get_file(file_pos)
-            slice_data = []
-            structured_npz = isinstance(data, np.lib.npyio.NpzFile)
-            structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
-            structured = structured_npz or structured_array
-            for i in range(self.seq_len):
-                idx_in_file = start_idx + i
-                if idx_in_file >= self.file_lengths[file_pos]:
-                    idx_in_file = self.file_lengths[file_pos] - 1
+                    data = np.load(path, allow_pickle=True, mmap_mode="r")
+                structured_npz = isinstance(data, np.lib.npyio.NpzFile)
+                structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
+                structured = structured_npz or structured_array
+                length = len(data['action']) if structured else len(data)
+                if length <= 0:
+                    if structured_npz:
+                        data.close()
+                    continue
+                max_start = max(1, length - self.seq_len)
+                for start_idx in range(max_start):
+                    slice_data = []
+                    for i in range(self.seq_len):
+                        idx_in_file = min(start_idx + i, length - 1)
+                        if structured_npz:
+                            slice_data.append((data['image'][idx_in_file], data['action'][idx_in_file]))
+                        else:
+                            slice_data.append(data[idx_in_file])
+                    next_entry = None
+                    next_idx = start_idx + self.seq_len
+                    if next_idx < length:
+                        next_entry = data['action'][next_idx] if structured else data[next_idx]
+                    yield self._prepare_item(slice_data, next_entry, structured, structured_npz)
                 if structured_npz:
-                    slice_data.append((data['image'][idx_in_file], data['action'][idx_in_file]))
-                else:
-                    slice_data.append(data[idx_in_file])
-            imgs = []
-            m_ins = []
-
-            for item in slice_data:
-                if structured:
-                    img = item['image'] if hasattr(item, 'dtype') else item[0]
-                    action = item['action'] if hasattr(item, 'dtype') else item[1]
-                    action_len = len(action)
-                    def aval(idx, default=0.0):
-                        return float(action[idx]) if idx < action_len else default
-                    ts_now = aval(0)
-                    mx = aval(1) / screen_w
-                    my = aval(2) / screen_h
-                    l_down = aval(3)
-                    r_down = aval(4)
-                    scroll = aval(5)
-                    delta_x = aval(16) / screen_w
-                    delta_y = aval(17) / screen_h
-                    l_down_x = aval(7) / screen_w
-                    l_down_y = aval(8) / screen_h
-                    l_up_x = aval(10) / screen_w
-                    l_up_y = aval(11) / screen_h
-                    r_down_x = aval(13) / screen_w
-                    r_down_y = aval(14) / screen_h
-                    r_up_x = aval(18) / screen_w
-                    r_up_y = aval(19) / screen_h
-                    traj_vals = []
-                    for ti in range(20, 40, 2):
-                        traj_vals.append(aval(ti) / screen_w)
-                        traj_vals.append(aval(ti + 1) / screen_h)
-                    time_since_l_down = max(0.0, ts_now - aval(6)) if aval(6) > 0 else 0.0
-                    time_since_l_up = max(0.0, ts_now - aval(9)) if aval(9) > 0 else 0.0
-                    time_since_r_down = max(0.0, ts_now - aval(12)) if aval(12) > 0 else 0.0
-                    time_since_r_up = max(0.0, ts_now - aval(15)) if aval(15) > 0 else 0.0
-                    is_ai = aval(40)
-                else:
-                    img_data = item["screen"]
-                    if isinstance(img_data, bytes):
-                        img_array = np.frombuffer(img_data, dtype=np.uint8)
-                        img = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
-                    else:
-                        img = img_data
-                    ts_now = item.get("ts", 0.0)
-                    mx = item["mouse_x"] / screen_w
-                    my = item["mouse_y"] / screen_h
-                    l_down = 1.0 if item["l_down"] else 0.0
-                    r_down = 1.0 if item["r_down"] else 0.0
-                    scroll = item["scroll"]
-                    delta_x = item.get("delta_x", 0.0) / screen_w
-                    delta_y = item.get("delta_y", 0.0) / screen_h
-                    l_down_pos = item.get("l_down_pos", (0.0, 0.0))
-                    l_up_pos = item.get("l_up_pos", (0.0, 0.0))
-                    r_down_pos = item.get("r_down_pos", (0.0, 0.0))
-                    r_up_pos = item.get("r_up_pos", (0.0, 0.0))
-                    l_down_x = l_down_pos[0] / screen_w
-                    l_down_y = l_down_pos[1] / screen_h
-                    l_up_x = l_up_pos[0] / screen_w
-                    l_up_y = l_up_pos[1] / screen_h
-                    r_down_x = r_down_pos[0] / screen_w
-                    r_down_y = r_down_pos[1] / screen_h
-                    r_up_x = r_up_pos[0] / screen_w
-                    r_up_y = r_up_pos[1] / screen_h
-                    raw_traj = item.get("trajectory", [])
-                    if raw_traj:
-                        traj_values = raw_traj
-                    else:
-                        traj_values = [item["mouse_x"], item["mouse_y"]] * 10
-                    traj_vals = []
-                    for i in range(0, min(len(traj_values), 20), 2):
-                        traj_vals.append(traj_values[i] / screen_w)
-                        if i + 1 < len(traj_values):
-                            traj_vals.append(traj_values[i + 1] / screen_h)
-                    while len(traj_vals) < 20:
-                        traj_vals.append(mx)
-                        traj_vals.append(my)
-                    time_since_l_down = max(0.0, ts_now - item.get("l_down_ts", 0.0)) if item.get("l_down_ts", 0.0) > 0 else 0.0
-                    time_since_l_up = max(0.0, ts_now - item.get("l_up_ts", 0.0)) if item.get("l_up_ts", 0.0) > 0 else 0.0
-                    time_since_r_down = max(0.0, ts_now - item.get("r_down_ts", 0.0)) if item.get("r_down_ts", 0.0) > 0 else 0.0
-                    time_since_r_up = max(0.0, ts_now - item.get("r_up_ts", 0.0)) if item.get("r_up_ts", 0.0) > 0 else 0.0
-                    is_ai = item.get("is_ai", 0.0)
-                img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB) if img.shape[2] == 4 else img
-                img = img.transpose(2, 0, 1) / 255.0
-                imgs.append(img)
-
-                m_vec = [
-                    mx, my,
-                    l_down,
-                    r_down,
-                    scroll,
-                    delta_x,
-                    delta_y,
-                    time_since_l_down,
-                    time_since_r_down,
-                    time_since_l_up,
-                    time_since_r_up,
-                    l_down_x,
-                    l_down_y,
-                    l_up_x,
-                    l_up_y,
-                    r_down_x,
-                    r_down_y,
-                    r_up_x,
-                    r_up_y
-                ]
-                m_vec.extend(traj_vals)
-                m_vec.append(is_ai)
-                m_ins.append(m_vec)
-
-            last_item = slice_data[-1]
-            if structured:
-                actions_array = data['action'] if isinstance(data, np.lib.npyio.NpzFile) else data['action']
-                if start_idx + self.seq_len < self.file_lengths[file_pos]:
-                    next_action = actions_array[start_idx + self.seq_len]
-                    labels = [next_action[1]/screen_w, next_action[2]/screen_h, next_action[3], next_action[4]]
-                else:
-                    fallback_action = last_item['action'] if hasattr(last_item, 'dtype') else last_item[1]
-                    labels = [fallback_action[1]/screen_w, fallback_action[2]/screen_h, 0.0, 0.0]
-            else:
-                if start_idx + self.seq_len < self.file_lengths[file_pos]:
-                    next_item = data[start_idx + self.seq_len]
-                    target_x = next_item["mouse_x"] / screen_w
-                    target_y = next_item["mouse_y"] / screen_h
-
-                    target_l = 1.0 if next_item["l_down"] else 0.0
-                    target_r = 1.0 if next_item["r_down"] else 0.0
-                    labels = [target_x, target_y, target_l, target_r]
-                else:
-                    labels = [last_item["mouse_x"]/screen_w, last_item["mouse_y"]/screen_h, 0.0, 0.0]
-
-            return torch.FloatTensor(np.array(imgs)), torch.FloatTensor(np.array(m_ins)), torch.FloatTensor(np.array(labels))
-        except Exception as e:
-            print(f"Data load error: {e}")
-            return torch.zeros((self.seq_len, 3, target_h, target_w)), torch.zeros((self.seq_len, mouse_feature_dim)), torch.zeros(4)
+                    data.close()
+            except Exception as e:
+                print(f"Data load error: {e}")
 
 def sample_trajectory(traj, ts_now, max_points=10, window=0.1, fallback_pos=(0, 0)):
     recent = [p for p in traj if ts_now - p[2] <= window]
@@ -540,19 +524,15 @@ def optimize_ai():
         batch_files = [files[i:i+5] for i in range(0, len(files), 5)]
 
         datasets = []
-        total_samples = 0
         init_total = len(batch_files)
         init_done = 0
         print("Dataset Init")
         torch.cuda.empty_cache()
         for bf in batch_files:
-            dataset = GameDataset(bf)
+            dataset = StreamingGameDataset(bf)
             init_done += 1
             progress_bar("Dataset Init", init_done, init_total)
-            if len(dataset) == 0:
-                continue
             datasets.append(dataset)
-            total_samples += len(dataset)
 
         if not datasets:
             print("No data to train.")
@@ -560,15 +540,13 @@ def optimize_ai():
             return
 
         epochs = 1
-        if total_samples and total_samples < 50:
-            epochs = min(10, max(3, int(50 / max(1, total_samples))))
 
         loaders = []
         for dataset in datasets:
-            loader = DataLoader(dataset, batch_size=4, shuffle=True, drop_last=False, num_workers=0, pin_memory=True)
+            loader = DataLoader(dataset, batch_size=4, drop_last=False, num_workers=0, pin_memory=True)
             loaders.append(loader)
 
-        total_steps = sum(len(loader) for loader in loaders) * epochs
+        total_steps = max(1, len(files) * 50)
         current_step = 0
         torch.cuda.empty_cache()
         for loader in loaders:
@@ -586,7 +564,7 @@ def optimize_ai():
                     scaler.step(optimizer)
                     scaler.update()
                     current_step += 1
-                    progress_bar("模型训练阶段", current_step, total_steps, f"Loss: {loss.item():.4f}")
+                    progress_bar("模型训练阶段", current_step, max(total_steps, current_step + 1), f"Loss: {loss.item():.4f}")
 
         temp_path = os.path.join(model_dir, "ai_model_temp.pth")
         torch.save(model.state_dict(), temp_path)
@@ -628,7 +606,9 @@ def start_training_mode():
     hidden = None
     input_buffer_img = []
     input_buffer_mouse = []
-    prev_pos = (0, 0)
+    with mouse_lock:
+        prev_pos = (mouse_state["x"], mouse_state["y"])
+    delta_history = deque(maxlen=5)
 
     with torch.no_grad():
         while not stop_training_flag:
@@ -688,7 +668,7 @@ def start_training_mode():
 
                 input_buffer_img.append(img_tensor)
                 input_buffer_mouse.append(m_vec)
-                prev_pos = (curr_x, curr_y)
+                prev_pos = (target_x, target_y)
                 
                 if len(input_buffer_img) > seq_len:
                     input_buffer_img.pop(0)
@@ -701,13 +681,18 @@ def start_training_mode():
                     out, hidden = model(t_imgs, t_mins, hidden)
                     
                     action = out[0, -1, :].cpu().numpy()
-                    
-                    pred_x = int(action[0] * screen_w)
-                    pred_y = int(action[1] * screen_h)
+
+                    pred_dx = action[0] * screen_w
+                    pred_dy = action[1] * screen_h
+                    delta_history.append((pred_dx, pred_dy))
+                    avg_dx = sum(d[0] for d in delta_history) / len(delta_history)
+                    avg_dy = sum(d[1] for d in delta_history) / len(delta_history)
+                    target_x = int(min(max(0, curr_x + avg_dx), screen_w - 1))
+                    target_y = int(min(max(0, curr_y + avg_dy), screen_h - 1))
                     pred_l = action[2]
                     pred_r = action[3]
-                    
-                    mouse_ctrl.position = (pred_x, pred_y)
+
+                    mouse_ctrl.position = (target_x, target_y)
                     
                     if pred_l > 0.5 and not l_down:
                         mouse_ctrl.press(mouse.Button.left)
@@ -728,6 +713,7 @@ def start_training_mode():
                 print(f"Training Runtime Error: {e}")
                 break
 
+    flush_buffers()
     ctypes.windll.user32.ShowWindow(hwnd, 9)
     current_mode = MODE_LEARNING
     print("Exited Training Mode. Back to Learning.")
@@ -829,15 +815,14 @@ def input_loop():
         cmd = input().strip()
         if cmd == "睡眠":
             if current_mode == MODE_LEARNING:
-                flush_done_event.clear()
-                flush_event.set()
-                flush_done_event.wait(timeout=3)
+                flush_buffers()
                 current_mode = MODE_SLEEP
                 optimize_ai()
                 current_mode = MODE_LEARNING
                 print("Back to Learning.")
         elif cmd == "训练":
             if current_mode == MODE_LEARNING:
+                flush_buffers()
                 current_mode = MODE_TRAINING
                 print("Entering Training Mode...")
                 t_thread = threading.Thread(target=start_training_mode)
@@ -867,8 +852,17 @@ if __name__ == "__main__":
     t_input = threading.Thread(target=input_loop)
     t_input.daemon = True
     t_input.start()
-    
+
     print("System initialized. Mode: LEARNING")
-    
+
     while True:
-        time.sleep(10)
+        try:
+            if not mouse_listener.is_alive():
+                mouse_listener = mouse.Listener(on_move=on_move, on_click=on_click, on_scroll=on_scroll)
+                mouse_listener.start()
+            if not key_listener.is_alive():
+                key_listener = keyboard.Listener(on_press=on_press_key)
+                key_listener.start()
+        except Exception as e:
+            print(f"Listener restart error: {e}")
+        time.sleep(2)
