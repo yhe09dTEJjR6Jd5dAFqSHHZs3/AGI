@@ -32,7 +32,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import autocast
+from torch.amp import GradScaler
 import numpy as np
 import cv2
 import mss
@@ -271,8 +272,8 @@ class GameDataset(Dataset):
         total = 0
         for f in file_list:
             try:
-                arr = np.load(f, allow_pickle=True, mmap_mode='r')
-                length = len(arr)
+                arr = np.load(f, allow_pickle=True)
+                length = len(arr['action']) if isinstance(arr, np.lib.npyio.NpzFile) or (hasattr(arr, 'dtype') and arr.dtype.names and 'action' in arr.dtype.names) else len(arr)
                 total_valid = max(1, length - self.seq_len + 1)
                 if total_valid > 0:
                     self.file_list.append(f)
@@ -296,7 +297,7 @@ class GameDataset(Dataset):
         if len(self.cache_order) >= self.cache_size:
             old_path = self.cache_order.pop(0)
             del self.cache[old_path]
-        arr = np.load(path, allow_pickle=True, mmap_mode='r')
+        arr = np.load(path, allow_pickle=True)
         self.cache[path] = arr
         self.cache_order.append(path)
         return arr
@@ -309,47 +310,90 @@ class GameDataset(Dataset):
             start_idx = idx if file_pos == 0 else idx - self.valid_prefix[file_pos - 1]
             data = self._get_file(file_pos)
             slice_data = []
+            structured_npz = isinstance(data, np.lib.npyio.NpzFile)
+            structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
+            structured = structured_npz or structured_array
             for i in range(self.seq_len):
                 idx_in_file = start_idx + i
                 if idx_in_file >= self.file_lengths[file_pos]:
                     idx_in_file = self.file_lengths[file_pos] - 1
-                slice_data.append(data[idx_in_file])
+                if structured_npz:
+                    slice_data.append((data['image'][idx_in_file], data['action'][idx_in_file]))
+                else:
+                    slice_data.append(data[idx_in_file])
             imgs = []
             m_ins = []
 
             for item in slice_data:
-                img_data = item["screen"]
-                if isinstance(img_data, bytes):
-                    img_array = np.frombuffer(img_data, dtype=np.uint8)
-                    img = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
+                if structured:
+                    img = item['image'] if hasattr(item, 'dtype') else item[0]
+                    action = item['action'] if hasattr(item, 'dtype') else item[1]
+                    ts_now = action[0]
+                    mx = action[1] / screen_w
+                    my = action[2] / screen_h
+                    l_down = action[3]
+                    r_down = action[4]
+                    scroll = action[5]
+                    delta_x = action[10] / screen_w
+                    time_since_l_down = max(0.0, ts_now - action[6]) if action[6] > 0 else 0.0
+                    time_since_l_up = max(0.0, ts_now - action[7]) if action[7] > 0 else 0.0
+                    time_since_r_down = max(0.0, ts_now - action[8]) if action[8] > 0 else 0.0
+                    time_since_r_up = max(0.0, ts_now - action[9]) if action[9] > 0 else 0.0
                 else:
-                    img = img_data
-                img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+                    img_data = item["screen"]
+                    if isinstance(img_data, bytes):
+                        img_array = np.frombuffer(img_data, dtype=np.uint8)
+                        img = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
+                    else:
+                        img = img_data
+                    ts_now = item.get("ts", 0.0)
+                    mx = item["mouse_x"] / screen_w
+                    my = item["mouse_y"] / screen_h
+                    l_down = 1.0 if item["l_down"] else 0.0
+                    r_down = 1.0 if item["r_down"] else 0.0
+                    scroll = item["scroll"]
+                    delta_x = item.get("delta_x", 0.0) / screen_w
+                    time_since_l_down = max(0.0, ts_now - item.get("l_down_ts", 0.0)) if item.get("l_down_ts", 0.0) > 0 else 0.0
+                    time_since_l_up = max(0.0, ts_now - item.get("l_up_ts", 0.0)) if item.get("l_up_ts", 0.0) > 0 else 0.0
+                    time_since_r_down = max(0.0, ts_now - item.get("r_down_ts", 0.0)) if item.get("r_down_ts", 0.0) > 0 else 0.0
+                    time_since_r_up = max(0.0, ts_now - item.get("r_up_ts", 0.0)) if item.get("r_up_ts", 0.0) > 0 else 0.0
+                img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB) if img.shape[2] == 4 else img
                 img = img.transpose(2, 0, 1) / 255.0
                 imgs.append(img)
 
-                mx = item["mouse_x"] / screen_w
-                my = item["mouse_y"] / screen_h
                 m_vec = [
                     mx, my,
-                    1.0 if item["l_down"] else 0.0,
-                    1.0 if item["r_down"] else 0.0,
-                    item["scroll"],
-                    0, 0, 0, 0, 0
+                    l_down,
+                    r_down,
+                    scroll,
+                    delta_x,
+                    time_since_l_down,
+                    time_since_r_down,
+                    time_since_l_up,
+                    time_since_r_up
                 ]
                 m_ins.append(m_vec)
 
             last_item = slice_data[-1]
-            if start_idx + self.seq_len < self.file_lengths[file_pos]:
-                next_item = data[start_idx + self.seq_len]
-                target_x = next_item["mouse_x"] / screen_w
-                target_y = next_item["mouse_y"] / screen_h
-
-                target_l = 1.0 if next_item["l_down"] else 0.0
-                target_r = 1.0 if next_item["r_down"] else 0.0
-                labels = [target_x, target_y, target_l, target_r]
+            if structured:
+                actions_array = data['action'] if isinstance(data, np.lib.npyio.NpzFile) else data['action']
+                if start_idx + self.seq_len < self.file_lengths[file_pos]:
+                    next_action = actions_array[start_idx + self.seq_len]
+                    labels = [next_action[1]/screen_w, next_action[2]/screen_h, next_action[3], next_action[4]]
+                else:
+                    fallback_action = last_item['action'] if hasattr(last_item, 'dtype') else last_item[1]
+                    labels = [fallback_action[1]/screen_w, fallback_action[2]/screen_h, 0.0, 0.0]
             else:
-                labels = [last_item["mouse_x"]/screen_w, last_item["mouse_y"]/screen_h, 0.0, 0.0]
+                if start_idx + self.seq_len < self.file_lengths[file_pos]:
+                    next_item = data[start_idx + self.seq_len]
+                    target_x = next_item["mouse_x"] / screen_w
+                    target_y = next_item["mouse_y"] / screen_h
+
+                    target_l = 1.0 if next_item["l_down"] else 0.0
+                    target_r = 1.0 if next_item["r_down"] else 0.0
+                    labels = [target_x, target_y, target_l, target_r]
+                else:
+                    labels = [last_item["mouse_x"]/screen_w, last_item["mouse_y"]/screen_h, 0.0, 0.0]
 
             return torch.FloatTensor(np.array(imgs)), torch.FloatTensor(np.array(m_ins)), torch.FloatTensor(np.array(labels))
         except Exception as e:
@@ -369,7 +413,7 @@ def optimize_ai():
     model.train()
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     criterion = nn.MSELoss()
-    scaler = GradScaler(enabled=device.type == "cuda")
+    scaler = GradScaler("cuda", enabled=device.type == "cuda")
     
     files = []
     now = time.time()
@@ -419,8 +463,6 @@ def optimize_ai():
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
     
     torch.save(model.state_dict(), model_path)
     print("Optimization Complete.")
@@ -448,7 +490,8 @@ def start_training_mode():
     hidden = None
     input_buffer_img = []
     input_buffer_mouse = []
-    
+    prev_pos = (0, 0)
+
     with torch.no_grad():
         while not stop_training_flag:
             start_time = time.time()
@@ -475,11 +518,17 @@ def start_training_mode():
                     curr_x / screen_w, curr_y / screen_h,
                     1.0 if l_down else 0.0,
                     1.0 if r_down else 0.0,
-                    scroll, 0, 0, 0, 0, 0
+                    scroll,
+                    (curr_x - prev_pos[0]) / screen_w,
+                    max(0.0, start_time - mouse_state["l_down_ts"]) if mouse_state["l_down_ts"] > 0 else 0.0,
+                    max(0.0, start_time - mouse_state["r_down_ts"]) if mouse_state["r_down_ts"] > 0 else 0.0,
+                    max(0.0, start_time - mouse_state["l_up_ts"]) if mouse_state["l_up_ts"] > 0 else 0.0,
+                    max(0.0, start_time - mouse_state["r_up_ts"]) if mouse_state["r_up_ts"] > 0 else 0.0
                 ]
-                
+
                 input_buffer_img.append(img_tensor)
                 input_buffer_mouse.append(m_vec)
+                prev_pos = (curr_x, curr_y)
                 
                 if len(input_buffer_img) > seq_len:
                     input_buffer_img.pop(0)
@@ -524,7 +573,8 @@ def start_training_mode():
     print("Exited Training Mode. Back to Learning.")
 
 def record_data_loop():
-    buffer = []
+    buffer_images = []
+    buffer_actions = []
     last_pos = (0, 0)
 
     while True:
@@ -542,34 +592,39 @@ def record_data_loop():
                     mouse_state["scroll"] = 0
                     traj = temp_trajectory[:]
                     temp_trajectory.clear()
-                
-                entry = {
-                    "ts": frame_ts if frame_ts else start_time,
-                    "screen": cv2.imencode(".png", img_small)[1].tobytes(),
-                    "mouse_x": c_state["x"],
-                    "mouse_y": c_state["y"],
-                    "l_down": c_state["l_down"],
-                    "l_down_ts": c_state["l_down_ts"],
-                    "l_up_pos": c_state["l_up_pos"],
-                    "l_up_ts": c_state["l_up_ts"],
-                    "r_down": c_state["r_down"],
-                    "r_down_ts": c_state["r_down_ts"],
-                    "r_up_pos": c_state["r_up_pos"],
-                    "r_up_ts": c_state["r_up_ts"],
-                    "scroll": c_state["scroll"],
-                    "delta_x": c_state["x"] - last_pos[0],
-                    "delta_y": c_state["y"] - last_pos[1],
-                    "trajectory": traj,
-                    "source": "AI" if current_mode == MODE_TRAINING else "Human"
-                }
 
-                buffer.append(entry)
+                ts_value = frame_ts if frame_ts else start_time
+                img_rgb = cv2.cvtColor(img_small, cv2.COLOR_BGRA2RGB) if img_small.shape[2] == 4 else img_small
+                buffer_images.append(img_rgb.astype(np.uint8))
+                action_entry = [
+                    ts_value,
+                    c_state["x"],
+                    c_state["y"],
+                    1.0 if c_state["l_down"] else 0.0,
+                    1.0 if c_state["r_down"] else 0.0,
+                    c_state["scroll"],
+                    c_state["l_down_ts"],
+                    c_state["l_up_ts"],
+                    c_state["r_down_ts"],
+                    c_state["r_up_ts"],
+                    c_state["x"] - last_pos[0],
+                    c_state["y"] - last_pos[1],
+                    1.0 if current_mode == MODE_TRAINING else 0.0
+                ]
+                buffer_actions.append(action_entry)
                 last_pos = (c_state["x"], c_state["y"])
-                
-                if len(buffer) >= 100:
+
+                if len(buffer_images) >= 100:
                     fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npy")
-                    np.save(fname, buffer)
-                    buffer = []
+                    img_arr = np.array(buffer_images, dtype=np.uint8)
+                    act_arr = np.array(buffer_actions, dtype=np.float32)
+                    dtype = np.dtype([('image', 'u1', img_arr.shape[1:]), ('action', 'f4', (act_arr.shape[1],))])
+                    rec_arr = np.empty(img_arr.shape[0], dtype=dtype)
+                    rec_arr['image'] = img_arr
+                    rec_arr['action'] = act_arr
+                    np.save(fname, rec_arr)
+                    buffer_images = []
+                    buffer_actions = []
                     check_disk_space()
 
                 elapsed = time.time() - start_time
@@ -579,19 +634,33 @@ def record_data_loop():
             except Exception as e:
                 print(f"Recording Error: {e}")
             if flush_event.is_set():
-                if buffer:
+                if buffer_images:
                     fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npy")
-                    np.save(fname, buffer)
-                    buffer = []
+                    img_arr = np.array(buffer_images, dtype=np.uint8)
+                    act_arr = np.array(buffer_actions, dtype=np.float32)
+                    dtype = np.dtype([('image', 'u1', img_arr.shape[1:]), ('action', 'f4', (act_arr.shape[1],))])
+                    rec_arr = np.empty(img_arr.shape[0], dtype=dtype)
+                    rec_arr['image'] = img_arr
+                    rec_arr['action'] = act_arr
+                    np.save(fname, rec_arr)
+                    buffer_images = []
+                    buffer_actions = []
                     check_disk_space()
                 flush_event.clear()
                 flush_done_event.set()
         else:
             if flush_event.is_set():
-                if buffer:
+                if buffer_images:
                     fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npy")
-                    np.save(fname, buffer)
-                    buffer = []
+                    img_arr = np.array(buffer_images, dtype=np.uint8)
+                    act_arr = np.array(buffer_actions, dtype=np.float32)
+                    dtype = np.dtype([('image', 'u1', img_arr.shape[1:]), ('action', 'f4', (act_arr.shape[1],))])
+                    rec_arr = np.empty(img_arr.shape[0], dtype=dtype)
+                    rec_arr['image'] = img_arr
+                    rec_arr['action'] = act_arr
+                    np.save(fname, rec_arr)
+                    buffer_images = []
+                    buffer_actions = []
                     check_disk_space()
                 flush_event.clear()
                 flush_done_event.set()
