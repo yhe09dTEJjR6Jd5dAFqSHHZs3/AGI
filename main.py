@@ -23,7 +23,7 @@ def install_requirements():
         except ImportError:
             print(f"Installing {package}...")
             try:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "-i", "https://pypi.tuna.tsinghua.edu.cn/simple", package])
             except Exception as e:
                 print(f"Error installing {package}: {e}")
 
@@ -38,6 +38,7 @@ import numpy as np
 import cv2
 import mss
 import psutil
+import torchvision.models as models
 from pynput import mouse, keyboard
 import pynvml
 
@@ -67,14 +68,14 @@ seq_len = 5
 screen_w, screen_h = 2560, 1600
 target_w, target_h = 256, 160
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-mouse_feature_dim = 36
+mouse_feature_dim = 40
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
 
 mouse_state = {
     "x": 0, "y": 0,
-    "l_down": False, "l_down_ts": 0.0, "l_up_pos": (0,0), "l_up_ts": 0.0,
-    "r_down": False, "r_down_ts": 0.0, "r_up_pos": (0,0), "r_up_ts": 0.0,
+    "l_down": False, "l_down_ts": 0.0, "l_down_pos": (0,0), "l_up_pos": (0,0), "l_up_ts": 0.0,
+    "r_down": False, "r_down_ts": 0.0, "r_down_pos": (0,0), "r_up_pos": (0,0), "r_up_ts": 0.0,
     "scroll": 0
 }
 mouse_lock = threading.Lock()
@@ -97,19 +98,17 @@ data_queue = queue.Queue()
 class UniversalAI(nn.Module):
     def __init__(self):
         super(UniversalAI, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.Flatten()
-        )
+        try:
+            weights = models.MobileNet_V3_Small_Weights.DEFAULT
+        except Exception:
+            weights = None
+        backbone = models.mobilenet_v3_small(weights=weights)
+        self.feature_extractor = backbone.features
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
 
         with torch.no_grad():
             dummy = torch.zeros(1, 3, target_h, target_w)
-            conv_out = self.conv(dummy)
+            conv_out = self.pool(self.feature_extractor(dummy))
             self.fc_input_dim = conv_out.view(1, -1).size(1)
         self.mouse_dim = mouse_feature_dim
 
@@ -124,15 +123,23 @@ class UniversalAI(nn.Module):
     def forward(self, img, mouse_input, hidden=None):
         batch_size, seq, c, h, w = img.size()
         img_reshaped = img.view(batch_size * seq, c, h, w)
-        feat = self.conv(img_reshaped)
+        feat = self.pool(self.feature_extractor(img_reshaped))
         feat = feat.view(batch_size, seq, -1)
-        
+
         combined = torch.cat((feat, mouse_input), dim=2)
-        
+
         out, hidden = self.lstm(combined, hidden)
 
         action = torch.sigmoid(self.fc_action(out))
         return action, hidden
+
+def maybe_compile(model):
+    if hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model)
+        except Exception:
+            pass
+    return model
 
 def ensure_initial_model():
     try:
@@ -242,11 +249,15 @@ def check_disk_space():
     try:
         total_size = 0
         files = []
-        for f in glob.glob(os.path.join(data_dir, "*.npy")):
-            size = os.path.getsize(f)
-            total_size += size
-            files.append((f, os.path.getmtime(f)))
-        
+        for pattern in ["*.npy", "*.npz"]:
+            for f in glob.glob(os.path.join(data_dir, pattern)):
+                try:
+                    size = os.path.getsize(f)
+                    total_size += size
+                    files.append((f, os.path.getmtime(f)))
+                except Exception:
+                    continue
+
         limit = 20 * 1024 * 1024 * 1024
         if total_size > limit:
             files.sort(key=lambda x: x[1])
@@ -256,8 +267,9 @@ def check_disk_space():
                 if now - mtime < 30:
                     continue
                 try:
-                    s = os.path.getsize(f)
-                    os.remove(f)
+                    with file_lock:
+                        s = os.path.getsize(f)
+                        os.remove(f)
                     total_size -= s
                 except:
                     pass
@@ -343,21 +355,25 @@ class GameDataset(Dataset):
                     l_down = aval(3)
                     r_down = aval(4)
                     scroll = aval(5)
-                    delta_x = aval(10) / screen_w
-                    delta_y = aval(11) / screen_h
-                    l_up_x = aval(12) / screen_w
-                    l_up_y = aval(13) / screen_h
-                    r_up_x = aval(14) / screen_w
-                    r_up_y = aval(15) / screen_h
+                    delta_x = aval(16) / screen_w
+                    delta_y = aval(17) / screen_h
+                    l_down_x = aval(7) / screen_w
+                    l_down_y = aval(8) / screen_h
+                    l_up_x = aval(10) / screen_w
+                    l_up_y = aval(11) / screen_h
+                    r_down_x = aval(13) / screen_w
+                    r_down_y = aval(14) / screen_h
+                    r_up_x = aval(18) / screen_w
+                    r_up_y = aval(19) / screen_h
                     traj_vals = []
-                    for ti in range(16, 36, 2):
+                    for ti in range(20, 40, 2):
                         traj_vals.append(aval(ti) / screen_w)
                         traj_vals.append(aval(ti + 1) / screen_h)
                     time_since_l_down = max(0.0, ts_now - aval(6)) if aval(6) > 0 else 0.0
-                    time_since_l_up = max(0.0, ts_now - aval(7)) if aval(7) > 0 else 0.0
-                    time_since_r_down = max(0.0, ts_now - aval(8)) if aval(8) > 0 else 0.0
-                    time_since_r_up = max(0.0, ts_now - aval(9)) if aval(9) > 0 else 0.0
-                    is_ai = aval(36)
+                    time_since_l_up = max(0.0, ts_now - aval(9)) if aval(9) > 0 else 0.0
+                    time_since_r_down = max(0.0, ts_now - aval(12)) if aval(12) > 0 else 0.0
+                    time_since_r_up = max(0.0, ts_now - aval(15)) if aval(15) > 0 else 0.0
+                    is_ai = aval(40)
                 else:
                     img_data = item["screen"]
                     if isinstance(img_data, bytes):
@@ -373,10 +389,18 @@ class GameDataset(Dataset):
                     scroll = item["scroll"]
                     delta_x = item.get("delta_x", 0.0) / screen_w
                     delta_y = item.get("delta_y", 0.0) / screen_h
-                    l_up_x = item.get("l_up_pos", (0.0, 0.0))[0] / screen_w
-                    l_up_y = item.get("l_up_pos", (0.0, 0.0))[1] / screen_h
-                    r_up_x = item.get("r_up_pos", (0.0, 0.0))[0] / screen_w
-                    r_up_y = item.get("r_up_pos", (0.0, 0.0))[1] / screen_h
+                    l_down_pos = item.get("l_down_pos", (0.0, 0.0))
+                    l_up_pos = item.get("l_up_pos", (0.0, 0.0))
+                    r_down_pos = item.get("r_down_pos", (0.0, 0.0))
+                    r_up_pos = item.get("r_up_pos", (0.0, 0.0))
+                    l_down_x = l_down_pos[0] / screen_w
+                    l_down_y = l_down_pos[1] / screen_h
+                    l_up_x = l_up_pos[0] / screen_w
+                    l_up_y = l_up_pos[1] / screen_h
+                    r_down_x = r_down_pos[0] / screen_w
+                    r_down_y = r_down_pos[1] / screen_h
+                    r_up_x = r_up_pos[0] / screen_w
+                    r_up_y = r_up_pos[1] / screen_h
                     raw_traj = item.get("trajectory", [])
                     if raw_traj:
                         traj_values = raw_traj
@@ -410,8 +434,12 @@ class GameDataset(Dataset):
                     time_since_r_down,
                     time_since_l_up,
                     time_since_r_up,
+                    l_down_x,
+                    l_down_y,
                     l_up_x,
                     l_up_y,
+                    r_down_x,
+                    r_down_y,
                     r_up_x,
                     r_up_y
                 ]
@@ -468,6 +496,7 @@ def optimize_ai():
             model.load_state_dict(torch.load(model_path, map_location=device))
         except:
             pass
+    model = maybe_compile(model)
 
     model.train()
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
@@ -475,12 +504,13 @@ def optimize_ai():
     scaler = GradScaler("cuda", enabled=device.type == "cuda")
 
     files = []
-    for f in glob.glob(os.path.join(data_dir, "*.npy")):
-        try:
-            if os.path.getsize(f) > 0:
-                files.append(f)
-        except:
-            continue
+    for pattern in ["*.npy", "*.npz"]:
+        for f in glob.glob(os.path.join(data_dir, pattern)):
+            try:
+                if os.path.getsize(f) > 0:
+                    files.append(f)
+            except:
+                continue
     if not files:
         print("No data to train.")
         return
@@ -506,7 +536,7 @@ def optimize_ai():
         epochs = min(10, max(3, int(50 / max(1, total_samples))))
 
     for dataset in datasets:
-        loader = DataLoader(dataset, batch_size=4, shuffle=True, drop_last=False)
+        loader = DataLoader(dataset, batch_size=4, shuffle=True, drop_last=False, num_workers=4, pin_memory=True)
 
         for _ in range(epochs):
             for imgs, mins, labels in loader:
@@ -548,6 +578,7 @@ def start_training_mode():
         model.load_state_dict(torch.load(model_path, map_location=device))
     except Exception as e:
         print(f"Model load error: {e}")
+    model = maybe_compile(model)
     model.eval()
     
     mouse_ctrl = mouse.Controller()
@@ -601,8 +632,12 @@ def start_training_mode():
                     max(0.0, ts_value - mouse_state["r_down_ts"]) if mouse_state["r_down_ts"] > 0 else 0.0,
                     max(0.0, ts_value - mouse_state["l_up_ts"]) if mouse_state["l_up_ts"] > 0 else 0.0,
                     max(0.0, ts_value - mouse_state["r_up_ts"]) if mouse_state["r_up_ts"] > 0 else 0.0,
+                    mouse_state["l_down_pos"][0] / screen_w,
+                    mouse_state["l_down_pos"][1] / screen_h,
                     l_up_pos[0] / screen_w,
                     l_up_pos[1] / screen_h,
+                    mouse_state["r_down_pos"][0] / screen_w,
+                    mouse_state["r_down_pos"][1] / screen_h,
                     r_up_pos[0] / screen_w,
                     r_up_pos[1] / screen_h
                 ]
@@ -687,13 +722,17 @@ def record_data_loop():
                     1.0 if c_state["r_down"] else 0.0,
                     c_state["scroll"],
                     c_state["l_down_ts"],
+                    c_state["l_down_pos"][0],
+                    c_state["l_down_pos"][1],
                     c_state["l_up_ts"],
+                    c_state["l_up_pos"][0],
+                    c_state["l_up_pos"][1],
                     c_state["r_down_ts"],
+                    c_state["r_down_pos"][0],
+                    c_state["r_down_pos"][1],
                     c_state["r_up_ts"],
                     c_state["x"] - last_pos[0],
                     c_state["y"] - last_pos[1],
-                    c_state["l_up_pos"][0],
-                    c_state["l_up_pos"][1],
                     c_state["r_up_pos"][0],
                     c_state["r_up_pos"][1]
                 ]
@@ -702,15 +741,11 @@ def record_data_loop():
                 buffer_actions.append(action_entry)
                 last_pos = (c_state["x"], c_state["y"])
 
-                if len(buffer_images) >= 1000:
-                    fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npy")
+                if len(buffer_images) >= 3000:
+                    fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npz")
                     img_arr = np.array(buffer_images, dtype=np.uint8)
                     act_arr = np.array(buffer_actions, dtype=np.float32)
-                    dtype = np.dtype([('image', 'u1', img_arr.shape[1:]), ('action', 'f4', (act_arr.shape[1],))])
-                    rec_arr = np.empty(img_arr.shape[0], dtype=dtype)
-                    rec_arr['image'] = img_arr
-                    rec_arr['action'] = act_arr
-                    np.save(fname, rec_arr)
+                    np.savez_compressed(fname, image=img_arr, action=act_arr)
                     buffer_images = []
                     buffer_actions = []
                     check_disk_space()
@@ -723,14 +758,10 @@ def record_data_loop():
                 print(f"Recording Error: {e}")
             if flush_event.is_set():
                 if buffer_images:
-                    fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npy")
+                    fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npz")
                     img_arr = np.array(buffer_images, dtype=np.uint8)
                     act_arr = np.array(buffer_actions, dtype=np.float32)
-                    dtype = np.dtype([('image', 'u1', img_arr.shape[1:]), ('action', 'f4', (act_arr.shape[1],))])
-                    rec_arr = np.empty(img_arr.shape[0], dtype=dtype)
-                    rec_arr['image'] = img_arr
-                    rec_arr['action'] = act_arr
-                    np.save(fname, rec_arr)
+                    np.savez_compressed(fname, image=img_arr, action=act_arr)
                     buffer_images = []
                     buffer_actions = []
                     check_disk_space()
@@ -739,14 +770,10 @@ def record_data_loop():
         else:
             if flush_event.is_set():
                 if buffer_images:
-                    fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npy")
+                    fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npz")
                     img_arr = np.array(buffer_images, dtype=np.uint8)
                     act_arr = np.array(buffer_actions, dtype=np.float32)
-                    dtype = np.dtype([('image', 'u1', img_arr.shape[1:]), ('action', 'f4', (act_arr.shape[1],))])
-                    rec_arr = np.empty(img_arr.shape[0], dtype=dtype)
-                    rec_arr['image'] = img_arr
-                    rec_arr['action'] = act_arr
-                    np.save(fname, rec_arr)
+                    np.savez_compressed(fname, image=img_arr, action=act_arr)
                     buffer_images = []
                     buffer_actions = []
                     check_disk_space()
