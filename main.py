@@ -9,6 +9,7 @@ import shutil
 import ctypes
 import random
 import glob
+import bisect
 
 def install_requirements():
     required = [
@@ -31,6 +32,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
 import numpy as np
 import cv2
 import mss
@@ -67,7 +69,7 @@ mouse_state = {
     "x": 0, "y": 0,
     "l_down": False, "l_down_ts": 0.0, "l_up_pos": (0,0), "l_up_ts": 0.0,
     "r_down": False, "r_down_ts": 0.0, "r_up_pos": (0,0), "r_up_ts": 0.0,
-    "scroll": 0, "traj": []
+    "scroll": 0
 }
 mouse_lock = threading.Lock()
 
@@ -106,9 +108,19 @@ class UniversalAI(nn.Module):
         combined = torch.cat((feat, mouse_input), dim=2)
         
         out, hidden = self.lstm(combined, hidden)
-        
+
         action = self.fc_action(out)
         return action, hidden
+
+def ensure_initial_model():
+    try:
+        model_path = os.path.join(model_dir, "ai_model.pth")
+        if not os.path.exists(model_path):
+            temp_model = UniversalAI()
+            torch.save(temp_model.state_dict(), model_path)
+            print("Generated initial AI model.")
+    except Exception as e:
+        print(f"Init model error: {e}")
 
 def get_sys_usage():
     try:
@@ -156,9 +168,6 @@ def on_move(x, y):
     with mouse_lock:
         mouse_state["x"] = x
         mouse_state["y"] = y
-        mouse_state["traj"].append((x, y))
-        if len(mouse_state["traj"]) > 50:
-            mouse_state["traj"].pop(0)
 
 def on_click(x, y, button, pressed):
     with mouse_lock:
@@ -213,22 +222,36 @@ def check_disk_space():
 class GameDataset(Dataset):
     def __init__(self, file_list):
         self.data = []
+        self.lengths = []
+        self.total_len = 0
         for f in file_list:
             try:
-                arr = np.load(f, allow_pickle=True)
+                arr = np.load(f, allow_pickle=True, mmap_mode='r')
                 self.data.append(arr)
-            except:
-                pass
-        if self.data:
-            self.data = np.concatenate(self.data, axis=0)
+                self.total_len += len(arr)
+                self.lengths.append(self.total_len)
+            except Exception as e:
+                print(f"Load error: {e}")
 
     def __len__(self):
-        if len(self.data) == 0: return 0
-        return len(self.data) - seq_len
+        if self.total_len == 0: return 0
+        return max(1, self.total_len - seq_len + 1)
+
+    def _get_item(self, idx):
+        pos = bisect.bisect_right(self.lengths, idx)
+        offset = idx if pos == 0 else idx - self.lengths[pos - 1]
+        return self.data[pos][offset]
 
     def __getitem__(self, idx):
         try:
-            slice_data = self.data[idx : idx + seq_len]
+            if self.total_len == 0:
+                return torch.zeros((seq_len, 3, target_h, target_w)), torch.zeros((seq_len, 10)), torch.zeros(4)
+            slice_data = []
+            for i in range(seq_len):
+                target_idx = idx + i
+                if target_idx >= self.total_len:
+                    target_idx = self.total_len - 1
+                slice_data.append(self._get_item(target_idx))
             imgs = []
             m_ins = []
             labels = []
@@ -249,13 +272,13 @@ class GameDataset(Dataset):
                     0, 0, 0, 0, 0
                 ]
                 m_ins.append(m_vec)
-            
+
             last_item = slice_data[-1]
-            if idx + seq_len < len(self.data):
-                next_item = self.data[idx + seq_len]
+            if idx + seq_len < self.total_len:
+                next_item = self._get_item(idx + seq_len)
                 target_x = next_item["mouse_x"] / screen_w
                 target_y = next_item["mouse_y"] / screen_h
-                
+
                 target_l = 1.0 if next_item["l_down"] else 0.0
                 target_r = 1.0 if next_item["r_down"] else 0.0
                 labels = [target_x, target_y, target_l, target_r]
@@ -276,10 +299,11 @@ def optimize_ai():
             model.load_state_dict(torch.load(model_path, map_location=device))
         except:
             pass
-    
+
     model.train()
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     criterion = nn.MSELoss()
+    scaler = GradScaler(enabled=device.type == "cuda")
     
     files = glob.glob(os.path.join(data_dir, "*.npy"))
     if not files:
@@ -293,17 +317,19 @@ def optimize_ai():
         dataset = GameDataset(bf)
         if len(dataset) == 0: continue
         loader = DataLoader(dataset, batch_size=4, shuffle=True, drop_last=False)
-        
+
         for imgs, mins, labels in loader:
             imgs = imgs.to(device)
             mins = mins.to(device)
             labels = labels.to(device)
-            
+
             optimizer.zero_grad()
-            out, _ = model(imgs, mins)
-            loss = criterion(out[:, -1, :], labels)
-            loss.backward()
-            optimizer.step()
+            with autocast(enabled=device.type == "cuda"):
+                out, _ = model(imgs, mins)
+                loss = criterion(out[:, -1, :], labels)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
     
     torch.save(model.state_dict(), model_path)
     print("Optimization Complete.")
@@ -313,6 +339,7 @@ def start_training_mode():
     stop_training_flag = False
     
     hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+    time.sleep(0.2)
     ctypes.windll.user32.ShowWindow(hwnd, 6)
     
     model_path = os.path.join(model_dir, "ai_model.pth")
@@ -407,7 +434,8 @@ def start_training_mode():
 def record_data_loop():
     sct = mss.mss()
     buffer = []
-    
+    last_pos = (0, 0)
+
     while True:
         if current_mode == MODE_LEARNING or current_mode == MODE_TRAINING:
             try:
@@ -418,7 +446,6 @@ def record_data_loop():
                 
                 with mouse_lock:
                     c_state = mouse_state.copy()
-                    c_state["traj"] = list(mouse_state["traj"])
                     mouse_state["scroll"] = 0
                 
                 entry = {
@@ -435,11 +462,13 @@ def record_data_loop():
                     "r_up_pos": c_state["r_up_pos"],
                     "r_up_ts": c_state["r_up_ts"],
                     "scroll": c_state["scroll"],
-                    "traj": c_state["traj"],
+                    "delta_x": c_state["x"] - last_pos[0],
+                    "delta_y": c_state["y"] - last_pos[1],
                     "source": "AI" if current_mode == MODE_TRAINING else "Human"
                 }
-                
+
                 buffer.append(entry)
+                last_pos = (c_state["x"], c_state["y"])
                 
                 if len(buffer) >= 100:
                     fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npy")
@@ -475,6 +504,7 @@ def input_loop():
                 t_thread.start()
 
 if __name__ == "__main__":
+    ensure_initial_model()
     mouse_listener = mouse.Listener(on_move=on_move, on_click=on_click, on_scroll=on_scroll)
     mouse_listener.start()
     
