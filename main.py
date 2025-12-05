@@ -33,8 +33,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast
-from torch.amp import GradScaler
+from torch.amp import autocast, GradScaler
 import numpy as np
 import cv2
 import mss
@@ -69,6 +68,8 @@ screen_w, screen_h = 2560, 1600
 target_w, target_h = 256, 160
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 mouse_feature_dim = 36
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
 
 mouse_state = {
     "x": 0, "y": 0,
@@ -80,6 +81,7 @@ mouse_lock = threading.Lock()
 temp_trajectory = deque(maxlen=200)
 frame_lock = threading.Lock()
 latest_frame = {"img": None, "ts": 0.0}
+file_lock = threading.Lock()
 
 def update_latest_frame(img, ts):
     with frame_lock:
@@ -251,7 +253,7 @@ def check_disk_space():
             now = time.time()
             while total_size > limit and files:
                 f, mtime = files.pop(0)
-                if now - mtime < 2:
+                if now - mtime < 30:
                     continue
                 try:
                     s = os.path.getsize(f)
@@ -274,7 +276,8 @@ class GameDataset(Dataset):
         total = 0
         for f in file_list:
             try:
-                arr = np.load(f, allow_pickle=True)
+                with file_lock:
+                    arr = np.load(f, allow_pickle=True, mmap_mode="r")
                 length = len(arr['action']) if isinstance(arr, np.lib.npyio.NpzFile) or (hasattr(arr, 'dtype') and arr.dtype.names and 'action' in arr.dtype.names) else len(arr)
                 total_valid = max(1, length - self.seq_len + 1)
                 if total_valid > 0:
@@ -299,7 +302,8 @@ class GameDataset(Dataset):
         if len(self.cache_order) >= self.cache_size:
             old_path = self.cache_order.pop(0)
             del self.cache[old_path]
-        arr = np.load(path, allow_pickle=True)
+        with file_lock:
+            arr = np.load(path, allow_pickle=True, mmap_mode="r")
         self.cache[path] = arr
         self.cache_order.append(path)
         return arr
@@ -469,12 +473,11 @@ def optimize_ai():
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     criterion = nn.MSELoss()
     scaler = GradScaler("cuda", enabled=device.type == "cuda")
-    
+
     files = []
-    now = time.time()
     for f in glob.glob(os.path.join(data_dir, "*.npy")):
         try:
-            if now - os.path.getmtime(f) > 1:
+            if os.path.getsize(f) > 0:
                 files.append(f)
         except:
             continue
@@ -512,15 +515,19 @@ def optimize_ai():
                 labels = labels.to(device)
 
                 optimizer.zero_grad()
-                with autocast(enabled=device.type == "cuda"):
+                with autocast(device_type="cuda", enabled=device.type == "cuda"):
                     out, _ = model(imgs, mins)
                     loss = criterion(out[:, -1, :], labels)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
-    
-    torch.save(model.state_dict(), model_path)
-    print("Optimization Complete.")
+
+    temp_path = os.path.join(model_dir, "ai_model_temp.pth")
+    torch.save(model.state_dict(), temp_path)
+    if os.path.exists(model_path):
+        os.remove(model_path)
+    os.rename(temp_path, model_path)
+    print("Optimization Complete (Safe Save).")
 
 def start_training_mode():
     global stop_training_flag, current_mode
