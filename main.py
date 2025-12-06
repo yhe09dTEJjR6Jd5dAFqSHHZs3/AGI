@@ -193,10 +193,24 @@ def ensure_initial_model():
         model_path = os.path.join(model_dir, "ai_model.pth")
         if not os.path.exists(model_path):
             temp_model = UniversalAI()
-            torch.save(temp_model.state_dict(), model_path)
+            alpha = float(temp_model.log_var_action.detach().item())
+            beta = float(temp_model.log_var_prediction.detach().item())
+            gamma = float(temp_model.log_var_energy.detach().item())
+            torch.save({"model_state": temp_model.state_dict(), "alpha": alpha, "beta": beta, "gamma": gamma}, model_path)
             print("Generated initial AI model.")
     except Exception as e:
         print(f"Init model error: {e}")
+
+def load_model_checkpoint(path, map_location=None):
+    try:
+        state = torch.load(path, map_location=map_location)
+        if isinstance(state, dict) and "model_state" in state:
+            return state
+        if isinstance(state, dict):
+            return {"model_state": state}
+    except Exception as e:
+        print(f"Load checkpoint error: {e}")
+    return None
 
 def get_sys_usage():
     try:
@@ -554,8 +568,9 @@ def optimize_ai():
         model = UniversalAI().to(device)
         if os.path.exists(model_path):
             try:
-                state = torch.load(model_path, map_location=device)
-                model.load_state_dict(state, strict=False)
+                state = load_model_checkpoint(model_path, map_location=device)
+                if state is not None:
+                    model.load_state_dict(state.get("model_state", {}), strict=False)
             except Exception as e:
                 print(f"Model load warning: {e}")
 
@@ -648,7 +663,10 @@ def optimize_ai():
                     progress_bar("模型训练阶段", current_step, max(total_steps, current_step + 1), f"Loss: {total_loss.item():.4f}")
 
         temp_path = os.path.join(model_dir, "ai_model_temp.pth")
-        torch.save(model.state_dict(), temp_path)
+        alpha = float(model.log_var_action.detach().item())
+        beta = float(model.log_var_prediction.detach().item())
+        gamma = float(model.log_var_energy.detach().item())
+        torch.save({"model_state": model.state_dict(), "alpha": alpha, "beta": beta, "gamma": gamma}, temp_path)
         try:
             if os.path.exists(model_path):
                 shutil.copy2(model_path, backup_path)
@@ -660,6 +678,13 @@ def optimize_ai():
             print(f"Save error: {e}")
             if os.path.exists(backup_path):
                 shutil.copy2(backup_path, model_path)
+        focus_weight = float(torch.exp(-model.log_var_action.detach()).item())
+        curiosity_weight = float(torch.exp(-model.log_var_prediction.detach()).item())
+        laziness_penalty = float(torch.exp(-model.log_var_energy.detach()).item())
+        print("[Optimization Done]")
+        print(f"> Imitation Weight (Focus): {focus_weight:.3f}  <-- exp(-alpha)")
+        print(f"> Prediction Weight (Curiosity): {curiosity_weight:.3f}  <-- exp(-beta)")
+        print(f"> Energy Penalty (Laziness): {laziness_penalty:.3f}  <-- exp(-gamma)")
         torch.cuda.empty_cache()
     except Exception as e:
         print(f"Critical Optimization Error: {e}")
@@ -684,7 +709,9 @@ def start_training_mode():
 
     model = UniversalAI().to(device)
     try:
-        model.load_state_dict(torch.load(model_path, map_location=device))
+        state = load_model_checkpoint(model_path, map_location=device)
+        if state is not None:
+            model.load_state_dict(state.get("model_state", {}))
     except Exception as e:
         print(f"Model load error: {e}")
     model.eval()
