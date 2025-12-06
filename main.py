@@ -85,6 +85,7 @@ stop_training_flag = False
 flush_event = threading.Event()
 flush_done_event = threading.Event()
 recording_pause_event = threading.Event()
+stop_optimization_flag = threading.Event()
 
 def flush_buffers(timeout=3):
     flush_done_event.clear()
@@ -281,7 +282,8 @@ def frame_generator_loop():
             while True:
                 start = time.time()
                 img = np.array(sct.grab({"top": 0, "left": 0, "width": screen_w, "height": screen_h}))
-                update_latest_frame(img, start)
+                img_small = cv2.resize(img, (target_w, target_h))
+                update_latest_frame(img_small, start)
                 desired = max(30, capture_freq * 2)
                 wait = (1.0 / desired) - (time.time() - start)
                 if wait > 0:
@@ -321,6 +323,8 @@ def on_press_key(key):
     global current_mode, stop_training_flag
     if current_mode == MODE_TRAINING:
         stop_training_flag = True
+    elif current_mode == MODE_SLEEP:
+        stop_optimization_flag.set()
 
 def check_disk_space():
     try:
@@ -358,7 +362,7 @@ def disk_writer_loop():
         try:
             fname, img_arr, act_arr = save_queue.get()
             with file_lock:
-                np.savez_compressed(fname, image=img_arr, action=act_arr)
+                np.savez(fname, image=img_arr, action=act_arr)
             check_disk_space()
         except Exception as e:
             print(f"Save Error: {e}")
@@ -600,6 +604,7 @@ def sample_trajectory(traj, ts_now, max_points=10, window=0.1, fallback_pos=(0, 
 
 def optimize_ai():
     try:
+        stop_optimization_flag.clear()
         gc.collect()
         torch.cuda.empty_cache()
         if torch.cuda.is_available():
@@ -628,6 +633,7 @@ def optimize_ai():
         bce_loss = nn.BCEWithLogitsLoss()
         scaler = GradScaler("cuda", enabled=device.type == "cuda")
         accumulation_steps = 4
+        interrupted = False
 
         files = []
         candidates = []
@@ -638,6 +644,8 @@ def optimize_ai():
         print("Scanning data files...")
         torch.cuda.empty_cache()
         for f in candidates:
+            if stop_optimization_flag.is_set():
+                break
             scanned += 1
             progress_bar("数据扫描阶段", scanned, total_scan)
             try:
@@ -645,13 +653,16 @@ def optimize_ai():
                     files.append(f)
             except:
                 continue
-        if not files:
+        if stop_optimization_flag.is_set():
+            interrupted = True
+            print("Optimization interrupted before dataset selection.")
+        if not files and not interrupted:
             print("No data to train.")
             torch.cuda.empty_cache()
             return
 
         random.shuffle(files)
-        batch_files = [files[i:i+5] for i in range(0, len(files), 5)]
+        batch_files = [files[i:i+5] for i in range(0, len(files), 5)] if files else []
 
         def estimate_steps(file_subset):
             total = 0
@@ -686,7 +697,7 @@ def optimize_ai():
         torch.cuda.empty_cache()
 
         total_steps = sum(chunk_steps)
-        if total_steps <= 0:
+        if total_steps <= 0 and not interrupted:
             print("No data to train.")
             torch.cuda.empty_cache()
             return
@@ -698,11 +709,18 @@ def optimize_ai():
         torch.cuda.empty_cache()
         for idx, bf in enumerate(batch_files):
             dataset = StreamingGameDataset(bf)
-            loader = DataLoader(dataset, batch_size=4, drop_last=False, num_workers=0, pin_memory=True)
+            if stop_optimization_flag.is_set():
+                interrupted = True
+                break
+            loader_workers = 2 if os.name != "nt" else 0
+            loader = DataLoader(dataset, batch_size=4, drop_last=False, num_workers=loader_workers, pin_memory=True, persistent_workers=loader_workers > 0)
             optimizer.zero_grad()
             for _ in range(epochs):
                 pending_steps = 0
                 for batch_idx, (imgs, mins, labels, next_frames) in enumerate(loader):
+                    if stop_optimization_flag.is_set():
+                        interrupted = True
+                        break
                     imgs = imgs.to(device)
                     mins = mins.to(device)
                     labels = labels.to(device)
@@ -719,7 +737,10 @@ def optimize_ai():
                         imitation_loss = mse_loss(delta_pred, target_delta) + bce_loss(button_logits[:, -1, :], target_buttons)
                         target_feat = model.encode_features(next_frames)
                         pred_loss = mse_loss(pred_feat, target_feat)
-                        energy_loss = torch.mean(torch.sum(delta_pred ** 2, dim=1))
+                        button_variation = button_logits[:, 1:, :] - button_logits[:, :-1, :]
+                        button_energy = torch.sum(button_variation ** 2, dim=(1, 2)) if button_variation.numel() > 0 else torch.zeros(1, device=button_logits.device)
+                        delta_energy = torch.sum(action[:, :, :2] ** 2, dim=2)
+                        energy_loss = torch.mean(delta_energy[:, -1] + button_energy)
                         total_loss = 0.5 * torch.exp(-log_var_action) * imitation_loss + 0.5 * log_var_action
                         total_loss = total_loss + 0.5 * torch.exp(-log_var_prediction) * pred_loss + 0.5 * log_var_prediction
                         total_loss = total_loss + 0.5 * torch.exp(-log_var_energy) * energy_loss + 0.5 * log_var_energy
@@ -740,24 +761,33 @@ def optimize_ai():
                     optimizer.zero_grad()
                 gc.collect()
                 torch.cuda.empty_cache()
+                if stop_optimization_flag.is_set():
+                    interrupted = True
+                    break
             del loader
             del dataset
             gc.collect()
             torch.cuda.empty_cache()
+            if stop_optimization_flag.is_set():
+                interrupted = True
+                break
 
         temp_path = os.path.join(model_dir, "ai_model_temp.pth")
         print(f"Final Loss Snapshot: {last_loss_value:.6f} | Steps: {current_step}/{total_steps}")
         alpha = float(model.log_var_action.detach().item())
         beta = float(model.log_var_prediction.detach().item())
         gamma = float(model.log_var_energy.detach().item())
-        torch.save({"model_state": model.state_dict(), "alpha": alpha, "beta": beta, "gamma": gamma}, temp_path)
+        torch.save({"model_state": model.state_dict(), "alpha": alpha, "beta": beta, "gamma": gamma, "last_loss": last_loss_value, "steps": current_step, "total_steps": total_steps, "interrupted": interrupted, "timestamp": time.time()}, temp_path)
         try:
             if os.path.exists(model_path):
                 shutil.copy2(model_path, backup_path)
             if os.path.exists(model_path):
                 os.remove(model_path)
             os.rename(temp_path, model_path)
-            print("Optimization Complete (Safe Save).")
+            if interrupted:
+                print("Optimization Interrupted (Safe Save).")
+            else:
+                print("Optimization Complete (Safe Save).")
         except Exception as e:
             print(f"Save error: {e}")
             if os.path.exists(backup_path):
@@ -765,10 +795,16 @@ def optimize_ai():
         focus_weight = float(torch.exp(-model.log_var_action.detach()).item())
         curiosity_weight = float(torch.exp(-model.log_var_prediction.detach()).item())
         laziness_penalty = float(torch.exp(-model.log_var_energy.detach()).item())
-        print("[Optimization Done]")
+        if interrupted:
+            print("[Optimization Interrupted]")
+            print(f"> Reason: Keyboard interrupt after {current_step}/{total_steps} steps")
+        else:
+            print("[Optimization Done]")
         print(f"> Imitation Weight (Focus): {focus_weight:.3f}  <-- exp(-alpha)")
         print(f"> Prediction Weight (Curiosity): {curiosity_weight:.3f}  <-- exp(-beta)")
         print(f"> Energy Penalty (Laziness): {laziness_penalty:.3f}  <-- exp(-gamma)")
+        print(f"> Last Loss: {last_loss_value:.6f}")
+        print(f"> Model Saved To: {model_path}")
         torch.cuda.empty_cache()
         if torch.cuda.is_available():
             try:
@@ -784,6 +820,7 @@ def optimize_ai():
         except Exception:
             pass
     finally:
+        stop_optimization_flag.clear()
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -819,8 +856,14 @@ def start_training_mode():
         prev_pos = (mouse_state["x"], mouse_state["y"])
     delta_history = deque(maxlen=5)
 
-    with torch.no_grad():
+    try:
+        model.share_memory()
+    except Exception:
+        pass
+
+    with torch.inference_mode():
         while not stop_training_flag:
+            time.sleep(0)
             start_time = time.time()
 
             try:
@@ -828,7 +871,6 @@ def start_training_mode():
                 if frame_img is None:
                     time.sleep(0.01)
                     continue
-                img_small = cv2.resize(frame_img, (target_w, target_h))
 
                 with mouse_lock:
                     curr_x, curr_y = mouse_state["x"], mouse_state["y"]
@@ -841,7 +883,7 @@ def start_training_mode():
 
                 mouse_state["scroll"] = 0
 
-                img_tensor = cv2.cvtColor(img_small, cv2.COLOR_BGRA2RGB)
+                img_tensor = cv2.cvtColor(frame_img, cv2.COLOR_BGRA2RGB)
                 img_tensor = img_tensor.transpose(2, 0, 1) / 255.0
 
                 ts_value = frame_ts if frame_ts else start_time
@@ -879,12 +921,12 @@ def start_training_mode():
 
                 input_buffer_img.append(img_tensor)
                 input_buffer_mouse.append(m_vec)
-                prev_pos = (target_x, target_y)
-                
+                prev_pos = (curr_x, curr_y)
+
                 if len(input_buffer_img) > seq_len:
                     input_buffer_img.pop(0)
                     input_buffer_mouse.pop(0)
-                
+
                 if len(input_buffer_img) == seq_len:
                     t_imgs = torch.FloatTensor(np.array([input_buffer_img])).to(device)
                     t_mins = torch.FloatTensor(np.array([input_buffer_mouse])).to(device)
@@ -904,22 +946,22 @@ def start_training_mode():
                     pred_r = action[3]
 
                     mouse_ctrl.position = (target_x, target_y)
-                    
+
                     if pred_l > 0.5 and not l_down:
                         mouse_ctrl.press(mouse.Button.left)
                     elif pred_l <= 0.5 and l_down:
                         mouse_ctrl.release(mouse.Button.left)
-                        
+
                     if pred_r > 0.5 and not r_down:
                         mouse_ctrl.press(mouse.Button.right)
                     elif pred_r <= 0.5 and r_down:
                         mouse_ctrl.release(mouse.Button.right)
-                
+
                 elapsed = time.time() - start_time
                 wait = (1.0 / capture_freq) - elapsed
                 if wait > 0:
                     time.sleep(wait)
-                    
+
             except Exception as e:
                 print(f"Training Runtime Error: {e}")
                 break
@@ -956,7 +998,6 @@ def record_data_loop():
                 if frame_img is None:
                     time.sleep(0.01)
                     continue
-                img_small = cv2.resize(frame_img, (target_w, target_h))
 
                 with mouse_lock:
                     c_state = mouse_state.copy()
@@ -965,7 +1006,7 @@ def record_data_loop():
 
                 ts_value = frame_ts if frame_ts else start_time
                 traj_flat = sample_trajectory(traj, ts_value, fallback_pos=(c_state["x"], c_state["y"]))
-                img_rgb = cv2.cvtColor(img_small, cv2.COLOR_BGRA2RGB) if img_small.shape[2] == 4 else img_small
+                img_rgb = cv2.cvtColor(frame_img, cv2.COLOR_BGRA2RGB) if frame_img.shape[2] == 4 else frame_img
                 buffer_images.append(img_rgb.astype(np.uint8))
                 action_entry = [
                     ts_value,
