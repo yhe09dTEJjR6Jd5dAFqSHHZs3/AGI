@@ -9,7 +9,11 @@ import shutil
 import ctypes
 import random
 import glob
+import gc
+import warnings
 from collections import deque
+
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 def progress_bar(prefix, current, total, suffix=""):
     total = max(total, 1)
@@ -220,13 +224,24 @@ def get_sys_usage():
         vram = 0
         try:
             pynvml.nvmlInit()
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-            gpu = util.gpu
-            mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            vram = (mem_info.used / mem_info.total) * 100
-        except:
-            pass
+            nvml_ready = True
+        except Exception:
+            nvml_ready = False
+        if nvml_ready:
+            try:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                gpu = util.gpu
+                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                vram = (mem_info.used / mem_info.total) * 100
+            except Exception:
+                gpu = 0
+                vram = 0
+            finally:
+                try:
+                    pynvml.nvmlShutdown()
+                except Exception:
+                    pass
         return max(cpu, mem, gpu, vram)
     except Exception as e:
         print(f"Monitor Error: {e}")
@@ -504,6 +519,11 @@ class StreamingGameDataset(IterableDataset):
                 try:
                     with file_lock:
                         data = np.load(path, allow_pickle=True, mmap_mode="r")
+                    if isinstance(data, np.ndarray) and getattr(data, "shape", None) == ():
+                        try:
+                            data = data.item()
+                        except Exception:
+                            data = [data]
                     structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                     structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
                     structured = structured_npz or structured_array
@@ -561,6 +581,7 @@ def sample_trajectory(traj, ts_now, max_points=10, window=0.1, fallback_pos=(0, 
 
 def optimize_ai():
     try:
+        gc.collect()
         torch.cuda.empty_cache()
         print("Starting Optimization...")
         model_path = os.path.join(model_dir, "ai_model.pth")
@@ -615,6 +636,8 @@ def optimize_ai():
             init_done += 1
             progress_bar("Dataset Init", init_done, init_total)
             datasets.append(dataset)
+        gc.collect()
+        torch.cuda.empty_cache()
 
         if not datasets:
             print("No data to train.")
@@ -661,6 +684,8 @@ def optimize_ai():
                         optimizer.zero_grad()
                     current_step += 1
                     progress_bar("模型训练阶段", current_step, max(total_steps, current_step + 1), f"Loss: {total_loss.item():.4f}")
+                gc.collect()
+                torch.cuda.empty_cache()
 
         temp_path = os.path.join(model_dir, "ai_model_temp.pth")
         alpha = float(model.log_var_action.detach().item())
@@ -686,10 +711,12 @@ def optimize_ai():
         print(f"> Prediction Weight (Curiosity): {curiosity_weight:.3f}  <-- exp(-beta)")
         print(f"> Energy Penalty (Laziness): {laziness_penalty:.3f}  <-- exp(-gamma)")
         torch.cuda.empty_cache()
+        gc.collect()
     except Exception as e:
         print(f"Critical Optimization Error: {e}")
         try:
             torch.cuda.empty_cache()
+            gc.collect()
         except Exception:
             pass
 
