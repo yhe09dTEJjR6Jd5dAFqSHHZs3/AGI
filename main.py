@@ -650,35 +650,52 @@ def optimize_ai():
         random.shuffle(files)
         batch_files = [files[i:i+5] for i in range(0, len(files), 5)]
 
-        datasets = []
-        loaders = []
+        def estimate_steps(file_subset):
+            total = 0
+            for path in file_subset:
+                try:
+                    with file_lock:
+                        data = np.load(path, allow_pickle=True, mmap_mode="r")
+                    structured_npz = isinstance(data, np.lib.npyio.NpzFile)
+                    structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
+                    structured = structured_npz or structured_array
+                    length = len(data['action']) if structured else len(data)
+                    steps = max(1, length - seq_len)
+                    total += steps
+                    if structured_npz:
+                        data.close()
+                except Exception:
+                    continue
+            return total
+
+        chunk_steps = []
         init_total = len(batch_files)
         init_done = 0
         print("Dataset Init")
         torch.cuda.empty_cache()
         for bf in batch_files:
-            dataset = StreamingGameDataset(bf)
+            steps = estimate_steps(bf)
+            chunk_steps.append(steps)
             init_done += 1
-            progress_bar("Dataset Init", init_done, init_total)
-            datasets.append(dataset)
+            progress_bar("Dataset Init", init_done, init_total, f"Chunks: {steps} steps")
+            torch.cuda.empty_cache()
         gc.collect()
         torch.cuda.empty_cache()
 
-        if not datasets:
+        total_steps = sum(chunk_steps)
+        if total_steps <= 0:
             print("No data to train.")
             torch.cuda.empty_cache()
             return
 
         epochs = 1
-
-        for dataset in datasets:
-            loader = DataLoader(dataset, batch_size=4, drop_last=False, num_workers=0, pin_memory=True)
-            loaders.append(loader)
-
-        total_steps = max(1, len(files) * 50)
         current_step = 0
+        total_chunks = len(batch_files)
+        last_loss_value = 0.0
         torch.cuda.empty_cache()
-        for loader in loaders:
+        for idx, bf in enumerate(batch_files):
+            dataset = StreamingGameDataset(bf)
+            loader = DataLoader(dataset, batch_size=4, drop_last=False, num_workers=0, pin_memory=True)
             optimizer.zero_grad()
             for _ in range(epochs):
                 hidden = None
@@ -710,15 +727,21 @@ def optimize_ai():
                         optimizer.zero_grad()
                         pending_steps = 0
                     current_step += 1
-                    progress_bar("模型训练阶段", current_step, max(total_steps, current_step + 1), f"Loss: {total_loss.item():.4f}")
+                    last_loss_value = total_loss.item()
+                    progress_bar("模型训练阶段", current_step, total_steps, f"Loss: {last_loss_value:.4f} | Chunk {idx+1}/{total_chunks}")
                 if pending_steps > 0:
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad()
                 gc.collect()
                 torch.cuda.empty_cache()
+            del loader
+            del dataset
+            gc.collect()
+            torch.cuda.empty_cache()
 
         temp_path = os.path.join(model_dir, "ai_model_temp.pth")
+        print(f"Final Loss Snapshot: {last_loss_value:.6f} | Steps: {current_step}/{total_steps}")
         alpha = float(model.log_var_action.detach().item())
         beta = float(model.log_var_prediction.detach().item())
         gamma = float(model.log_var_energy.detach().item())
@@ -756,11 +779,6 @@ def optimize_ai():
         except Exception:
             pass
     finally:
-        try:
-            del loaders
-            del datasets
-        except Exception:
-            pass
         torch.cuda.empty_cache()
         gc.collect()
 
