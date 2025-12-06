@@ -604,6 +604,9 @@ def optimize_ai():
         torch.cuda.empty_cache()
         if torch.cuda.is_available():
             try:
+                torch.cuda.reset_peak_memory_stats()
+                torch.cuda.reset_accumulated_memory_stats()
+                torch.cuda.synchronize()
                 torch.cuda.ipc_collect()
             except Exception:
                 pass
@@ -698,7 +701,6 @@ def optimize_ai():
             loader = DataLoader(dataset, batch_size=4, drop_last=False, num_workers=0, pin_memory=True)
             optimizer.zero_grad()
             for _ in range(epochs):
-                hidden = None
                 pending_steps = 0
                 for batch_idx, (imgs, mins, labels, next_frames) in enumerate(loader):
                     imgs = imgs.to(device)
@@ -707,7 +709,10 @@ def optimize_ai():
                     next_frames = next_frames.to(device)
 
                     with autocast(device_type="cuda", enabled=device.type == "cuda"):
-                        action, pred_feat, button_logits, hidden = model(imgs, mins, hidden)
+                        log_var_action = torch.clamp(model.log_var_action, -6.0, 6.0)
+                        log_var_prediction = torch.clamp(model.log_var_prediction, -6.0, 6.0)
+                        log_var_energy = torch.clamp(model.log_var_energy, -6.0, 6.0)
+                        action, pred_feat, button_logits, _ = model(imgs, mins, None)
                         delta_pred = action[:, -1, :2]
                         target_delta = labels[:, :2]
                         target_buttons = labels[:, 2:]
@@ -715,9 +720,9 @@ def optimize_ai():
                         target_feat = model.encode_features(next_frames)
                         pred_loss = mse_loss(pred_feat, target_feat)
                         energy_loss = torch.mean(torch.sum(delta_pred ** 2, dim=1))
-                        total_loss = 0.5 * torch.exp(-model.log_var_action) * imitation_loss + 0.5 * model.log_var_action
-                        total_loss = total_loss + 0.5 * torch.exp(-model.log_var_prediction) * pred_loss + 0.5 * model.log_var_prediction
-                        total_loss = total_loss + 0.5 * torch.exp(-model.log_var_energy) * energy_loss + 0.5 * model.log_var_energy
+                        total_loss = 0.5 * torch.exp(-log_var_action) * imitation_loss + 0.5 * log_var_action
+                        total_loss = total_loss + 0.5 * torch.exp(-log_var_prediction) * pred_loss + 0.5 * log_var_prediction
+                        total_loss = total_loss + 0.5 * torch.exp(-log_var_energy) * energy_loss + 0.5 * log_var_energy
                         total_loss = total_loss / accumulation_steps
                     scaler.scale(total_loss).backward()
                     pending_steps += 1
