@@ -80,6 +80,7 @@ current_mode = MODE_LEARNING
 stop_training_flag = False
 flush_event = threading.Event()
 flush_done_event = threading.Event()
+recording_pause_event = threading.Event()
 
 def flush_buffers(timeout=3):
     flush_done_event.clear()
@@ -127,6 +128,9 @@ class UniversalAI(nn.Module):
             weights = None
         backbone = models.mobilenet_v3_small(weights=weights)
         self.feature_extractor = backbone.features
+        for p in self.feature_extractor.parameters():
+            p.requires_grad = False
+        self.feature_extractor.eval()
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
 
         with torch.no_grad():
@@ -143,7 +147,19 @@ class UniversalAI(nn.Module):
             nn.Linear(256, 4)
         )
 
+        self.feature_decoder = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128)
+        )
+
+        self.log_var_action = nn.Parameter(torch.tensor(0.0))
+        self.log_var_prediction = nn.Parameter(torch.tensor(0.0))
+        self.log_var_energy = nn.Parameter(torch.tensor(0.0))
+
     def forward(self, img, mouse_input, hidden=None):
+        if hidden is not None:
+            hidden = tuple(h.detach() for h in hidden)
         batch_size, seq, c, h, w = img.size()
         img_reshaped = img.view(batch_size * seq, c, h, w)
         feat = self.pool(self.feature_extractor(img_reshaped))
@@ -155,9 +171,22 @@ class UniversalAI(nn.Module):
 
         raw_action = self.fc_action(out)
         delta = torch.tanh(raw_action[:, :, :2])
-        buttons = torch.sigmoid(raw_action[:, :, 2:])
+        buttons_logits = raw_action[:, :, 2:]
+        buttons = torch.sigmoid(buttons_logits)
         action = torch.cat((delta, buttons), dim=2)
-        return action, hidden
+        pred_features = self.feature_decoder(out[:, -1, :])
+        return action, pred_features, buttons_logits, hidden
+
+    def encode_features(self, img):
+        with torch.no_grad():
+            feat = self.pool(self.feature_extractor(img))
+            feat = feat.view(feat.size(0), -1)
+            if feat.size(1) > 128:
+                feat = feat[:, :128]
+            elif feat.size(1) < 128:
+                pad = torch.zeros(feat.size(0), 128 - feat.size(1), device=feat.device)
+                feat = torch.cat([feat, pad], dim=1)
+        return feat
 
 def ensure_initial_model():
     try:
@@ -303,9 +332,27 @@ class StreamingGameDataset(IterableDataset):
         imgs = []
         m_ins = []
 
-        for item in slice_data:
+        def norm_coord(v, dim):
+            return (2.0 * (v / dim)) - 1.0
+
+        def load_image(item):
             if structured:
                 img = item['image'] if hasattr(item, 'dtype') else item[0]
+            else:
+                img_data = item.get("screen")
+                if isinstance(img_data, bytes):
+                    img_array = np.frombuffer(img_data, dtype=np.uint8)
+                    img = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
+                else:
+                    img = img_data
+            return img
+
+        def normalize_image(img):
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB) if img.shape[2] == 4 else img
+            return img.transpose(2, 0, 1) / 255.0
+
+        for item in slice_data:
+            if structured:
                 action = item['action'] if hasattr(item, 'dtype') else item[1]
                 action_len = len(action)
 
@@ -313,67 +360,61 @@ class StreamingGameDataset(IterableDataset):
                     return float(action[idx]) if idx < action_len else default
 
                 ts_now = aval(0)
-                mx = aval(1) / screen_w
-                my = aval(2) / screen_h
+                mx = norm_coord(aval(1), screen_w)
+                my = norm_coord(aval(2), screen_h)
                 l_down = aval(3)
                 r_down = aval(4)
                 scroll = aval(5)
                 delta_x = aval(16) / screen_w
                 delta_y = aval(17) / screen_h
-                l_down_x = aval(7) / screen_w
-                l_down_y = aval(8) / screen_h
-                l_up_x = aval(10) / screen_w
-                l_up_y = aval(11) / screen_h
-                r_down_x = aval(13) / screen_w
-                r_down_y = aval(14) / screen_h
-                r_up_x = aval(18) / screen_w
-                r_up_y = aval(19) / screen_h
+                l_down_x = norm_coord(aval(7), screen_w)
+                l_down_y = norm_coord(aval(8), screen_h)
+                l_up_x = norm_coord(aval(10), screen_w)
+                l_up_y = norm_coord(aval(11), screen_h)
+                r_down_x = norm_coord(aval(13), screen_w)
+                r_down_y = norm_coord(aval(14), screen_h)
+                r_up_x = norm_coord(aval(18), screen_w)
+                r_up_y = norm_coord(aval(19), screen_h)
                 traj_vals = []
                 for ti in range(20, 40, 2):
-                    traj_vals.append(aval(ti) / screen_w)
-                    traj_vals.append(aval(ti + 1) / screen_h)
+                    traj_vals.append(norm_coord(aval(ti), screen_w))
+                    traj_vals.append(norm_coord(aval(ti + 1), screen_h))
                 time_since_l_down = max(0.0, ts_now - aval(6)) if aval(6) > 0 else 0.0
                 time_since_l_up = max(0.0, ts_now - aval(9)) if aval(9) > 0 else 0.0
                 time_since_r_down = max(0.0, ts_now - aval(12)) if aval(12) > 0 else 0.0
                 time_since_r_up = max(0.0, ts_now - aval(15)) if aval(15) > 0 else 0.0
                 is_ai = aval(40)
             else:
-                img_data = item["screen"]
-                if isinstance(img_data, bytes):
-                    img_array = np.frombuffer(img_data, dtype=np.uint8)
-                    img = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
-                else:
-                    img = img_data
                 ts_now = item.get("ts", 0.0)
-                mx = item["mouse_x"] / screen_w
-                my = item["mouse_y"] / screen_h
-                l_down = 1.0 if item["l_down"] else 0.0
-                r_down = 1.0 if item["r_down"] else 0.0
-                scroll = item["scroll"]
+                mx = norm_coord(item.get("mouse_x", 0.0), screen_w)
+                my = norm_coord(item.get("mouse_y", 0.0), screen_h)
+                l_down = 1.0 if item.get("l_down", False) else 0.0
+                r_down = 1.0 if item.get("r_down", False) else 0.0
+                scroll = item.get("scroll", 0.0)
                 delta_x = item.get("delta_x", 0.0) / screen_w
                 delta_y = item.get("delta_y", 0.0) / screen_h
                 l_down_pos = item.get("l_down_pos", (0.0, 0.0))
                 l_up_pos = item.get("l_up_pos", (0.0, 0.0))
                 r_down_pos = item.get("r_down_pos", (0.0, 0.0))
                 r_up_pos = item.get("r_up_pos", (0.0, 0.0))
-                l_down_x = l_down_pos[0] / screen_w
-                l_down_y = l_down_pos[1] / screen_h
-                l_up_x = l_up_pos[0] / screen_w
-                l_up_y = l_up_pos[1] / screen_h
-                r_down_x = r_down_pos[0] / screen_w
-                r_down_y = r_down_pos[1] / screen_h
-                r_up_x = r_up_pos[0] / screen_w
-                r_up_y = r_up_pos[1] / screen_h
+                l_down_x = norm_coord(l_down_pos[0], screen_w)
+                l_down_y = norm_coord(l_down_pos[1], screen_h)
+                l_up_x = norm_coord(l_up_pos[0], screen_w)
+                l_up_y = norm_coord(l_up_pos[1], screen_h)
+                r_down_x = norm_coord(r_down_pos[0], screen_w)
+                r_down_y = norm_coord(r_down_pos[1], screen_h)
+                r_up_x = norm_coord(r_up_pos[0], screen_w)
+                r_up_y = norm_coord(r_up_pos[1], screen_h)
                 raw_traj = item.get("trajectory", [])
                 if raw_traj:
                     traj_values = raw_traj
                 else:
-                    traj_values = [item["mouse_x"], item["mouse_y"]] * 10
+                    traj_values = [item.get("mouse_x", 0.0), item.get("mouse_y", 0.0)] * 10
                 traj_vals = []
                 for i in range(0, min(len(traj_values), 20), 2):
-                    traj_vals.append(traj_values[i] / screen_w)
+                    traj_vals.append(norm_coord(traj_values[i], screen_w))
                     if i + 1 < len(traj_values):
-                        traj_vals.append(traj_values[i + 1] / screen_h)
+                        traj_vals.append(norm_coord(traj_values[i + 1], screen_h))
                 while len(traj_vals) < 20:
                     traj_vals.append(mx)
                     traj_vals.append(my)
@@ -382,8 +423,8 @@ class StreamingGameDataset(IterableDataset):
                 time_since_r_down = max(0.0, ts_now - item.get("r_down_ts", 0.0)) if item.get("r_down_ts", 0.0) > 0 else 0.0
                 time_since_r_up = max(0.0, ts_now - item.get("r_up_ts", 0.0)) if item.get("r_up_ts", 0.0) > 0 else 0.0
                 is_ai = item.get("is_ai", 0.0)
-            img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB) if img.shape[2] == 4 else img
-            img = img.transpose(2, 0, 1) / 255.0
+            img_raw = load_image(item)
+            img = normalize_image(img_raw)
             imgs.append(img)
 
             m_vec = [
@@ -412,7 +453,8 @@ class StreamingGameDataset(IterableDataset):
 
         if next_entry is not None:
             if structured:
-                next_action = next_entry if hasattr(next_entry, 'dtype') else next_entry
+                next_action_source = next_entry[1] if isinstance(next_entry, tuple) else next_entry
+                next_action = next_action_source if hasattr(next_action_source, 'dtype') else next_action_source
                 action_len = len(next_action)
 
                 def nval(idx, default=0.0):
@@ -431,42 +473,63 @@ class StreamingGameDataset(IterableDataset):
                     1.0 if next_entry.get("l_down", False) else 0.0,
                     1.0 if next_entry.get("r_down", False) else 0.0
                 ]
+            next_img_raw = load_image(next_entry if not isinstance(next_entry, tuple) else next_entry[0])
+            next_img = normalize_image(next_img_raw)
         else:
             labels = [0.0, 0.0, 0.0, 0.0]
+            next_img = np.zeros((3, target_h, target_w), dtype=np.float32)
 
-        return torch.FloatTensor(np.array(imgs)), torch.FloatTensor(np.array(m_ins)), torch.FloatTensor(np.array(labels))
+        return torch.FloatTensor(np.array(imgs)), torch.FloatTensor(np.array(m_ins)), torch.FloatTensor(np.array(labels)), torch.FloatTensor(np.array(next_img))
 
     def __iter__(self):
-        for path in self.file_list:
-            try:
-                with file_lock:
-                    data = np.load(path, allow_pickle=True, mmap_mode="r")
-                structured_npz = isinstance(data, np.lib.npyio.NpzFile)
-                structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
-                structured = structured_npz or structured_array
-                length = len(data['action']) if structured else len(data)
-                if length <= 0:
+        output_queue = queue.Queue(maxsize=8)
+        stop_event = threading.Event()
+
+        def producer():
+            for path in self.file_list:
+                try:
+                    with file_lock:
+                        data = np.load(path, allow_pickle=True, mmap_mode="r")
+                    structured_npz = isinstance(data, np.lib.npyio.NpzFile)
+                    structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
+                    structured = structured_npz or structured_array
+                    length = len(data['action']) if structured else len(data)
+                    if length <= 0:
+                        if structured_npz:
+                            data.close()
+                        continue
+                    max_start = max(1, length - self.seq_len)
+                    for start_idx in range(max_start):
+                        slice_data = []
+                        for i in range(self.seq_len):
+                            idx_in_file = min(start_idx + i, length - 1)
+                            if structured_npz:
+                                slice_data.append((data['image'][idx_in_file], data['action'][idx_in_file]))
+                            else:
+                                slice_data.append(data[idx_in_file])
+                        next_entry = None
+                        next_idx = start_idx + self.seq_len
+                        if next_idx < length:
+                            if structured_npz:
+                                next_entry = (data['image'][next_idx], data['action'][next_idx])
+                            elif structured:
+                                next_entry = data[next_idx]
+                            else:
+                                next_entry = data[next_idx]
+                        item = self._prepare_item(slice_data, next_entry, structured, structured_npz)
+                        output_queue.put(item)
                     if structured_npz:
                         data.close()
-                    continue
-                max_start = max(1, length - self.seq_len)
-                for start_idx in range(max_start):
-                    slice_data = []
-                    for i in range(self.seq_len):
-                        idx_in_file = min(start_idx + i, length - 1)
-                        if structured_npz:
-                            slice_data.append((data['image'][idx_in_file], data['action'][idx_in_file]))
-                        else:
-                            slice_data.append(data[idx_in_file])
-                    next_entry = None
-                    next_idx = start_idx + self.seq_len
-                    if next_idx < length:
-                        next_entry = data['action'][next_idx] if structured else data[next_idx]
-                    yield self._prepare_item(slice_data, next_entry, structured, structured_npz)
-                if structured_npz:
-                    data.close()
-            except Exception as e:
-                print(f"Data load error: {e}")
+                except Exception as e:
+                    print(f"Data load error: {e}")
+            stop_event.set()
+
+        threading.Thread(target=producer, daemon=True).start()
+        while not (stop_event.is_set() and output_queue.empty()):
+            try:
+                yield output_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
 
 def sample_trajectory(traj, ts_now, max_points=10, window=0.1, fallback_pos=(0, 0)):
     recent = [p for p in traj if ts_now - p[2] <= window]
@@ -487,17 +550,21 @@ def optimize_ai():
         torch.cuda.empty_cache()
         print("Starting Optimization...")
         model_path = os.path.join(model_dir, "ai_model.pth")
+        backup_path = os.path.join(model_dir, "ai_model_prev.pth")
         model = UniversalAI().to(device)
         if os.path.exists(model_path):
             try:
-                model.load_state_dict(torch.load(model_path, map_location=device))
-            except:
-                pass
+                state = torch.load(model_path, map_location=device)
+                model.load_state_dict(state, strict=False)
+            except Exception as e:
+                print(f"Model load warning: {e}")
 
         model.train()
         optimizer = optim.Adam(model.parameters(), lr=1e-4)
-        criterion = nn.MSELoss()
+        mse_loss = nn.MSELoss()
+        bce_loss = nn.BCEWithLogitsLoss()
         scaler = GradScaler("cuda", enabled=device.type == "cuda")
+        accumulation_steps = 4
 
         files = []
         candidates = []
@@ -550,28 +617,49 @@ def optimize_ai():
         current_step = 0
         torch.cuda.empty_cache()
         for loader in loaders:
+            optimizer.zero_grad()
             for _ in range(epochs):
-                for imgs, mins, labels in loader:
+                hidden = None
+                for batch_idx, (imgs, mins, labels, next_frames) in enumerate(loader):
                     imgs = imgs.to(device)
                     mins = mins.to(device)
                     labels = labels.to(device)
+                    next_frames = next_frames.to(device)
 
-                    optimizer.zero_grad()
                     with autocast(device_type="cuda", enabled=device.type == "cuda"):
-                        out, _ = model(imgs, mins)
-                        loss = criterion(out[:, -1, :], labels)
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
+                        action, pred_feat, button_logits, hidden = model(imgs, mins, hidden)
+                        delta_pred = action[:, -1, :2]
+                        target_delta = labels[:, :2]
+                        target_buttons = labels[:, 2:]
+                        imitation_loss = mse_loss(delta_pred, target_delta) + bce_loss(button_logits[:, -1, :], target_buttons)
+                        target_feat = model.encode_features(next_frames)
+                        pred_loss = mse_loss(pred_feat, target_feat)
+                        energy_loss = torch.mean(torch.sum(delta_pred ** 2, dim=1))
+                        total_loss = 0.5 * torch.exp(-model.log_var_action) * imitation_loss + 0.5 * model.log_var_action
+                        total_loss = total_loss + 0.5 * torch.exp(-model.log_var_prediction) * pred_loss + 0.5 * model.log_var_prediction
+                        total_loss = total_loss + 0.5 * torch.exp(-model.log_var_energy) * energy_loss + 0.5 * model.log_var_energy
+                        total_loss = total_loss / accumulation_steps
+                    scaler.scale(total_loss).backward()
+                    if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(loader):
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad()
                     current_step += 1
-                    progress_bar("模型训练阶段", current_step, max(total_steps, current_step + 1), f"Loss: {loss.item():.4f}")
+                    progress_bar("模型训练阶段", current_step, max(total_steps, current_step + 1), f"Loss: {total_loss.item():.4f}")
 
         temp_path = os.path.join(model_dir, "ai_model_temp.pth")
         torch.save(model.state_dict(), temp_path)
-        if os.path.exists(model_path):
-            os.remove(model_path)
-        os.rename(temp_path, model_path)
-        print("Optimization Complete (Safe Save).")
+        try:
+            if os.path.exists(model_path):
+                shutil.copy2(model_path, backup_path)
+            if os.path.exists(model_path):
+                os.remove(model_path)
+            os.rename(temp_path, model_path)
+            print("Optimization Complete (Safe Save).")
+        except Exception as e:
+            print(f"Save error: {e}")
+            if os.path.exists(backup_path):
+                shutil.copy2(backup_path, model_path)
         torch.cuda.empty_cache()
     except Exception as e:
         print(f"Critical Optimization Error: {e}")
@@ -636,15 +724,17 @@ def start_training_mode():
                 img_tensor = img_tensor.transpose(2, 0, 1) / 255.0
 
                 ts_value = frame_ts if frame_ts else start_time
+                def norm_coord(v, dim):
+                    return (2.0 * (v / dim)) - 1.0
                 traj_flat = sample_trajectory(traj, ts_value, fallback_pos=(curr_x, curr_y))
                 traj_norm = []
                 for i, v in enumerate(traj_flat):
                     if i % 2 == 0:
-                        traj_norm.append(v / screen_w)
+                        traj_norm.append(norm_coord(v, screen_w))
                     else:
-                        traj_norm.append(v / screen_h)
+                        traj_norm.append(norm_coord(v, screen_h))
                 m_vec = [
-                    curr_x / screen_w, curr_y / screen_h,
+                    norm_coord(curr_x, screen_w), norm_coord(curr_y, screen_h),
                     1.0 if l_down else 0.0,
                     1.0 if r_down else 0.0,
                     scroll,
@@ -654,14 +744,14 @@ def start_training_mode():
                     max(0.0, ts_value - mouse_state["r_down_ts"]) if mouse_state["r_down_ts"] > 0 else 0.0,
                     max(0.0, ts_value - mouse_state["l_up_ts"]) if mouse_state["l_up_ts"] > 0 else 0.0,
                     max(0.0, ts_value - mouse_state["r_up_ts"]) if mouse_state["r_up_ts"] > 0 else 0.0,
-                    mouse_state["l_down_pos"][0] / screen_w,
-                    mouse_state["l_down_pos"][1] / screen_h,
-                    l_up_pos[0] / screen_w,
-                    l_up_pos[1] / screen_h,
-                    mouse_state["r_down_pos"][0] / screen_w,
-                    mouse_state["r_down_pos"][1] / screen_h,
-                    r_up_pos[0] / screen_w,
-                    r_up_pos[1] / screen_h
+                    norm_coord(mouse_state["l_down_pos"][0], screen_w),
+                    norm_coord(mouse_state["l_down_pos"][1], screen_h),
+                    norm_coord(l_up_pos[0], screen_w),
+                    norm_coord(l_up_pos[1], screen_h),
+                    norm_coord(mouse_state["r_down_pos"][0], screen_w),
+                    norm_coord(mouse_state["r_down_pos"][1], screen_h),
+                    norm_coord(r_up_pos[0], screen_w),
+                    norm_coord(r_up_pos[1], screen_h)
                 ]
                 m_vec.extend(traj_norm)
                 m_vec.append(1.0)
@@ -677,10 +767,10 @@ def start_training_mode():
                 if len(input_buffer_img) == seq_len:
                     t_imgs = torch.FloatTensor(np.array([input_buffer_img])).to(device)
                     t_mins = torch.FloatTensor(np.array([input_buffer_mouse])).to(device)
-                    
-                    out, hidden = model(t_imgs, t_mins, hidden)
-                    
-                    action = out[0, -1, :].cpu().numpy()
+
+                    action_out, _, _, hidden = model(t_imgs, t_mins, hidden)
+
+                    action = action_out[0, -1, :].cpu().numpy()
 
                     pred_dx = action[0] * screen_w
                     pred_dy = action[1] * screen_h
@@ -724,6 +814,20 @@ def record_data_loop():
     last_pos = (0, 0)
 
     while True:
+        if recording_pause_event.is_set():
+            if flush_event.is_set():
+                if buffer_images:
+                    fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npz")
+                    img_arr = np.array(buffer_images, dtype=np.uint8)
+                    act_arr = np.array(buffer_actions, dtype=np.float32)
+                    np.savez_compressed(fname, image=img_arr, action=act_arr)
+                    buffer_images = []
+                    buffer_actions = []
+                    check_disk_space()
+                flush_event.clear()
+                flush_done_event.set()
+            time.sleep(0.05)
+            continue
         if current_mode == MODE_LEARNING or current_mode == MODE_TRAINING:
             try:
                 start_time = time.time()
@@ -815,10 +919,12 @@ def input_loop():
         cmd = input().strip()
         if cmd == "睡眠":
             if current_mode == MODE_LEARNING:
+                recording_pause_event.set()
                 flush_buffers()
                 current_mode = MODE_SLEEP
                 optimize_ai()
                 current_mode = MODE_LEARNING
+                recording_pause_event.clear()
                 print("Back to Learning.")
         elif cmd == "训练":
             if current_mode == MODE_LEARNING:
