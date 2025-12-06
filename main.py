@@ -122,6 +122,7 @@ def get_latest_frame():
         return latest_frame["img"], latest_frame["ts"]
 
 data_queue = queue.Queue()
+save_queue = queue.Queue()
 
 class UniversalAI(nn.Module):
     def __init__(self):
@@ -352,6 +353,18 @@ def check_disk_space():
     except Exception as e:
         print(f"Disk clean error: {e}")
 
+def disk_writer_loop():
+    while True:
+        try:
+            fname, img_arr, act_arr = save_queue.get()
+            with file_lock:
+                np.savez_compressed(fname, image=img_arr, action=act_arr)
+            check_disk_space()
+        except Exception as e:
+            print(f"Save Error: {e}")
+        finally:
+            save_queue.task_done()
+
 class StreamingGameDataset(IterableDataset):
     def __init__(self, file_list):
         self.file_list = list(file_list)
@@ -365,8 +378,14 @@ class StreamingGameDataset(IterableDataset):
             return (2.0 * (v / dim)) - 1.0
 
         def load_image(item):
+            if isinstance(item, np.ndarray) and item.ndim == 3:
+                return item
             if structured:
-                img = item['image'] if hasattr(item, 'dtype') else item[0]
+                if isinstance(item, tuple):
+                    return item[0]
+                if hasattr(item, 'dtype'):
+                    return item['image']
+                return item[0]
             else:
                 img_data = item.get("screen")
                 if isinstance(img_data, bytes):
@@ -502,7 +521,7 @@ class StreamingGameDataset(IterableDataset):
                     1.0 if next_entry.get("l_down", False) else 0.0,
                     1.0 if next_entry.get("r_down", False) else 0.0
                 ]
-            next_img_raw = load_image(next_entry if not isinstance(next_entry, tuple) else next_entry[0])
+            next_img_raw = load_image(next_entry)
             next_img = normalize_image(next_img_raw)
         else:
             labels = [0.0, 0.0, 0.0, 0.0]
@@ -627,6 +646,7 @@ def optimize_ai():
         batch_files = [files[i:i+5] for i in range(0, len(files), 5)]
 
         datasets = []
+        loaders = []
         init_total = len(batch_files)
         init_done = 0
         print("Dataset Init")
@@ -646,7 +666,6 @@ def optimize_ai():
 
         epochs = 1
 
-        loaders = []
         for dataset in datasets:
             loader = DataLoader(dataset, batch_size=4, drop_last=False, num_workers=0, pin_memory=True)
             loaders.append(loader)
@@ -719,6 +738,14 @@ def optimize_ai():
             gc.collect()
         except Exception:
             pass
+    finally:
+        try:
+            del loaders
+            del datasets
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
+        gc.collect()
 
 def start_training_mode():
     global stop_training_flag, current_mode
@@ -874,10 +901,10 @@ def record_data_loop():
                     fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npz")
                     img_arr = np.array(buffer_images, dtype=np.uint8)
                     act_arr = np.array(buffer_actions, dtype=np.float32)
-                    np.savez_compressed(fname, image=img_arr, action=act_arr)
+                    save_queue.put((fname, img_arr, act_arr))
                     buffer_images = []
                     buffer_actions = []
-                    check_disk_space()
+                    save_queue.join()
                 flush_event.clear()
                 flush_done_event.set()
             time.sleep(0.05)
@@ -931,10 +958,9 @@ def record_data_loop():
                     fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npz")
                     img_arr = np.array(buffer_images, dtype=np.uint8)
                     act_arr = np.array(buffer_actions, dtype=np.float32)
-                    np.savez_compressed(fname, image=img_arr, action=act_arr)
+                    save_queue.put((fname, img_arr, act_arr))
                     buffer_images = []
                     buffer_actions = []
-                    check_disk_space()
 
                 elapsed = time.time() - start_time
                 wait = (1.0 / capture_freq) - elapsed
@@ -947,10 +973,10 @@ def record_data_loop():
                     fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npz")
                     img_arr = np.array(buffer_images, dtype=np.uint8)
                     act_arr = np.array(buffer_actions, dtype=np.float32)
-                    np.savez_compressed(fname, image=img_arr, action=act_arr)
+                    save_queue.put((fname, img_arr, act_arr))
                     buffer_images = []
                     buffer_actions = []
-                    check_disk_space()
+                    save_queue.join()
                 flush_event.clear()
                 flush_done_event.set()
         else:
@@ -959,10 +985,10 @@ def record_data_loop():
                     fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npz")
                     img_arr = np.array(buffer_images, dtype=np.uint8)
                     act_arr = np.array(buffer_actions, dtype=np.float32)
-                    np.savez_compressed(fname, image=img_arr, action=act_arr)
+                    save_queue.put((fname, img_arr, act_arr))
                     buffer_images = []
                     buffer_actions = []
-                    check_disk_space()
+                    save_queue.join()
                 flush_event.clear()
                 flush_done_event.set()
             time.sleep(1)
@@ -1004,6 +1030,10 @@ if __name__ == "__main__":
     t_frame = threading.Thread(target=frame_generator_loop)
     t_frame.daemon = True
     t_frame.start()
+
+    t_save = threading.Thread(target=disk_writer_loop)
+    t_save.daemon = True
+    t_save.start()
 
     t_rec = threading.Thread(target=record_data_loop)
     t_rec.daemon = True
