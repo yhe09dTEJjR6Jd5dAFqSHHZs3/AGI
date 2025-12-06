@@ -602,6 +602,11 @@ def optimize_ai():
     try:
         gc.collect()
         torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
         print("Starting Optimization...")
         model_path = os.path.join(model_dir, "ai_model.pth")
         backup_path = os.path.join(model_dir, "ai_model_prev.pth")
@@ -677,6 +682,7 @@ def optimize_ai():
             optimizer.zero_grad()
             for _ in range(epochs):
                 hidden = None
+                pending_steps = 0
                 for batch_idx, (imgs, mins, labels, next_frames) in enumerate(loader):
                     imgs = imgs.to(device)
                     mins = mins.to(device)
@@ -697,12 +703,18 @@ def optimize_ai():
                         total_loss = total_loss + 0.5 * torch.exp(-model.log_var_energy) * energy_loss + 0.5 * model.log_var_energy
                         total_loss = total_loss / accumulation_steps
                     scaler.scale(total_loss).backward()
-                    if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(loader):
+                    pending_steps += 1
+                    if pending_steps % accumulation_steps == 0:
                         scaler.step(optimizer)
                         scaler.update()
                         optimizer.zero_grad()
+                        pending_steps = 0
                     current_step += 1
                     progress_bar("模型训练阶段", current_step, max(total_steps, current_step + 1), f"Loss: {total_loss.item():.4f}")
+                if pending_steps > 0:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
                 gc.collect()
                 torch.cuda.empty_cache()
 
@@ -730,6 +742,11 @@ def optimize_ai():
         print(f"> Prediction Weight (Curiosity): {curiosity_weight:.3f}  <-- exp(-beta)")
         print(f"> Energy Penalty (Laziness): {laziness_penalty:.3f}  <-- exp(-gamma)")
         torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
         gc.collect()
     except Exception as e:
         print(f"Critical Optimization Error: {e}")
