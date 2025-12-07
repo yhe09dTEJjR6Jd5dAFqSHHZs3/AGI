@@ -262,6 +262,11 @@ def recreate_lmdb_env(new_size_gb):
 
 def append_lmdb_records(img_arr, act_arr):
     global lmdb_counter, current_map_size_gb
+    if len(img_arr) != len(act_arr):
+        print("LMDB append skipped due to length mismatch")
+        return
+    if len(img_arr) == 0:
+        return
     payloads = []
     for i in range(len(img_arr)):
         buf = io.BytesIO()
@@ -841,6 +846,41 @@ def disk_writer_loop():
         finally:
             save_queue.task_done()
 
+def safe_action_array(entry):
+    try:
+        if hasattr(entry, "dtype") and getattr(entry.dtype, "names", None) and "action" in entry.dtype.names:
+            return np.atleast_1d(entry["action"])
+        if isinstance(entry, dict) and "action" in entry:
+            return np.atleast_1d(entry["action"])
+        if isinstance(entry, (tuple, list)):
+            if len(entry) >= 2:
+                return np.atleast_1d(entry[1])
+        return np.zeros(mouse_feature_dim + 1, dtype=np.float32)
+    except Exception:
+        return np.zeros(mouse_feature_dim + 1, dtype=np.float32)
+
+def safe_image_data(entry, structured=False):
+    try:
+        if isinstance(entry, np.ndarray) and entry.ndim == 3:
+            return entry
+        if structured:
+            if hasattr(entry, "dtype") and getattr(entry.dtype, "names", None) and "image" in entry.dtype.names:
+                return entry["image"]
+            if isinstance(entry, (tuple, list)) and len(entry) >= 1:
+                return entry[0]
+        if isinstance(entry, dict):
+            img_data = entry.get("screen")
+            if isinstance(img_data, bytes):
+                img_array = np.frombuffer(img_data, dtype=np.uint8)
+                img = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
+            else:
+                img = img_data
+            if img is not None:
+                return img
+    except Exception:
+        pass
+    return np.zeros((target_h, target_w, 3), dtype=np.uint8)
+
 class StreamingGameDataset(IterableDataset):
     def __init__(self, file_list):
         self.file_list = list(file_list)
@@ -854,22 +894,7 @@ class StreamingGameDataset(IterableDataset):
             return (2.0 * (v / dim)) - 1.0
 
         def load_image(item):
-            if isinstance(item, np.ndarray) and item.ndim == 3:
-                return item
-            if structured:
-                if isinstance(item, tuple):
-                    return item[0]
-                if hasattr(item, 'dtype'):
-                    return item['image']
-                return item[0]
-            else:
-                img_data = item.get("screen")
-                if isinstance(img_data, bytes):
-                    img_array = np.frombuffer(img_data, dtype=np.uint8)
-                    img = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
-                else:
-                    img = img_data
-            return img
+            return safe_image_data(item, structured)
 
         def normalize_image(img):
             img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB) if img.shape[2] == 4 else img
@@ -877,7 +902,7 @@ class StreamingGameDataset(IterableDataset):
 
         for item in slice_data:
             if structured:
-                raw_action = item['action'] if hasattr(item, 'dtype') else item[1]
+                raw_action = safe_action_array(item)
                 action = np.atleast_1d(raw_action)
                 action_len = len(action)
 
@@ -978,13 +1003,7 @@ class StreamingGameDataset(IterableDataset):
 
         if next_entry is not None:
             if structured:
-                if hasattr(next_entry, 'dtype') and getattr(next_entry.dtype, "names", None) and 'action' in next_entry.dtype.names:
-                    next_action_source = next_entry['action']
-                elif isinstance(next_entry, tuple):
-                    next_action_source = next_entry[1]
-                else:
-                    next_action_source = next_entry
-                next_action = np.atleast_1d(next_action_source)
+                next_action = np.atleast_1d(safe_action_array(next_entry))
                 action_len = len(next_action)
 
                 def nval(idx, default=0.0):
@@ -1180,6 +1199,117 @@ def sample_trajectory(traj, ts_now, max_points=10, window=0.1, fallback_pos=(0, 
         flat.extend([px, py])
     return flat
 
+def sample_actions_from_source(path, sample_cap=8):
+    samples = []
+    total_len = 0
+    try:
+        if path == lmdb_path:
+            count = 0
+            for payload in iterate_lmdb_entries():
+                if count >= sample_cap:
+                    break
+                buf = io.BytesIO(payload)
+                data = np.load(buf, allow_pickle=True)
+                structured_npz = isinstance(data, np.lib.npyio.NpzFile)
+                structured_array = hasattr(data, 'dtype') and getattr(data.dtype, "names", None) and 'action' in data.dtype.names
+                structured = structured_npz or structured_array
+                if structured:
+                    acts = data['action'] if structured_npz else data['action']
+                    total_len = max(total_len, len(acts))
+                    if len(acts) > 0:
+                        samples.append(safe_action_array((None, acts[0]) if structured_npz else acts[0]))
+                else:
+                    total_len += 1
+                    samples.append(safe_action_array(data))
+                release_data_handle(data)
+                count += 1
+        elif path == log_path:
+            count = 0
+            for payload in iterate_binary_log(path):
+                if count >= sample_cap:
+                    break
+                buf = io.BytesIO(payload)
+                data = np.load(buf, allow_pickle=True)
+                structured_npz = isinstance(data, np.lib.npyio.NpzFile)
+                structured_array = hasattr(data, 'dtype') and getattr(data.dtype, "names", None) and 'action' in data.dtype.names
+                structured = structured_npz or structured_array
+                length = len(data['action']) if structured else len(data)
+                total_len += length
+                step = max(1, max(1, length // sample_cap))
+                for idx in range(0, length, step):
+                    if len(samples) >= sample_cap:
+                        break
+                    entry = (data['image'][idx], data['action'][idx]) if structured_npz else data[idx]
+                    samples.append(safe_action_array(entry))
+                release_data_handle(data)
+                count += 1
+        else:
+            with file_read_lock:
+                data = np.load(path, allow_pickle=True, mmap_mode="r")
+            structured_npz = isinstance(data, np.lib.npyio.NpzFile)
+            structured_array = hasattr(data, 'dtype') and getattr(data.dtype, "names", None) and 'action' in data.dtype.names
+            structured = structured_npz or structured_array
+            length = len(data['action']) if structured else len(data)
+            total_len = length
+            step = max(1, max(1, length // sample_cap))
+            for idx in range(0, length, step):
+                if len(samples) >= sample_cap:
+                    break
+                entry = (data['image'][idx], data['action'][idx]) if structured_npz else data[idx]
+                samples.append(safe_action_array(entry))
+            release_data_handle(data)
+    except Exception as e:
+        print(f"Data probe error: {e}")
+    return total_len, samples
+
+def build_sleep_file_mix(candidates, limit=20):
+    stats = []
+    for path in candidates:
+        length, samples = sample_actions_from_source(path)
+        try:
+            mtime = os.path.getmtime(path)
+        except Exception:
+            mtime = 0
+        if length <= 0 and not samples:
+            continue
+        human_score = 0.0
+        surprise_score = 0.0
+        if samples:
+            human_score = float(np.mean([1.0 if (len(a) > mouse_feature_dim and a[mouse_feature_dim] < 0.5) else 0.0 for a in samples]))
+            surprise_score = float(np.mean([float(np.mean(np.abs(a[16:18]))) if len(a) > 18 else 0.0 for a in samples]))
+        stats.append((path, human_score, surprise_score, length, mtime))
+    if not stats:
+        return []
+    stats.sort(key=lambda x: x[3], reverse=True)
+    total = min(limit, len(stats))
+    human_n = max(1, int(total * 0.4))
+    recent_n = max(1, int(total * 0.3))
+    surprise_n = max(1, int(total * 0.2))
+    random_n = max(0, total - human_n - recent_n - surprise_n)
+    human_pool = sorted(stats, key=lambda x: (x[1], x[3]), reverse=True)
+    recent_pool = sorted(stats, key=lambda x: x[4], reverse=True)
+    surprise_pool = sorted(stats, key=lambda x: x[2], reverse=True)
+    history_pool = sorted(stats, key=lambda x: x[4])
+    selected_paths = set()
+    selection = []
+
+    def pick(pool, count):
+        for item in pool:
+            if len(selection) >= total or count <= 0:
+                break
+            if item[0] in selected_paths:
+                continue
+            selection.append(item[0])
+            selected_paths.add(item[0])
+            count -= 1
+
+    pick(human_pool, human_n)
+    pick(recent_pool, recent_n)
+    pick(surprise_pool, surprise_n)
+    random.shuffle(history_pool)
+    pick(history_pool, random_n)
+    return selection
+
 def optimize_ai():
     global low_vram_mode
     try:
@@ -1213,26 +1343,29 @@ def optimize_ai():
         mse_loss = nn.MSELoss()
         bce_loss = nn.BCEWithLogitsLoss()
         scaler = GradScaler("cuda", enabled=device.type == "cuda")
-        accumulation_steps = 4
-        train_batch_size = 4
+        accumulation_steps = 8
+        train_batch_size = 8
         low_vram_mode = False
         total_mem_gb = None
         if torch.cuda.is_available():
             try:
                 total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
                 if total_mem_gb <= 4:
-                    accumulation_steps = 2
-                    train_batch_size = 1
+                    accumulation_steps = 8
+                    train_batch_size = 2
                     low_vram_mode = True
-                elif total_mem_gb > 8:
-                    accumulation_steps = 6
+                elif total_mem_gb <= 6:
+                    accumulation_steps = 8
+                    train_batch_size = 4
+                elif total_mem_gb > 10:
+                    accumulation_steps = 10
+                    train_batch_size = 12
             except Exception:
                 pass
         interrupted = False
 
         consolidate_data_files()
 
-        files = []
         candidates = []
         for pattern in ["*.npy", "*.npz"]:
             candidates.extend(glob.glob(os.path.join(data_dir, pattern)))
@@ -1240,11 +1373,21 @@ def optimize_ai():
             candidates.append(log_path)
         if os.path.exists(lmdb_path):
             candidates.append(lmdb_path)
-        total_scan = len(candidates)
+        valid_candidates = []
+        for c in candidates:
+            try:
+                if os.path.getsize(c) > 0:
+                    valid_candidates.append(c)
+            except Exception:
+                continue
+        prioritized = build_sleep_file_mix(valid_candidates, limit=25)
+        target_files = prioritized if prioritized else valid_candidates
+        files = []
+        total_scan = len(target_files)
         scanned = 0
         print("Scanning data files...")
         torch.cuda.empty_cache()
-        for f in candidates:
+        for f in target_files:
             if stop_optimization_flag.is_set():
                 break
             scanned += 1
