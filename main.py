@@ -159,10 +159,22 @@ def cleanup_before_sleep():
             latest_frame["img"] = None
             latest_frame["ts"] = 0.0
         temp_trajectory.clear()
-        torch.cuda.empty_cache()
     except Exception:
         pass
     gc.collect()
+    torch.cuda.empty_cache()
+
+def force_memory_cleanup(iterations=2, delay=0.05):
+    for _ in range(iterations):
+        gc.collect()
+        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.ipc_collect()
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+        time.sleep(delay)
 
 data_queue = queue.Queue()
 save_queue = queue.Queue()
@@ -299,7 +311,7 @@ class UniversalAI(nn.Module):
         mask = mask.masked_fill(mask == 1, float('-inf'))
         for block in self.blocks:
             if self.use_checkpoint and self.training:
-                x = checkpoint(lambda t: block(t, mask), x)
+                x = checkpoint(lambda t: block(t, mask), x, use_reentrant=False)
             else:
                 x = block(x, mask)
         action_token = x[:, -1, :]
@@ -893,8 +905,7 @@ def optimize_ai():
     try:
         time.sleep(1.0)
         stop_optimization_flag.clear()
-        gc.collect()
-        torch.cuda.empty_cache()
+        force_memory_cleanup(3, 0.1)
         if torch.cuda.is_available():
             try:
                 torch.cuda.reset_peak_memory_stats()
@@ -1173,10 +1184,7 @@ def optimize_ai():
 def start_training_mode():
     global stop_training_flag, current_mode
     stop_training_flag = False
-
-    gc.collect()
-    torch.cuda.empty_cache()
-
+    force_memory_cleanup(2, 0.05)
     hwnd = ctypes.windll.kernel32.GetConsoleWindow()
     time.sleep(0.2)
     ctypes.windll.user32.ShowWindow(hwnd, 6)
