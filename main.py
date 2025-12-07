@@ -854,7 +854,11 @@ def safe_action_array(entry):
             return np.atleast_1d(entry["action"])
         if isinstance(entry, (tuple, list)):
             if len(entry) >= 2:
-                return np.atleast_1d(entry[1])
+                candidate = entry[1]
+                if candidate is None:
+                    return np.zeros(mouse_feature_dim + 1, dtype=np.float32)
+                return np.atleast_1d(candidate)
+            return np.zeros(mouse_feature_dim + 1, dtype=np.float32)
         return np.zeros(mouse_feature_dim + 1, dtype=np.float32)
     except Exception:
         return np.zeros(mouse_feature_dim + 1, dtype=np.float32)
@@ -880,6 +884,26 @@ def safe_image_data(entry, structured=False):
     except Exception:
         pass
     return np.zeros((target_h, target_w, 3), dtype=np.uint8)
+
+def build_entry_pair(data, idx, structured_npz, structured):
+    try:
+        if structured_npz:
+            images = data.get('image') if isinstance(data, dict) else data['image']
+            actions = data.get('action') if isinstance(data, dict) else data['action']
+            if images is None or actions is None:
+                return None
+            if idx < len(images) and idx < len(actions):
+                return (images[idx], actions[idx])
+            return None
+        if structured:
+            if idx < len(data):
+                return data[idx]
+            return None
+        if idx < len(data):
+            return data[idx]
+    except Exception:
+        return None
+    return None
 
 class StreamingGameDataset(IterableDataset):
     def __init__(self, file_list):
@@ -1062,19 +1086,17 @@ class StreamingGameDataset(IterableDataset):
                                         slice_data = []
                                         for i in range(self.seq_len):
                                             idx_in_file = min(start_idx + i, length - 1)
-                                            if structured_npz:
-                                                slice_data.append((data['image'][idx_in_file], data['action'][idx_in_file]))
-                                            else:
-                                                slice_data.append(data[idx_in_file])
+                                            entry = build_entry_pair(data, idx_in_file, structured_npz, structured)
+                                            if entry is None:
+                                                slice_data = []
+                                                break
+                                            slice_data.append(entry)
                                         next_entry = None
                                         next_idx = start_idx + self.seq_len
                                         if next_idx < length:
-                                            if structured_npz:
-                                                next_entry = (data['image'][next_idx], data['action'][next_idx])
-                                            elif structured:
-                                                next_entry = data[next_idx]
-                                            else:
-                                                next_entry = data[next_idx]
+                                            next_entry = build_entry_pair(data, next_idx, structured_npz, structured)
+                                        if not slice_data:
+                                            continue
                                         item = self._prepare_item(slice_data, next_entry, structured, structured_npz)
                                         output_queue.put(item)
                                     release_data_handle(data)
@@ -1103,19 +1125,17 @@ class StreamingGameDataset(IterableDataset):
                                         slice_data = []
                                         for i in range(self.seq_len):
                                             idx_in_file = min(start_idx + i, length - 1)
-                                            if structured_npz:
-                                                slice_data.append((data['image'][idx_in_file], data['action'][idx_in_file]))
-                                            else:
-                                                slice_data.append(data[idx_in_file])
+                                            entry = build_entry_pair(data, idx_in_file, structured_npz, structured)
+                                            if entry is None:
+                                                slice_data = []
+                                                break
+                                            slice_data.append(entry)
                                         next_entry = None
                                         next_idx = start_idx + self.seq_len
                                         if next_idx < length:
-                                            if structured_npz:
-                                                next_entry = (data['image'][next_idx], data['action'][next_idx])
-                                            elif structured:
-                                                next_entry = data[next_idx]
-                                            else:
-                                                next_entry = data[next_idx]
+                                            next_entry = build_entry_pair(data, next_idx, structured_npz, structured)
+                                        if not slice_data:
+                                            continue
                                         item = self._prepare_item(slice_data, next_entry, structured, structured_npz)
                                         output_queue.put(item)
                                     release_data_handle(data)
@@ -1144,19 +1164,17 @@ class StreamingGameDataset(IterableDataset):
                             slice_data = []
                             for i in range(self.seq_len):
                                 idx_in_file = min(start_idx + i, length - 1)
-                                if structured_npz:
-                                    slice_data.append((data['image'][idx_in_file], data['action'][idx_in_file]))
-                                else:
-                                    slice_data.append(data[idx_in_file])
+                                entry = build_entry_pair(data, idx_in_file, structured_npz, structured)
+                                if entry is None:
+                                    slice_data = []
+                                    break
+                                slice_data.append(entry)
                             next_entry = None
                             next_idx = start_idx + self.seq_len
                             if next_idx < length:
-                                if structured_npz:
-                                    next_entry = (data['image'][next_idx], data['action'][next_idx])
-                                elif structured:
-                                    next_entry = data[next_idx]
-                                else:
-                                    next_entry = data[next_idx]
+                                next_entry = build_entry_pair(data, next_idx, structured_npz, structured)
+                            if not slice_data:
+                                continue
                             item = self._prepare_item(slice_data, next_entry, structured, structured_npz)
                             output_queue.put(item)
                         release_data_handle(data)
