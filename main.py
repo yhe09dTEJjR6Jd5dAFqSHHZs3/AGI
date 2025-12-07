@@ -18,6 +18,7 @@ if os.name == "nt":
     import winreg
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", module="pynvml")
 
 def resolve_desktop_path():
     if os.name == "nt":
@@ -157,6 +158,7 @@ lmdb_lock = threading.Lock()
 lmdb_env = None
 lmdb_counter = 0
 lmdb_start = 0
+current_map_size_gb = 10
 
 def update_latest_frame(img, ts):
     with frame_lock:
@@ -229,10 +231,12 @@ def iterate_binary_log(path):
         print(f"Binary log read error: {e}")
         return []
 
-def get_lmdb_env(map_size_gb=24):
-    global lmdb_env, lmdb_counter, lmdb_start
+def get_lmdb_env(map_size_gb=None):
+    global lmdb_env, lmdb_counter, lmdb_start, current_map_size_gb
+    if map_size_gb is not None:
+        current_map_size_gb = map_size_gb
     if lmdb_env is None:
-        size_bytes = map_size_gb * (1024 ** 3)
+        size_bytes = int(current_map_size_gb * (1024 ** 3))
         lmdb_env = lmdb.open(lmdb_path, map_size=size_bytes, subdir=False, max_dbs=1, lock=True)
         with lmdb_env.begin(write=True) as txn:
             counter_bytes = txn.get(b"__counter__")
@@ -243,24 +247,44 @@ def get_lmdb_env(map_size_gb=24):
             txn.put(b"__start__", lmdb_start.to_bytes(8, "little"))
     return lmdb_env
 
-def append_lmdb_records(img_arr, act_arr):
+def recreate_lmdb_env(new_size_gb):
+    global lmdb_env
     try:
-        env = get_lmdb_env()
-        payloads = []
-        for i in range(len(img_arr)):
-            buf = io.BytesIO()
-            np.savez_compressed(buf, image=img_arr[i], action=act_arr[i])
-            payloads.append(buf.getvalue())
-        global lmdb_counter
-        with lmdb_lock:
-            with env.begin(write=True) as txn:
-                for payload in payloads:
-                    key = lmdb_counter.to_bytes(8, "little")
-                    txn.put(key, payload)
-                    lmdb_counter += 1
-                txn.put(b"__counter__", lmdb_counter.to_bytes(8, "little"))
-    except Exception as e:
-        print(f"LMDB append error: {e}")
+        if lmdb_env is not None:
+            lmdb_env.close()
+    except Exception:
+        pass
+    lmdb_env = None
+    return get_lmdb_env(new_size_gb)
+
+def append_lmdb_records(img_arr, act_arr):
+    global lmdb_counter, current_map_size_gb
+    payloads = []
+    for i in range(len(img_arr)):
+        buf = io.BytesIO()
+        np.savez_compressed(buf, image=img_arr[i], action=act_arr[i])
+        payloads.append(buf.getvalue())
+    retry = 0
+    while retry < 3:
+        try:
+            env = get_lmdb_env()
+            with lmdb_lock:
+                with env.begin(write=True) as txn:
+                    for payload in payloads:
+                        key = lmdb_counter.to_bytes(8, "little")
+                        txn.put(key, payload)
+                        lmdb_counter += 1
+                    txn.put(b"__counter__", lmdb_counter.to_bytes(8, "little"))
+            return
+        except lmdb.MapFullError:
+            with lmdb_lock:
+                current_map_size_gb = int(max(current_map_size_gb * 1.5, current_map_size_gb + 1))
+                recreate_lmdb_env(current_map_size_gb)
+            print(f"LMDB resized to {current_map_size_gb}GB")
+            retry += 1
+        except Exception as e:
+            print(f"LMDB append error: {e}")
+            return
 
 def get_lmdb_length():
     try:
@@ -769,6 +793,13 @@ def disk_writer_loop():
     while True:
         try:
             fname, img_arr, act_arr = save_queue.get()
+            try:
+                temp_path = f"{fname}.tmp"
+                with file_lock:
+                    np.savez(temp_path, image=img_arr, action=act_arr)
+                    os.replace(temp_path, fname)
+            except Exception as e:
+                print(f"File save error: {e}")
             append_lmdb_records(img_arr, act_arr)
             append_binary_log(img_arr, act_arr)
             check_counter += 1
@@ -818,7 +849,8 @@ class StreamingGameDataset(IterableDataset):
 
         for item in slice_data:
             if structured:
-                action = item['action'] if hasattr(item, 'dtype') else item[1]
+                raw_action = item['action'] if hasattr(item, 'dtype') else item[1]
+                action = np.atleast_1d(raw_action)
                 action_len = len(action)
 
                 def aval(idx, default=0.0):
@@ -918,8 +950,13 @@ class StreamingGameDataset(IterableDataset):
 
         if next_entry is not None:
             if structured:
-                next_action_source = next_entry[1] if isinstance(next_entry, tuple) else next_entry
-                next_action = next_action_source if hasattr(next_action_source, 'dtype') else next_action_source
+                if hasattr(next_entry, 'dtype') and getattr(next_entry.dtype, "names", None) and 'action' in next_entry.dtype.names:
+                    next_action_source = next_entry['action']
+                elif isinstance(next_entry, tuple):
+                    next_action_source = next_entry[1]
+                else:
+                    next_action_source = next_entry
+                next_action = np.atleast_1d(next_action_source)
                 action_len = len(next_action)
 
                 def nval(idx, default=0.0):
@@ -1134,14 +1171,17 @@ def optimize_ai():
         bce_loss = nn.BCEWithLogitsLoss()
         scaler = GradScaler("cuda", enabled=device.type == "cuda")
         accumulation_steps = 4
+        train_batch_size = 4
         low_vram_mode = False
+        total_mem_gb = None
         if torch.cuda.is_available():
             try:
-                total_mem = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-                if total_mem < 4:
+                total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                if total_mem_gb <= 4:
                     accumulation_steps = 2
+                    train_batch_size = 1
                     low_vram_mode = True
-                elif total_mem > 8:
+                elif total_mem_gb > 8:
                     accumulation_steps = 6
             except Exception:
                 pass
@@ -1248,7 +1288,6 @@ def optimize_ai():
         current_step = 0
         total_chunks = len(batch_files)
         last_loss_value = 0.0
-        train_batch_size = 4
         plateau_counter = 0
         prev_loss = float('inf')
         finetune_enabled = False
