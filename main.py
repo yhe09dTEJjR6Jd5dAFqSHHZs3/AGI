@@ -53,8 +53,11 @@ def install_requirements():
         "pynput": "pynput",
         "psutil": "psutil",
         "nvidia-ml-py": "pynvml",
-        "pillow": "PIL"
+        "pillow": "PIL",
+        "lmdb": "lmdb"
     }
+    if os.name == "nt":
+        package_map["dxcam"] = "dxcam"
     for package, import_name in package_map.items():
         try:
             __import__(import_name)
@@ -80,6 +83,11 @@ import psutil
 import torchvision.models as models
 from pynput import mouse, keyboard
 import pynvml
+import lmdb
+if os.name == "nt":
+    import dxcam
+else:
+    dxcam = None
 
 desktop_path = resolve_desktop_path()
 base_dir = os.path.join(desktop_path, "AAA")
@@ -88,6 +96,7 @@ model_dir = os.path.join(base_dir, "model")
 temp_dir = os.path.join(base_dir, "temp")
 log_path = os.path.join(data_dir, "experience.log")
 index_path = os.path.join(data_dir, "experience.idx")
+lmdb_path = os.path.join(data_dir, "experience.lmdb")
 
 for d in [base_dir, data_dir, model_dir, temp_dir]:
     if not os.path.exists(d):
@@ -144,6 +153,10 @@ temp_trajectory = deque(maxlen=200)
 frame_lock = threading.Lock()
 latest_frame = {"img": None, "ts": 0.0}
 file_lock = threading.Lock()
+lmdb_lock = threading.Lock()
+lmdb_env = None
+lmdb_counter = 0
+lmdb_start = 0
 
 def update_latest_frame(img, ts):
     with frame_lock:
@@ -215,6 +228,98 @@ def iterate_binary_log(path):
     except Exception as e:
         print(f"Binary log read error: {e}")
         return []
+
+def get_lmdb_env(map_size_gb=24):
+    global lmdb_env, lmdb_counter, lmdb_start
+    if lmdb_env is None:
+        size_bytes = map_size_gb * (1024 ** 3)
+        lmdb_env = lmdb.open(lmdb_path, map_size=size_bytes, subdir=False, max_dbs=1, lock=True)
+        with lmdb_env.begin(write=True) as txn:
+            counter_bytes = txn.get(b"__counter__")
+            start_bytes = txn.get(b"__start__")
+            lmdb_counter = int.from_bytes(counter_bytes, "little") if counter_bytes else 0
+            lmdb_start = int.from_bytes(start_bytes, "little") if start_bytes else 0
+            txn.put(b"__counter__", lmdb_counter.to_bytes(8, "little"))
+            txn.put(b"__start__", lmdb_start.to_bytes(8, "little"))
+    return lmdb_env
+
+def append_lmdb_records(img_arr, act_arr):
+    try:
+        env = get_lmdb_env()
+        payloads = []
+        for i in range(len(img_arr)):
+            buf = io.BytesIO()
+            np.savez_compressed(buf, image=img_arr[i], action=act_arr[i])
+            payloads.append(buf.getvalue())
+        global lmdb_counter
+        with lmdb_lock:
+            with env.begin(write=True) as txn:
+                for payload in payloads:
+                    key = lmdb_counter.to_bytes(8, "little")
+                    txn.put(key, payload)
+                    lmdb_counter += 1
+                txn.put(b"__counter__", lmdb_counter.to_bytes(8, "little"))
+    except Exception as e:
+        print(f"LMDB append error: {e}")
+
+def get_lmdb_length():
+    try:
+        env = get_lmdb_env()
+        with env.begin() as txn:
+            counter_bytes = txn.get(b"__counter__")
+            start_bytes = txn.get(b"__start__")
+            end_val = int.from_bytes(counter_bytes, "little") if counter_bytes else 0
+            start_val = int.from_bytes(start_bytes, "little") if start_bytes else 0
+            return max(0, end_val - start_val)
+    except Exception as e:
+        print(f"LMDB length error: {e}")
+        return 0
+
+def iterate_lmdb_entries():
+    try:
+        env = get_lmdb_env()
+        with env.begin() as txn:
+            start_bytes = txn.get(b"__start__")
+            start_val = int.from_bytes(start_bytes, "little") if start_bytes else 0
+        with env.begin() as txn:
+            cursor = txn.cursor()
+            seek_key = start_val.to_bytes(8, "little")
+            if cursor.set_key(seek_key):
+                pass
+            else:
+                cursor.first()
+            for key, val in cursor:
+                if key in (b"__counter__", b"__start__"):
+                    continue
+                yield val
+    except Exception as e:
+        print(f"LMDB iterate error: {e}")
+
+def trim_lmdb(limit_bytes):
+    try:
+        if not os.path.exists(lmdb_path):
+            return
+        size = os.path.getsize(lmdb_path)
+        if size <= limit_bytes:
+            return
+        env = get_lmdb_env()
+        with lmdb_lock:
+            with env.begin(write=True) as txn:
+                start_bytes = txn.get(b"__start__")
+                counter_bytes = txn.get(b"__counter__")
+                start_val = int.from_bytes(start_bytes, "little") if start_bytes else 0
+                end_val = int.from_bytes(counter_bytes, "little") if counter_bytes else 0
+                keep = int(limit_bytes * 0.8)
+                target_start = start_val
+                while target_start < end_val and os.path.getsize(lmdb_path) > keep:
+                    key = target_start.to_bytes(8, "little")
+                    txn.delete(key)
+                    target_start += 1
+                txn.put(b"__start__", target_start.to_bytes(8, "little"))
+                global lmdb_start
+                lmdb_start = target_start
+    except Exception as e:
+        print(f"LMDB trim error: {e}")
 
 def trim_binary_log(limit_bytes):
     try:
@@ -291,6 +396,7 @@ class UniversalAI(nn.Module):
         self.blocks = nn.ModuleList([CausalBlock(self.model_dim, 8, 1024, 0.1) for _ in range(4)])
         self.input_proj = nn.Linear(self.fc_input_dim + self.mouse_dim, self.model_dim)
         self.pos_embedding = nn.Parameter(torch.zeros(1, 512, self.model_dim))
+        self.memory_unit = nn.GRU(self.model_dim, self.model_dim, batch_first=True)
         self.action_head = nn.Linear(self.model_dim, grid_size)
         self.button_head = nn.Linear(self.model_dim, 2)
         self.feature_decoder = nn.Sequential(nn.Linear(self.model_dim, 256), nn.ReLU(), nn.Linear(256, 128))
@@ -315,11 +421,12 @@ class UniversalAI(nn.Module):
                 x = checkpoint(lambda t: block(t, mask), x, use_reentrant=False)
             else:
                 x = block(x, mask)
-        action_token = x[:, -1, :]
+        mem_out, hidden_out = self.memory_unit(x, hidden)
+        action_token = mem_out[:, -1, :]
         grid_logits = self.action_head(action_token)
         button_logits = self.button_head(action_token)
         pred_features = self.feature_decoder(action_token)
-        return grid_logits, pred_features, button_logits, None
+        return grid_logits, pred_features, button_logits, hidden_out
 
     def encode_features(self, img):
         with torch.no_grad():
@@ -424,13 +531,25 @@ def resource_monitor():
 
 def frame_generator_loop():
     try:
-        with mss.mss() as sct:
+        camera = None
+        use_dx = os.name == "nt" and dxcam is not None
+        if use_dx:
+            try:
+                camera = dxcam.create(output_idx=0)
+                camera.start(target_fps=max(30, capture_freq * 2), video_mode=True, dup=False)
+            except Exception:
+                camera = None
+                use_dx = False
+        if use_dx and camera:
             while True:
                 start = time.time()
-                img = np.array(sct.grab({"top": 0, "left": 0, "width": screen_w, "height": screen_h}))
+                frame = camera.get_latest_frame()
+                if frame is None:
+                    time.sleep(0.001)
+                    continue
                 step_x = max(1, screen_w // target_w)
                 step_y = max(1, screen_h // target_h)
-                img_small = img[::step_y, ::step_x]
+                img_small = frame[::step_y, ::step_x]
                 if img_small.shape[1] > target_w:
                     img_small = img_small[:, :target_w]
                 if img_small.shape[0] > target_h:
@@ -440,6 +559,23 @@ def frame_generator_loop():
                 wait = (1.0 / desired) - (time.time() - start)
                 if wait > 0:
                     time.sleep(wait)
+        else:
+            with mss.mss() as sct:
+                while True:
+                    start = time.time()
+                    img = np.array(sct.grab({"top": 0, "left": 0, "width": screen_w, "height": screen_h}))
+                    step_x = max(1, screen_w // target_w)
+                    step_y = max(1, screen_h // target_h)
+                    img_small = img[::step_y, ::step_x]
+                    if img_small.shape[1] > target_w:
+                        img_small = img_small[:, :target_w]
+                    if img_small.shape[0] > target_h:
+                        img_small = img_small[:target_h, :]
+                    update_latest_frame(img_small, start)
+                    desired = max(30, capture_freq * 2)
+                    wait = (1.0 / desired) - (time.time() - start)
+                    if wait > 0:
+                        time.sleep(wait)
     except Exception as e:
         print(f"Frame Generator Error: {e}")
 
@@ -519,7 +655,7 @@ def check_disk_space():
                     files.append((f, os.path.getmtime(f)))
                 except Exception:
                     continue
-        for extra in [log_path, index_path]:
+        for extra in [log_path, index_path, lmdb_path]:
             if os.path.exists(extra):
                 try:
                     total_size += os.path.getsize(extra)
@@ -528,6 +664,7 @@ def check_disk_space():
 
         limit = 20 * 1024 * 1024 * 1024
         if total_size > limit:
+            trim_lmdb(limit)
             files.sort(key=lambda x: x[1])
             now = time.time()
             skip_guard = 0
@@ -632,6 +769,7 @@ def disk_writer_loop():
     while True:
         try:
             fname, img_arr, act_arr = save_queue.get()
+            append_lmdb_records(img_arr, act_arr)
             append_binary_log(img_arr, act_arr)
             check_counter += 1
             now = time.time()
@@ -858,6 +996,47 @@ class StreamingGameDataset(IterableDataset):
                             except Exception as e:
                                 print(f"Binary data load error: {e}")
                         continue
+                    if path == lmdb_path:
+                        try:
+                            for payload in iterate_lmdb_entries():
+                                if stop_optimization_flag.is_set():
+                                    break
+                                buf = io.BytesIO(payload)
+                                data = np.load(buf, allow_pickle=True)
+                                structured_npz = isinstance(data, np.lib.npyio.NpzFile)
+                                structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
+                                structured = structured_npz or structured_array
+                                length = len(data['action']) if structured else len(data)
+                                if length <= 0:
+                                    if structured_npz:
+                                        data.close()
+                                    continue
+                                max_start = max(1, length - self.seq_len)
+                                for start_idx in range(max_start):
+                                    if stop_optimization_flag.is_set():
+                                        break
+                                    slice_data = []
+                                    for i in range(self.seq_len):
+                                        idx_in_file = min(start_idx + i, length - 1)
+                                        if structured_npz:
+                                            slice_data.append((data['image'][idx_in_file], data['action'][idx_in_file]))
+                                        else:
+                                            slice_data.append(data[idx_in_file])
+                                    next_entry = None
+                                    next_idx = start_idx + self.seq_len
+                                    if next_idx < length:
+                                        if structured_npz:
+                                            next_entry = (data['image'][next_idx], data['action'][next_idx])
+                                        elif structured:
+                                            next_entry = data[next_idx]
+                                        else:
+                                            next_entry = data[next_idx]
+                                    item = self._prepare_item(slice_data, next_entry, structured, structured_npz)
+                                    output_queue.put(item)
+                                release_data_handle(data)
+                        except Exception as e:
+                            print(f"LMDB data load error: {e}")
+                        continue
                     with file_lock:
                         data = np.load(path, allow_pickle=True, mmap_mode="r")
                     if isinstance(data, np.ndarray) and getattr(data, "shape", None) == ():
@@ -976,6 +1155,8 @@ def optimize_ai():
             candidates.extend(glob.glob(os.path.join(data_dir, pattern)))
         if os.path.exists(log_path):
             candidates.append(log_path)
+        if os.path.exists(lmdb_path):
+            candidates.append(lmdb_path)
         total_scan = len(candidates)
         scanned = 0
         print("Scanning data files...")
@@ -1020,6 +1201,11 @@ def optimize_ai():
                             steps = max(1, length - seq_len)
                             total += steps
                             release_data_handle(data)
+                        continue
+                    if path == lmdb_path:
+                        length = get_lmdb_length()
+                        steps = max(1, length - seq_len)
+                        total += steps
                         continue
                     with file_lock:
                         data = np.load(path, allow_pickle=True, mmap_mode="r")
@@ -1218,6 +1404,8 @@ def optimize_ai():
 
 def start_training_mode():
     global stop_training_flag, current_mode
+    time.sleep(1.0)
+    stop_optimization_flag.clear()
     stop_training_flag = False
     force_memory_cleanup(2, 0.05)
     hwnd = ctypes.windll.kernel32.GetConsoleWindow()
@@ -1247,6 +1435,7 @@ def start_training_mode():
     with mouse_lock:
         prev_pos = (mouse_state["x"], mouse_state["y"])
     target_history = deque(maxlen=8)
+    hidden_state = None
     try:
         model.share_memory()
     except Exception:
@@ -1254,9 +1443,34 @@ def start_training_mode():
     time.sleep(1.0)
     stop_training_flag = False
 
-    def bezier_interp(p0, p1, p2, t):
-        one_minus = 1.0 - t
-        return (one_minus * one_minus * p0) + (2.0 * one_minus * t * p1) + (t * t * p2)
+    class PIDController:
+        def __init__(self, kp, ki, kd):
+            self.kp = kp
+            self.ki = ki
+            self.kd = kd
+            self.integral_x = 0.0
+            self.integral_y = 0.0
+            self.prev_err_x = 0.0
+            self.prev_err_y = 0.0
+            self.prev_time = time.time()
+
+        def step(self, target, current):
+            now = time.time()
+            dt = max(now - self.prev_time, 1e-3)
+            err_x = target[0] - current[0]
+            err_y = target[1] - current[1]
+            self.integral_x += err_x * dt
+            self.integral_y += err_y * dt
+            der_x = (err_x - self.prev_err_x) / dt
+            der_y = (err_y - self.prev_err_y) / dt
+            self.prev_err_x = err_x
+            self.prev_err_y = err_y
+            self.prev_time = now
+            out_x = (self.kp * err_x) + (self.ki * self.integral_x) + (self.kd * der_x)
+            out_y = (self.kp * err_y) + (self.ki * self.integral_y) + (self.kd * der_y)
+            return current[0] + out_x, current[1] + out_y
+
+    pid = PIDController(0.6, 0.02, 0.3)
 
     while not stop_training_flag:
         if stop_training_flag:
@@ -1329,25 +1543,24 @@ def start_training_mode():
                 t_mins = torch.FloatTensor(np.array([input_buffer_mouse])).to(device)
                 surprise_optimizer.zero_grad(set_to_none=True)
                 with autocast(device_type="cuda", enabled=device.type == "cuda"):
-                    grid_logits, pred_feat, button_logits, _ = model(t_imgs, t_mins, None)
+                    grid_logits, pred_feat, button_logits, hidden_out = model(t_imgs, t_mins, hidden_state)
                 grid_probs = torch.softmax(grid_logits[0], dim=-1)
                 pred_cell = torch.argmax(grid_probs).item()
                 cell_x = pred_cell % grid_w
                 cell_y = pred_cell // grid_w
                 target_x = int(((cell_x + 0.5) / grid_w) * screen_w)
                 target_y = int(((cell_y + 0.5) / grid_h) * screen_h)
+                hidden_state = hidden_out.detach()
                 target_history.append((target_x, target_y))
                 avg_x = sum(p[0] for p in target_history) / len(target_history)
                 avg_y = sum(p[1] for p in target_history) / len(target_history)
                 current_mouse = mouse_ctrl.position
-                control_x = (current_mouse[0] + avg_x) / 2.0
-                control_y = (current_mouse[1] + avg_y) / 2.0
-                eased_x = bezier_interp(current_mouse[0], control_x, avg_x, 0.35)
-                eased_y = bezier_interp(current_mouse[1], control_y, avg_y, 0.35)
-                filtered_x = (eased_x * 0.7) + (current_mouse[0] * 0.3)
-                filtered_y = (eased_y * 0.7) + (current_mouse[1] * 0.3)
-                jitter_x = random.uniform(-2.0, 2.0)
-                jitter_y = random.uniform(-2.0, 2.0)
+                pid_target = (avg_x, avg_y)
+                pid_out = pid.step(pid_target, current_mouse)
+                filtered_x = (pid_out[0] * 0.8) + (current_mouse[0] * 0.2)
+                filtered_y = (pid_out[1] * 0.8) + (current_mouse[1] * 0.2)
+                jitter_x = random.uniform(-1.0, 1.0)
+                jitter_y = random.uniform(-1.0, 1.0)
                 final_x = int(min(max(0, filtered_x + jitter_x), screen_w - 1))
                 final_y = int(min(max(0, filtered_y + jitter_y), screen_h - 1))
                 pred_buttons = torch.sigmoid(button_logits[0]).detach().cpu().numpy()
