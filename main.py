@@ -732,6 +732,7 @@ def sample_trajectory(traj, ts_now, max_points=10, window=0.1, fallback_pos=(0, 
 
 def optimize_ai():
     try:
+        time.sleep(1.0)
         stop_optimization_flag.clear()
         gc.collect()
         torch.cuda.empty_cache()
@@ -763,6 +764,15 @@ def optimize_ai():
         bce_loss = nn.BCEWithLogitsLoss()
         scaler = GradScaler("cuda", enabled=device.type == "cuda")
         accumulation_steps = 4
+        if torch.cuda.is_available():
+            try:
+                total_mem = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                if total_mem < 4:
+                    accumulation_steps = 2
+                elif total_mem > 8:
+                    accumulation_steps = 6
+            except Exception:
+                pass
         interrupted = False
 
         consolidate_data_files()
@@ -981,7 +991,10 @@ def optimize_ai():
 def start_training_mode():
     global stop_training_flag, current_mode
     stop_training_flag = False
-    
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
     hwnd = ctypes.windll.kernel32.GetConsoleWindow()
     time.sleep(0.2)
     ctypes.windll.user32.ShowWindow(hwnd, 6)
@@ -1016,6 +1029,13 @@ def start_training_mode():
         pass
 
     with torch.inference_mode():
+        time.sleep(1.0)
+        stop_training_flag = False
+
+        def bezier_interp(p0, p1, p2, t):
+            one_minus = 1.0 - t
+            return (one_minus * one_minus * p0) + (2.0 * one_minus * t * p1) + (t * t * p2)
+
         while not stop_training_flag:
             time.sleep(0)
             start_time = time.time()
@@ -1105,11 +1125,14 @@ def start_training_mode():
                     target_x = int(min(max(0, curr_x + avg_dx), screen_w - 1))
                     target_y = int(min(max(0, curr_y + avg_dy), screen_h - 1))
                     current_mouse = mouse_ctrl.position
-                    smooth_factor = 0.35
-                    smooth_x = int(current_mouse[0] + (target_x - current_mouse[0]) * smooth_factor)
-                    smooth_y = int(current_mouse[1] + (target_y - current_mouse[1]) * smooth_factor)
-                    target_x = int(min(max(0, smooth_x), screen_w - 1))
-                    target_y = int(min(max(0, smooth_y), screen_h - 1))
+                    control_x = (current_mouse[0] + target_x) / 2.0
+                    control_y = (current_mouse[1] + target_y) / 2.0
+                    eased_x = bezier_interp(current_mouse[0], control_x, target_x, 0.35)
+                    eased_y = bezier_interp(current_mouse[1], control_y, target_y, 0.35)
+                    filtered_x = (eased_x * 0.7) + (current_mouse[0] * 0.3)
+                    filtered_y = (eased_y * 0.7) + (current_mouse[1] * 0.3)
+                    target_x = int(min(max(0, filtered_x), screen_w - 1))
+                    target_y = int(min(max(0, filtered_y), screen_h - 1))
                     pred_l = action[2]
                     pred_r = action[3]
 
