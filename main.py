@@ -17,6 +17,7 @@ import tempfile
 from collections import deque
 if os.name == "nt":
     import winreg
+    import msvcrt
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", module="pynvml")
@@ -116,6 +117,7 @@ flush_event = threading.Event()
 flush_done_event = threading.Event()
 recording_pause_event = threading.Event()
 stop_optimization_flag = threading.Event()
+capture_pause_event = threading.Event()
 low_vram_mode = False
 
 def set_process_priority():
@@ -564,16 +566,32 @@ def resource_monitor():
 def frame_generator_loop():
     try:
         camera = None
+        sct = None
         use_dx = os.name == "nt" and dxcam is not None
-        if use_dx:
-            try:
-                camera = dxcam.create(output_idx=0)
-                camera.start(target_fps=max(30, capture_freq * 2), video_mode=True, dup=False)
-            except Exception:
-                camera = None
-                use_dx = False
-        if use_dx and camera:
-            while True:
+        while True:
+            if capture_pause_event.is_set():
+                if camera is not None:
+                    try:
+                        camera.stop()
+                    except Exception:
+                        pass
+                    camera = None
+                if sct is not None:
+                    try:
+                        sct.close()
+                    except Exception:
+                        pass
+                    sct = None
+                time.sleep(0.1)
+                continue
+            if use_dx and camera is None:
+                try:
+                    camera = dxcam.create(output_idx=0)
+                    camera.start(target_fps=max(30, capture_freq * 2), video_mode=True, dup=False)
+                except Exception:
+                    camera = None
+                    use_dx = False
+            if use_dx and camera is not None:
                 start = time.time()
                 frame = camera.get_latest_frame()
                 if frame is None:
@@ -591,23 +609,23 @@ def frame_generator_loop():
                 wait = (1.0 / desired) - (time.time() - start)
                 if wait > 0:
                     time.sleep(wait)
-        else:
-            with mss.mss() as sct:
-                while True:
-                    start = time.time()
-                    img = np.array(sct.grab({"top": 0, "left": 0, "width": screen_w, "height": screen_h}))
-                    step_x = max(1, screen_w // target_w)
-                    step_y = max(1, screen_h // target_h)
-                    img_small = img[::step_y, ::step_x]
-                    if img_small.shape[1] > target_w:
-                        img_small = img_small[:, :target_w]
-                    if img_small.shape[0] > target_h:
-                        img_small = img_small[:target_h, :]
-                    update_latest_frame(img_small, start)
-                    desired = max(30, capture_freq * 2)
-                    wait = (1.0 / desired) - (time.time() - start)
-                    if wait > 0:
-                        time.sleep(wait)
+                continue
+            if sct is None:
+                sct = mss.mss()
+            start = time.time()
+            img = np.array(sct.grab({"top": 0, "left": 0, "width": screen_w, "height": screen_h}))
+            step_x = max(1, screen_w // target_w)
+            step_y = max(1, screen_h // target_h)
+            img_small = img[::step_y, ::step_x]
+            if img_small.shape[1] > target_w:
+                img_small = img_small[:, :target_w]
+            if img_small.shape[0] > target_h:
+                img_small = img_small[:target_h, :]
+            update_latest_frame(img_small, start)
+            desired = max(30, capture_freq * 2)
+            wait = (1.0 / desired) - (time.time() - start)
+            if wait > 0:
+                time.sleep(wait)
     except Exception as e:
         print(f"Frame Generator Error: {e}")
 
@@ -744,6 +762,7 @@ def consolidate_data_files(max_frames=10000, min_commit=4000):
             try:
                 with file_read_lock:
                     data = np.load(path, allow_pickle=True)
+                data = unwrap_array(data)
                 structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                 if not structured_npz or 'image' not in data or 'action' not in data:
                     if structured_npz:
@@ -846,12 +865,49 @@ def disk_writer_loop():
         finally:
             save_queue.task_done()
 
+def unwrap_array(obj):
+    if isinstance(obj, np.ndarray) and obj.ndim == 0:
+        try:
+            return obj.item()
+        except Exception:
+            return obj
+    return obj
+
+def prepare_saved_arrays(buffer_images, buffer_actions):
+    imgs = []
+    for img in buffer_images:
+        arr = np.asarray(unwrap_array(img), dtype=np.uint8)
+        if arr.ndim == 2:
+            arr = np.stack([arr] * 3, axis=-1)
+        if arr.shape[0] != target_h or arr.shape[1] != target_w:
+            arr = cv2.resize(arr, (target_w, target_h))
+        if arr.shape[2] > 3:
+            arr = arr[:, :, :3]
+        imgs.append(arr)
+    act_len = max((len(np.asarray(unwrap_array(a)).flatten()) for a in buffer_actions), default=0)
+    acts = []
+    for a in buffer_actions:
+        flat = np.asarray(unwrap_array(a), dtype=np.float32).flatten()
+        if len(flat) < act_len:
+            pad = np.zeros(act_len - len(flat), dtype=np.float32)
+            flat = np.concatenate([flat, pad])
+        acts.append(flat)
+    img_arr = np.stack(imgs, axis=0) if imgs else np.empty((0, target_h, target_w, 3), dtype=np.uint8)
+    act_arr = np.stack(acts, axis=0) if acts else np.empty((0, act_len), dtype=np.float32)
+    return img_arr, act_arr
+
 def safe_action_array(entry):
     try:
         if hasattr(entry, "dtype") and getattr(entry.dtype, "names", None) and "action" in entry.dtype.names:
-            return np.asarray(entry["action"], dtype=np.float32)
+            value = entry["action"]
+            if isinstance(value, np.ndarray) and value.ndim == 0:
+                value = value.item()
+            return np.asarray(value, dtype=np.float32)
         if isinstance(entry, dict) and "action" in entry:
-            return np.asarray(entry["action"], dtype=np.float32)
+            value = entry["action"]
+            if isinstance(value, np.ndarray) and value.ndim == 0:
+                value = value.item()
+            return np.asarray(value, dtype=np.float32)
         if isinstance(entry, (tuple, list)):
             if len(entry) >= 2:
                 candidate = entry[1]
@@ -869,7 +925,10 @@ def safe_image_data(entry, structured=False):
             return entry
         if structured:
             if hasattr(entry, "dtype") and getattr(entry.dtype, "names", None) and "image" in entry.dtype.names:
-                return entry["image"]
+                value = entry["image"]
+                if isinstance(value, np.ndarray) and value.ndim == 0:
+                    value = value.item()
+                return value
             if isinstance(entry, (tuple, list)) and len(entry) >= 1:
                 return entry[0]
         if isinstance(entry, dict):
@@ -890,6 +949,10 @@ def build_entry_pair(data, idx, structured_npz, structured):
         if structured_npz:
             images = data.get('image') if isinstance(data, dict) else data['image']
             actions = data.get('action') if isinstance(data, dict) else data['action']
+            if isinstance(images, np.ndarray) and images.ndim == 0:
+                images = images.item()
+            if isinstance(actions, np.ndarray) and actions.ndim == 0:
+                actions = actions.item()
             if images is None or actions is None:
                 return None
             if idx < len(images) and idx < len(actions):
@@ -912,8 +975,16 @@ def build_entry_pair(data, idx, structured_npz, structured):
 
 def dataset_length(data, structured, structured_npz):
     try:
+        if isinstance(data, np.ndarray) and data.ndim == 0:
+            try:
+                data = data.item()
+            except Exception:
+                return 0
         if structured:
-            return len(data['action']) if structured_npz else len(data['action'])
+            actions = data['action']
+            if isinstance(actions, np.ndarray) and actions.ndim == 0:
+                actions = actions.item()
+            return len(actions)
         if isinstance(data, (list, tuple)) and len(data) == 2 and hasattr(data[0], "__len__") and hasattr(data[1], "__len__"):
             return min(len(data[0]), len(data[1]))
         return len(data)
@@ -1087,6 +1158,7 @@ class StreamingGameDataset(IterableDataset):
                                 try:
                                     buf = io.BytesIO(payload)
                                     data = np.load(buf, allow_pickle=True)
+                                    data = unwrap_array(data)
                                     structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                                     structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
                                     structured = structured_npz or structured_array
@@ -1126,6 +1198,7 @@ class StreamingGameDataset(IterableDataset):
                                         break
                                     buf = io.BytesIO(payload)
                                     data = np.load(buf, allow_pickle=True)
+                                    data = unwrap_array(data)
                                     structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                                     structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
                                     structured = structured_npz or structured_array
@@ -1160,11 +1233,7 @@ class StreamingGameDataset(IterableDataset):
                             continue
                         with file_read_lock:
                             data = np.load(path, allow_pickle=True, mmap_mode="r")
-                        if isinstance(data, np.ndarray) and getattr(data, "shape", None) == ():
-                            try:
-                                data = data.item()
-                            except Exception:
-                                data = [data]
+                        data = unwrap_array(data)
                         structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                         structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
                         structured = structured_npz or structured_array
@@ -1244,6 +1313,7 @@ def sample_actions_from_source(path, sample_cap=8):
                     break
                 buf = io.BytesIO(payload)
                 data = np.load(buf, allow_pickle=True)
+                data = unwrap_array(data)
                 structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                 structured_array = hasattr(data, 'dtype') and getattr(data.dtype, "names", None) and 'action' in data.dtype.names
                 structured = structured_npz or structured_array
@@ -1264,6 +1334,7 @@ def sample_actions_from_source(path, sample_cap=8):
                     break
                 buf = io.BytesIO(payload)
                 data = np.load(buf, allow_pickle=True)
+                data = unwrap_array(data)
                 structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                 structured_array = hasattr(data, 'dtype') and getattr(data.dtype, "names", None) and 'action' in data.dtype.names
                 structured = structured_npz or structured_array
@@ -1280,6 +1351,7 @@ def sample_actions_from_source(path, sample_cap=8):
         else:
             with file_read_lock:
                 data = np.load(path, allow_pickle=True, mmap_mode="r")
+            data = unwrap_array(data)
             structured_npz = isinstance(data, np.lib.npyio.NpzFile)
             structured_array = hasattr(data, 'dtype') and getattr(data.dtype, "names", None) and 'action' in data.dtype.names
             structured = structured_npz or structured_array
@@ -1349,6 +1421,7 @@ def optimize_ai():
     try:
         time.sleep(1.0)
         stop_optimization_flag.clear()
+        capture_pause_event.set()
         force_memory_cleanup(3, 0.1)
         if torch.cuda.is_available():
             try:
@@ -1454,6 +1527,7 @@ def optimize_ai():
                                 break
                             buf = io.BytesIO(payload)
                             data = np.load(buf, allow_pickle=True)
+                            data = unwrap_array(data)
                             structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                             structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
                             structured = structured_npz or structured_array
@@ -1469,6 +1543,7 @@ def optimize_ai():
                         continue
                     with file_read_lock:
                         data = np.load(path, allow_pickle=True, mmap_mode="r")
+                    data = unwrap_array(data)
                     structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                     structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
                     structured = structured_npz or structured_array
@@ -1658,6 +1733,7 @@ def optimize_ai():
             pass
     finally:
         stop_optimization_flag.clear()
+        capture_pause_event.clear()
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -1866,8 +1942,7 @@ def record_data_loop():
             if flush_event.is_set():
                 if buffer_images:
                     fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npz")
-                    img_arr = np.array(buffer_images, dtype=np.uint8)
-                    act_arr = np.array(buffer_actions, dtype=np.float32)
+                    img_arr, act_arr = prepare_saved_arrays(buffer_images, buffer_actions)
                     save_queue.put((fname, img_arr, act_arr))
                     buffer_images = []
                     buffer_actions = []
@@ -1922,8 +1997,7 @@ def record_data_loop():
 
                 if len(buffer_images) >= 10000:
                     fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npz")
-                    img_arr = np.array(buffer_images, dtype=np.uint8)
-                    act_arr = np.array(buffer_actions, dtype=np.float32)
+                    img_arr, act_arr = prepare_saved_arrays(buffer_images, buffer_actions)
                     save_queue.put((fname, img_arr, act_arr))
                     buffer_images = []
                     buffer_actions = []
@@ -1937,8 +2011,7 @@ def record_data_loop():
             if flush_event.is_set():
                 if buffer_images:
                     fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npz")
-                    img_arr = np.array(buffer_images, dtype=np.uint8)
-                    act_arr = np.array(buffer_actions, dtype=np.float32)
+                    img_arr, act_arr = prepare_saved_arrays(buffer_images, buffer_actions)
                     save_queue.put((fname, img_arr, act_arr))
                     buffer_images = []
                     buffer_actions = []
@@ -1949,8 +2022,7 @@ def record_data_loop():
             if flush_event.is_set():
                 if buffer_images:
                     fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npz")
-                    img_arr = np.array(buffer_images, dtype=np.uint8)
-                    act_arr = np.array(buffer_actions, dtype=np.float32)
+                    img_arr, act_arr = prepare_saved_arrays(buffer_images, buffer_actions)
                     save_queue.put((fname, img_arr, act_arr))
                     buffer_images = []
                     buffer_actions = []
@@ -1986,17 +2058,58 @@ def interpret_command(cmd):
 def input_loop():
     global current_mode
     while True:
-        cmd = input().strip()
+        cmd = None
+        if os.name == "nt":
+            try:
+                if msvcrt.kbhit():
+                    ch = msvcrt.getwch()
+                    if ch in ("\r", "\n"):
+                        cmd = ""
+                    elif ch == "\b":
+                        continue
+                    else:
+                        buffer = ch
+                        while True:
+                            if msvcrt.kbhit():
+                                c2 = msvcrt.getwch()
+                                if c2 in ("\r", "\n"):
+                                    break
+                                if c2 == "\b":
+                                    if buffer:
+                                        buffer = buffer[:-1]
+                                    continue
+                                buffer += c2
+                            else:
+                                time.sleep(0.05)
+                        cmd = buffer
+                else:
+                    time.sleep(0.05)
+                    continue
+            except Exception as e:
+                print(f"Input error: {e}")
+                time.sleep(0.1)
+                continue
+        else:
+            try:
+                cmd = input().strip()
+            except Exception as e:
+                print(f"Input error: {e}")
+                time.sleep(0.1)
+                continue
+        if cmd is None:
+            continue
         interpreted = interpret_command(cmd)
         if interpreted == "sleep":
             if current_mode == MODE_LEARNING:
                 recording_pause_event.set()
+                capture_pause_event.set()
                 flush_buffers()
                 cleanup_before_sleep()
                 current_mode = MODE_SLEEP
                 optimize_ai()
                 current_mode = MODE_LEARNING
                 recording_pause_event.clear()
+                capture_pause_event.clear()
                 print("Back to Learning.")
         elif interpreted == "train":
             if current_mode == MODE_LEARNING:
