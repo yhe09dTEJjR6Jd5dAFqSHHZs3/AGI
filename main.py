@@ -13,6 +13,7 @@ import gc
 import warnings
 import io
 import struct
+import tempfile
 from collections import deque
 if os.name == "nt":
     import winreg
@@ -153,7 +154,9 @@ mouse_lock = threading.Lock()
 temp_trajectory = deque(maxlen=200)
 frame_lock = threading.Lock()
 latest_frame = {"img": None, "ts": 0.0}
-file_lock = threading.Lock()
+file_read_lock = threading.Lock()
+file_write_lock = threading.Lock()
+log_lock = threading.Lock()
 lmdb_lock = threading.Lock()
 lmdb_env = None
 lmdb_counter = 0
@@ -201,7 +204,7 @@ def append_binary_log(img_arr, act_arr):
         np.savez_compressed(buf, image=img_arr, action=act_arr)
         payload = buf.getvalue()
         header = struct.pack("<Q", len(payload))
-        with file_lock:
+        with log_lock:
             with open(log_path, "ab") as f:
                 f.write(header)
                 f.write(payload)
@@ -212,7 +215,7 @@ def append_binary_log(img_arr, act_arr):
 
 def iterate_binary_log(path):
     try:
-        with file_lock:
+        with log_lock:
             if not os.path.exists(path):
                 return []
             records = []
@@ -351,7 +354,7 @@ def trim_binary_log(limit_bytes):
             return
         if not os.path.exists(index_path):
             return
-        with file_lock:
+        with log_lock:
             with open(index_path, "rb") as idx_f:
                 length_bytes = idx_f.read()
             lengths = [struct.unpack("<Q", length_bytes[i:i+8])[0] for i in range(0, len(length_bytes), 8)]
@@ -707,7 +710,7 @@ def check_disk_space():
                         break
                     continue
                 try:
-                    with file_lock:
+                    with file_write_lock:
                         s = os.path.getsize(f)
                         os.remove(f)
                     total_size -= s
@@ -734,7 +737,7 @@ def consolidate_data_files(max_frames=10000, min_commit=4000):
             if stop_optimization_flag.is_set():
                 break
             try:
-                with file_lock:
+                with file_read_lock:
                     data = np.load(path, allow_pickle=True)
                 structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                 if not structured_npz or 'image' not in data or 'action' not in data:
@@ -759,7 +762,7 @@ def consolidate_data_files(max_frames=10000, min_commit=4000):
                     merged_images = np.concatenate(buffer_images, axis=0)
                     merged_actions = np.concatenate(buffer_actions, axis=0)
                     fname = os.path.join(data_dir, f"merged_{int(time.time()*1000)}.npz")
-                    with file_lock:
+                    with file_write_lock:
                         np.savez(fname, image=merged_images, action=merged_actions)
                         for old in collected:
                             if os.path.exists(old):
@@ -775,7 +778,7 @@ def consolidate_data_files(max_frames=10000, min_commit=4000):
                 merged_images = np.concatenate(buffer_images, axis=0)
                 merged_actions = np.concatenate(buffer_actions, axis=0)
                 fname = os.path.join(data_dir, f"merged_{int(time.time()*1000)}.npz")
-                with file_lock:
+                with file_write_lock:
                     np.savez(fname, image=merged_images, action=merged_actions)
                     for old in collected:
                         if os.path.exists(old):
@@ -785,6 +788,30 @@ def consolidate_data_files(max_frames=10000, min_commit=4000):
     except Exception as e:
         print(f"Merge error: {e}")
 
+def atomic_save_npz(fname, img_arr, act_arr, retries=5, backoff=0.25):
+    last_error = None
+    for attempt in range(retries):
+        temp_path = None
+        try:
+            os.makedirs(os.path.dirname(fname), exist_ok=True)
+            fd, temp_path = tempfile.mkstemp(prefix="tmp_", suffix=".npz", dir=temp_dir)
+            os.close(fd)
+            np.savez(temp_path, image=img_arr, action=act_arr)
+            with file_write_lock:
+                os.replace(temp_path, fname)
+            return True
+        except Exception as e:
+            last_error = e
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+            time.sleep(backoff * (attempt + 1))
+    if last_error is not None:
+        print(f"File save error: {last_error}")
+    return False
+
 def disk_writer_loop():
     check_counter = 0
     last_check = time.time()
@@ -793,15 +820,16 @@ def disk_writer_loop():
     while True:
         try:
             fname, img_arr, act_arr = save_queue.get()
-            try:
-                temp_path = f"{fname}.tmp"
-                with file_lock:
-                    np.savez(temp_path, image=img_arr, action=act_arr)
-                    os.replace(temp_path, fname)
-            except Exception as e:
-                print(f"File save error: {e}")
-            append_lmdb_records(img_arr, act_arr)
-            append_binary_log(img_arr, act_arr)
+            saved = atomic_save_npz(fname, img_arr, act_arr)
+            if saved:
+                try:
+                    append_lmdb_records(img_arr, act_arr)
+                except Exception as e:
+                    print(f"LMDB pipeline error: {e}")
+                try:
+                    append_binary_log(img_arr, act_arr)
+                except Exception as e:
+                    print(f"Binary log pipeline error: {e}")
             check_counter += 1
             now = time.time()
             if check_counter >= check_interval or now - last_check >= check_time_window:
@@ -988,139 +1016,154 @@ class StreamingGameDataset(IterableDataset):
         stop_event = threading.Event()
 
         def producer():
-            for path in self.file_list:
-                if stop_optimization_flag.is_set():
-                    break
-                try:
-                    if path == log_path:
-                        for payload in iterate_binary_log(path):
-                            if stop_optimization_flag.is_set():
-                                break
-                            try:
-                                buf = io.BytesIO(payload)
-                                data = np.load(buf, allow_pickle=True)
-                                structured_npz = isinstance(data, np.lib.npyio.NpzFile)
-                                structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
-                                structured = structured_npz or structured_array
-                                length = len(data['action']) if structured else len(data)
-                                if length <= 0:
-                                    if structured_npz:
-                                        data.close()
-                                    continue
-                                max_start = max(1, length - self.seq_len)
-                                for start_idx in range(max_start):
-                                    if stop_optimization_flag.is_set():
-                                        break
-                                    slice_data = []
-                                    for i in range(self.seq_len):
-                                        idx_in_file = min(start_idx + i, length - 1)
-                                        if structured_npz:
-                                            slice_data.append((data['image'][idx_in_file], data['action'][idx_in_file]))
-                                        else:
-                                            slice_data.append(data[idx_in_file])
-                                    next_entry = None
-                                    next_idx = start_idx + self.seq_len
-                                    if next_idx < length:
-                                        if structured_npz:
-                                            next_entry = (data['image'][next_idx], data['action'][next_idx])
-                                        elif structured:
-                                            next_entry = data[next_idx]
-                                        else:
-                                            next_entry = data[next_idx]
-                                    item = self._prepare_item(slice_data, next_entry, structured, structured_npz)
-                                    output_queue.put(item)
-                                release_data_handle(data)
-                            except Exception as e:
-                                print(f"Binary data load error: {e}")
-                        continue
-                    if path == lmdb_path:
-                        try:
-                            for payload in iterate_lmdb_entries():
+            try:
+                for path in self.file_list:
+                    if stop_optimization_flag.is_set():
+                        break
+                    try:
+                        if path == log_path:
+                            for payload in iterate_binary_log(path):
                                 if stop_optimization_flag.is_set():
                                     break
-                                buf = io.BytesIO(payload)
-                                data = np.load(buf, allow_pickle=True)
-                                structured_npz = isinstance(data, np.lib.npyio.NpzFile)
-                                structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
-                                structured = structured_npz or structured_array
-                                length = len(data['action']) if structured else len(data)
-                                if length <= 0:
-                                    if structured_npz:
-                                        data.close()
-                                    continue
-                                max_start = max(1, length - self.seq_len)
-                                for start_idx in range(max_start):
+                                try:
+                                    buf = io.BytesIO(payload)
+                                    data = np.load(buf, allow_pickle=True)
+                                    structured_npz = isinstance(data, np.lib.npyio.NpzFile)
+                                    structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
+                                    structured = structured_npz or structured_array
+                                    length = len(data['action']) if structured else len(data)
+                                    if length <= 0:
+                                        if structured_npz:
+                                            data.close()
+                                        continue
+                                    max_start = max(1, length - self.seq_len)
+                                    for start_idx in range(max_start):
+                                        if stop_optimization_flag.is_set():
+                                            break
+                                        slice_data = []
+                                        for i in range(self.seq_len):
+                                            idx_in_file = min(start_idx + i, length - 1)
+                                            if structured_npz:
+                                                slice_data.append((data['image'][idx_in_file], data['action'][idx_in_file]))
+                                            else:
+                                                slice_data.append(data[idx_in_file])
+                                        next_entry = None
+                                        next_idx = start_idx + self.seq_len
+                                        if next_idx < length:
+                                            if structured_npz:
+                                                next_entry = (data['image'][next_idx], data['action'][next_idx])
+                                            elif structured:
+                                                next_entry = data[next_idx]
+                                            else:
+                                                next_entry = data[next_idx]
+                                        item = self._prepare_item(slice_data, next_entry, structured, structured_npz)
+                                        output_queue.put(item)
+                                    release_data_handle(data)
+                                except Exception as e:
+                                    print(f"Binary data load error: {e}")
+                            continue
+                        if path == lmdb_path:
+                            try:
+                                for payload in iterate_lmdb_entries():
                                     if stop_optimization_flag.is_set():
                                         break
-                                    slice_data = []
-                                    for i in range(self.seq_len):
-                                        idx_in_file = min(start_idx + i, length - 1)
+                                    buf = io.BytesIO(payload)
+                                    data = np.load(buf, allow_pickle=True)
+                                    structured_npz = isinstance(data, np.lib.npyio.NpzFile)
+                                    structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
+                                    structured = structured_npz or structured_array
+                                    length = len(data['action']) if structured else len(data)
+                                    if length <= 0:
                                         if structured_npz:
-                                            slice_data.append((data['image'][idx_in_file], data['action'][idx_in_file]))
-                                        else:
-                                            slice_data.append(data[idx_in_file])
-                                    next_entry = None
-                                    next_idx = start_idx + self.seq_len
-                                    if next_idx < length:
-                                        if structured_npz:
-                                            next_entry = (data['image'][next_idx], data['action'][next_idx])
-                                        elif structured:
-                                            next_entry = data[next_idx]
-                                        else:
-                                            next_entry = data[next_idx]
-                                    item = self._prepare_item(slice_data, next_entry, structured, structured_npz)
-                                    output_queue.put(item)
-                                release_data_handle(data)
-                        except Exception as e:
-                            print(f"LMDB data load error: {e}")
-                        continue
-                    with file_lock:
-                        data = np.load(path, allow_pickle=True, mmap_mode="r")
-                    if isinstance(data, np.ndarray) and getattr(data, "shape", None) == ():
-                        try:
-                            data = data.item()
-                        except Exception:
-                            data = [data]
-                    structured_npz = isinstance(data, np.lib.npyio.NpzFile)
-                    structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
-                    structured = structured_npz or structured_array
-                    length = len(data['action']) if structured else len(data)
-                    if length <= 0:
-                        if structured_npz:
-                            data.close()
-                        continue
-                    max_start = max(1, length - self.seq_len)
-                    for start_idx in range(max_start):
-                        if stop_optimization_flag.is_set():
-                            break
-                        slice_data = []
-                        for i in range(self.seq_len):
-                            idx_in_file = min(start_idx + i, length - 1)
+                                            data.close()
+                                        continue
+                                    max_start = max(1, length - self.seq_len)
+                                    for start_idx in range(max_start):
+                                        if stop_optimization_flag.is_set():
+                                            break
+                                        slice_data = []
+                                        for i in range(self.seq_len):
+                                            idx_in_file = min(start_idx + i, length - 1)
+                                            if structured_npz:
+                                                slice_data.append((data['image'][idx_in_file], data['action'][idx_in_file]))
+                                            else:
+                                                slice_data.append(data[idx_in_file])
+                                        next_entry = None
+                                        next_idx = start_idx + self.seq_len
+                                        if next_idx < length:
+                                            if structured_npz:
+                                                next_entry = (data['image'][next_idx], data['action'][next_idx])
+                                            elif structured:
+                                                next_entry = data[next_idx]
+                                            else:
+                                                next_entry = data[next_idx]
+                                        item = self._prepare_item(slice_data, next_entry, structured, structured_npz)
+                                        output_queue.put(item)
+                                    release_data_handle(data)
+                            except Exception as e:
+                                print(f"LMDB data load error: {e}")
+                            continue
+                        with file_read_lock:
+                            data = np.load(path, allow_pickle=True, mmap_mode="r")
+                        if isinstance(data, np.ndarray) and getattr(data, "shape", None) == ():
+                            try:
+                                data = data.item()
+                            except Exception:
+                                data = [data]
+                        structured_npz = isinstance(data, np.lib.npyio.NpzFile)
+                        structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
+                        structured = structured_npz or structured_array
+                        length = len(data['action']) if structured else len(data)
+                        if length <= 0:
                             if structured_npz:
-                                slice_data.append((data['image'][idx_in_file], data['action'][idx_in_file]))
-                            else:
-                                slice_data.append(data[idx_in_file])
-                        next_entry = None
-                        next_idx = start_idx + self.seq_len
-                        if next_idx < length:
-                            if structured_npz:
-                                next_entry = (data['image'][next_idx], data['action'][next_idx])
-                            elif structured:
-                                next_entry = data[next_idx]
-                            else:
-                                next_entry = data[next_idx]
-                        item = self._prepare_item(slice_data, next_entry, structured, structured_npz)
-                        output_queue.put(item)
-                    release_data_handle(data)
-                except Exception as e:
-                    print(f"Data load error: {e}")
-            stop_event.set()
+                                data.close()
+                            continue
+                        max_start = max(1, length - self.seq_len)
+                        for start_idx in range(max_start):
+                            if stop_optimization_flag.is_set():
+                                break
+                            slice_data = []
+                            for i in range(self.seq_len):
+                                idx_in_file = min(start_idx + i, length - 1)
+                                if structured_npz:
+                                    slice_data.append((data['image'][idx_in_file], data['action'][idx_in_file]))
+                                else:
+                                    slice_data.append(data[idx_in_file])
+                            next_entry = None
+                            next_idx = start_idx + self.seq_len
+                            if next_idx < length:
+                                if structured_npz:
+                                    next_entry = (data['image'][next_idx], data['action'][next_idx])
+                                elif structured:
+                                    next_entry = data[next_idx]
+                                else:
+                                    next_entry = data[next_idx]
+                            item = self._prepare_item(slice_data, next_entry, structured, structured_npz)
+                            output_queue.put(item)
+                        release_data_handle(data)
+                    except Exception as e:
+                        print(f"Data load error: {e}")
+            except Exception as e:
+                print(f"Producer failure: {e}")
+            finally:
+                stop_event.set()
 
-        threading.Thread(target=producer, daemon=True).start()
-        while not (stop_event.is_set() and output_queue.empty()):
+        producer_thread = threading.Thread(target=producer, daemon=True)
+        producer_thread.start()
+        idle_start = time.time()
+        while True:
             try:
-                yield output_queue.get(timeout=0.5)
+                item = output_queue.get(timeout=0.5)
+                idle_start = time.time()
+                yield item
             except queue.Empty:
+                producer_alive = producer_thread.is_alive()
+                if stop_event.is_set() and output_queue.empty():
+                    break
+                if not producer_alive and output_queue.empty():
+                    break
+                if not producer_alive and time.time() - idle_start > 2.0:
+                    break
                 continue
 
 def sample_trajectory(traj, ts_now, max_points=10, window=0.1, fallback_pos=(0, 0)):
@@ -1247,7 +1290,7 @@ def optimize_ai():
                         steps = max(1, length - seq_len)
                         total += steps
                         continue
-                    with file_lock:
+                    with file_read_lock:
                         data = np.load(path, allow_pickle=True, mmap_mode="r")
                     structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                     structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
