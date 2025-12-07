@@ -849,15 +849,15 @@ def disk_writer_loop():
 def safe_action_array(entry):
     try:
         if hasattr(entry, "dtype") and getattr(entry.dtype, "names", None) and "action" in entry.dtype.names:
-            return np.atleast_1d(entry["action"])
+            return np.asarray(entry["action"], dtype=np.float32)
         if isinstance(entry, dict) and "action" in entry:
-            return np.atleast_1d(entry["action"])
+            return np.asarray(entry["action"], dtype=np.float32)
         if isinstance(entry, (tuple, list)):
             if len(entry) >= 2:
                 candidate = entry[1]
                 if candidate is None:
                     return np.zeros(mouse_feature_dim + 1, dtype=np.float32)
-                return np.atleast_1d(candidate)
+                return np.asarray(candidate, dtype=np.float32)
             return np.zeros(mouse_feature_dim + 1, dtype=np.float32)
         return np.zeros(mouse_feature_dim + 1, dtype=np.float32)
     except Exception:
@@ -899,11 +899,26 @@ def build_entry_pair(data, idx, structured_npz, structured):
             if idx < len(data):
                 return data[idx]
             return None
+        if isinstance(data, (list, tuple)) and len(data) == 2 and hasattr(data[0], "__len__") and hasattr(data[1], "__len__"):
+            pair_len = min(len(data[0]), len(data[1]))
+            if idx < pair_len:
+                return (data[0][idx], data[1][idx])
+            return None
         if idx < len(data):
             return data[idx]
     except Exception:
         return None
     return None
+
+def dataset_length(data, structured, structured_npz):
+    try:
+        if structured:
+            return len(data['action']) if structured_npz else len(data['action'])
+        if isinstance(data, (list, tuple)) and len(data) == 2 and hasattr(data[0], "__len__") and hasattr(data[1], "__len__"):
+            return min(len(data[0]), len(data[1]))
+        return len(data)
+    except Exception:
+        return 0
 
 class StreamingGameDataset(IterableDataset):
     def __init__(self, file_list):
@@ -911,8 +926,9 @@ class StreamingGameDataset(IterableDataset):
         self.seq_len = seq_len
 
     def _prepare_item(self, slice_data, next_entry, structured, structured_npz):
-        imgs = []
-        m_ins = []
+        slice_len = len(slice_data)
+        imgs = np.empty((slice_len, 3, target_h, target_w), dtype=np.uint8)
+        m_ins = np.empty((slice_len, mouse_feature_dim), dtype=np.float32)
 
         def norm_coord(v, dim):
             return (2.0 * (v / dim)) - 1.0
@@ -922,9 +938,9 @@ class StreamingGameDataset(IterableDataset):
 
         def normalize_image(img):
             img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB) if img.shape[2] == 4 else img
-            return img.transpose(2, 0, 1) / 255.0
+            return img.transpose(2, 0, 1).astype(np.uint8, copy=False)
 
-        for item in slice_data:
+        for idx, item in enumerate(slice_data):
             if structured:
                 raw_action = safe_action_array(item)
                 action = np.atleast_1d(raw_action)
@@ -999,7 +1015,7 @@ class StreamingGameDataset(IterableDataset):
                 is_ai = item.get("is_ai", 0.0)
             img_raw = load_image(item)
             img = normalize_image(img_raw)
-            imgs.append(img)
+            imgs[idx] = img
 
             m_vec = [
                 mx, my,
@@ -1023,7 +1039,7 @@ class StreamingGameDataset(IterableDataset):
             ]
             m_vec.extend(traj_vals)
             m_vec.append(is_ai)
-            m_ins.append(m_vec)
+            m_ins[idx] = np.asarray(m_vec, dtype=np.float32)
 
         if next_entry is not None:
             if structured:
@@ -1050,9 +1066,9 @@ class StreamingGameDataset(IterableDataset):
             next_img = normalize_image(next_img_raw)
         else:
             labels = [0.0, 0.0, 0.0]
-            next_img = np.zeros((3, target_h, target_w), dtype=np.float32)
+            next_img = np.zeros((3, target_h, target_w), dtype=np.uint8)
 
-        return torch.FloatTensor(np.array(imgs)), torch.FloatTensor(np.array(m_ins)), torch.FloatTensor(np.array(labels)), torch.FloatTensor(np.array(next_img))
+        return torch.from_numpy(imgs).float().div(255.0), torch.from_numpy(m_ins), torch.tensor(labels, dtype=torch.float32), torch.from_numpy(np.asarray(next_img, dtype=np.uint8)).float().div(255.0)
 
     def __iter__(self):
         output_queue = queue.Queue(maxsize=8)
@@ -1074,7 +1090,7 @@ class StreamingGameDataset(IterableDataset):
                                     structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                                     structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
                                     structured = structured_npz or structured_array
-                                    length = len(data['action']) if structured else len(data)
+                                    length = dataset_length(data, structured, structured_npz)
                                     if length <= 0:
                                         if structured_npz:
                                             data.close()
@@ -1113,7 +1129,7 @@ class StreamingGameDataset(IterableDataset):
                                     structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                                     structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
                                     structured = structured_npz or structured_array
-                                    length = len(data['action']) if structured else len(data)
+                                    length = dataset_length(data, structured, structured_npz)
                                     if length <= 0:
                                         if structured_npz:
                                             data.close()
@@ -1152,7 +1168,7 @@ class StreamingGameDataset(IterableDataset):
                         structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                         structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
                         structured = structured_npz or structured_array
-                        length = len(data['action']) if structured else len(data)
+                        length = dataset_length(data, structured, structured_npz)
                         if length <= 0:
                             if structured_npz:
                                 data.close()
@@ -1251,7 +1267,7 @@ def sample_actions_from_source(path, sample_cap=8):
                 structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                 structured_array = hasattr(data, 'dtype') and getattr(data.dtype, "names", None) and 'action' in data.dtype.names
                 structured = structured_npz or structured_array
-                length = len(data['action']) if structured else len(data)
+                length = dataset_length(data, structured, structured_npz)
                 total_len += length
                 step = max(1, max(1, length // sample_cap))
                 for idx in range(0, length, step):
@@ -1267,7 +1283,7 @@ def sample_actions_from_source(path, sample_cap=8):
             structured_npz = isinstance(data, np.lib.npyio.NpzFile)
             structured_array = hasattr(data, 'dtype') and getattr(data.dtype, "names", None) and 'action' in data.dtype.names
             structured = structured_npz or structured_array
-            length = len(data['action']) if structured else len(data)
+            length = dataset_length(data, structured, structured_npz)
             total_len = length
             step = max(1, max(1, length // sample_cap))
             for idx in range(0, length, step):
@@ -1369,12 +1385,12 @@ def optimize_ai():
             try:
                 total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
                 if total_mem_gb <= 4:
-                    accumulation_steps = 8
-                    train_batch_size = 2
+                    accumulation_steps = 12
+                    train_batch_size = 1
                     low_vram_mode = True
                 elif total_mem_gb <= 6:
-                    accumulation_steps = 8
-                    train_batch_size = 4
+                    accumulation_steps = 10
+                    train_batch_size = 3
                 elif total_mem_gb > 10:
                     accumulation_steps = 10
                     train_batch_size = 12
@@ -1441,7 +1457,7 @@ def optimize_ai():
                             structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                             structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
                             structured = structured_npz or structured_array
-                            length = len(data['action']) if structured else len(data)
+                            length = dataset_length(data, structured, structured_npz)
                             steps = max(1, length - seq_len)
                             total += steps
                             release_data_handle(data)
@@ -1456,7 +1472,7 @@ def optimize_ai():
                     structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                     structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
                     structured = structured_npz or structured_array
-                    length = len(data['action']) if structured else len(data)
+                    length = dataset_length(data, structured, structured_npz)
                     steps = max(1, length - seq_len)
                     total += steps
                     release_data_handle(data)
@@ -1503,7 +1519,7 @@ def optimize_ai():
             chunk_trained = False
             while not chunk_trained and not stop_optimization_flag.is_set():
                 dataset = StreamingGameDataset(bf)
-                loader_workers = 2 if os.name != "nt" else 0
+                loader_workers = 0 if low_vram_mode or os.name == "nt" else 2
                 loader = DataLoader(dataset, batch_size=train_batch_size, drop_last=False, num_workers=loader_workers, pin_memory=True, persistent_workers=loader_workers > 0)
                 optimizer.zero_grad()
                 attempt_steps = 0
