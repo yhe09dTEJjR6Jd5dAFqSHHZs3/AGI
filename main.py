@@ -12,8 +12,22 @@ import glob
 import gc
 import warnings
 from collections import deque
+if os.name == "nt":
+    import winreg
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+def resolve_desktop_path():
+    if os.name == "nt":
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders')
+            path = winreg.QueryValueEx(key, "Desktop")[0]
+            winreg.CloseKey(key)
+            if path:
+                return path
+        except Exception as e:
+            print(f"Desktop path resolve error: {e}")
+    return os.path.join(os.path.expanduser("~"), "Desktop")
 
 def progress_bar(prefix, current, total, suffix=""):
     total = max(total, 1)
@@ -64,7 +78,7 @@ import torchvision.models as models
 from pynput import mouse, keyboard
 import pynvml
 
-desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+desktop_path = resolve_desktop_path()
 base_dir = os.path.join(desktop_path, "AAA")
 data_dir = os.path.join(base_dir, "data")
 model_dir = os.path.join(base_dir, "model")
@@ -121,6 +135,17 @@ def update_latest_frame(img, ts):
 def get_latest_frame():
     with frame_lock:
         return latest_frame["img"], latest_frame["ts"]
+
+def cleanup_before_sleep():
+    try:
+        with frame_lock:
+            latest_frame["img"] = None
+            latest_frame["ts"] = 0.0
+        temp_trajectory.clear()
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    gc.collect()
 
 data_queue = queue.Queue()
 save_queue = queue.Queue()
@@ -389,6 +414,67 @@ def check_disk_space():
                     continue
     except Exception as e:
         print(f"Disk clean error: {e}")
+
+def consolidate_data_files(max_frames=10000, min_commit=4000):
+    try:
+        candidates = sorted(glob.glob(os.path.join(data_dir, "*.npz")), key=os.path.getmtime)
+        buffer_images = []
+        buffer_actions = []
+        collected = []
+        for path in candidates:
+            if stop_optimization_flag.is_set():
+                break
+            try:
+                with file_lock:
+                    data = np.load(path, allow_pickle=True)
+                structured_npz = isinstance(data, np.lib.npyio.NpzFile)
+                if not structured_npz or 'image' not in data or 'action' not in data:
+                    if structured_npz:
+                        data.close()
+                    continue
+                imgs = np.array(data['image'])
+                acts = np.array(data['action'])
+                if structured_npz:
+                    data.close()
+                if len(acts) >= max_frames:
+                    continue
+                buffer_images.append(imgs)
+                buffer_actions.append(acts)
+                collected.append(path)
+            except Exception as e:
+                print(f"Merge read error: {e}")
+                continue
+            total_frames = sum(len(a) for a in buffer_actions)
+            if total_frames >= max_frames:
+                try:
+                    merged_images = np.concatenate(buffer_images, axis=0)
+                    merged_actions = np.concatenate(buffer_actions, axis=0)
+                    fname = os.path.join(data_dir, f"merged_{int(time.time()*1000)}.npz")
+                    with file_lock:
+                        np.savez(fname, image=merged_images, action=merged_actions)
+                        for old in collected:
+                            if os.path.exists(old):
+                                os.remove(old)
+                except Exception as e:
+                    print(f"Merge write error: {e}")
+                buffer_images = []
+                buffer_actions = []
+                collected = []
+        remaining = sum(len(a) for a in buffer_actions)
+        if remaining >= min_commit and buffer_images:
+            try:
+                merged_images = np.concatenate(buffer_images, axis=0)
+                merged_actions = np.concatenate(buffer_actions, axis=0)
+                fname = os.path.join(data_dir, f"merged_{int(time.time()*1000)}.npz")
+                with file_lock:
+                    np.savez(fname, image=merged_images, action=merged_actions)
+                    for old in collected:
+                        if os.path.exists(old):
+                            os.remove(old)
+            except Exception as e:
+                print(f"Merge final write error: {e}")
+    except Exception as e:
+        print(f"Merge error: {e}")
 
 def disk_writer_loop():
     check_counter = 0
@@ -661,21 +747,25 @@ def optimize_ai():
         model_path = os.path.join(model_dir, "ai_model.pth")
         backup_path = os.path.join(model_dir, "ai_model_prev.pth")
         model = UniversalAI().to(device)
+        optimizer = optim.Adam(model.parameters(), lr=1e-4)
         if os.path.exists(model_path):
             try:
                 state = load_model_checkpoint(model_path, map_location=device)
                 if state is not None:
                     model.load_state_dict(state.get("model_state", {}), strict=False)
+                    if "optimizer_state" in state:
+                        optimizer.load_state_dict(state["optimizer_state"])
             except Exception as e:
                 print(f"Model load warning: {e}")
 
         model.train()
-        optimizer = optim.Adam(model.parameters(), lr=1e-4)
         mse_loss = nn.MSELoss()
         bce_loss = nn.BCEWithLogitsLoss()
         scaler = GradScaler("cuda", enabled=device.type == "cuda")
         accumulation_steps = 4
         interrupted = False
+
+        consolidate_data_files()
 
         files = []
         candidates = []
@@ -841,7 +931,7 @@ def optimize_ai():
         alpha = float(model.log_var_action.detach().item())
         beta = float(model.log_var_prediction.detach().item())
         gamma = float(model.log_var_energy.detach().item())
-        torch.save({"model_state": model.state_dict(), "alpha": alpha, "beta": beta, "gamma": gamma, "last_loss": last_loss_value, "steps": current_step, "total_steps": total_steps, "interrupted": interrupted, "timestamp": time.time()}, temp_path)
+        torch.save({"model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(), "alpha": alpha, "beta": beta, "gamma": gamma, "last_loss": last_loss_value, "steps": current_step, "total_steps": total_steps, "interrupted": interrupted, "timestamp": time.time()}, temp_path)
         try:
             if os.path.exists(model_path):
                 shutil.copy2(model_path, backup_path)
@@ -929,6 +1019,14 @@ def start_training_mode():
         while not stop_training_flag:
             time.sleep(0)
             start_time = time.time()
+
+            if os.name == "nt":
+                try:
+                    if ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x8000:
+                        stop_training_flag = True
+                        break
+                except Exception as e:
+                    print(f"Priority key error: {e}")
 
             try:
                 frame_img, frame_ts = get_latest_frame()
@@ -1105,7 +1203,7 @@ def record_data_loop():
                 buffer_actions.append(action_entry)
                 last_pos = (c_state["x"], c_state["y"])
 
-                if len(buffer_images) >= 3000:
+                if len(buffer_images) >= 10000:
                     fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npz")
                     img_arr = np.array(buffer_images, dtype=np.uint8)
                     act_arr = np.array(buffer_actions, dtype=np.float32)
@@ -1152,6 +1250,7 @@ def input_loop():
             if current_mode == MODE_LEARNING:
                 recording_pause_event.set()
                 flush_buffers()
+                cleanup_before_sleep()
                 current_mode = MODE_SLEEP
                 optimize_ai()
                 current_mode = MODE_LEARNING
