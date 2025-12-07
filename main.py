@@ -101,6 +101,16 @@ flush_done_event = threading.Event()
 recording_pause_event = threading.Event()
 stop_optimization_flag = threading.Event()
 
+def set_process_priority():
+    try:
+        proc = psutil.Process(os.getpid())
+        if os.name == "nt":
+            proc.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+        else:
+            proc.nice(psutil.NORMAL_PRIORITY_CLASS if hasattr(psutil, "NORMAL_PRIORITY_CLASS") else 5)
+    except Exception as e:
+        print(f"Priority set error: {e}")
+
 def flush_buffers(timeout=3):
     flush_done_event.clear()
     flush_event.set()
@@ -307,7 +317,13 @@ def frame_generator_loop():
             while True:
                 start = time.time()
                 img = np.array(sct.grab({"top": 0, "left": 0, "width": screen_w, "height": screen_h}))
-                img_small = cv2.resize(img, (target_w, target_h))
+                step_x = max(1, screen_w // target_w)
+                step_y = max(1, screen_h // target_h)
+                img_small = img[::step_y, ::step_x]
+                if img_small.shape[1] > target_w:
+                    img_small = img_small[:, :target_w]
+                if img_small.shape[0] > target_h:
+                    img_small = img_small[:target_h, :]
                 update_latest_frame(img_small, start)
                 desired = max(30, capture_freq * 2)
                 wait = (1.0 / desired) - (time.time() - start)
@@ -1131,8 +1147,10 @@ def start_training_mode():
                     eased_y = bezier_interp(current_mouse[1], control_y, target_y, 0.35)
                     filtered_x = (eased_x * 0.7) + (current_mouse[0] * 0.3)
                     filtered_y = (eased_y * 0.7) + (current_mouse[1] * 0.3)
-                    target_x = int(min(max(0, filtered_x), screen_w - 1))
-                    target_y = int(min(max(0, filtered_y), screen_h - 1))
+                    jitter_x = random.uniform(-2.0, 2.0)
+                    jitter_y = random.uniform(-2.0, 2.0)
+                    target_x = int(min(max(0, filtered_x + jitter_x), screen_w - 1))
+                    target_y = int(min(max(0, filtered_y + jitter_y), screen_h - 1))
                     pred_l = action[2]
                     pred_r = action[3]
 
@@ -1265,11 +1283,36 @@ def record_data_loop():
                 flush_done_event.set()
             time.sleep(1)
 
+def interpret_command(cmd):
+    variants = set()
+    for item in [cmd, cmd.lower()]:
+        variants.add(item)
+    encs = [sys.stdin.encoding, sys.getdefaultencoding(), "utf-8", "gbk"]
+    for enc in encs:
+        if not enc:
+            continue
+        try:
+            recon = cmd.encode(enc, errors="ignore").decode("utf-8", errors="ignore")
+            variants.update([recon, recon.lower()])
+        except Exception:
+            pass
+        try:
+            recon = cmd.encode(enc, errors="ignore").decode("gbk", errors="ignore")
+            variants.update([recon, recon.lower()])
+        except Exception:
+            pass
+    if any(v in ("睡眠", "sleep") for v in variants):
+        return "sleep"
+    if any(v in ("训练", "train") for v in variants):
+        return "train"
+    return None
+
 def input_loop():
     global current_mode
     while True:
         cmd = input().strip()
-        if cmd == "睡眠":
+        interpreted = interpret_command(cmd)
+        if interpreted == "sleep":
             if current_mode == MODE_LEARNING:
                 recording_pause_event.set()
                 flush_buffers()
@@ -1279,7 +1322,7 @@ def input_loop():
                 current_mode = MODE_LEARNING
                 recording_pause_event.clear()
                 print("Back to Learning.")
-        elif cmd == "训练":
+        elif interpreted == "train":
             if current_mode == MODE_LEARNING:
                 flush_buffers()
                 current_mode = MODE_TRAINING
@@ -1290,6 +1333,7 @@ def input_loop():
 
 if __name__ == "__main__":
     ensure_initial_model()
+    set_process_priority()
     mouse_listener = mouse.Listener(on_move=on_move, on_click=on_click, on_scroll=on_scroll)
     mouse_listener.start()
     
