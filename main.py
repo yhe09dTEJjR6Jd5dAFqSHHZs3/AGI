@@ -105,6 +105,7 @@ flush_event = threading.Event()
 flush_done_event = threading.Event()
 recording_pause_event = threading.Event()
 stop_optimization_flag = threading.Event()
+low_vram_mode = False
 
 def set_process_priority():
     try:
@@ -493,6 +494,19 @@ def file_in_use(path):
     except Exception:
         return False
 
+def release_data_handle(data):
+    try:
+        if hasattr(data, "close"):
+            data.close()
+    except Exception:
+        pass
+    try:
+        mmap_obj = getattr(data, "_mmap", None)
+        if mmap_obj:
+            mmap_obj.close()
+    except Exception:
+        pass
+
 def check_disk_space():
     try:
         total_size = 0
@@ -800,9 +814,13 @@ class StreamingGameDataset(IterableDataset):
 
         def producer():
             for path in self.file_list:
+                if stop_optimization_flag.is_set():
+                    break
                 try:
                     if path == log_path:
                         for payload in iterate_binary_log(path):
+                            if stop_optimization_flag.is_set():
+                                break
                             try:
                                 buf = io.BytesIO(payload)
                                 data = np.load(buf, allow_pickle=True)
@@ -816,6 +834,8 @@ class StreamingGameDataset(IterableDataset):
                                     continue
                                 max_start = max(1, length - self.seq_len)
                                 for start_idx in range(max_start):
+                                    if stop_optimization_flag.is_set():
+                                        break
                                     slice_data = []
                                     for i in range(self.seq_len):
                                         idx_in_file = min(start_idx + i, length - 1)
@@ -834,8 +854,7 @@ class StreamingGameDataset(IterableDataset):
                                             next_entry = data[next_idx]
                                     item = self._prepare_item(slice_data, next_entry, structured, structured_npz)
                                     output_queue.put(item)
-                                if structured_npz:
-                                    data.close()
+                                release_data_handle(data)
                             except Exception as e:
                                 print(f"Binary data load error: {e}")
                         continue
@@ -856,6 +875,8 @@ class StreamingGameDataset(IterableDataset):
                         continue
                     max_start = max(1, length - self.seq_len)
                     for start_idx in range(max_start):
+                        if stop_optimization_flag.is_set():
+                            break
                         slice_data = []
                         for i in range(self.seq_len):
                             idx_in_file = min(start_idx + i, length - 1)
@@ -874,8 +895,7 @@ class StreamingGameDataset(IterableDataset):
                                 next_entry = data[next_idx]
                         item = self._prepare_item(slice_data, next_entry, structured, structured_npz)
                         output_queue.put(item)
-                    if structured_npz:
-                        data.close()
+                    release_data_handle(data)
                 except Exception as e:
                     print(f"Data load error: {e}")
             stop_event.set()
@@ -902,6 +922,7 @@ def sample_trajectory(traj, ts_now, max_points=10, window=0.1, fallback_pos=(0, 
     return flat
 
 def optimize_ai():
+    global low_vram_mode
     try:
         time.sleep(1.0)
         stop_optimization_flag.clear()
@@ -934,11 +955,13 @@ def optimize_ai():
         bce_loss = nn.BCEWithLogitsLoss()
         scaler = GradScaler("cuda", enabled=device.type == "cuda")
         accumulation_steps = 4
+        low_vram_mode = False
         if torch.cuda.is_available():
             try:
                 total_mem = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
                 if total_mem < 4:
                     accumulation_steps = 2
+                    low_vram_mode = True
                 elif total_mem > 8:
                     accumulation_steps = 6
             except Exception:
@@ -981,9 +1004,13 @@ def optimize_ai():
         def estimate_steps(file_subset):
             total = 0
             for path in file_subset:
+                if stop_optimization_flag.is_set():
+                    break
                 try:
                     if path == log_path:
                         for payload in iterate_binary_log(path):
+                            if stop_optimization_flag.is_set():
+                                break
                             buf = io.BytesIO(payload)
                             data = np.load(buf, allow_pickle=True)
                             structured_npz = isinstance(data, np.lib.npyio.NpzFile)
@@ -992,8 +1019,7 @@ def optimize_ai():
                             length = len(data['action']) if structured else len(data)
                             steps = max(1, length - seq_len)
                             total += steps
-                            if structured_npz:
-                                data.close()
+                            release_data_handle(data)
                         continue
                     with file_lock:
                         data = np.load(path, allow_pickle=True, mmap_mode="r")
@@ -1003,8 +1029,7 @@ def optimize_ai():
                     length = len(data['action']) if structured else len(data)
                     steps = max(1, length - seq_len)
                     total += steps
-                    if structured_npz:
-                        data.close()
+                    release_data_handle(data)
                 except Exception:
                     continue
             return total
@@ -1015,6 +1040,9 @@ def optimize_ai():
         print("Dataset Init")
         torch.cuda.empty_cache()
         for bf in batch_files:
+            if stop_optimization_flag.is_set():
+                interrupted = True
+                break
             steps = estimate_steps(bf)
             chunk_steps.append(steps)
             init_done += 1
@@ -1030,6 +1058,7 @@ def optimize_ai():
             return
 
         epochs = 1
+        total_samples = total_steps
         current_step = 0
         total_chunks = len(batch_files)
         last_loss_value = 0.0
@@ -1060,6 +1089,7 @@ def optimize_ai():
                             mins = mins.to(device)
                             labels = labels.to(device)
                             next_frames = next_frames.to(device)
+                            batch_sample = imgs.size(0)
 
                             with autocast(device_type="cuda", enabled=device.type == "cuda"):
                                 log_var_action = torch.clamp(model.log_var_action, -6.0, 6.0)
@@ -1079,27 +1109,32 @@ def optimize_ai():
                                 total_loss = total_loss / accumulation_steps
                             scaler.scale(total_loss).backward()
                             pending_steps += 1
-                            attempt_steps += 1
+                            attempt_steps += batch_sample
                             if pending_steps % accumulation_steps == 0:
                                 scaler.step(optimizer)
                                 scaler.update()
                                 optimizer.zero_grad()
                                 pending_steps = 0
-                        current_step += 1
-                        last_loss_value = total_loss.item()
-                        if abs(last_loss_value - prev_loss) < 1e-4:
-                            plateau_counter += 1
-                        else:
-                            plateau_counter = 0
-                        prev_loss = last_loss_value
-                        if plateau_counter >= 3 and not finetune_enabled:
-                            model.enable_backbone_finetune(0.25)
-                            finetune_enabled = True
-                        progress_bar("模型训练阶段", current_step, total_steps, f"Loss: {last_loss_value:.4f} | Chunk {idx+1}/{total_chunks}")
-                    if pending_steps > 0:
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad()
+                            last_loss_value = float(total_loss.item())
+                            if abs(last_loss_value - prev_loss) < 1e-4:
+                                plateau_counter += 1
+                            else:
+                                plateau_counter = 0
+                            prev_loss = last_loss_value
+                            current_step += batch_sample
+                            if plateau_counter >= 3 and not finetune_enabled:
+                                model.enable_backbone_finetune(0.25)
+                                finetune_enabled = True
+                            progress_bar("模型训练阶段", current_step, total_samples, f"Loss: {last_loss_value:.4f} | Chunk {idx+1}/{total_chunks}")
+                            del imgs, mins, labels, next_frames, grid_logits, pred_feat, button_logits, target_grid, target_buttons, target_feat, total_loss
+                            if low_vram_mode or batch_idx % 2 == 1:
+                                torch.cuda.empty_cache()
+                            if low_vram_mode:
+                                gc.collect()
+                        if pending_steps > 0:
+                            scaler.step(optimizer)
+                            scaler.update()
+                            optimizer.zero_grad()
                         if stop_optimization_flag.is_set():
                             interrupted = True
                             break
@@ -1224,6 +1259,8 @@ def start_training_mode():
         return (one_minus * one_minus * p0) + (2.0 * one_minus * t * p1) + (t * t * p2)
 
     while not stop_training_flag:
+        if stop_training_flag:
+            break
         time.sleep(0)
         start_time = time.time()
         if os.name == "nt":
