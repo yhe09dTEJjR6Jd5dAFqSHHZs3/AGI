@@ -42,6 +42,7 @@ GPU：NVIDIA GeForce RTX 3050 Ti
 当经验池大小＞20GB时，删除最旧数据，直到经验池大小＜20GB。
 
 FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead.
+
 FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
 
-
+UserWarning: torch.utils.checkpoint: the use_reentrant parameter should be passed explicitly. In version 2.5 we will raise an exception if use_reentrant is not passed. use_reentrant=False is recommended, but if you need to preserve the current default behavior, you can pass use_reentrant=True.
