@@ -93,7 +93,7 @@ def flush_buffers(timeout=3):
     flush_done_event.wait(timeout=timeout)
 
 capture_freq = 10
-seq_len = 5
+seq_len = 12
 screen_w, screen_h = 2560, 1600
 target_w, target_h = 256, 160
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -326,6 +326,22 @@ def on_press_key(key):
     elif current_mode == MODE_SLEEP:
         stop_optimization_flag.set()
 
+def file_in_use(path):
+    try:
+        if os.name == "nt":
+            fd = os.open(path, os.O_RDONLY)
+            os.close(fd)
+        else:
+            with open(path, "rb"):
+                pass
+        return False
+    except PermissionError:
+        return True
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return False
+
 def check_disk_space():
     try:
         total_size = 0
@@ -343,27 +359,53 @@ def check_disk_space():
         if total_size > limit:
             files.sort(key=lambda x: x[1])
             now = time.time()
+            skip_guard = 0
             while total_size > limit and files:
                 f, mtime = files.pop(0)
                 if now - mtime < 30:
+                    files.append((f, mtime))
+                    skip_guard += 1
+                    if skip_guard >= len(files):
+                        break
+                    continue
+                if file_in_use(f):
+                    files.append((f, mtime))
+                    skip_guard += 1
+                    if skip_guard >= len(files):
+                        break
                     continue
                 try:
                     with file_lock:
                         s = os.path.getsize(f)
                         os.remove(f)
                     total_size -= s
-                except:
-                    pass
+                    skip_guard = 0
+                except PermissionError:
+                    files.append((f, mtime))
+                    skip_guard += 1
+                    if skip_guard >= len(files):
+                        break
+                except Exception:
+                    continue
     except Exception as e:
         print(f"Disk clean error: {e}")
 
 def disk_writer_loop():
+    check_counter = 0
+    last_check = time.time()
+    check_interval = 10
+    check_time_window = 60.0
     while True:
         try:
             fname, img_arr, act_arr = save_queue.get()
             with file_lock:
                 np.savez(fname, image=img_arr, action=act_arr)
-            check_disk_space()
+            check_counter += 1
+            now = time.time()
+            if check_counter >= check_interval or now - last_check >= check_time_window:
+                check_disk_space()
+                last_check = now
+                check_counter = 0
         except Exception as e:
             print(f"Save Error: {e}")
         finally:
@@ -706,68 +748,90 @@ def optimize_ai():
         current_step = 0
         total_chunks = len(batch_files)
         last_loss_value = 0.0
+        train_batch_size = 4
         torch.cuda.empty_cache()
         for idx, bf in enumerate(batch_files):
-            dataset = StreamingGameDataset(bf)
             if stop_optimization_flag.is_set():
                 interrupted = True
                 break
-            loader_workers = 2 if os.name != "nt" else 0
-            loader = DataLoader(dataset, batch_size=4, drop_last=False, num_workers=loader_workers, pin_memory=True, persistent_workers=loader_workers > 0)
-            optimizer.zero_grad()
-            for _ in range(epochs):
-                pending_steps = 0
-                for batch_idx, (imgs, mins, labels, next_frames) in enumerate(loader):
-                    if stop_optimization_flag.is_set():
-                        interrupted = True
-                        break
-                    imgs = imgs.to(device)
-                    mins = mins.to(device)
-                    labels = labels.to(device)
-                    next_frames = next_frames.to(device)
-
-                    with autocast(device_type="cuda", enabled=device.type == "cuda"):
-                        log_var_action = torch.clamp(model.log_var_action, -6.0, 6.0)
-                        log_var_prediction = torch.clamp(model.log_var_prediction, -6.0, 6.0)
-                        log_var_energy = torch.clamp(model.log_var_energy, -6.0, 6.0)
-                        action, pred_feat, button_logits, _ = model(imgs, mins, None)
-                        delta_pred = action[:, -1, :2]
-                        target_delta = labels[:, :2]
-                        target_buttons = labels[:, 2:]
-                        imitation_loss = mse_loss(delta_pred, target_delta) + bce_loss(button_logits[:, -1, :], target_buttons)
-                        target_feat = model.encode_features(next_frames)
-                        pred_loss = mse_loss(pred_feat, target_feat)
-                        button_variation = button_logits[:, 1:, :] - button_logits[:, :-1, :]
-                        button_energy = torch.sum(button_variation ** 2, dim=(1, 2)) if button_variation.numel() > 0 else torch.zeros(1, device=button_logits.device)
-                        delta_energy = torch.sum(action[:, :, :2] ** 2, dim=2)
-                        energy_loss = torch.mean(delta_energy[:, -1] + button_energy)
-                        total_loss = 0.5 * torch.exp(-log_var_action) * imitation_loss + 0.5 * log_var_action
-                        total_loss = total_loss + 0.5 * torch.exp(-log_var_prediction) * pred_loss + 0.5 * log_var_prediction
-                        total_loss = total_loss + 0.5 * torch.exp(-log_var_energy) * energy_loss + 0.5 * log_var_energy
-                        total_loss = total_loss / accumulation_steps
-                    scaler.scale(total_loss).backward()
-                    pending_steps += 1
-                    if pending_steps % accumulation_steps == 0:
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad()
+            chunk_trained = False
+            while not chunk_trained and not stop_optimization_flag.is_set():
+                dataset = StreamingGameDataset(bf)
+                loader_workers = 2 if os.name != "nt" else 0
+                loader = DataLoader(dataset, batch_size=train_batch_size, drop_last=False, num_workers=loader_workers, pin_memory=True, persistent_workers=loader_workers > 0)
+                optimizer.zero_grad()
+                attempt_steps = 0
+                try:
+                    for _ in range(epochs):
                         pending_steps = 0
-                    current_step += 1
-                    last_loss_value = total_loss.item()
-                    progress_bar("模型训练阶段", current_step, total_steps, f"Loss: {last_loss_value:.4f} | Chunk {idx+1}/{total_chunks}")
-                if pending_steps > 0:
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-                gc.collect()
-                torch.cuda.empty_cache()
-                if stop_optimization_flag.is_set():
-                    interrupted = True
-                    break
-            del loader
-            del dataset
-            gc.collect()
-            torch.cuda.empty_cache()
+                        for batch_idx, (imgs, mins, labels, next_frames) in enumerate(loader):
+                            if stop_optimization_flag.is_set():
+                                interrupted = True
+                                break
+                            imgs = imgs.to(device)
+                            mins = mins.to(device)
+                            labels = labels.to(device)
+                            next_frames = next_frames.to(device)
+
+                            with autocast(device_type="cuda", enabled=device.type == "cuda"):
+                                log_var_action = torch.clamp(model.log_var_action, -6.0, 6.0)
+                                log_var_prediction = torch.clamp(model.log_var_prediction, -6.0, 6.0)
+                                log_var_energy = torch.clamp(model.log_var_energy, -6.0, 6.0)
+                                action, pred_feat, button_logits, _ = model(imgs, mins, None)
+                                delta_pred = action[:, -1, :2]
+                                target_delta = labels[:, :2]
+                                target_buttons = labels[:, 2:]
+                                imitation_loss = mse_loss(delta_pred, target_delta) + bce_loss(button_logits[:, -1, :], target_buttons)
+                                target_feat = model.encode_features(next_frames)
+                                pred_loss = mse_loss(pred_feat, target_feat)
+                                button_variation = button_logits[:, 1:, :] - button_logits[:, :-1, :]
+                                button_energy = torch.sum(button_variation ** 2, dim=(1, 2)) if button_variation.numel() > 0 else torch.zeros(1, device=button_logits.device)
+                                delta_energy = torch.sum(action[:, :, :2] ** 2, dim=2)
+                                energy_loss = torch.mean(delta_energy[:, -1] + button_energy)
+                                total_loss = 0.5 * torch.exp(-log_var_action) * imitation_loss + 0.5 * log_var_action
+                                total_loss = total_loss + 0.5 * torch.exp(-log_var_prediction) * pred_loss + 0.5 * log_var_prediction
+                                total_loss = total_loss + 0.5 * torch.exp(-log_var_energy) * energy_loss + 0.5 * log_var_energy
+                                total_loss = total_loss / accumulation_steps
+                            scaler.scale(total_loss).backward()
+                            pending_steps += 1
+                            attempt_steps += 1
+                            if pending_steps % accumulation_steps == 0:
+                                scaler.step(optimizer)
+                                scaler.update()
+                                optimizer.zero_grad()
+                                pending_steps = 0
+                            current_step += 1
+                            last_loss_value = total_loss.item()
+                            progress_bar("模型训练阶段", current_step, total_steps, f"Loss: {last_loss_value:.4f} | Chunk {idx+1}/{total_chunks}")
+                        if pending_steps > 0:
+                            scaler.step(optimizer)
+                            scaler.update()
+                            optimizer.zero_grad()
+                        if stop_optimization_flag.is_set():
+                            interrupted = True
+                            break
+                    chunk_trained = True
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        current_step = max(0, current_step - attempt_steps)
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                        if train_batch_size > 1:
+                            train_batch_size = max(1, train_batch_size // 2)
+                            print(f"OOM detected, reducing batch size to {train_batch_size}")
+                            continue
+                        interrupted = True
+                        stop_optimization_flag.set()
+                    else:
+                        current_step = max(0, current_step - attempt_steps)
+                        interrupted = True
+                        print(f"Training error: {e}")
+                        stop_optimization_flag.set()
+                finally:
+                    del loader
+                    del dataset
+                    gc.collect()
+                    torch.cuda.empty_cache()
             if stop_optimization_flag.is_set():
                 interrupted = True
                 break
@@ -854,7 +918,7 @@ def start_training_mode():
     input_buffer_mouse = []
     with mouse_lock:
         prev_pos = (mouse_state["x"], mouse_state["y"])
-    delta_history = deque(maxlen=5)
+    delta_history = deque(maxlen=8)
 
     try:
         model.share_memory()
@@ -942,6 +1006,12 @@ def start_training_mode():
                     avg_dy = sum(d[1] for d in delta_history) / len(delta_history)
                     target_x = int(min(max(0, curr_x + avg_dx), screen_w - 1))
                     target_y = int(min(max(0, curr_y + avg_dy), screen_h - 1))
+                    current_mouse = mouse_ctrl.position
+                    smooth_factor = 0.35
+                    smooth_x = int(current_mouse[0] + (target_x - current_mouse[0]) * smooth_factor)
+                    smooth_y = int(current_mouse[1] + (target_y - current_mouse[1]) * smooth_factor)
+                    target_x = int(min(max(0, smooth_x), screen_w - 1))
+                    target_y = int(min(max(0, smooth_y), screen_h - 1))
                     pred_l = action[2]
                     pred_r = action[3]
 
