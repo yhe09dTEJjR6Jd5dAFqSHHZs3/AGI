@@ -898,26 +898,33 @@ def prepare_saved_arrays(buffer_images, buffer_actions):
 
 def safe_action_array(entry):
     try:
+        value = None
         if hasattr(entry, "dtype") and getattr(entry.dtype, "names", None) and "action" in entry.dtype.names:
             value = entry["action"]
-            if isinstance(value, np.ndarray) and value.ndim == 0:
-                value = value.item()
-            return np.asarray(value, dtype=np.float32)
-        if isinstance(entry, dict) and "action" in entry:
+        elif isinstance(entry, dict) and "action" in entry:
             value = entry["action"]
-            if isinstance(value, np.ndarray) and value.ndim == 0:
-                value = value.item()
-            return np.asarray(value, dtype=np.float32)
-        if isinstance(entry, (tuple, list)):
+        elif isinstance(entry, (tuple, list)):
             if len(entry) >= 2:
-                candidate = entry[1]
-                if candidate is None:
-                    return np.zeros(mouse_feature_dim + 1, dtype=np.float32)
-                return np.asarray(candidate, dtype=np.float32)
-            return np.zeros(mouse_feature_dim + 1, dtype=np.float32)
-        return np.zeros(mouse_feature_dim + 1, dtype=np.float32)
+                value = entry[1]
+        else:
+            value = entry
+        if isinstance(value, np.ndarray) and value.ndim == 0:
+            try:
+                value = value.item()
+            except Exception:
+                pass
+        if value is None:
+            base = np.zeros(0, dtype=np.float32)
+        else:
+            base = np.asarray(value, dtype=np.float32).reshape(-1)
+        min_len = mouse_feature_dim + 1
+        if base.size < min_len:
+            pad = np.zeros(min_len - base.size, dtype=np.float32)
+            base = np.concatenate([base, pad], axis=0)
+        return base
     except Exception:
         return np.zeros(mouse_feature_dim + 1, dtype=np.float32)
+
 
 def safe_image_data(entry, structured=False):
     try:
@@ -1319,9 +1326,12 @@ def sample_actions_from_source(path, sample_cap=8):
                 structured = structured_npz or structured_array
                 if structured:
                     acts = data['action'] if structured_npz else data['action']
-                    total_len = max(total_len, len(acts))
-                    if len(acts) > 0:
-                        samples.append(safe_action_array((None, acts[0]) if structured_npz else acts[0]))
+                    arr = np.asarray(acts, dtype=np.float32)
+                    length = int(arr.size if arr.ndim == 1 else (arr.shape[0] if arr.ndim > 0 else 0))
+                    if length > total_len:
+                        total_len = length
+                    if length > 0:
+                        samples.append(safe_action_array(arr[0]))
                 else:
                     total_len += 1
                     samples.append(safe_action_array(data))
@@ -1339,13 +1349,13 @@ def sample_actions_from_source(path, sample_cap=8):
                 structured_array = hasattr(data, 'dtype') and getattr(data.dtype, "names", None) and 'action' in data.dtype.names
                 structured = structured_npz or structured_array
                 length = dataset_length(data, structured, structured_npz)
-                total_len += length
-                step = max(1, max(1, length // sample_cap))
-                for idx in range(0, length, step):
-                    if len(samples) >= sample_cap:
-                        break
+                total_len += max(0, int(length))
+                step = max(1, max(1, int(length // sample_cap))) if length > 0 else 1
+                idx = 0
+                while idx < length and len(samples) < sample_cap:
                     entry = (data['image'][idx], data['action'][idx]) if structured_npz else data[idx]
                     samples.append(safe_action_array(entry))
+                    idx += step
                 release_data_handle(data)
                 count += 1
         else:
@@ -1356,17 +1366,18 @@ def sample_actions_from_source(path, sample_cap=8):
             structured_array = hasattr(data, 'dtype') and getattr(data.dtype, "names", None) and 'action' in data.dtype.names
             structured = structured_npz or structured_array
             length = dataset_length(data, structured, structured_npz)
-            total_len = length
-            step = max(1, max(1, length // sample_cap))
-            for idx in range(0, length, step):
-                if len(samples) >= sample_cap:
-                    break
+            total_len = max(0, int(length))
+            step = max(1, max(1, int(length // sample_cap))) if length > 0 else 1
+            idx = 0
+            while idx < length and len(samples) < sample_cap:
                 entry = (data['image'][idx], data['action'][idx]) if structured_npz else data[idx]
                 samples.append(safe_action_array(entry))
+                idx += step
             release_data_handle(data)
     except Exception as e:
         print(f"Data probe error: {e}")
     return total_len, samples
+
 
 def build_sleep_file_mix(candidates, limit=20):
     stats = []
@@ -1381,11 +1392,34 @@ def build_sleep_file_mix(candidates, limit=20):
         human_score = 0.0
         surprise_score = 0.0
         if samples:
-            human_score = float(np.mean([1.0 if (len(a) > mouse_feature_dim and a[mouse_feature_dim] < 0.5) else 0.0 for a in samples]))
-            surprise_score = float(np.mean([float(np.mean(np.abs(a[16:18]))) if len(a) > 18 else 0.0 for a in samples]))
-        stats.append((path, human_score, surprise_score, length, mtime))
+            flat_samples = []
+            for a in samples:
+                try:
+                    v = np.asarray(a, dtype=np.float32).reshape(-1)
+                except Exception:
+                    v = safe_action_array(a)
+                flat_samples.append(v)
+            human_vals = []
+            surprise_vals = []
+            for v in flat_samples:
+                size = int(getattr(v, "size", 0))
+                if size <= 0:
+                    continue
+                if size > mouse_feature_dim:
+                    human_vals.append(1.0 if v[mouse_feature_dim] < 0.5 else 0.0)
+                else:
+                    human_vals.append(0.5)
+                if size > 18:
+                    surprise_vals.append(float(np.mean(np.abs(v[16:18]))))
+                else:
+                    surprise_vals.append(0.0)
+            if human_vals:
+                human_score = float(np.mean(human_vals))
+            if surprise_vals:
+                surprise_score = float(np.mean(surprise_vals))
+        stats.append((path, human_score, surprise_score, int(length), float(mtime)))
     if not stats:
-        return []
+        return [], []
     stats.sort(key=lambda x: x[3], reverse=True)
     total = min(limit, len(stats))
     human_n = max(1, int(total * 0.4))
@@ -1414,7 +1448,8 @@ def build_sleep_file_mix(candidates, limit=20):
     pick(surprise_pool, surprise_n)
     random.shuffle(history_pool)
     pick(history_pool, random_n)
-    return selection
+    return selection, stats
+
 
 def optimize_ai():
     global low_vram_mode
@@ -1487,7 +1522,8 @@ def optimize_ai():
                     valid_candidates.append(c)
             except Exception:
                 continue
-        prioritized = build_sleep_file_mix(valid_candidates, limit=25)
+        sleep_stats = []
+        prioritized, sleep_stats = build_sleep_file_mix(valid_candidates, limit=25)
         target_files = prioritized if prioritized else valid_candidates
         files = []
         total_scan = len(target_files)
@@ -1578,8 +1614,14 @@ def optimize_ai():
             torch.cuda.empty_cache()
             return
 
-        epochs = 1
-        total_samples = total_steps
+        if total_steps < 5000:
+            epochs = 3
+        elif total_steps < 20000:
+            epochs = 2
+        else:
+            epochs = 1
+
+        total_samples = total_steps * epochs
         current_step = 0
         total_chunks = len(batch_files)
         last_loss_value = 0.0
@@ -1717,6 +1759,31 @@ def optimize_ai():
         print(f"> Energy Penalty (Laziness): {laziness_penalty:.3f}  <-- exp(-gamma)")
         print(f"> Last Loss: {last_loss_value:.6f}")
         print(f"> Model Saved To: {model_path}")
+        train_file_count = len(files)
+        estimated_samples = 0
+        human_ratio = 0.0
+        ai_ratio = 0.0
+        recent_ratio = 0.0
+        recent_cutoff = time.time() - 7 * 24 * 60 * 60
+        if sleep_stats:
+            used_stats = [s for s in sleep_stats if s[0] in files]
+            if used_stats:
+                total_len = sum(max(1, s[3]) for s in used_stats)
+                estimated_samples = total_len
+                human_weighted = sum(max(1, s[3]) * s[1] for s in used_stats)
+                human_ratio = human_weighted / total_len if total_len > 0 else 0.0
+                ai_ratio = 1.0 - human_ratio
+                recent_weighted_len = sum(max(1, s[3]) for s in used_stats if s[4] >= recent_cutoff)
+                recent_ratio = recent_weighted_len / total_len if total_len > 0 else 0.0
+        print(f"> 训练文件数量: {train_file_count}")
+        print(f"> 估计覆盖经验序列数: {estimated_samples}")
+        if sleep_stats:
+            print(f"> 人类/AI 样本比例(估计): {human_ratio:.3f} / {ai_ratio:.3f}")
+            print(f"> 最近数据比例(近7天, 估计): {recent_ratio:.3f}")
+        else:
+            print("> 未获取到睡眠混合统计信息，使用原始文件集合。")
+        print(f"> 有效 Epoch 数: {epochs}")
+        print(f"> Batch Size: {train_batch_size}")
         torch.cuda.empty_cache()
         if torch.cuda.is_available():
             try:
