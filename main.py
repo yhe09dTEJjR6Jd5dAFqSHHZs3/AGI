@@ -29,6 +29,8 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", module="pynvml")
 
 progress_bar_lock = threading.Lock()
+progress_bar_last = {}
+progress_bar_min_interval = 0.12
 
 def log_exception(context, err=None, extra=None):
     parts = [context]
@@ -61,6 +63,13 @@ def progress_bar(prefix, current, total, suffix="", channel="opt"):
     total = max(total, 1)
     ratio = current / total
     percent = format(ratio * 100, ".2f")
+    now = time.time()
+    with progress_bar_lock:
+        last = progress_bar_last.get(channel, 0)
+        force = current <= 0 or current >= total
+        if not force and now - last < progress_bar_min_interval:
+            return
+        progress_bar_last[channel] = now
     update_window_progress(ratio * 100, f"{prefix} {percent}% {suffix}".strip(), channel=channel)
 
 def install_requirements():
@@ -370,6 +379,7 @@ def get_latest_frame():
         return latest_frame["img"], latest_frame["ts"]
 
 def cleanup_before_sleep():
+    global dxcam_camera
     try:
         with frame_lock:
             latest_frame["img"] = None
@@ -377,6 +387,20 @@ def cleanup_before_sleep():
         temp_trajectory.clear()
     except Exception as e:
         print(f"Cleanup warning during sleep prep: {e}")
+    try:
+        if dxcam_camera is not None:
+            try:
+                dxcam_camera.stop()
+            except Exception as stop_err:
+                print(f"DXCam stop warning: {stop_err}")
+            try:
+                if hasattr(dxcam_camera, "release"):
+                    dxcam_camera.release()
+            except Exception as rel_err:
+                print(f"DXCam release warning: {rel_err}")
+            dxcam_camera = None
+    except Exception as e:
+        print(f"DXCam cleanup exception: {e}")
     for _ in range(3):
         gc.collect()
         try:
@@ -2029,22 +2053,19 @@ def optimize_ai():
                         entries = load_index_entries()
                         if not entries:
                             continue
-                        known_steps = [max(1, int(c) - seq_len) for _, _, c in entries if c > 0]
-                        total += sum(known_steps)
-                        unknown_entries = [(i, e) for i, e in enumerate(entries) if e[2] <= 0]
+                        for _, _, count in entries:
+                            if count > 0:
+                                total += max(1, int(count) - seq_len)
+                        unknown_entries = [e for e in entries if e[2] <= 0]
                         if unknown_entries:
-                            probe = min(len(unknown_entries), 5)
-                            idx_candidates = np.linspace(0, len(unknown_entries) - 1, probe, dtype=int)
+                            samples = unknown_entries[:2]
                             measured = []
-                            remaining = len(unknown_entries)
-                            for idx_val in idx_candidates:
+                            for entry in samples:
                                 if stop_optimization_flag.is_set():
                                     ensure_stop_reason()
                                     break
-                                _, entry = unknown_entries[idx_val]
                                 payload = read_log_payload(entry[0], entry[1])
                                 if payload is None:
-                                    remaining = max(0, remaining - 1)
                                     continue
                                 buf = io.BytesIO(payload)
                                 data = np.load(buf, allow_pickle=True)
@@ -2054,13 +2075,13 @@ def optimize_ai():
                                 structured = structured_npz or structured_array
                                 length = dataset_length(data, structured, structured_npz)
                                 release_data_handle(data)
-                                steps = max(1, int(length) - seq_len)
-                                total += steps
-                                measured.append(steps)
-                                remaining = max(0, remaining - 1)
-                            if remaining > 0 and measured:
+                                measured.append(max(1, int(length) - seq_len))
+                            remaining = max(0, len(unknown_entries) - len(samples))
+                            if measured:
                                 avg_steps = float(sum(measured)) / float(len(measured))
-                                total += int(avg_steps * remaining)
+                                total += int(sum(measured))
+                                if remaining > 0:
+                                    total += int(avg_steps * remaining)
                         continue
                     if path == lmdb_path:
                         keys = lmdb_key_plan.get(path)
