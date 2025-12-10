@@ -57,14 +57,11 @@ def resolve_desktop_path():
             print(f"Desktop path resolve error: {e}")
     return os.path.join(os.path.expanduser("~"), "Desktop")
 
-def progress_bar(prefix, current, total, suffix=""):
+def progress_bar(prefix, current, total, suffix="", channel="opt"):
     total = max(total, 1)
     ratio = current / total
-    bar_len = 30
-    filled = int(bar_len * ratio)
-    bar = "█" * filled + "-" * (bar_len - filled)
     percent = format(ratio * 100, ".2f")
-    update_window_progress(ratio * 100, f"{prefix} {percent}% {suffix}".strip())
+    update_window_progress(ratio * 100, f"{prefix} {percent}% {suffix}".strip(), channel=channel)
 
 def install_requirements():
     package_map = {
@@ -158,7 +155,10 @@ def set_process_priority():
 def flush_buffers(timeout=3):
     flush_done_event.clear()
     flush_event.set()
-    flush_done_event.wait(timeout=timeout)
+    finished = flush_done_event.wait(timeout=timeout)
+    if not finished:
+        update_window_status("等待数据刷盘超时，已跳过阻塞写入。", "warn")
+    return finished
 
 def report_to_window(msg, level="info"):
     try:
@@ -186,12 +186,15 @@ class SciFiWindow:
         self.queue = queue.Queue()
         self.root = tk.Tk()
         self.root.title("Nebula Core")
-        self.root.geometry("520x420")
+        self.root.geometry("540x480")
         self.root.configure(bg="#0a0f1a")
         self.root.resizable(False, False)
         self.mode_var = tk.StringVar(value=current_mode)
         self.status_var = tk.StringVar(value="Initializing...")
-        self.progress_var = tk.StringVar(value="0.00%")
+        self.scan_progress_var = tk.StringVar(value="0.00%")
+        self.scan_text_var = tk.StringVar(value="数据扫描：待开始")
+        self.opt_progress_var = tk.StringVar(value="0.00%")
+        self.opt_text_var = tk.StringVar(value="AI优化：待开始")
         title = tk.Label(self.root, text="AGI Control", fg="#7fffd4", bg="#0a0f1a", font=("Consolas", 16, "bold"))
         title.pack(pady=6)
         mode_frame = tk.Frame(self.root, bg="#0a0f1a")
@@ -209,9 +212,20 @@ class SciFiWindow:
         tk.Button(btn_frame, text="训练", command=self.on_train, fg="#0a0f1a", bg="#60a5fa", activebackground="#3b82f6", width=10).pack(side="left", padx=5)
         progress_frame = tk.Frame(self.root, bg="#0a0f1a")
         progress_frame.pack(fill="x", padx=10, pady=4)
-        self.progress = ttk.Progressbar(progress_frame, orient="horizontal", length=380, mode="determinate", maximum=100)
-        self.progress.pack(side="left", padx=4)
-        tk.Label(progress_frame, textvariable=self.progress_var, fg="#e3f2fd", bg="#0a0f1a", font=("Consolas", 10)).pack(side="left", padx=4)
+        scan_frame = tk.Frame(progress_frame, bg="#0a0f1a")
+        scan_frame.pack(fill="x", pady=2)
+        tk.Label(scan_frame, text="数据扫描", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 10)).pack(side="left", padx=4)
+        self.scan_progress = ttk.Progressbar(scan_frame, orient="horizontal", length=320, mode="determinate", maximum=100)
+        self.scan_progress.pack(side="left", padx=4)
+        tk.Label(scan_frame, textvariable=self.scan_progress_var, fg="#e3f2fd", bg="#0a0f1a", font=("Consolas", 10)).pack(side="left", padx=4)
+        tk.Label(progress_frame, textvariable=self.scan_text_var, fg="#d4fc79", bg="#0a0f1a", font=("Consolas", 9), anchor="w").pack(fill="x", padx=6)
+        opt_frame = tk.Frame(progress_frame, bg="#0a0f1a")
+        opt_frame.pack(fill="x", pady=2)
+        tk.Label(opt_frame, text="AI优化", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 10)).pack(side="left", padx=4)
+        self.opt_progress = ttk.Progressbar(opt_frame, orient="horizontal", length=320, mode="determinate", maximum=100)
+        self.opt_progress.pack(side="left", padx=4)
+        tk.Label(opt_frame, textvariable=self.opt_progress_var, fg="#e3f2fd", bg="#0a0f1a", font=("Consolas", 10)).pack(side="left", padx=4)
+        tk.Label(progress_frame, textvariable=self.opt_text_var, fg="#d4fc79", bg="#0a0f1a", font=("Consolas", 9), anchor="w").pack(fill="x", padx=6)
         log_frame = tk.Frame(self.root, bg="#0a0f1a")
         log_frame.pack(fill="both", expand=True, padx=10, pady=6)
         self.log_area = scrolledtext.ScrolledText(log_frame, state="disabled", fg="#9ae6ff", bg="#0f172a", insertbackground="#7fffd4", font=("Consolas", 9))
@@ -231,11 +245,17 @@ class SciFiWindow:
                         self.log_area.see("end")
                         self.log_area.configure(state="disabled")
                     elif kind == "progress":
-                        pct, text = payload
+                        channel, pct, text = payload
                         try:
                             val = float(max(0.0, min(100.0, pct)))
-                            self.progress["value"] = val
-                            self.progress_var.set(text if text else f"{val:.2f}%")
+                            if channel == "scan":
+                                self.scan_progress["value"] = val
+                                self.scan_progress_var.set(f"{val:.2f}%")
+                                self.scan_text_var.set(text if text else f"数据扫描 {val:.2f}%")
+                            else:
+                                self.opt_progress["value"] = val
+                                self.opt_progress_var.set(f"{val:.2f}%")
+                                self.opt_text_var.set(text if text else f"AI优化 {val:.2f}%")
                         except Exception:
                             pass
                 else:
@@ -256,8 +276,8 @@ class SciFiWindow:
     def set_mode(self, mode):
         self.mode_var.set(mode)
 
-    def set_progress(self, pct, text=None):
-        self.queue.put(("progress", (pct, text or f"{pct:.2f}%")))
+    def set_progress(self, channel, pct, text=None):
+        self.queue.put(("progress", (channel, pct, text or f"{pct:.2f}%")))
 
     def minimize(self):
         try:
@@ -301,10 +321,10 @@ def update_window_status(msg, level="info"):
     except Exception:
         pass
 
-def update_window_progress(pct, text=None):
+def update_window_progress(pct, text=None, channel="opt"):
     try:
         if window_ui is not None:
-            window_ui.set_progress(pct, text)
+            window_ui.set_progress(channel, pct, text)
     except Exception:
         pass
 
@@ -383,6 +403,18 @@ def force_memory_cleanup(iterations=2, delay=0.05):
 data_queue = queue.Queue()
 save_queue = queue.Queue()
 
+def wait_for_save_queue(timeout=3.0):
+    try:
+        deadline = time.time() + max(0.0, timeout)
+        while time.time() < deadline:
+            if getattr(save_queue, "unfinished_tasks", 0) <= 0:
+                return True
+            time.sleep(0.05)
+        return getattr(save_queue, "unfinished_tasks", 0) <= 0
+    except Exception as e:
+        print(f"Save queue wait warning: {e}")
+        return False
+
 def append_binary_log(img_arr, act_arr):
     try:
         buf = io.BytesIO()
@@ -412,20 +444,23 @@ def iterate_binary_log(path):
         entries = load_index_entries()
         if not entries:
             return []
-        with log_lock:
-            with open(path, "rb") as f:
-                for offset, length, _ in entries:
-                    f.seek(offset)
-                    header = f.read(8)
-                    if not header or len(header) < 8:
-                        break
-                    payload_len = struct.unpack("<Q", header)[0]
-                    if payload_len <= 0:
-                        continue
-                    payload = f.read(payload_len)
-                    if len(payload) < payload_len:
-                        break
-                    yield payload
+        for offset, length, _ in entries:
+            try:
+                with log_lock:
+                    with open(path, "rb") as f:
+                        f.seek(offset)
+                        header = f.read(8)
+                        if not header or len(header) < 8:
+                            break
+                        payload_len = struct.unpack("<Q", header)[0]
+                        if payload_len <= 0:
+                            continue
+                        payload = f.read(payload_len)
+                        if len(payload) < payload_len:
+                            break
+                yield payload
+            except Exception as read_err:
+                print(f"Binary log read warning: {read_err}")
     except Exception as e:
         print(f"Binary log read error: {e}")
         return []
@@ -1542,7 +1577,8 @@ class StreamingGameDataset(IterableDataset):
                                 log_exception("LMDB data iteration failure", e)
                             continue
                         with file_read_lock:
-                            data = np.load(path, allow_pickle=True, mmap_mode="r")
+                            with open(path, "rb") as f:
+                                data = np.load(f, allow_pickle=True)
                         data = unwrap_array(data)
                         structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                         structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
@@ -1854,29 +1890,17 @@ def optimize_ai():
         update_window_status("启动睡眠优化...", "info")
         model_path = os.path.join(model_dir, "ai_model.pth")
         backup_path = os.path.join(model_dir, "ai_model_prev.pth")
-        model = UniversalAI().to(device)
-        optimizer = optim.Adam(model.parameters(), lr=1e-4)
-        if os.path.exists(model_path):
-            try:
-                state = load_model_checkpoint(model_path, map_location=device)
-                if state is not None:
-                    model.load_state_dict(state.get("model_state", {}), strict=False)
-                    if "optimizer_state" in state:
-                        optimizer.load_state_dict(state["optimizer_state"])
-            except Exception as e:
-                print(f"Model load warning: {e}")
-
-        model.train()
-        mse_loss = nn.MSELoss()
-        bce_loss = nn.BCEWithLogitsLoss()
-        scaler = GradScaler("cuda", enabled=device.type == "cuda")
         accumulation_steps = 8
         train_batch_size = 8
         low_vram_mode = False
         total_mem_gb = None
+        free_mem_gb = None
+        train_device = device
         if torch.cuda.is_available():
             try:
-                total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                free_bytes, total_bytes = torch.cuda.mem_get_info()
+                total_mem_gb = total_bytes / (1024 ** 3)
+                free_mem_gb = free_bytes / (1024 ** 3)
                 if total_mem_gb <= 4:
                     accumulation_steps = 12
                     train_batch_size = 1
@@ -1887,8 +1911,33 @@ def optimize_ai():
                 elif total_mem_gb > 10:
                     accumulation_steps = 10
                     train_batch_size = 12
+                if free_mem_gb is not None and (free_mem_gb < 2.0 or total_mem_gb <= 4):
+                    low_vram_mode = True
+                    train_batch_size = 1
+                    accumulation_steps = max(accumulation_steps, 10)
+                    if free_mem_gb < 1.5:
+                        train_device = torch.device("cpu")
+                        update_window_status("可用显存不足，已切换到CPU训练以避免溢出。", "warn")
+                    else:
+                        update_window_status("检测到显存紧张，已启用低显存训练配置。", "warn")
             except Exception as e:
                 print(f"GPU property probe warning: {e}")
+        model = UniversalAI().to(train_device)
+        optimizer = optim.Adam(model.parameters(), lr=1e-4)
+        if os.path.exists(model_path):
+            try:
+                state = load_model_checkpoint(model_path, map_location=train_device)
+                if state is not None:
+                    model.load_state_dict(state.get("model_state", {}), strict=False)
+                    if "optimizer_state" in state:
+                        optimizer.load_state_dict(state["optimizer_state"])
+            except Exception as e:
+                print(f"Model load warning: {e}")
+
+        model.train()
+        mse_loss = nn.MSELoss()
+        bce_loss = nn.BCEWithLogitsLoss()
+        scaler = GradScaler("cuda", enabled=train_device.type == "cuda")
         effective_batch = train_batch_size * accumulation_steps
         interrupted = False
         early_stop_reason = None
@@ -1951,7 +2000,7 @@ def optimize_ai():
                 ensure_stop_reason()
                 break
             scanned += 1
-            progress_bar("数据扫描阶段", scanned, total_scan)
+            progress_bar("数据扫描阶段", scanned, total_scan, channel="scan")
             try:
                 if os.path.getsize(f) > 0:
                     files.append(f)
@@ -2058,7 +2107,7 @@ def optimize_ai():
             steps = estimate_steps(bf)
             chunk_steps.append(steps)
             init_done += 1
-            progress_bar("Dataset Init", init_done, init_total, f"Chunks: {steps} steps")
+            progress_bar("Dataset Init", init_done, init_total, f"Chunks: {steps} steps", channel="scan")
             torch.cuda.empty_cache()
         gc.collect()
         torch.cuda.empty_cache()
@@ -2158,13 +2207,13 @@ def optimize_ai():
                                 interrupted = True
                                 ensure_stop_reason()
                                 break
-                            imgs = imgs.to(device)
-                            mins = mins.to(device)
-                            labels = labels.to(device)
-                            next_frames = next_frames.to(device)
+                            imgs = imgs.to(train_device)
+                            mins = mins.to(train_device)
+                            labels = labels.to(train_device)
+                            next_frames = next_frames.to(train_device)
                             batch_sample = imgs.size(0)
 
-                            with autocast(device_type="cuda", enabled=device.type == "cuda"):
+                            with autocast(device_type="cuda", enabled=train_device.type == "cuda"):
                                 log_var_action = torch.clamp(model.log_var_action, -6.0, 6.0)
                                 log_var_prediction = torch.clamp(model.log_var_prediction, -6.0, 6.0)
                                 log_var_energy = torch.clamp(model.log_var_energy, -6.0, 6.0)
@@ -2374,16 +2423,27 @@ def start_training_mode():
             update_window_status("未找到模型，训练已取消。", "error")
             return
 
-        model = UniversalAI().to(device)
+        train_device = device
+        if torch.cuda.is_available():
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info()
+                free_gb = free_bytes / (1024 ** 3)
+                if free_gb < 1.5:
+                    train_device = torch.device("cpu")
+                    update_window_status("训练模式切换至CPU以避免显存溢出。", "warn")
+            except Exception as e:
+                print(f"Training VRAM probe warning: {e}")
+
+        model = UniversalAI().to(train_device)
         try:
-            state = load_model_checkpoint(model_path, map_location=device)
+            state = load_model_checkpoint(model_path, map_location=train_device)
             if state is not None:
                 model.load_state_dict(state.get("model_state", {}))
         except Exception as e:
             print(f"Model load error: {e}")
         model.train()
         surprise_optimizer = optim.AdamW(model.parameters(), lr=5e-5)
-        surprise_scaler = GradScaler("cuda", enabled=device.type == "cuda")
+        surprise_scaler = GradScaler("cuda", enabled=train_device.type == "cuda")
         mse_surprise = nn.MSELoss()
         mouse_ctrl = mouse.Controller()
         input_buffer_img = []
@@ -2500,10 +2560,10 @@ def start_training_mode():
                     input_buffer_img.pop(0)
                     input_buffer_mouse.pop(0)
                 if len(input_buffer_img) == seq_len:
-                    t_imgs = torch.FloatTensor(np.array([input_buffer_img])).to(device)
-                    t_mins = torch.FloatTensor(np.array([input_buffer_mouse])).to(device)
+                    t_imgs = torch.FloatTensor(np.array([input_buffer_img])).to(train_device)
+                    t_mins = torch.FloatTensor(np.array([input_buffer_mouse])).to(train_device)
                     surprise_optimizer.zero_grad(set_to_none=True)
-                    with autocast(device_type="cuda", enabled=device.type == "cuda"):
+                    with autocast(device_type="cuda", enabled=train_device.type == "cuda"):
                         grid_logits, pred_feat, button_logits, hidden_out = model(t_imgs, t_mins, hidden_state)
                     grid_probs = torch.softmax(grid_logits[0], dim=-1)
                     pred_cell = torch.argmax(grid_probs).item()
@@ -2538,8 +2598,8 @@ def start_training_mode():
                     actual_frame, _ = get_latest_frame()
                     if actual_frame is not None:
                         actual_rgb = cv2.cvtColor(actual_frame, cv2.COLOR_BGRA2RGB) if actual_frame.shape[2] == 4 else actual_frame
-                        actual_tensor = torch.FloatTensor(actual_rgb.transpose(2, 0, 1) / 255.0).unsqueeze(0).to(device)
-                        with autocast(device_type="cuda", enabled=device.type == "cuda"):
+                        actual_tensor = torch.FloatTensor(actual_rgb.transpose(2, 0, 1) / 255.0).unsqueeze(0).to(train_device)
+                        with autocast(device_type="cuda", enabled=train_device.type == "cuda"):
                             actual_feat = model.encode_features(actual_tensor)
                             surprise_loss = mse_surprise(pred_feat, actual_feat)
                         if surprise_loss.item() > 0.001:
@@ -2582,7 +2642,9 @@ def record_data_loop():
                     save_queue.put((img_arr, act_arr, source_type))
                     buffer_images = []
                     buffer_actions = []
-                    save_queue.join()
+                    flushed = wait_for_save_queue(timeout=3.0)
+                    if not flushed:
+                        update_window_status("磁盘写入阻塞，已跳过部分待写入数据。", "warn")
                 flush_event.clear()
                 flush_done_event.set()
             time.sleep(0.05)
@@ -2652,7 +2714,9 @@ def record_data_loop():
                     save_queue.put((img_arr, act_arr, source_type))
                     buffer_images = []
                     buffer_actions = []
-                    save_queue.join()
+                    flushed = wait_for_save_queue(timeout=3.0)
+                    if not flushed:
+                        update_window_status("磁盘写入阻塞，已跳过部分待写入数据。", "warn")
                 flush_event.clear()
                 flush_done_event.set()
         else:
@@ -2663,7 +2727,9 @@ def record_data_loop():
                     save_queue.put((img_arr, act_arr, source_type))
                     buffer_images = []
                     buffer_actions = []
-                    save_queue.join()
+                    flushed = wait_for_save_queue(timeout=3.0)
+                    if not flushed:
+                        update_window_status("磁盘写入阻塞，已跳过部分待写入数据。", "warn")
                 flush_event.clear()
                 flush_done_event.set()
             time.sleep(1)
