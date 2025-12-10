@@ -397,6 +397,34 @@ def append_meta_entry(key_val, length, source_type, action_score):
     except Exception as e:
         print(f"Meta append error: {e}")
 
+def compute_action_score(actions):
+    try:
+        arr = np.asarray(actions, dtype=np.float32)
+    except Exception:
+        return 0.0
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    elif arr.ndim > 2:
+        arr = arr.reshape(arr.shape[0], -1)
+    scores = []
+    for row in arr:
+        length = len(row)
+        def val(idx):
+            return float(row[idx]) if idx < length else 0.0
+        delta_x = val(16)
+        delta_y = val(17)
+        movement = min(1.0, math.sqrt(delta_x * delta_x + delta_y * delta_y) / max(screen_w, screen_h))
+        click = 1.0 if val(3) > 0.1 or val(4) > 0.1 else 0.0
+        scroll_mag = min(1.0, abs(val(5)) / 120.0)
+        hold_trace = 1.0 if any(abs(val(i)) > 0.0 for i in (7, 8, 10, 11, 13, 14, 18, 19)) else 0.0
+        salience = 0.45 * movement + 0.35 * click + 0.15 * scroll_mag + 0.05 * hold_trace
+        if salience < 0.02:
+            salience = 0.0
+        scores.append(salience)
+    if not scores:
+        return 0.0
+    return float(np.mean(scores))
+
 def append_lmdb_records(img_arr, act_arr, source_type="human"):
     global lmdb_counter, current_map_size_gb
     if len(img_arr) != len(act_arr):
@@ -421,10 +449,7 @@ def append_lmdb_records(img_arr, act_arr, source_type="human"):
                     txn.put(key, payload)
                     lmdb_counter += 1
                     txn.put(b"__counter__", lmdb_counter.to_bytes(8, "little"))
-            try:
-                score = float(np.mean(np.abs(act_arr))) if act_arr.size > 0 else 0.0
-            except Exception:
-                score = 0.0
+            score = compute_action_score(act_arr)
             append_meta_entry(lmdb_counter - 1, len(img_arr), source_type, score)
             return
         except lmdb.MapFullError:
@@ -1574,49 +1599,64 @@ def build_sleep_file_mix(candidates, limit=20):
             stats.append((path, human_score, surprise_score, int(length), float(mtime), steps_est, None))
     if not stats:
         return [], [], {}
-    stats.sort(key=lambda x: x[3], reverse=True)
-    if limit and len(stats) > limit:
-        stats = stats[:limit]
-    total_steps = sum(s[5] for s in stats)
-    if total_steps <= 0:
-        return [], stats, {}
-    human_target = total_steps * 0.4
-    recent_target = total_steps * 0.3
-    surprise_target = total_steps * 0.2
-    history_target = max(0, total_steps - (human_target + recent_target + surprise_target))
-    human_pool = sorted(stats, key=lambda x: (x[1], x[5]), reverse=True)
-    recent_pool = sorted(stats, key=lambda x: x[4], reverse=True)
-    surprise_pool = sorted(stats, key=lambda x: x[2], reverse=True)
-    history_pool = sorted(stats, key=lambda x: x[4])
-    selected_paths = set()
+    if not stats:
+        return [], [], {}
+    now_ts = time.time()
+    weights = []
+    for path, human_score, surprise_score, length, ts, steps_est, key in stats:
+        recency_bias = math.exp(-max(0.0, now_ts - ts) / (2 * 24 * 3600)) if ts > 0 else 0.05
+        history_bonus = 0.08 if ts > 0 and (now_ts - ts) > (14 * 24 * 3600) else 0.0
+        density = math.log1p(max(1.0, steps_est)) / math.log(2.0)
+        weight = 0.55 * recency_bias + 0.2 * human_score + 0.2 * (1.0 + surprise_score) + 0.05 * density + history_bonus
+        weights.append(max(weight, 0.01))
+    sample_count = min(limit if limit else len(stats), len(stats))
+    picks = random.choices(range(len(stats)), weights=weights, k=sample_count)
     selection = []
-
-    def pick_steps(pool, target_steps, tag):
-        if target_steps <= 0:
-            return
-        used_steps = 0
-        for item in pool:
-            path = item[0]
-            key = item[6]
-            if key is None and path in selected_paths and path != lmdb_path:
-                continue
-            if path == lmdb_path:
-                lmdb_selection.setdefault(path, []).append(key)
+    selected_paths = set()
+    oldest_idx = min(range(len(stats)), key=lambda i: stats[i][4])
+    if oldest_idx not in picks and len(stats) > 1:
+        picks[-1] = oldest_idx
+    for idx in picks:
+        path, _, _, _, ts, steps_est, key = stats[idx]
+        if path == lmdb_path:
+            lmdb_selection.setdefault(path, []).append(key)
+        if path not in selected_paths:
             selection.append(path)
             selected_paths.add(path)
-            used_steps += item[5]
-            if used_steps >= target_steps:
-                break
-        if used_steps < target_steps and pool:
-            print(f"[{tag}] 未达到目标步数，仅累积 {used_steps}/{int(target_steps)} steps")
-
-    pick_steps(human_pool, human_target, "高质样本")
-    pick_steps(recent_pool, recent_target, "近期样本")
-    pick_steps(surprise_pool, surprise_target, "高惊讶度样本")
-    random.shuffle(history_pool)
-    pick_steps(history_pool, history_target, "历史样本")
-    selection = list(dict.fromkeys(selection))
     return selection, stats, lmdb_selection
+
+
+def update_meta_with_loss(key_plan, paths, loss_value):
+    try:
+        if loss_value <= 0:
+            return
+        targets = set()
+        for p in paths:
+            if p == lmdb_path:
+                keys = key_plan.get(p)
+                if keys:
+                    targets.update(keys)
+        if not targets:
+            return
+        with meta_lock:
+            if os.path.exists(meta_path):
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            else:
+                data = []
+            changed = False
+            now_ts = time.time()
+            for entry in data:
+                if entry.get("key") in targets:
+                    old_score = float(entry.get("action_score", 0.0))
+                    entry["action_score"] = 0.7 * old_score + 0.3 * min(5.0, float(loss_value))
+                    entry["timestamp"] = max(float(entry.get("timestamp", now_ts)), now_ts - 0.1)
+                    changed = True
+            if changed:
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+    except Exception as e:
+        print(f"Meta loss feedback error: {e}")
 
 
 def optimize_ai():
@@ -1888,6 +1928,8 @@ def optimize_ai():
                 break
             chunk_trained = False
             while not chunk_trained and not stop_optimization_flag.is_set():
+                chunk_loss_acc = 0.0
+                chunk_sample_count = 0
                 dataset = StreamingGameDataset(bf, lmdb_key_plan)
                 loader_workers = 0 if low_vram_mode or os.name == "nt" else 2
                 loader = DataLoader(dataset, batch_size=train_batch_size, drop_last=False, num_workers=loader_workers, pin_memory=True, persistent_workers=loader_workers > 0)
@@ -1925,6 +1967,9 @@ def optimize_ai():
                                 total_loss = total_loss + 0.5 * torch.exp(-log_var_energy) * energy_loss + 0.5 * log_var_energy
                                 total_loss = total_loss / accumulation_steps
                             scaler.scale(total_loss).backward()
+                            loss_val = float(total_loss.item())
+                            chunk_loss_acc += loss_val * batch_sample
+                            chunk_sample_count += batch_sample
                             pending_steps += 1
                             attempt_steps += batch_sample
                             if pending_steps % accumulation_steps == 0:
@@ -2005,6 +2050,9 @@ def optimize_ai():
             if stop_optimization_flag.is_set():
                 interrupted = True
                 break
+            if chunk_loss_acc > 0 and chunk_sample_count > 0:
+                chunk_avg_loss = chunk_loss_acc / chunk_sample_count
+                update_meta_with_loss(lmdb_key_plan, bf, chunk_avg_loss)
 
         temp_path = os.path.join(model_dir, "ai_model_temp.pth")
         print(f"Final Loss Snapshot: {last_loss_value:.6f} | Steps: {current_step}/{total_steps}")
