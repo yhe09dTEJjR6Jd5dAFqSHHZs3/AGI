@@ -229,35 +229,104 @@ def append_binary_log(img_arr, act_arr):
         np.savez_compressed(buf, image=img_arr, action=act_arr)
         payload = buf.getvalue()
         header = struct.pack("<Q", len(payload))
+        sample_count = 0
+        try:
+            sample_count = min(len(img_arr), len(act_arr))
+        except Exception:
+            sample_count = 0
+        load_index_entries(upgrade=True)
         with log_lock:
             with open(log_path, "ab") as f:
+                offset = f.tell()
                 f.write(header)
                 f.write(payload)
             with open(index_path, "ab") as idx:
-                idx.write(header)
+                idx.write(struct.pack("<QQQ", offset, len(payload), int(sample_count)))
     except Exception as e:
         print(f"Binary log append error: {e}")
 
 def iterate_binary_log(path):
     try:
+        if not os.path.exists(path):
+            return []
+        entries = load_index_entries()
+        if not entries:
+            return []
         with log_lock:
-            if not os.path.exists(path):
-                return []
-            records = []
             with open(path, "rb") as f:
-                while True:
+                for offset, length, _ in entries:
+                    f.seek(offset)
                     header = f.read(8)
                     if not header or len(header) < 8:
                         break
-                    length = struct.unpack("<Q", header)[0]
-                    payload = f.read(length)
-                    if len(payload) < length:
+                    payload_len = struct.unpack("<Q", header)[0]
+                    if payload_len <= 0:
+                        continue
+                    payload = f.read(payload_len)
+                    if len(payload) < payload_len:
                         break
-                    records.append(payload)
-        return records
+                    yield payload
     except Exception as e:
         print(f"Binary log read error: {e}")
         return []
+
+def load_index_entries(upgrade=False):
+    try:
+        if not os.path.exists(index_path):
+            return []
+        with log_lock:
+            with open(index_path, "rb") as idx:
+                data = idx.read()
+        if not data:
+            return []
+        entry_size = 24 if len(data) % 24 == 0 else (16 if len(data) % 16 == 0 else 8)
+        entries = []
+        if entry_size == 24:
+            for i in range(0, len(data), 24):
+                offset, length, count = struct.unpack("<QQQ", data[i:i+24])
+                entries.append((offset, length, count))
+        elif entry_size == 16:
+            for i in range(0, len(data), 16):
+                offset, length = struct.unpack("<QQ", data[i:i+16])
+                entries.append((offset, length, 0))
+        else:
+            offset_val = 0
+            for i in range(0, len(data), 8):
+                length = struct.unpack("<Q", data[i:i+8])[0]
+                entries.append((offset_val, length, 0))
+                offset_val += length + 8
+        if upgrade and entry_size != 24:
+            try:
+                with log_lock:
+                    with open(index_path, "wb") as idx:
+                        for off, ln, cnt in entries:
+                            idx.write(struct.pack("<QQQ", off, ln, cnt))
+            except Exception as e:
+                log_exception("Index upgrade failure", e)
+        return entries
+    except Exception as e:
+        log_exception("Index load failure", e)
+        return []
+
+def read_log_payload(offset, length):
+    try:
+        with log_lock:
+            with open(log_path, "rb") as f:
+                f.seek(offset)
+                header = f.read(8)
+                if not header or len(header) < 8:
+                    return None
+                payload_len = struct.unpack("<Q", header)[0]
+                if payload_len <= 0:
+                    return None
+                data_len = payload_len if length <= 0 else min(payload_len, length)
+                payload = f.read(data_len)
+                if len(payload) < data_len:
+                    return None
+                return payload
+    except Exception as e:
+        log_exception("Log payload read error", e)
+        return None
 
 def get_lmdb_env(map_size_gb=None):
     global lmdb_env, lmdb_counter, lmdb_start, current_map_size_gb
@@ -431,36 +500,35 @@ def trim_binary_log(limit_bytes):
     try:
         if not os.path.exists(log_path):
             return
-        if not os.path.exists(index_path):
+        entries = load_index_entries()
+        if not entries:
             return
+        total_bytes = sum(l + 8 for _, l, _ in entries)
+        if total_bytes <= limit_bytes:
+            return
+        keep_limit = int(limit_bytes * 0.8)
+        keep_entries = []
+        size_acc = 0
+        for offset, length, count in reversed(entries):
+            if size_acc + length + 8 > keep_limit and keep_entries:
+                break
+            keep_entries.append((offset, length, count))
+            size_acc += length + 8
+        keep_entries = list(reversed(keep_entries))
+        if not keep_entries:
+            return
+        start_offset = keep_entries[0][0]
+        with open(log_path, "rb") as f:
+            f.seek(start_offset)
+            remaining = f.read()
         with log_lock:
-            with open(index_path, "rb") as idx_f:
-                length_bytes = idx_f.read()
-            lengths = [struct.unpack("<Q", length_bytes[i:i+8])[0] for i in range(0, len(length_bytes), 8)]
-            if not lengths:
-                return
-            total_bytes = sum(lengths) + len(lengths) * 8
-            if total_bytes <= limit_bytes:
-                return
-            keep_limit = int(limit_bytes * 0.8)
-            keep_lengths = []
-            size_acc = 0
-            for l in reversed(lengths):
-                if size_acc + l + 8 > keep_limit and keep_lengths:
-                    break
-                keep_lengths.append(l)
-                size_acc += l + 8
-            keep_lengths = list(reversed(keep_lengths))
-            start_idx = len(lengths) - len(keep_lengths)
-            offset = sum(lengths[:start_idx]) + start_idx * 8
-            with open(log_path, "rb") as f:
-                f.seek(offset)
-                remaining = f.read()
             with open(log_path, "wb") as f:
                 f.write(remaining)
             with open(index_path, "wb") as idx_f:
-                for l in keep_lengths:
-                    idx_f.write(struct.pack("<Q", l))
+                base_offset = 0
+                for _, length, count in keep_entries:
+                    idx_f.write(struct.pack("<QQQ", base_offset, length, count))
+                    base_offset += length + 8
     except Exception as e:
         print(f"Binary log trim error: {e}")
 
@@ -1381,10 +1449,23 @@ def sample_actions_from_source(path, sample_cap=8):
                 except Exception as e:
                     log_exception("LMDB sample error", e, f"key={meta_key}")
         elif path == log_path:
-            count = 0
-            for payload in iterate_binary_log(path):
-                if count >= sample_cap:
-                    break
+            entries = load_index_entries()
+            if not entries:
+                return 0, []
+            known_total = sum(int(c) for _, _, c in entries if c > 0)
+            unknown_remaining = len([1 for _, _, c in entries if c <= 0])
+            unknown_indices = [i for i, e in enumerate(entries) if e[2] <= 0]
+            pool = unknown_indices if unknown_indices else list(range(len(entries)))
+            pick = min(len(pool), sample_cap)
+            if pick <= 0:
+                return known_total, []
+            indices = [pool[i] for i in np.linspace(0, len(pool) - 1, pick, dtype=int)]
+            measured = []
+            for i in indices:
+                offset, length_bytes, count = entries[i]
+                payload = read_log_payload(offset, length_bytes)
+                if payload is None:
+                    continue
                 buf = io.BytesIO(payload)
                 data = np.load(buf, allow_pickle=True)
                 data = unwrap_array(data)
@@ -1392,7 +1473,10 @@ def sample_actions_from_source(path, sample_cap=8):
                 structured_array = hasattr(data, 'dtype') and getattr(data.dtype, "names", None) and 'action' in data.dtype.names
                 structured = structured_npz or structured_array
                 length = dataset_length(data, structured, structured_npz)
-                total_len += max(0, int(length))
+                if count <= 0:
+                    total_len += max(0, int(length))
+                    unknown_remaining = max(0, unknown_remaining - 1)
+                    measured.append(max(0, int(length)))
                 step = max(1, max(1, int(length // sample_cap))) if length > 0 else 1
                 idx = 0
                 while idx < length and len(samples) < sample_cap:
@@ -1400,7 +1484,10 @@ def sample_actions_from_source(path, sample_cap=8):
                     samples.append(safe_action_array(entry))
                     idx += step
                 release_data_handle(data)
-                count += 1
+            total_len += known_total
+            if unknown_remaining > 0 and measured:
+                avg_len = float(sum(measured)) / float(len(measured))
+                total_len += int(avg_len * unknown_remaining)
         else:
             with file_read_lock:
                 data = np.load(path, allow_pickle=True, mmap_mode="r")
@@ -1632,19 +1719,40 @@ def optimize_ai():
                     break
                 try:
                     if path == log_path:
-                        for payload in iterate_binary_log(path):
-                            if stop_optimization_flag.is_set():
-                                break
-                            buf = io.BytesIO(payload)
-                            data = np.load(buf, allow_pickle=True)
-                            data = unwrap_array(data)
-                            structured_npz = isinstance(data, np.lib.npyio.NpzFile)
-                            structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
-                            structured = structured_npz or structured_array
-                            length = dataset_length(data, structured, structured_npz)
-                            steps = max(1, length - seq_len)
-                            total += steps
-                            release_data_handle(data)
+                        entries = load_index_entries()
+                        if not entries:
+                            continue
+                        known_steps = [max(1, int(c) - seq_len) for _, _, c in entries if c > 0]
+                        total += sum(known_steps)
+                        unknown_entries = [(i, e) for i, e in enumerate(entries) if e[2] <= 0]
+                        if unknown_entries:
+                            probe = min(len(unknown_entries), 5)
+                            idx_candidates = np.linspace(0, len(unknown_entries) - 1, probe, dtype=int)
+                            measured = []
+                            remaining = len(unknown_entries)
+                            for idx_val in idx_candidates:
+                                if stop_optimization_flag.is_set():
+                                    break
+                                _, entry = unknown_entries[idx_val]
+                                payload = read_log_payload(entry[0], entry[1])
+                                if payload is None:
+                                    remaining = max(0, remaining - 1)
+                                    continue
+                                buf = io.BytesIO(payload)
+                                data = np.load(buf, allow_pickle=True)
+                                data = unwrap_array(data)
+                                structured_npz = isinstance(data, np.lib.npyio.NpzFile)
+                                structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
+                                structured = structured_npz or structured_array
+                                length = dataset_length(data, structured, structured_npz)
+                                release_data_handle(data)
+                                steps = max(1, int(length) - seq_len)
+                                total += steps
+                                measured.append(steps)
+                                remaining = max(0, remaining - 1)
+                            if remaining > 0 and measured:
+                                avg_steps = float(sum(measured)) / float(len(measured))
+                                total += int(avg_steps * remaining)
                         continue
                     if path == lmdb_path:
                         keys = lmdb_key_plan.get(path)
