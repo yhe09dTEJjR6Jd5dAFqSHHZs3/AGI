@@ -204,8 +204,16 @@ def cleanup_before_sleep():
         temp_trajectory.clear()
     except Exception as e:
         print(f"Cleanup warning during sleep prep: {e}")
-    gc.collect()
-    torch.cuda.empty_cache()
+    for _ in range(3):
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.ipc_collect()
+                torch.cuda.synchronize()
+        except Exception as ce:
+            print(f"Sleep cleanup CUDA warning: {ce}")
+        time.sleep(0.05)
 
 def force_memory_cleanup(iterations=2, delay=0.05):
     for _ in range(iterations):
@@ -1804,6 +1812,28 @@ def optimize_ai():
         torch.cuda.empty_cache()
 
         total_steps = sum(chunk_steps)
+        sleep_ratio = 0.618
+        if total_steps > 0:
+            target_steps = max(1, int(total_steps * sleep_ratio))
+            combined = list(zip(batch_files, chunk_steps))
+            random.shuffle(combined)
+            sampled_batches = []
+            sampled_steps = []
+            acc_steps = 0
+            for paths, steps in combined:
+                if acc_steps >= target_steps:
+                    break
+                allowed = min(steps, target_steps - acc_steps)
+                if allowed <= 0:
+                    continue
+                sampled_batches.append(paths)
+                sampled_steps.append(allowed)
+                acc_steps += allowed
+            if acc_steps > 0:
+                batch_files = sampled_batches
+                chunk_steps = sampled_steps
+                total_steps = sum(chunk_steps)
+                print(f"睡眠采样比例 61.8%: 预计 {total_steps}/{target_steps} steps，批次数 {len(batch_files)}")
         max_sleep_steps = 15000
         if total_mem_gb is not None:
             if total_mem_gb <= 4:
@@ -2137,6 +2167,9 @@ def start_training_mode():
                 return current[0] + out_x, current[1] + out_y
 
         pid = PIDController(0.6, 0.02, 0.3)
+        jitter_amplitude = 1.5
+        jitter_floor = 0.15
+        jitter_decay = 0.995
 
         while not stop_training_flag:
             if stop_training_flag:
@@ -2225,8 +2258,9 @@ def start_training_mode():
                     pid_out = pid.step(pid_target, current_mouse)
                     filtered_x = (pid_out[0] * 0.8) + (current_mouse[0] * 0.2)
                     filtered_y = (pid_out[1] * 0.8) + (current_mouse[1] * 0.2)
-                    jitter_x = random.uniform(-1.0, 1.0)
-                    jitter_y = random.uniform(-1.0, 1.0)
+                    jitter_x = random.uniform(-jitter_amplitude, jitter_amplitude)
+                    jitter_y = random.uniform(-jitter_amplitude, jitter_amplitude)
+                    jitter_amplitude = max(jitter_floor, jitter_amplitude * jitter_decay)
                     final_x = int(min(max(0, filtered_x + jitter_x), screen_w - 1))
                     final_y = int(min(max(0, filtered_y + jitter_y), screen_h - 1))
                     pred_buttons = torch.sigmoid(button_logits[0]).detach().cpu().numpy()
