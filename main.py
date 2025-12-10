@@ -16,6 +16,7 @@ import struct
 import tempfile
 import json
 import math
+import traceback
 from collections import deque
 if os.name == "nt":
     import winreg
@@ -23,6 +24,17 @@ if os.name == "nt":
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", module="pynvml")
+
+def log_exception(context, err=None, extra=None):
+    parts = [context]
+    if err is not None:
+        parts.append(str(err))
+    if extra:
+        parts.append(str(extra))
+    print(" | ".join(parts))
+    tb = traceback.format_exc()
+    if tb:
+        print(tb.strip())
 
 def resolve_desktop_path():
     if os.name == "nt":
@@ -345,7 +357,7 @@ def get_lmdb_length():
         print(f"LMDB length error: {e}")
         return 0
 
-def iterate_lmdb_entries(keys=None):
+def iterate_lmdb_entries(keys=None, return_keys=False):
     try:
         env = get_lmdb_env()
         if keys is None:
@@ -362,16 +374,16 @@ def iterate_lmdb_entries(keys=None):
                 for key, val in cursor:
                     if key in (b"__counter__", b"__start__"):
                         continue
-                    yield val
+                    yield (int.from_bytes(key, "little"), val) if return_keys else val
         else:
             with env.begin() as txn:
                 for k in keys:
                     key_bytes = int(k).to_bytes(8, "little")
                     val = txn.get(key_bytes)
                     if val is not None:
-                        yield val
+                        yield (int(k), val) if return_keys else val
     except Exception as e:
-        print(f"LMDB iterate error: {e}")
+        log_exception("LMDB iterate error", e)
 
 def trim_lmdb(limit_bytes):
     try:
@@ -982,8 +994,29 @@ class StreamingGameDataset(IterableDataset):
             return safe_image_data(item, structured)
 
         def normalize_image(img):
-            img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB) if img.shape[2] == 4 else img
-            return img.transpose(2, 0, 1).astype(np.uint8, copy=False)
+            arr = None
+            try:
+                arr = np.asarray(img) if img is not None else None
+                if arr is None or arr.size == 0:
+                    return np.zeros((3, target_h, target_w), dtype=np.uint8)
+                if arr.ndim == 2:
+                    arr = np.stack([arr] * 3, axis=-1)
+                elif arr.ndim == 3 and arr.shape[2] == 1:
+                    arr = np.repeat(arr, 3, axis=2)
+                elif arr.ndim < 3:
+                    arr = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+                if arr.ndim == 3 and arr.shape[2] > 3:
+                    arr = arr[:, :, :3]
+                if arr.shape[0] != target_h or arr.shape[1] != target_w:
+                    arr = cv2.resize(arr, (target_w, target_h))
+                if arr.ndim == 3 and arr.shape[2] == 4:
+                    arr = cv2.cvtColor(arr, cv2.COLOR_BGRA2RGB)
+                if arr.ndim != 3 or arr.shape[2] < 3:
+                    arr = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+            except Exception as e:
+                log_exception("Image normalize error", e)
+                arr = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+            return arr.transpose(2, 0, 1).astype(np.uint8, copy=False)
 
         for idx, item in enumerate(slice_data):
             if structured:
@@ -1164,51 +1197,54 @@ class StreamingGameDataset(IterableDataset):
                                         output_queue.put(item)
                                     release_data_handle(data)
                                 except Exception as e:
-                                    print(f"Binary data load error: {e}")
+                                    log_exception("Binary data load error", e, f"path={path}")
                             continue
                         if path == lmdb_path:
                             try:
                                 keys = self.lmdb_keys.get(lmdb_path)
-                                for payload in iterate_lmdb_entries(keys):
+                                for meta_key, payload in iterate_lmdb_entries(keys, return_keys=True):
                                     if stop_optimization_flag.is_set():
                                         break
-                                    buf = io.BytesIO(payload)
-                                    data = np.load(buf, allow_pickle=True)
-                                    data = unwrap_array(data)
-                                    structured_npz = isinstance(data, np.lib.npyio.NpzFile)
-                                    structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
-                                    structured = structured_npz or structured_array
-                                    if structured_npz and (('image' not in data) or ('action' not in data)):
-                                        release_data_handle(data)
-                                        continue
-                                    length = dataset_length(data, structured, structured_npz)
-                                    if length <= 0:
-                                        if structured_npz:
-                                            data.close()
-                                        continue
-                                    max_start = max(1, length - self.seq_len)
-                                    for start_idx in range(max_start):
-                                        if stop_optimization_flag.is_set():
-                                            break
-                                        slice_data = []
-                                        for i in range(self.seq_len):
-                                            idx_in_file = min(start_idx + i, length - 1)
-                                            entry = build_entry_pair(data, idx_in_file, structured_npz, structured)
-                                            if entry is None:
-                                                slice_data = []
-                                                break
-                                            slice_data.append(entry)
-                                        next_entry = None
-                                        next_idx = start_idx + self.seq_len
-                                        if next_idx < length:
-                                            next_entry = build_entry_pair(data, next_idx, structured_npz, structured)
-                                        if not slice_data:
+                                    try:
+                                        buf = io.BytesIO(payload)
+                                        data = np.load(buf, allow_pickle=True)
+                                        data = unwrap_array(data)
+                                        structured_npz = isinstance(data, np.lib.npyio.NpzFile)
+                                        structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
+                                        structured = structured_npz or structured_array
+                                        if structured_npz and (('image' not in data) or ('action' not in data)):
+                                            release_data_handle(data)
                                             continue
-                                        item = self._prepare_item(slice_data, next_entry, structured, structured_npz)
-                                        output_queue.put(item)
-                                    release_data_handle(data)
+                                        length = dataset_length(data, structured, structured_npz)
+                                        if length <= 0:
+                                            if structured_npz:
+                                                data.close()
+                                            continue
+                                        max_start = max(1, length - self.seq_len)
+                                        for start_idx in range(max_start):
+                                            if stop_optimization_flag.is_set():
+                                                break
+                                            slice_data = []
+                                            for i in range(self.seq_len):
+                                                idx_in_file = min(start_idx + i, length - 1)
+                                                entry = build_entry_pair(data, idx_in_file, structured_npz, structured)
+                                                if entry is None:
+                                                    slice_data = []
+                                                    break
+                                                slice_data.append(entry)
+                                            next_entry = None
+                                            next_idx = start_idx + self.seq_len
+                                            if next_idx < length:
+                                                next_entry = build_entry_pair(data, next_idx, structured_npz, structured)
+                                            if not slice_data:
+                                                continue
+                                            item = self._prepare_item(slice_data, next_entry, structured, structured_npz)
+                                            output_queue.put(item)
+                                        release_data_handle(data)
+                                    except Exception as e:
+                                        log_exception("LMDB data load error", e, f"key={meta_key}")
                             except Exception as e:
-                                print(f"LMDB data load error: {e}")
+                                log_exception("LMDB data iteration failure", e)
                             continue
                         with file_read_lock:
                             data = np.load(path, allow_pickle=True, mmap_mode="r")
@@ -1243,9 +1279,9 @@ class StreamingGameDataset(IterableDataset):
                             output_queue.put(item)
                         release_data_handle(data)
                     except Exception as e:
-                        print(f"Data load error: {e}")
+                        log_exception("Data load error", e, f"path={path}")
             except Exception as e:
-                print(f"Producer failure: {e}")
+                log_exception("Producer failure", e)
             finally:
                 stop_event.set()
 
@@ -1288,27 +1324,30 @@ def sample_actions_from_source(path, sample_cap=8):
         if path == lmdb_path:
             meta_entries = load_meta_entries()
             key_subset = [m.get("key") for m in sorted(meta_entries, key=lambda x: x.get("timestamp", 0), reverse=True)[:sample_cap] if "key" in m]
-            for payload in iterate_lmdb_entries(key_subset):
-                buf = io.BytesIO(payload)
-                data = np.load(buf, allow_pickle=True)
-                data = unwrap_array(data)
-                structured_npz = isinstance(data, np.lib.npyio.NpzFile)
-                structured_array = hasattr(data, 'dtype') and getattr(data.dtype, "names", None) and 'action' in data.dtype.names
-                structured = structured_npz or structured_array
-                if structured_npz and (('image' not in data) or ('action' not in data)):
+            for meta_key, payload in iterate_lmdb_entries(key_subset, return_keys=True):
+                try:
+                    buf = io.BytesIO(payload)
+                    data = np.load(buf, allow_pickle=True)
+                    data = unwrap_array(data)
+                    structured_npz = isinstance(data, np.lib.npyio.NpzFile)
+                    structured_array = hasattr(data, 'dtype') and getattr(data.dtype, "names", None) and 'action' in data.dtype.names
+                    structured = structured_npz or structured_array
+                    if structured_npz and (('image' not in data) or ('action' not in data)):
+                        release_data_handle(data)
+                        continue
+                    length = dataset_length(data, structured, structured_npz)
+                    total_len += max(0, int(length))
+                    step = max(1, int(max(1, length) // max(1, sample_cap))) if length > 0 else 1
+                    idx = 0
+                    while idx < length and len(samples) < sample_cap:
+                        entry = build_entry_pair(data, idx, structured_npz, structured)
+                        if entry is None:
+                            break
+                        samples.append(safe_action_array(entry))
+                        idx += step
                     release_data_handle(data)
-                    continue
-                length = dataset_length(data, structured, structured_npz)
-                total_len += max(0, int(length))
-                step = max(1, int(max(1, length) // max(1, sample_cap))) if length > 0 else 1
-                idx = 0
-                while idx < length and len(samples) < sample_cap:
-                    entry = build_entry_pair(data, idx, structured_npz, structured)
-                    if entry is None:
-                        break
-                    samples.append(safe_action_array(entry))
-                    idx += step
-                release_data_handle(data)
+                except Exception as e:
+                    log_exception("LMDB sample error", e, f"key={meta_key}")
         elif path == log_path:
             count = 0
             for payload in iterate_binary_log(path):
@@ -1347,7 +1386,7 @@ def sample_actions_from_source(path, sample_cap=8):
                 idx += step
             release_data_handle(data)
     except Exception as e:
-        print(f"Data probe error: {e}")
+        log_exception("Data probe error", e, f"path={path}")
     return total_len, samples
 
 
@@ -1520,8 +1559,8 @@ def optimize_ai():
             try:
                 if os.path.getsize(c) > 0:
                     valid_candidates.append(c)
-            except Exception:
-                continue
+            except Exception as e:
+                log_exception("Data candidate check failed", e, f"path={c}")
         sleep_stats = []
         lmdb_key_plan = {}
         prioritized, sleep_stats, lmdb_key_plan = build_sleep_file_mix(valid_candidates, limit=25)
@@ -1539,8 +1578,8 @@ def optimize_ai():
             try:
                 if os.path.getsize(f) > 0:
                     files.append(f)
-            except:
-                continue
+            except Exception as e:
+                log_exception("Data scan failed", e, f"path={f}")
         if stop_optimization_flag.is_set():
             interrupted = True
             print("Optimization interrupted before dataset selection.")
@@ -1584,8 +1623,8 @@ def optimize_ai():
                                     length = int(meta_entries[0].get("length", 0))
                                     steps = max(1, length - seq_len)
                                     total += steps
-                                except Exception:
-                                    continue
+                                except Exception as e:
+                                    log_exception("LMDB meta parse failure", e, f"key={meta_key}")
                         else:
                             length = get_lmdb_length()
                             steps = max(1, length - seq_len)
@@ -1601,8 +1640,8 @@ def optimize_ai():
                     steps = max(1, length - seq_len)
                     total += steps
                     release_data_handle(data)
-                except Exception:
-                    continue
+                except Exception as e:
+                    log_exception("Step estimation error", e, f"path={path}")
             return total
 
         chunk_steps = []
@@ -2231,6 +2270,7 @@ def input_loop():
             cmd = command_queue.get(timeout=0.1)
         except queue.Empty:
             continue
+        print(f"收到指令: {cmd}")
         interpreted = interpret_command(cmd)
         if interpreted == "sleep":
             if current_mode == MODE_LEARNING:
@@ -2245,6 +2285,8 @@ def input_loop():
                 recording_pause_event.clear()
                 capture_pause_event.clear()
                 print("Back to Learning.")
+            else:
+                print(f"当前模式为{current_mode}，暂无法进入睡眠模式。")
         elif interpreted == "train":
             if current_mode == MODE_LEARNING:
                 flush_buffers()
@@ -2253,6 +2295,10 @@ def input_loop():
                 t_thread = threading.Thread(target=start_training_mode)
                 t_thread.daemon = True
                 t_thread.start()
+            else:
+                print(f"当前模式为{current_mode}，暂无法进入训练模式。")
+        else:
+            print(f"未能识别的指令: {cmd}")
 
 if __name__ == "__main__":
     ensure_initial_model()
