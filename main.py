@@ -14,6 +14,8 @@ import warnings
 import io
 import struct
 import tempfile
+import json
+import math
 from collections import deque
 if os.name == "nt":
     import winreg
@@ -100,6 +102,7 @@ temp_dir = os.path.join(base_dir, "temp")
 log_path = os.path.join(data_dir, "experience.log")
 index_path = os.path.join(data_dir, "experience.idx")
 lmdb_path = os.path.join(data_dir, "experience.lmdb")
+meta_path = os.path.join(data_dir, "experience_meta.json")
 
 for d in [base_dir, data_dir, model_dir, temp_dir]:
     if not os.path.exists(d):
@@ -160,10 +163,12 @@ file_read_lock = threading.Lock()
 file_write_lock = threading.Lock()
 log_lock = threading.Lock()
 lmdb_lock = threading.Lock()
+meta_lock = threading.Lock()
 lmdb_env = None
 lmdb_counter = 0
 lmdb_start = 0
 current_map_size_gb = 10
+dxcam_camera = None
 
 def update_latest_frame(img, ts):
     with frame_lock:
@@ -199,6 +204,7 @@ def force_memory_cleanup(iterations=2, delay=0.05):
 
 data_queue = queue.Queue()
 save_queue = queue.Queue()
+command_queue = queue.Queue()
 
 def append_binary_log(img_arr, act_arr):
     try:
@@ -262,29 +268,59 @@ def recreate_lmdb_env(new_size_gb):
     lmdb_env = None
     return get_lmdb_env(new_size_gb)
 
-def append_lmdb_records(img_arr, act_arr):
+def load_meta_entries():
+    try:
+        if not os.path.exists(meta_path):
+            return []
+        with meta_lock:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"Meta read error: {e}")
+        return []
+
+def append_meta_entry(key_val, length, source_type, action_score):
+    try:
+        entry = {"key": int(key_val), "length": int(length), "timestamp": time.time(), "type": source_type, "action_score": float(action_score)}
+        with meta_lock:
+            data = load_meta_entries()
+            data.append(entry)
+            if len(data) > 20000:
+                data = data[-20000:]
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+    except Exception as e:
+        print(f"Meta append error: {e}")
+
+def append_lmdb_records(img_arr, act_arr, source_type="human"):
     global lmdb_counter, current_map_size_gb
     if len(img_arr) != len(act_arr):
         print("LMDB append skipped due to length mismatch")
         return
     if len(img_arr) == 0:
         return
-    payloads = []
-    for i in range(len(img_arr)):
+    try:
         buf = io.BytesIO()
-        np.savez_compressed(buf, image=img_arr[i], action=act_arr[i])
-        payloads.append(buf.getvalue())
+        np.savez_compressed(buf, image=img_arr, action=act_arr)
+        payload = buf.getvalue()
+    except Exception as e:
+        print(f"Chunk pack error: {e}")
+        return
     retry = 0
     while retry < 3:
         try:
             env = get_lmdb_env()
             with lmdb_lock:
                 with env.begin(write=True) as txn:
-                    for payload in payloads:
-                        key = lmdb_counter.to_bytes(8, "little")
-                        txn.put(key, payload)
-                        lmdb_counter += 1
+                    key = lmdb_counter.to_bytes(8, "little")
+                    txn.put(key, payload)
+                    lmdb_counter += 1
                     txn.put(b"__counter__", lmdb_counter.to_bytes(8, "little"))
+            try:
+                score = float(np.mean(np.abs(act_arr))) if act_arr.size > 0 else 0.0
+            except Exception:
+                score = 0.0
+            append_meta_entry(lmdb_counter - 1, len(img_arr), source_type, score)
             return
         except lmdb.MapFullError:
             with lmdb_lock:
@@ -309,23 +345,31 @@ def get_lmdb_length():
         print(f"LMDB length error: {e}")
         return 0
 
-def iterate_lmdb_entries():
+def iterate_lmdb_entries(keys=None):
     try:
         env = get_lmdb_env()
-        with env.begin() as txn:
-            start_bytes = txn.get(b"__start__")
-            start_val = int.from_bytes(start_bytes, "little") if start_bytes else 0
-        with env.begin() as txn:
-            cursor = txn.cursor()
-            seek_key = start_val.to_bytes(8, "little")
-            if cursor.set_key(seek_key):
-                pass
-            else:
-                cursor.first()
-            for key, val in cursor:
-                if key in (b"__counter__", b"__start__"):
-                    continue
-                yield val
+        if keys is None:
+            with env.begin() as txn:
+                start_bytes = txn.get(b"__start__")
+                start_val = int.from_bytes(start_bytes, "little") if start_bytes else 0
+            with env.begin() as txn:
+                cursor = txn.cursor()
+                seek_key = start_val.to_bytes(8, "little")
+                if cursor.set_key(seek_key):
+                    pass
+                else:
+                    cursor.first()
+                for key, val in cursor:
+                    if key in (b"__counter__", b"__start__"):
+                        continue
+                    yield val
+        else:
+            with env.begin() as txn:
+                for k in keys:
+                    key_bytes = int(k).to_bytes(8, "little")
+                    val = txn.get(key_bytes)
+                    if val is not None:
+                        yield val
     except Exception as e:
         print(f"LMDB iterate error: {e}")
 
@@ -565,7 +609,8 @@ def resource_monitor():
 
 def frame_generator_loop():
     try:
-        camera = None
+        global dxcam_camera
+        camera = dxcam_camera
         sct = None
         use_dx = os.name == "nt" and dxcam is not None
         while True:
@@ -575,7 +620,7 @@ def frame_generator_loop():
                         camera.stop()
                     except Exception as e:
                         print(f"Camera stop warning: {e}")
-                    camera = None
+                    camera = dxcam_camera
                 if sct is not None:
                     try:
                         sct.close()
@@ -586,10 +631,12 @@ def frame_generator_loop():
                 continue
             if use_dx and camera is None:
                 try:
-                    camera = dxcam.create(output_idx=0)
+                    dxcam_camera = dxcam_camera if dxcam_camera is not None else dxcam.create(output_idx=0)
+                    camera = dxcam_camera
                     camera.start(target_fps=max(30, capture_freq * 2), video_mode=True, dup=False)
                 except Exception:
                     camera = None
+                    dxcam_camera = None
                     use_dx = False
             if use_dx and camera is not None:
                 start = time.time()
@@ -748,11 +795,12 @@ def disk_writer_loop():
             if payload is None or len(payload) < 2:
                 continue
             img_arr, act_arr = payload[0], payload[1]
+            source_type = payload[2] if len(payload) > 2 else "human"
             if len(img_arr) != len(act_arr) or len(img_arr) == 0:
                 print("LMDB pipeline skipped invalid batch")
                 continue
             try:
-                append_lmdb_records(img_arr, act_arr)
+                append_lmdb_records(img_arr, act_arr, source_type)
             except Exception as e:
                 print(f"LMDB pipeline error: {e}")
             check_counter += 1
@@ -917,9 +965,10 @@ def dataset_length(data, structured, structured_npz):
         return 0
 
 class StreamingGameDataset(IterableDataset):
-    def __init__(self, file_list):
+    def __init__(self, file_list, lmdb_keys=None):
         self.file_list = list(file_list)
         self.seq_len = seq_len
+        self.lmdb_keys = lmdb_keys or {}
 
     def _prepare_item(self, slice_data, next_entry, structured, structured_npz):
         slice_len = len(slice_data)
@@ -1119,7 +1168,8 @@ class StreamingGameDataset(IterableDataset):
                             continue
                         if path == lmdb_path:
                             try:
-                                for payload in iterate_lmdb_entries():
+                                keys = self.lmdb_keys.get(lmdb_path)
+                                for payload in iterate_lmdb_entries(keys):
                                     if stop_optimization_flag.is_set():
                                         break
                                     buf = io.BytesIO(payload)
@@ -1236,10 +1286,9 @@ def sample_actions_from_source(path, sample_cap=8):
     total_len = 0
     try:
         if path == lmdb_path:
-            count = 0
-            for payload in iterate_lmdb_entries():
-                if count >= sample_cap:
-                    break
+            meta_entries = load_meta_entries()
+            key_subset = [m.get("key") for m in sorted(meta_entries, key=lambda x: x.get("timestamp", 0), reverse=True)[:sample_cap] if "key" in m]
+            for payload in iterate_lmdb_entries(key_subset):
                 buf = io.BytesIO(payload)
                 data = np.load(buf, allow_pickle=True)
                 data = unwrap_array(data)
@@ -1248,21 +1297,18 @@ def sample_actions_from_source(path, sample_cap=8):
                 structured = structured_npz or structured_array
                 if structured_npz and (('image' not in data) or ('action' not in data)):
                     release_data_handle(data)
-                    count += 1
                     continue
-                if structured:
-                    acts = data['action'] if structured_npz else data['action']
-                    arr = np.asarray(acts, dtype=np.float32)
-                    length = int(arr.size if arr.ndim == 1 else (arr.shape[0] if arr.ndim > 0 else 0))
-                    if length > total_len:
-                        total_len = length
-                    if length > 0:
-                        samples.append(safe_action_array(arr[0]))
-                else:
-                    total_len += 1
-                    samples.append(safe_action_array(data))
+                length = dataset_length(data, structured, structured_npz)
+                total_len += max(0, int(length))
+                step = max(1, int(max(1, length) // max(1, sample_cap))) if length > 0 else 1
+                idx = 0
+                while idx < length and len(samples) < sample_cap:
+                    entry = build_entry_pair(data, idx, structured_npz, structured)
+                    if entry is None:
+                        break
+                    samples.append(safe_action_array(entry))
+                    idx += step
                 release_data_handle(data)
-                count += 1
         elif path == log_path:
             count = 0
             for payload in iterate_binary_log(path):
@@ -1307,52 +1353,67 @@ def sample_actions_from_source(path, sample_cap=8):
 
 def build_sleep_file_mix(candidates, limit=20):
     stats = []
+    lmdb_selection = {}
     for path in candidates:
-        length, samples = sample_actions_from_source(path)
-        try:
-            mtime = os.path.getmtime(path)
-        except Exception:
-            mtime = 0
-        if length <= 0 and not samples:
-            continue
-        human_score = 0.0
-        surprise_score = 0.0
-        if samples:
-            flat_samples = []
-            for a in samples:
-                try:
-                    v = np.asarray(a, dtype=np.float32).reshape(-1)
-                except Exception:
-                    v = safe_action_array(a)
-                flat_samples.append(v)
-            human_vals = []
-            surprise_vals = []
-            for v in flat_samples:
-                size = int(getattr(v, "size", 0))
-                if size <= 0:
+        if path == lmdb_path:
+            meta_entries = load_meta_entries()
+            if not meta_entries:
+                continue
+            for m in meta_entries:
+                length = int(m.get("length", 0))
+                if length <= 0:
                     continue
-                if size > mouse_feature_dim:
-                    human_vals.append(1.0 if v[mouse_feature_dim] < 0.5 else 0.0)
-                else:
-                    human_vals.append(0.5)
-                if size > 18:
-                    surprise_vals.append(float(np.mean(np.abs(v[16:18]))))
-                else:
-                    surprise_vals.append(0.0)
-            if human_vals:
-                human_score = float(np.mean(human_vals))
-            if surprise_vals:
-                surprise_score = float(np.mean(surprise_vals))
-        steps_est = max(1, int(length) - seq_len)
-        stats.append((path, human_score, surprise_score, int(length), float(mtime), steps_est))
+                ts = float(m.get("timestamp", 0))
+                human_score = 1.0 if m.get("type") == "human" else 0.3
+                surprise_score = float(m.get("action_score", 0.0))
+                steps_est = max(1, length - seq_len)
+                stats.append((path, human_score, surprise_score, length, ts, steps_est, m.get("key")))
+        else:
+            length, samples = sample_actions_from_source(path)
+            try:
+                mtime = os.path.getmtime(path)
+            except Exception:
+                mtime = 0
+            if length <= 0 and not samples:
+                continue
+            human_score = 0.0
+            surprise_score = 0.0
+            if samples:
+                flat_samples = []
+                for a in samples:
+                    try:
+                        v = np.asarray(a, dtype=np.float32).reshape(-1)
+                    except Exception:
+                        v = safe_action_array(a)
+                    flat_samples.append(v)
+                human_vals = []
+                surprise_vals = []
+                for v in flat_samples:
+                    size = int(getattr(v, "size", 0))
+                    if size <= 0:
+                        continue
+                    if size > mouse_feature_dim:
+                        human_vals.append(1.0 if v[mouse_feature_dim] < 0.5 else 0.0)
+                    else:
+                        human_vals.append(0.5)
+                    if size > 18:
+                        surprise_vals.append(float(np.mean(np.abs(v[16:18]))))
+                    else:
+                        surprise_vals.append(0.0)
+                if human_vals:
+                    human_score = float(np.mean(human_vals))
+                if surprise_vals:
+                    surprise_score = float(np.mean(surprise_vals))
+            steps_est = max(1, int(length) - seq_len)
+            stats.append((path, human_score, surprise_score, int(length), float(mtime), steps_est, None))
     if not stats:
-        return [], []
+        return [], [], {}
     stats.sort(key=lambda x: x[3], reverse=True)
     if limit and len(stats) > limit:
         stats = stats[:limit]
     total_steps = sum(s[5] for s in stats)
     if total_steps <= 0:
-        return [], stats
+        return [], stats, {}
     human_target = total_steps * 0.4
     recent_target = total_steps * 0.3
     surprise_target = total_steps * 0.2
@@ -1369,10 +1430,14 @@ def build_sleep_file_mix(candidates, limit=20):
             return
         used_steps = 0
         for item in pool:
-            if item[0] in selected_paths:
+            path = item[0]
+            key = item[6]
+            if key is None and path in selected_paths and path != lmdb_path:
                 continue
-            selection.append(item[0])
-            selected_paths.add(item[0])
+            if path == lmdb_path:
+                lmdb_selection.setdefault(path, []).append(key)
+            selection.append(path)
+            selected_paths.add(path)
             used_steps += item[5]
             if used_steps >= target_steps:
                 break
@@ -1384,7 +1449,8 @@ def build_sleep_file_mix(candidates, limit=20):
     pick_steps(surprise_pool, surprise_target, "高惊讶度样本")
     random.shuffle(history_pool)
     pick_steps(history_pool, history_target, "历史样本")
-    return selection, stats
+    selection = list(dict.fromkeys(selection))
+    return selection, stats, lmdb_selection
 
 
 def optimize_ai():
@@ -1441,6 +1507,7 @@ def optimize_ai():
                     train_batch_size = 12
             except Exception as e:
                 print(f"GPU property probe warning: {e}")
+        effective_batch = train_batch_size * accumulation_steps
         interrupted = False
 
         consolidate_data_files()
@@ -1456,7 +1523,8 @@ def optimize_ai():
             except Exception:
                 continue
         sleep_stats = []
-        prioritized, sleep_stats = build_sleep_file_mix(valid_candidates, limit=25)
+        lmdb_key_plan = {}
+        prioritized, sleep_stats, lmdb_key_plan = build_sleep_file_mix(valid_candidates, limit=25)
         target_files = prioritized if prioritized else valid_candidates
         files = []
         total_scan = len(target_files)
@@ -1506,9 +1574,22 @@ def optimize_ai():
                             release_data_handle(data)
                         continue
                     if path == lmdb_path:
-                        length = get_lmdb_length()
-                        steps = max(1, length - seq_len)
-                        total += steps
+                        keys = lmdb_key_plan.get(path)
+                        if keys:
+                            for meta_key in keys:
+                                try:
+                                    meta_entries = [m for m in load_meta_entries() if m.get("key") == meta_key]
+                                    if not meta_entries:
+                                        continue
+                                    length = int(meta_entries[0].get("length", 0))
+                                    steps = max(1, length - seq_len)
+                                    total += steps
+                                except Exception:
+                                    continue
+                        else:
+                            length = get_lmdb_length()
+                            steps = max(1, length - seq_len)
+                            total += steps
                         continue
                     with file_read_lock:
                         data = np.load(path, allow_pickle=True, mmap_mode="r")
@@ -1596,7 +1677,7 @@ def optimize_ai():
                 break
             chunk_trained = False
             while not chunk_trained and not stop_optimization_flag.is_set():
-                dataset = StreamingGameDataset(bf)
+                dataset = StreamingGameDataset(bf, lmdb_key_plan)
                 loader_workers = 0 if low_vram_mode or os.name == "nt" else 2
                 loader = DataLoader(dataset, batch_size=train_batch_size, drop_last=False, num_workers=loader_workers, pin_memory=True, persistent_workers=loader_workers > 0)
                 optimizer.zero_grad()
@@ -1693,8 +1774,10 @@ def optimize_ai():
                         torch.cuda.empty_cache()
                         gc.collect()
                         if train_batch_size > 1:
-                            train_batch_size = max(1, train_batch_size // 2)
-                            print(f"OOM detected, reducing batch size to {train_batch_size}")
+                            new_batch = max(1, train_batch_size // 2)
+                            train_batch_size = new_batch
+                            accumulation_steps = max(accumulation_steps, int(math.ceil(effective_batch / max(1, train_batch_size))))
+                            print(f"OOM detected, batch -> {train_batch_size}, accumulation -> {accumulation_steps}")
                             continue
                         interrupted = True
                         stop_optimization_flag.set()
@@ -2005,13 +2088,15 @@ def record_data_loop():
     buffer_images = []
     buffer_actions = []
     last_pos = (0, 0)
+    chunk_target = random.randint(60, 100)
 
     while True:
         if recording_pause_event.is_set():
             if flush_event.is_set():
                 if buffer_images:
                     img_arr, act_arr = prepare_saved_arrays(buffer_images, buffer_actions)
-                    save_queue.put((img_arr, act_arr))
+                    source_type = "ai" if current_mode == MODE_TRAINING else "human"
+                    save_queue.put((img_arr, act_arr, source_type))
                     buffer_images = []
                     buffer_actions = []
                     save_queue.join()
@@ -2063,11 +2148,13 @@ def record_data_loop():
                 buffer_actions.append(action_entry)
                 last_pos = (c_state["x"], c_state["y"])
 
-                if len(buffer_images) >= 10000:
+                if len(buffer_images) >= chunk_target:
                     img_arr, act_arr = prepare_saved_arrays(buffer_images, buffer_actions)
-                    save_queue.put((img_arr, act_arr))
+                    source_type = "ai" if current_mode == MODE_TRAINING else "human"
+                    save_queue.put((img_arr, act_arr, source_type))
                     buffer_images = []
                     buffer_actions = []
+                    chunk_target = random.randint(60, 100)
 
                 elapsed = time.time() - start_time
                 wait = (1.0 / capture_freq) - elapsed
@@ -2078,7 +2165,8 @@ def record_data_loop():
             if flush_event.is_set():
                 if buffer_images:
                     img_arr, act_arr = prepare_saved_arrays(buffer_images, buffer_actions)
-                    save_queue.put((img_arr, act_arr))
+                    source_type = "ai" if current_mode == MODE_TRAINING else "human"
+                    save_queue.put((img_arr, act_arr, source_type))
                     buffer_images = []
                     buffer_actions = []
                     save_queue.join()
@@ -2088,7 +2176,8 @@ def record_data_loop():
             if flush_event.is_set():
                 if buffer_images:
                     img_arr, act_arr = prepare_saved_arrays(buffer_images, buffer_actions)
-                    save_queue.put((img_arr, act_arr))
+                    source_type = "ai" if current_mode == MODE_TRAINING else "human"
+                    save_queue.put((img_arr, act_arr, source_type))
                     buffer_images = []
                     buffer_actions = []
                     save_queue.join()
@@ -2120,48 +2209,27 @@ def interpret_command(cmd):
         return "train"
     return None
 
+def enqueue_input():
+    while True:
+        try:
+            cmd = input("请输入指令（睡眠/训练）： ").strip()
+            command_queue.put(cmd)
+        except Exception as e:
+            print(f"Input error: {e}")
+            time.sleep(0.2)
+
 def input_loop():
     global current_mode
+    reader_started = False
     while True:
-        cmd = None
-        if os.name == "nt":
-            try:
-                if msvcrt.kbhit():
-                    ch = msvcrt.getwch()
-                    if ch in ("\r", "\n"):
-                        cmd = ""
-                    elif ch == "\b":
-                        continue
-                    else:
-                        buffer = ch
-                        while True:
-                            if msvcrt.kbhit():
-                                c2 = msvcrt.getwch()
-                                if c2 in ("\r", "\n"):
-                                    break
-                                if c2 == "\b":
-                                    if buffer:
-                                        buffer = buffer[:-1]
-                                    continue
-                                buffer += c2
-                            else:
-                                time.sleep(0.05)
-                        cmd = buffer
-                else:
-                    time.sleep(0.05)
-                    continue
-            except Exception as e:
-                print(f"Input error: {e}")
-                time.sleep(0.1)
-                continue
-        else:
-            try:
-                cmd = input("请输入指令（睡眠/训练）： ").strip()
-            except Exception as e:
-                print(f"Input error: {e}")
-                time.sleep(0.1)
-                continue
-        if cmd is None:
+        if not reader_started:
+            t_reader = threading.Thread(target=enqueue_input)
+            t_reader.daemon = True
+            t_reader.start()
+            reader_started = True
+        try:
+            cmd = command_queue.get(timeout=0.1)
+        except queue.Empty:
             continue
         interpreted = interpret_command(cmd)
         if interpreted == "sleep":
