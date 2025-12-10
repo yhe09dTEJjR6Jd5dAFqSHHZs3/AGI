@@ -25,6 +25,8 @@ if os.name == "nt":
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", module="pynvml")
 
+progress_bar_lock = threading.Lock()
+
 def log_exception(context, err=None, extra=None):
     parts = [context]
     if err is not None:
@@ -55,10 +57,11 @@ def progress_bar(prefix, current, total, suffix=""):
     filled = int(bar_len * ratio)
     bar = "█" * filled + "-" * (bar_len - filled)
     percent = format(ratio * 100, ".2f")
-    sys.stdout.write(f"\r{prefix} [{bar}] {percent}% {suffix}")
-    sys.stdout.flush()
-    if current >= total:
-        sys.stdout.write("\n")
+    with progress_bar_lock:
+        sys.stdout.write(f"\r{prefix} [{bar}] {percent}% {suffix}")
+        sys.stdout.flush()
+        if current >= total:
+            sys.stdout.write("\n")
 
 def install_requirements():
     package_map = {
@@ -281,6 +284,17 @@ def recreate_lmdb_env(new_size_gb):
         print(f"LMDB close warning before resize: {e}")
     lmdb_env = None
     return get_lmdb_env(new_size_gb)
+
+def reset_lmdb_env():
+    global lmdb_env
+    with lmdb_lock:
+        try:
+            if lmdb_env is not None:
+                lmdb_env.close()
+        except Exception as e:
+            print(f"LMDB reset warning: {e}")
+        lmdb_env = None
+    gc.collect()
 
 def load_meta_entries():
     try:
@@ -1155,15 +1169,21 @@ class StreamingGameDataset(IterableDataset):
         output_queue = queue.Queue(maxsize=queue_size)
         stop_event = threading.Event()
 
+        def should_stop():
+            if stop_optimization_flag.is_set():
+                gc.collect()
+                return True
+            return False
+
         def producer():
             try:
                 for path in self.file_list:
-                    if stop_optimization_flag.is_set():
+                    if should_stop():
                         break
                     try:
                         if path == log_path:
                             for payload in iterate_binary_log(path):
-                                if stop_optimization_flag.is_set():
+                                if should_stop():
                                     break
                                 try:
                                     buf = io.BytesIO(payload)
@@ -1179,7 +1199,7 @@ class StreamingGameDataset(IterableDataset):
                                         continue
                                     max_start = max(1, length - self.seq_len)
                                     for start_idx in range(max_start):
-                                        if stop_optimization_flag.is_set():
+                                        if should_stop():
                                             break
                                         slice_data = []
                                         for i in range(self.seq_len):
@@ -1205,7 +1225,7 @@ class StreamingGameDataset(IterableDataset):
                             try:
                                 keys = self.lmdb_keys.get(lmdb_path)
                                 for meta_key, payload in iterate_lmdb_entries(keys, return_keys=True):
-                                    if stop_optimization_flag.is_set():
+                                    if should_stop():
                                         break
                                     try:
                                         buf = io.BytesIO(payload)
@@ -1224,7 +1244,7 @@ class StreamingGameDataset(IterableDataset):
                                             continue
                                         max_start = max(1, length - self.seq_len)
                                         for start_idx in range(max_start):
-                                            if stop_optimization_flag.is_set():
+                                            if should_stop():
                                                 break
                                             slice_data = []
                                             for i in range(self.seq_len):
@@ -1261,7 +1281,7 @@ class StreamingGameDataset(IterableDataset):
                             continue
                         max_start = max(1, length - self.seq_len)
                         for start_idx in range(max_start):
-                            if stop_optimization_flag.is_set():
+                            if should_stop():
                                 break
                             slice_data = []
                             for i in range(self.seq_len):
@@ -1290,20 +1310,30 @@ class StreamingGameDataset(IterableDataset):
         producer_thread = threading.Thread(target=producer, daemon=True)
         producer_thread.start()
         idle_start = time.time()
-        while True:
+        try:
+            while True:
+                try:
+                    item = output_queue.get(timeout=0.5)
+                    idle_start = time.time()
+                    yield item
+                except queue.Empty:
+                    producer_alive = producer_thread.is_alive()
+                    if stop_event.is_set() and output_queue.empty():
+                        break
+                    if not producer_alive and output_queue.empty():
+                        break
+                    if not producer_alive and time.time() - idle_start > 2.0:
+                        break
+                    continue
+        finally:
+            stop_event.set()
+            producer_thread.join(timeout=1.0)
             try:
-                item = output_queue.get(timeout=0.5)
-                idle_start = time.time()
-                yield item
+                while True:
+                    output_queue.get_nowait()
             except queue.Empty:
-                producer_alive = producer_thread.is_alive()
-                if stop_event.is_set() and output_queue.empty():
-                    break
-                if not producer_alive and output_queue.empty():
-                    break
-                if not producer_alive and time.time() - idle_start > 2.0:
-                    break
-                continue
+                pass
+            gc.collect()
 
 def sample_trajectory(traj, ts_now, max_points=10, window=0.1, fallback_pos=(0, 0)):
     recent = [p for p in traj if ts_now - p[2] <= window]
@@ -1497,6 +1527,8 @@ def build_sleep_file_mix(candidates, limit=20):
 def optimize_ai():
     global low_vram_mode
     try:
+        if os.name == "nt":
+            reset_lmdb_env()
         time.sleep(1.0)
         stop_optimization_flag.clear()
         capture_pause_event.set()
