@@ -134,6 +134,8 @@ recording_pause_event = threading.Event()
 stop_optimization_flag = threading.Event()
 capture_pause_event = threading.Event()
 low_vram_mode = False
+input_allowed_event = threading.Event()
+input_allowed_event.set()
 
 def set_process_priority():
     try:
@@ -1932,196 +1934,200 @@ def start_training_mode():
     hwnd = ctypes.windll.kernel32.GetConsoleWindow()
     time.sleep(0.2)
     ctypes.windll.user32.ShowWindow(hwnd, 6)
-    
+
     model_path = os.path.join(model_dir, "ai_model.pth")
-    if not os.path.exists(model_path):
-        print("No model found. Aborting training.")
-        ctypes.windll.user32.ShowWindow(hwnd, 9) 
-        return
-
-    model = UniversalAI().to(device)
     try:
-        state = load_model_checkpoint(model_path, map_location=device)
-        if state is not None:
-            model.load_state_dict(state.get("model_state", {}))
-    except Exception as e:
-        print(f"Model load error: {e}")
-    model.train()
-    surprise_optimizer = optim.AdamW(model.parameters(), lr=5e-5)
-    surprise_scaler = GradScaler("cuda", enabled=device.type == "cuda")
-    mse_surprise = nn.MSELoss()
-    mouse_ctrl = mouse.Controller()
-    input_buffer_img = []
-    input_buffer_mouse = []
-    with mouse_lock:
-        prev_pos = (mouse_state["x"], mouse_state["y"])
-    target_history = deque(maxlen=8)
-    hidden_state = None
-    try:
-        model.share_memory()
-    except Exception as e:
-        print(f"Share memory warning: {e}")
-    time.sleep(1.0)
-    stop_training_flag = False
-    train_start = time.time()
-    action_steps = 0
+        if not os.path.exists(model_path):
+            print("No model found. Aborting training.")
+            ctypes.windll.user32.ShowWindow(hwnd, 9)
+            return
 
-    class PIDController:
-        def __init__(self, kp, ki, kd):
-            self.kp = kp
-            self.ki = ki
-            self.kd = kd
-            self.integral_x = 0.0
-            self.integral_y = 0.0
-            self.prev_err_x = 0.0
-            self.prev_err_y = 0.0
-            self.prev_time = time.time()
-
-        def step(self, target, current):
-            now = time.time()
-            dt = max(now - self.prev_time, 1e-3)
-            err_x = target[0] - current[0]
-            err_y = target[1] - current[1]
-            self.integral_x += err_x * dt
-            self.integral_y += err_y * dt
-            der_x = (err_x - self.prev_err_x) / dt
-            der_y = (err_y - self.prev_err_y) / dt
-            self.prev_err_x = err_x
-            self.prev_err_y = err_y
-            self.prev_time = now
-            out_x = (self.kp * err_x) + (self.ki * self.integral_x) + (self.kd * der_x)
-            out_y = (self.kp * err_y) + (self.ki * self.integral_y) + (self.kd * der_y)
-            return current[0] + out_x, current[1] + out_y
-
-    pid = PIDController(0.6, 0.02, 0.3)
-
-    while not stop_training_flag:
-        if stop_training_flag:
-            break
-        time.sleep(0)
-        start_time = time.time()
-        if os.name == "nt":
-            try:
-                if ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x8000:
-                    stop_training_flag = True
-                    break
-            except Exception as e:
-                print(f"Priority key error: {e}")
+        model = UniversalAI().to(device)
         try:
-            frame_img, frame_ts = get_latest_frame()
-            if frame_img is None:
-                time.sleep(0.01)
-                continue
-            with mouse_lock:
-                curr_x, curr_y = mouse_state["x"], mouse_state["y"]
-                l_down = mouse_state["l_down"]
-                r_down = mouse_state["r_down"]
-                scroll = mouse_state["scroll"]
-                l_up_pos = mouse_state["l_up_pos"]
-                r_up_pos = mouse_state["r_up_pos"]
-                traj = list(temp_trajectory)
-            mouse_state["scroll"] = 0
-            img_tensor = cv2.cvtColor(frame_img, cv2.COLOR_BGRA2RGB)
-            img_tensor = img_tensor.transpose(2, 0, 1) / 255.0
-            ts_value = frame_ts if frame_ts else start_time
-            def norm_coord(v, dim):
-                return (2.0 * (v / dim)) - 1.0
-            traj_flat = sample_trajectory(traj, ts_value, fallback_pos=(curr_x, curr_y))
-            traj_norm = []
-            for i, v in enumerate(traj_flat):
-                if i % 2 == 0:
-                    traj_norm.append(norm_coord(v, screen_w))
-                else:
-                    traj_norm.append(norm_coord(v, screen_h))
-            m_vec = [
-                norm_coord(curr_x, screen_w), norm_coord(curr_y, screen_h),
-                1.0 if l_down else 0.0,
-                1.0 if r_down else 0.0,
-                scroll,
-                (curr_x - prev_pos[0]) / screen_w,
-                (curr_y - prev_pos[1]) / screen_h,
-                max(0.0, ts_value - mouse_state["l_down_ts"]) if mouse_state["l_down_ts"] > 0 else 0.0,
-                max(0.0, ts_value - mouse_state["r_down_ts"]) if mouse_state["r_down_ts"] > 0 else 0.0,
-                max(0.0, ts_value - mouse_state["l_up_ts"]) if mouse_state["l_up_ts"] > 0 else 0.0,
-                max(0.0, ts_value - mouse_state["r_up_ts"]) if mouse_state["r_up_ts"] > 0 else 0.0,
-                norm_coord(mouse_state["l_down_pos"][0], screen_w),
-                norm_coord(mouse_state["l_down_pos"][1], screen_h),
-                norm_coord(l_up_pos[0], screen_w),
-                norm_coord(l_up_pos[1], screen_h),
-                norm_coord(mouse_state["r_down_pos"][0], screen_w),
-                norm_coord(mouse_state["r_down_pos"][1], screen_h),
-                norm_coord(r_up_pos[0], screen_w),
-                norm_coord(r_up_pos[1], screen_h)
-            ]
-            m_vec.extend(traj_norm)
-            m_vec.append(1.0)
-            input_buffer_img.append(img_tensor)
-            input_buffer_mouse.append(m_vec)
-            prev_pos = (curr_x, curr_y)
-            if len(input_buffer_img) > seq_len:
-                input_buffer_img.pop(0)
-                input_buffer_mouse.pop(0)
-            if len(input_buffer_img) == seq_len:
-                t_imgs = torch.FloatTensor(np.array([input_buffer_img])).to(device)
-                t_mins = torch.FloatTensor(np.array([input_buffer_mouse])).to(device)
-                surprise_optimizer.zero_grad(set_to_none=True)
-                with autocast(device_type="cuda", enabled=device.type == "cuda"):
-                    grid_logits, pred_feat, button_logits, hidden_out = model(t_imgs, t_mins, hidden_state)
-                grid_probs = torch.softmax(grid_logits[0], dim=-1)
-                pred_cell = torch.argmax(grid_probs).item()
-                cell_x = pred_cell % grid_w
-                cell_y = pred_cell // grid_w
-                target_x = int(((cell_x + 0.5) / grid_w) * screen_w)
-                target_y = int(((cell_y + 0.5) / grid_h) * screen_h)
-                hidden_state = hidden_out.detach()
-                target_history.append((target_x, target_y))
-                avg_x = sum(p[0] for p in target_history) / len(target_history)
-                avg_y = sum(p[1] for p in target_history) / len(target_history)
-                current_mouse = mouse_ctrl.position
-                pid_target = (avg_x, avg_y)
-                pid_out = pid.step(pid_target, current_mouse)
-                filtered_x = (pid_out[0] * 0.8) + (current_mouse[0] * 0.2)
-                filtered_y = (pid_out[1] * 0.8) + (current_mouse[1] * 0.2)
-                jitter_x = random.uniform(-1.0, 1.0)
-                jitter_y = random.uniform(-1.0, 1.0)
-                final_x = int(min(max(0, filtered_x + jitter_x), screen_w - 1))
-                final_y = int(min(max(0, filtered_y + jitter_y), screen_h - 1))
-                pred_buttons = torch.sigmoid(button_logits[0]).detach().cpu().numpy()
-                mouse_ctrl.position = (final_x, final_y)
-                if pred_buttons[0] > 0.5 and not l_down:
-                    mouse_ctrl.press(mouse.Button.left)
-                elif pred_buttons[0] <= 0.5 and l_down:
-                    mouse_ctrl.release(mouse.Button.left)
-                if pred_buttons[1] > 0.5 and not r_down:
-                    mouse_ctrl.press(mouse.Button.right)
-                elif pred_buttons[1] <= 0.5 and r_down:
-                    mouse_ctrl.release(mouse.Button.right)
-                actual_frame, _ = get_latest_frame()
-                if actual_frame is not None:
-                    actual_rgb = cv2.cvtColor(actual_frame, cv2.COLOR_BGRA2RGB) if actual_frame.shape[2] == 4 else actual_frame
-                    actual_tensor = torch.FloatTensor(actual_rgb.transpose(2, 0, 1) / 255.0).unsqueeze(0).to(device)
+            state = load_model_checkpoint(model_path, map_location=device)
+            if state is not None:
+                model.load_state_dict(state.get("model_state", {}))
+        except Exception as e:
+            print(f"Model load error: {e}")
+        model.train()
+        surprise_optimizer = optim.AdamW(model.parameters(), lr=5e-5)
+        surprise_scaler = GradScaler("cuda", enabled=device.type == "cuda")
+        mse_surprise = nn.MSELoss()
+        mouse_ctrl = mouse.Controller()
+        input_buffer_img = []
+        input_buffer_mouse = []
+        with mouse_lock:
+            prev_pos = (mouse_state["x"], mouse_state["y"])
+        target_history = deque(maxlen=8)
+        hidden_state = None
+        try:
+            model.share_memory()
+        except Exception as e:
+            print(f"Share memory warning: {e}")
+        time.sleep(1.0)
+        stop_training_flag = False
+        train_start = time.time()
+        action_steps = 0
+
+        class PIDController:
+            def __init__(self, kp, ki, kd):
+                self.kp = kp
+                self.ki = ki
+                self.kd = kd
+                self.integral_x = 0.0
+                self.integral_y = 0.0
+                self.prev_err_x = 0.0
+                self.prev_err_y = 0.0
+                self.prev_time = time.time()
+
+            def step(self, target, current):
+                now = time.time()
+                dt = max(now - self.prev_time, 1e-3)
+                err_x = target[0] - current[0]
+                err_y = target[1] - current[1]
+                self.integral_x += err_x * dt
+                self.integral_y += err_y * dt
+                der_x = (err_x - self.prev_err_x) / dt
+                der_y = (err_y - self.prev_err_y) / dt
+                self.prev_err_x = err_x
+                self.prev_err_y = err_y
+                self.prev_time = now
+                out_x = (self.kp * err_x) + (self.ki * self.integral_x) + (self.kd * der_x)
+                out_y = (self.kp * err_y) + (self.ki * self.integral_y) + (self.kd * der_y)
+                return current[0] + out_x, current[1] + out_y
+
+        pid = PIDController(0.6, 0.02, 0.3)
+
+        while not stop_training_flag:
+            if stop_training_flag:
+                break
+            time.sleep(0)
+            start_time = time.time()
+            if os.name == "nt":
+                try:
+                    if ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x8000:
+                        stop_training_flag = True
+                        break
+                except Exception as e:
+                    print(f"Priority key error: {e}")
+            try:
+                frame_img, frame_ts = get_latest_frame()
+                if frame_img is None:
+                    time.sleep(0.01)
+                    continue
+                with mouse_lock:
+                    curr_x, curr_y = mouse_state["x"], mouse_state["y"]
+                    l_down = mouse_state["l_down"]
+                    r_down = mouse_state["r_down"]
+                    scroll = mouse_state["scroll"]
+                    l_up_pos = mouse_state["l_up_pos"]
+                    r_up_pos = mouse_state["r_up_pos"]
+                    traj = list(temp_trajectory)
+                mouse_state["scroll"] = 0
+                img_tensor = cv2.cvtColor(frame_img, cv2.COLOR_BGRA2RGB)
+                img_tensor = img_tensor.transpose(2, 0, 1) / 255.0
+                ts_value = frame_ts if frame_ts else start_time
+                def norm_coord(v, dim):
+                    return (2.0 * (v / dim)) - 1.0
+                traj_flat = sample_trajectory(traj, ts_value, fallback_pos=(curr_x, curr_y))
+                traj_norm = []
+                for i, v in enumerate(traj_flat):
+                    if i % 2 == 0:
+                        traj_norm.append(norm_coord(v, screen_w))
+                    else:
+                        traj_norm.append(norm_coord(v, screen_h))
+                m_vec = [
+                    norm_coord(curr_x, screen_w), norm_coord(curr_y, screen_h),
+                    1.0 if l_down else 0.0,
+                    1.0 if r_down else 0.0,
+                    scroll,
+                    (curr_x - prev_pos[0]) / screen_w,
+                    (curr_y - prev_pos[1]) / screen_h,
+                    max(0.0, ts_value - mouse_state["l_down_ts"]) if mouse_state["l_down_ts"] > 0 else 0.0,
+                    max(0.0, ts_value - mouse_state["r_down_ts"]) if mouse_state["r_down_ts"] > 0 else 0.0,
+                    max(0.0, ts_value - mouse_state["l_up_ts"]) if mouse_state["l_up_ts"] > 0 else 0.0,
+                    max(0.0, ts_value - mouse_state["r_up_ts"]) if mouse_state["r_up_ts"] > 0 else 0.0,
+                    norm_coord(mouse_state["l_down_pos"][0], screen_w),
+                    norm_coord(mouse_state["l_down_pos"][1], screen_h),
+                    norm_coord(l_up_pos[0], screen_w),
+                    norm_coord(l_up_pos[1], screen_h),
+                    norm_coord(mouse_state["r_down_pos"][0], screen_w),
+                    norm_coord(mouse_state["r_down_pos"][1], screen_h),
+                    norm_coord(r_up_pos[0], screen_w),
+                    norm_coord(r_up_pos[1], screen_h)
+                ]
+                m_vec.extend(traj_norm)
+                m_vec.append(1.0)
+                input_buffer_img.append(img_tensor)
+                input_buffer_mouse.append(m_vec)
+                prev_pos = (curr_x, curr_y)
+                if len(input_buffer_img) > seq_len:
+                    input_buffer_img.pop(0)
+                    input_buffer_mouse.pop(0)
+                if len(input_buffer_img) == seq_len:
+                    t_imgs = torch.FloatTensor(np.array([input_buffer_img])).to(device)
+                    t_mins = torch.FloatTensor(np.array([input_buffer_mouse])).to(device)
+                    surprise_optimizer.zero_grad(set_to_none=True)
                     with autocast(device_type="cuda", enabled=device.type == "cuda"):
-                        actual_feat = model.encode_features(actual_tensor)
-                        surprise_loss = mse_surprise(pred_feat, actual_feat)
-                    if surprise_loss.item() > 0.001:
-                        surprise_scaler.scale(surprise_loss).backward()
-                        surprise_scaler.step(surprise_optimizer)
-                        surprise_scaler.update()
+                        grid_logits, pred_feat, button_logits, hidden_out = model(t_imgs, t_mins, hidden_state)
+                    grid_probs = torch.softmax(grid_logits[0], dim=-1)
+                    pred_cell = torch.argmax(grid_probs).item()
+                    cell_x = pred_cell % grid_w
+                    cell_y = pred_cell // grid_w
+                    target_x = int(((cell_x + 0.5) / grid_w) * screen_w)
+                    target_y = int(((cell_y + 0.5) / grid_h) * screen_h)
+                    hidden_state = hidden_out.detach()
+                    target_history.append((target_x, target_y))
+                    avg_x = sum(p[0] for p in target_history) / len(target_history)
+                    avg_y = sum(p[1] for p in target_history) / len(target_history)
+                    current_mouse = mouse_ctrl.position
+                    pid_target = (avg_x, avg_y)
+                    pid_out = pid.step(pid_target, current_mouse)
+                    filtered_x = (pid_out[0] * 0.8) + (current_mouse[0] * 0.2)
+                    filtered_y = (pid_out[1] * 0.8) + (current_mouse[1] * 0.2)
+                    jitter_x = random.uniform(-1.0, 1.0)
+                    jitter_y = random.uniform(-1.0, 1.0)
+                    final_x = int(min(max(0, filtered_x + jitter_x), screen_w - 1))
+                    final_y = int(min(max(0, filtered_y + jitter_y), screen_h - 1))
+                    pred_buttons = torch.sigmoid(button_logits[0]).detach().cpu().numpy()
+                    mouse_ctrl.position = (final_x, final_y)
+                    if pred_buttons[0] > 0.5 and not l_down:
+                        mouse_ctrl.press(mouse.Button.left)
+                    elif pred_buttons[0] <= 0.5 and l_down:
+                        mouse_ctrl.release(mouse.Button.left)
+                    if pred_buttons[1] > 0.5 and not r_down:
+                        mouse_ctrl.press(mouse.Button.right)
+                    elif pred_buttons[1] <= 0.5 and r_down:
+                        mouse_ctrl.release(mouse.Button.right)
+                    actual_frame, _ = get_latest_frame()
+                    if actual_frame is not None:
+                        actual_rgb = cv2.cvtColor(actual_frame, cv2.COLOR_BGRA2RGB) if actual_frame.shape[2] == 4 else actual_frame
+                        actual_tensor = torch.FloatTensor(actual_rgb.transpose(2, 0, 1) / 255.0).unsqueeze(0).to(device)
+                        with autocast(device_type="cuda", enabled=device.type == "cuda"):
+                            actual_feat = model.encode_features(actual_tensor)
+                            surprise_loss = mse_surprise(pred_feat, actual_feat)
+                        if surprise_loss.item() > 0.001:
+                            surprise_scaler.scale(surprise_loss).backward()
+                            surprise_scaler.step(surprise_optimizer)
+                            surprise_scaler.update()
                 surprise_optimizer.zero_grad(set_to_none=True)
                 action_steps += 1
-            elapsed = time.time() - start_time
-            wait = (1.0 / capture_freq) - elapsed
-            if wait > 0:
-                time.sleep(wait)
-        except Exception as e:
-            print(f"Training Runtime Error: {e}")
-            break
-    flush_buffers()
-    ctypes.windll.user32.ShowWindow(hwnd, 9)
-    current_mode = MODE_LEARNING
-    duration = time.time() - train_start
-    print(f"训练模式总结: 步数 {action_steps}, 人类样本 0, AI样本 {action_steps}, 用时 {duration:.2f} 秒")
-    print("Exited Training Mode. Back to Learning.")
+                elapsed = time.time() - start_time
+                wait = (1.0 / capture_freq) - elapsed
+                if wait > 0:
+                    time.sleep(wait)
+            except Exception as e:
+                print(f"Training Runtime Error: {e}")
+                break
+        flush_buffers()
+        ctypes.windll.user32.ShowWindow(hwnd, 9)
+        current_mode = MODE_LEARNING
+        duration = time.time() - train_start
+        print(f"训练模式总结: 步数 {action_steps}, 人类样本 0, AI样本 {action_steps}, 用时 {duration:.2f} 秒")
+        print("Exited Training Mode. Back to Learning.")
+    finally:
+        current_mode = MODE_LEARNING
+        input_allowed_event.set()
 
 def record_data_loop():
     buffer_images = []
@@ -2251,6 +2257,7 @@ def interpret_command(cmd):
 def enqueue_input():
     while True:
         try:
+            input_allowed_event.wait()
             cmd = input("请输入指令（睡眠/训练）： ").strip()
             command_queue.put(cmd)
         except Exception as e:
@@ -2275,6 +2282,7 @@ def input_loop():
         if interpreted == "sleep":
             if current_mode == MODE_LEARNING:
                 print("检测到睡眠指令，正在准备进入睡眠模式...")
+                input_allowed_event.clear()
                 recording_pause_event.set()
                 capture_pause_event.set()
                 flush_buffers()
@@ -2284,6 +2292,7 @@ def input_loop():
                 current_mode = MODE_LEARNING
                 recording_pause_event.clear()
                 capture_pause_event.clear()
+                input_allowed_event.set()
                 print("Back to Learning.")
             else:
                 print(f"当前模式为{current_mode}，暂无法进入睡眠模式。")
@@ -2291,6 +2300,7 @@ def input_loop():
             if current_mode == MODE_LEARNING:
                 flush_buffers()
                 current_mode = MODE_TRAINING
+                input_allowed_event.clear()
                 print("检测到训练指令，进入训练模式...")
                 t_thread = threading.Thread(target=start_training_mode)
                 t_thread.daemon = True
