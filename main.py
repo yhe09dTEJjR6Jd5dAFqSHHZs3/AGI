@@ -2259,6 +2259,7 @@ def enqueue_input():
         try:
             input_allowed_event.wait()
             cmd = input("请输入指令（睡眠/训练）： ").strip()
+            input_allowed_event.clear()
             command_queue.put(cmd)
         except Exception as e:
             print(f"Input error: {e}")
@@ -2282,7 +2283,6 @@ def input_loop():
         if interpreted == "sleep":
             if current_mode == MODE_LEARNING:
                 print("检测到睡眠指令，正在准备进入睡眠模式...")
-                input_allowed_event.clear()
                 recording_pause_event.set()
                 capture_pause_event.set()
                 flush_buffers()
@@ -2309,6 +2309,7 @@ def input_loop():
                 print(f"当前模式为{current_mode}，暂无法进入训练模式。")
         else:
             print(f"未能识别的指令: {cmd}")
+            input_allowed_event.set()
 
 if __name__ == "__main__":
     ensure_initial_model()
