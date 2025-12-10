@@ -18,6 +18,8 @@ import json
 import math
 import traceback
 from collections import deque
+import tkinter as tk
+from tkinter import scrolledtext
 if os.name == "nt":
     import winreg
     import msvcrt
@@ -33,10 +35,14 @@ def log_exception(context, err=None, extra=None):
         parts.append(str(err))
     if extra:
         parts.append(str(extra))
-    print(" | ".join(parts))
+    message = " | ".join(parts)
+    print(message)
+    report_to_window(message, "error")
     tb = traceback.format_exc()
     if tb:
-        print(tb.strip())
+        detail = tb.strip()
+        print(detail)
+        report_to_window(detail, "error")
 
 def resolve_desktop_path():
     if os.name == "nt":
@@ -139,6 +145,8 @@ capture_pause_event = threading.Event()
 low_vram_mode = False
 input_allowed_event = threading.Event()
 input_allowed_event.set()
+window_ui = None
+user_stop_request_reason = None
 
 def set_process_priority():
     try:
@@ -154,6 +162,111 @@ def flush_buffers(timeout=3):
     flush_done_event.clear()
     flush_event.set()
     flush_done_event.wait(timeout=timeout)
+
+def report_to_window(msg, level="info"):
+    try:
+        if window_ui is not None:
+            window_ui.log(msg, level)
+    except Exception:
+        pass
+
+class SciFiWindow:
+    def __init__(self):
+        self.queue = queue.Queue()
+        self.root = tk.Tk()
+        self.root.title("Nebula Core")
+        self.root.geometry("520x420")
+        self.root.configure(bg="#0a0f1a")
+        self.root.resizable(False, False)
+        self.mode_var = tk.StringVar(value=current_mode)
+        self.status_var = tk.StringVar(value="Initializing...")
+        title = tk.Label(self.root, text="AGI Control", fg="#7fffd4", bg="#0a0f1a", font=("Consolas", 16, "bold"))
+        title.pack(pady=6)
+        mode_frame = tk.Frame(self.root, bg="#0a0f1a")
+        mode_frame.pack(fill="x", padx=10)
+        tk.Label(mode_frame, text="Mode", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 12)).pack(side="left")
+        tk.Label(mode_frame, textvariable=self.mode_var, fg="#e3f2fd", bg="#0a0f1a", font=("Consolas", 12, "bold")).pack(side="left", padx=8)
+        status_frame = tk.Frame(self.root, bg="#0a0f1a")
+        status_frame.pack(fill="x", padx=10, pady=4)
+        tk.Label(status_frame, text="Status", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 11)).pack(side="left")
+        tk.Label(status_frame, textvariable=self.status_var, fg="#d4fc79", bg="#0a0f1a", font=("Consolas", 10), wraplength=340, justify="left").pack(side="left", padx=6)
+        btn_frame = tk.Frame(self.root, bg="#0a0f1a")
+        btn_frame.pack(fill="x", padx=10, pady=6)
+        tk.Button(btn_frame, text="睡眠", command=self.on_sleep, fg="#0a0f1a", bg="#7fffd4", activebackground="#10b981", width=10).pack(side="left", padx=5)
+        tk.Button(btn_frame, text="早停", command=self.on_early_stop, fg="#0a0f1a", bg="#fbbf24", activebackground="#f59e0b", width=10).pack(side="left", padx=5)
+        tk.Button(btn_frame, text="训练", command=self.on_train, fg="#0a0f1a", bg="#60a5fa", activebackground="#3b82f6", width=10).pack(side="left", padx=5)
+        log_frame = tk.Frame(self.root, bg="#0a0f1a")
+        log_frame.pack(fill="both", expand=True, padx=10, pady=6)
+        self.log_area = scrolledtext.ScrolledText(log_frame, state="disabled", fg="#9ae6ff", bg="#0f172a", insertbackground="#7fffd4", font=("Consolas", 9))
+        self.log_area.pack(fill="both", expand=True)
+        self.root.protocol("WM_DELETE_WINDOW", self.minimize)
+        self.root.after(200, self.process_queue)
+
+    def process_queue(self):
+        try:
+            while not self.queue.empty():
+                entry = self.queue.get()
+                self.log_area.configure(state="normal")
+                self.log_area.insert("end", entry + "\n")
+                self.log_area.see("end")
+                self.log_area.configure(state="disabled")
+        except Exception:
+            pass
+        finally:
+            self.root.after(200, self.process_queue)
+
+    def log(self, msg, level="info"):
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self.queue.put(f"[{level.upper()} {ts}] {msg}")
+        self.status_var.set(msg)
+
+    def set_mode(self, mode):
+        self.mode_var.set(mode)
+
+    def minimize(self):
+        try:
+            self.root.iconify()
+        except Exception:
+            pass
+
+    def on_sleep(self):
+        request_sleep_mode()
+
+    def on_early_stop(self):
+        request_early_stop()
+
+    def on_train(self):
+        request_training_mode()
+
+    def run(self):
+        self.root.mainloop()
+
+def init_window():
+    global window_ui
+    try:
+        window_ui = SciFiWindow()
+        t = threading.Thread(target=window_ui.run)
+        t.daemon = True
+        t.start()
+        return True
+    except Exception as e:
+        print(f"UI init error: {e}")
+        return False
+
+def update_window_mode(mode):
+    try:
+        if window_ui is not None:
+            window_ui.set_mode(mode)
+    except Exception:
+        pass
+
+def update_window_status(msg, level="info"):
+    report_to_window(msg, level)
+    try:
+        if window_ui is not None:
+            window_ui.status_var.set(msg)
+    except Exception:
+        pass
 
 capture_freq = 10
 seq_len = 12
@@ -833,12 +946,36 @@ def on_scroll(x, y, dx, dy):
     with mouse_lock:
         mouse_state["scroll"] = dy
 
-def on_press_key(key):
+def release_mouse_outputs():
+    try:
+        ctrl = mouse.Controller()
+        ctrl.release(mouse.Button.left)
+        ctrl.release(mouse.Button.right)
+    except Exception as e:
+        log_exception("Mouse release failure", e)
+
+def handle_training_escape(msg):
     global current_mode, stop_training_flag
-    if current_mode == MODE_TRAINING:
-        stop_training_flag = True
-    elif current_mode == MODE_SLEEP:
-        stop_optimization_flag.set()
+    stop_training_flag = True
+    release_mouse_outputs()
+    flush_buffers()
+    current_mode = MODE_LEARNING
+    update_window_mode(current_mode)
+    update_window_status(msg, "warn")
+    input_allowed_event.set()
+
+def on_press_key(key):
+    global current_mode, stop_training_flag, user_stop_request_reason
+    try:
+        if key == keyboard.Key.esc:
+            if current_mode == MODE_TRAINING:
+                handle_training_escape("检测到ESC，暂停输出并返回学习模式")
+            elif current_mode == MODE_SLEEP:
+                user_stop_request_reason = "用户按下ESC提前结束睡眠优化"
+                stop_optimization_flag.set()
+                update_window_status("ESC触发早停，正在保存模型...", "warn")
+    except Exception as e:
+        log_exception("Key listener error", e)
 
 def file_in_use(path):
     try:
@@ -1660,12 +1797,13 @@ def update_meta_with_loss(key_plan, paths, loss_value):
 
 
 def optimize_ai():
-    global low_vram_mode
+    global low_vram_mode, user_stop_request_reason
     try:
         if os.name == "nt":
             reset_lmdb_env()
         time.sleep(1.0)
         stop_optimization_flag.clear()
+        user_stop_request_reason = None
         capture_pause_event.set()
         opt_start = time.time()
         force_memory_cleanup(3, 0.1)
@@ -1678,6 +1816,7 @@ def optimize_ai():
             except Exception as e:
                 print(f"CUDA stats reset warning: {e}")
         print("Starting Optimization...")
+        update_window_status("启动睡眠优化...", "info")
         model_path = os.path.join(model_dir, "ai_model.pth")
         backup_path = os.path.join(model_dir, "ai_model_prev.pth")
         model = UniversalAI().to(device)
@@ -1717,6 +1856,14 @@ def optimize_ai():
                 print(f"GPU property probe warning: {e}")
         effective_batch = train_batch_size * accumulation_steps
         interrupted = False
+        early_stop_reason = None
+
+        def ensure_stop_reason(reason=None):
+            nonlocal early_stop_reason
+            if early_stop_reason is None:
+                early_stop_reason = reason or user_stop_request_reason or "用户触发提前结束"
+                if early_stop_reason:
+                    update_window_status(early_stop_reason, "warn")
 
         consolidate_data_files()
 
@@ -1741,6 +1888,7 @@ def optimize_ai():
         torch.cuda.empty_cache()
         for f in target_files:
             if stop_optimization_flag.is_set():
+                ensure_stop_reason()
                 break
             scanned += 1
             progress_bar("数据扫描阶段", scanned, total_scan)
@@ -1751,6 +1899,7 @@ def optimize_ai():
                 log_exception("Data scan failed", e, f"path={f}")
         if stop_optimization_flag.is_set():
             interrupted = True
+            ensure_stop_reason()
             print("Optimization interrupted before dataset selection.")
         if not files and not interrupted:
             print("No data to train.")
@@ -1764,6 +1913,7 @@ def optimize_ai():
             total = 0
             for path in file_subset:
                 if stop_optimization_flag.is_set():
+                    ensure_stop_reason()
                     break
                 try:
                     if path == log_path:
@@ -1780,6 +1930,7 @@ def optimize_ai():
                             remaining = len(unknown_entries)
                             for idx_val in idx_candidates:
                                 if stop_optimization_flag.is_set():
+                                    ensure_stop_reason()
                                     break
                                 _, entry = unknown_entries[idx_val]
                                 payload = read_log_payload(entry[0], entry[1])
@@ -1842,6 +1993,7 @@ def optimize_ai():
         for bf in batch_files:
             if stop_optimization_flag.is_set():
                 interrupted = True
+                ensure_stop_reason()
                 break
             steps = estimate_steps(bf)
             chunk_steps.append(steps)
@@ -1925,6 +2077,7 @@ def optimize_ai():
         for idx, bf in enumerate(batch_files):
             if stop_optimization_flag.is_set():
                 interrupted = True
+                ensure_stop_reason()
                 break
             chunk_trained = False
             while not chunk_trained and not stop_optimization_flag.is_set():
@@ -1943,6 +2096,7 @@ def optimize_ai():
                         for batch_idx, (imgs, mins, labels, next_frames) in enumerate(loader):
                             if stop_optimization_flag.is_set():
                                 interrupted = True
+                                ensure_stop_reason()
                                 break
                             imgs = imgs.to(device)
                             mins = mins.to(device)
@@ -2008,6 +2162,7 @@ def optimize_ai():
                                     force_memory_cleanup(1, 0.02)
                         if stop_optimization_flag.is_set() or early_stop_reason:
                             interrupted = True
+                            ensure_stop_reason(early_stop_reason)
                             break
                         if pending_steps > 0:
                             scaler.step(optimizer)
@@ -2022,6 +2177,7 @@ def optimize_ai():
                         epoch_idx += 1
                         if stop_optimization_flag.is_set():
                             interrupted = True
+                            ensure_stop_reason(early_stop_reason)
                             break
                     chunk_trained = True
                 except RuntimeError as e:
@@ -2037,11 +2193,13 @@ def optimize_ai():
                             continue
                         interrupted = True
                         stop_optimization_flag.set()
+                        ensure_stop_reason("显存不足，提前结束睡眠优化")
                     else:
                         current_step = max(0, current_step - attempt_steps)
                         interrupted = True
                         print(f"Training error: {e}")
                         stop_optimization_flag.set()
+                        ensure_stop_reason("训练过程中出现错误，提前停止")
                 finally:
                     del loader
                     del dataset
@@ -2049,6 +2207,7 @@ def optimize_ai():
                     torch.cuda.empty_cache()
             if stop_optimization_flag.is_set():
                 interrupted = True
+                ensure_stop_reason(early_stop_reason)
                 break
             if chunk_loss_acc > 0 and chunk_sample_count > 0:
                 chunk_avg_loss = chunk_loss_acc / chunk_sample_count
@@ -2077,11 +2236,14 @@ def optimize_ai():
         focus_weight = float(torch.exp(-model.log_var_action.detach()).item())
         curiosity_weight = float(torch.exp(-model.log_var_prediction.detach()).item())
         laziness_penalty = float(torch.exp(-model.log_var_energy.detach()).item())
+        reason_text = early_stop_reason or user_stop_request_reason or f"Keyboard interrupt after {current_step}/{total_steps} steps"
         if interrupted:
             print("[Optimization Interrupted]")
-            print(f"> Reason: Keyboard interrupt after {current_step}/{total_steps} steps")
+            print(f"> Reason: {reason_text}")
+            update_window_status(f"睡眠优化中断: {reason_text}", "warn")
         else:
             print("[Optimization Done]")
+            update_window_status("睡眠优化完成，返回学习模式", "info")
         print(f"> Imitation Weight (Focus): {focus_weight:.3f}  <-- exp(-alpha)")
         print(f"> Prediction Weight (Curiosity): {curiosity_weight:.3f}  <-- exp(-beta)")
         print(f"> Energy Penalty (Laziness): {laziness_penalty:.3f}  <-- exp(-gamma)")
@@ -2158,6 +2320,7 @@ def start_training_mode():
         if not os.path.exists(model_path):
             print("No model found. Aborting training.")
             ctypes.windll.user32.ShowWindow(hwnd, 9)
+            update_window_status("未找到模型，训练已取消。", "error")
             return
 
         model = UniversalAI().to(device)
@@ -2340,6 +2503,7 @@ def start_training_mode():
                     time.sleep(wait)
             except Exception as e:
                 print(f"Training Runtime Error: {e}")
+                update_window_status(f"训练过程中出现异常: {e}", "error")
                 break
         flush_buffers()
         ctypes.windll.user32.ShowWindow(hwnd, 9)
@@ -2347,6 +2511,7 @@ def start_training_mode():
         duration = time.time() - train_start
         print(f"训练模式总结: 步数 {action_steps}, 人类样本 0, AI样本 {action_steps}, 用时 {duration:.2f} 秒")
         print("Exited Training Mode. Back to Learning.")
+        update_window_status(f"训练结束，步数{action_steps}，返回学习模式。", "info")
     finally:
         current_mode = MODE_LEARNING
         input_allowed_event.set()
@@ -2452,6 +2617,71 @@ def record_data_loop():
                 flush_done_event.set()
             time.sleep(1)
 
+def request_sleep_mode():
+    global current_mode, user_stop_request_reason
+    if current_mode != MODE_LEARNING:
+        msg = f"当前模式为{current_mode}，暂无法进入睡眠模式。"
+        print(msg)
+        update_window_status(msg, "warn")
+        input_allowed_event.set()
+        return
+    input_allowed_event.clear()
+    user_stop_request_reason = None
+    def run():
+        global current_mode
+        try:
+            update_window_status("检测到睡眠指令，正在准备进入睡眠模式...", "info")
+            recording_pause_event.set()
+            capture_pause_event.set()
+            flush_buffers()
+            cleanup_before_sleep()
+            current_mode = MODE_SLEEP
+            update_window_mode(current_mode)
+            optimize_ai()
+        except Exception as e:
+            log_exception("Sleep mode failure", e)
+        finally:
+            current_mode = MODE_LEARNING
+            recording_pause_event.clear()
+            capture_pause_event.clear()
+            input_allowed_event.set()
+            update_window_mode(current_mode)
+            update_window_status("Back to Learning.", "info")
+    threading.Thread(target=run, daemon=True).start()
+
+def request_training_mode():
+    global current_mode, stop_training_flag
+    if current_mode != MODE_LEARNING:
+        msg = f"当前模式为{current_mode}，暂无法进入训练模式。"
+        print(msg)
+        update_window_status(msg, "warn")
+        input_allowed_event.set()
+        return
+    input_allowed_event.clear()
+    flush_buffers()
+    current_mode = MODE_TRAINING
+    update_window_mode(current_mode)
+    update_window_status("检测到训练指令，进入训练模式...", "info")
+    if window_ui is not None:
+        window_ui.minimize()
+    t_thread = threading.Thread(target=start_training_mode)
+    t_thread.daemon = True
+    t_thread.start()
+
+def request_early_stop():
+    global current_mode, user_stop_request_reason
+    if current_mode == MODE_SLEEP:
+        user_stop_request_reason = "用户点击早停按钮"
+        stop_optimization_flag.set()
+        msg = "早停请求已发出，正在停止优化并保存数据..."
+        print(msg)
+        update_window_status(msg, "warn")
+    else:
+        msg = f"当前模式为{current_mode}，早停请求未生效。"
+        print(msg)
+        update_window_status(msg, "warn")
+        input_allowed_event.set()
+
 def interpret_command(cmd):
     variants = set()
     for item in [cmd, cmd.lower()]:
@@ -2503,32 +2733,9 @@ def input_loop():
         print(f"收到指令: {cmd}")
         interpreted = interpret_command(cmd)
         if interpreted == "sleep":
-            if current_mode == MODE_LEARNING:
-                print("检测到睡眠指令，正在准备进入睡眠模式...")
-                recording_pause_event.set()
-                capture_pause_event.set()
-                flush_buffers()
-                cleanup_before_sleep()
-                current_mode = MODE_SLEEP
-                optimize_ai()
-                current_mode = MODE_LEARNING
-                recording_pause_event.clear()
-                capture_pause_event.clear()
-                input_allowed_event.set()
-                print("Back to Learning.")
-            else:
-                print(f"当前模式为{current_mode}，暂无法进入睡眠模式。")
+            request_sleep_mode()
         elif interpreted == "train":
-            if current_mode == MODE_LEARNING:
-                flush_buffers()
-                current_mode = MODE_TRAINING
-                input_allowed_event.clear()
-                print("检测到训练指令，进入训练模式...")
-                t_thread = threading.Thread(target=start_training_mode)
-                t_thread.daemon = True
-                t_thread.start()
-            else:
-                print(f"当前模式为{current_mode}，暂无法进入训练模式。")
+            request_training_mode()
         else:
             print(f"未能识别的指令: {cmd}")
             input_allowed_event.set()
@@ -2536,6 +2743,9 @@ def input_loop():
 if __name__ == "__main__":
     ensure_initial_model()
     set_process_priority()
+    init_window()
+    update_window_mode(current_mode)
+    update_window_status("System initializing...", "info")
     mouse_listener = mouse.Listener(on_move=on_move, on_click=on_click, on_scroll=on_scroll)
     mouse_listener.start()
     
