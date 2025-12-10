@@ -17,6 +17,7 @@ import tempfile
 import json
 import math
 import traceback
+import builtins
 from collections import deque
 import tkinter as tk
 from tkinter import scrolledtext, ttk
@@ -36,13 +37,13 @@ def log_exception(context, err=None, extra=None):
     if extra:
         parts.append(str(extra))
     message = " | ".join(parts)
-    print(message)
     report_to_window(message, "error")
+    update_window_status(message, "error")
     tb = traceback.format_exc()
     if tb:
         detail = tb.strip()
-        print(detail)
         report_to_window(detail, "error")
+        update_window_status(detail, "error")
 
 def resolve_desktop_path():
     if os.name == "nt":
@@ -63,11 +64,6 @@ def progress_bar(prefix, current, total, suffix=""):
     filled = int(bar_len * ratio)
     bar = "█" * filled + "-" * (bar_len - filled)
     percent = format(ratio * 100, ".2f")
-    with progress_bar_lock:
-        sys.stdout.write(f"\r{prefix} [{bar}] {percent}% {suffix}")
-        sys.stdout.flush()
-        if current >= total:
-            sys.stdout.write("\n")
     update_window_progress(ratio * 100, f"{prefix} {percent}% {suffix}".strip())
 
 def install_requirements():
@@ -170,6 +166,20 @@ def report_to_window(msg, level="info"):
             window_ui.log(msg, level)
     except Exception:
         pass
+
+def window_log(msg, level="info", to_status=False):
+    report_to_window(msg, level)
+    if to_status:
+        update_window_status(msg, level)
+
+def window_print(*args, level="info", status=False, **kwargs):
+    if not args:
+        return
+    sep = kwargs.get("sep", " ")
+    message = sep.join(str(a) for a in args)
+    window_log(message, level, status)
+
+builtins.print = window_print
 
 class SciFiWindow:
     def __init__(self):
@@ -999,10 +1009,6 @@ def on_press_key(key):
         if key == keyboard.Key.esc:
             if current_mode == MODE_TRAINING:
                 handle_training_escape("检测到ESC，暂停输出并返回学习模式")
-            elif current_mode == MODE_SLEEP:
-                user_stop_request_reason = "用户按下ESC提前结束睡眠优化"
-                stop_optimization_flag.set()
-                update_window_status("ESC触发早停，正在保存模型...", "warn")
     except Exception as e:
         log_exception("Key listener error", e)
 
