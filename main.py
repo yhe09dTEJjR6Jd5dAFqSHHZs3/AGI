@@ -696,119 +696,20 @@ def release_data_handle(data):
 def check_disk_space():
     try:
         total_size = 0
-        files = []
-        for pattern in ["*.npy", "*.npz"]:
-            for f in glob.glob(os.path.join(data_dir, pattern)):
-                try:
-                    size = os.path.getsize(f)
-                    total_size += size
-                    files.append((f, os.path.getmtime(f)))
-                except Exception:
-                    continue
-        for extra in [log_path, index_path, lmdb_path]:
-            if os.path.exists(extra):
-                try:
-                    total_size += os.path.getsize(extra)
-                except Exception as e:
-                    print(f"Disk size check warning for {extra}: {e}")
-
+        if os.path.exists(lmdb_path):
+            try:
+                total_size += os.path.getsize(lmdb_path)
+            except Exception as e:
+                print(f"Disk size check warning for LMDB: {e}")
         limit = 20 * 1024 * 1024 * 1024
         if total_size > limit:
             trim_lmdb(limit)
-            files.sort(key=lambda x: x[1])
-            now = time.time()
-            skip_guard = 0
-            while total_size > limit and files:
-                f, mtime = files.pop(0)
-                if now - mtime < 30:
-                    files.append((f, mtime))
-                    skip_guard += 1
-                    if skip_guard >= len(files):
-                        break
-                    continue
-                if file_in_use(f):
-                    files.append((f, mtime))
-                    skip_guard += 1
-                    if skip_guard >= len(files):
-                        break
-                    continue
-                try:
-                    with file_write_lock:
-                        s = os.path.getsize(f)
-                        os.remove(f)
-                    total_size -= s
-                    skip_guard = 0
-                except PermissionError:
-                    files.append((f, mtime))
-                    skip_guard += 1
-                    if skip_guard >= len(files):
-                        break
-                except Exception:
-                    continue
-            if total_size > limit:
-                trim_binary_log(limit)
     except Exception as e:
         print(f"Disk clean error: {e}")
 
 def consolidate_data_files(max_frames=10000, min_commit=4000):
     try:
-        candidates = sorted(glob.glob(os.path.join(data_dir, "*.npz")), key=os.path.getmtime)
-        buffer_images = []
-        buffer_actions = []
-        collected = []
-        for path in candidates:
-            if stop_optimization_flag.is_set():
-                break
-            try:
-                with file_read_lock:
-                    data = np.load(path, allow_pickle=True)
-                data = unwrap_array(data)
-                structured_npz = isinstance(data, np.lib.npyio.NpzFile)
-                if not structured_npz or 'image' not in data or 'action' not in data:
-                    if structured_npz:
-                        data.close()
-                    continue
-                imgs = np.array(data['image'])
-                acts = np.array(data['action'])
-                if structured_npz:
-                    data.close()
-                if len(acts) >= max_frames:
-                    continue
-                buffer_images.append(imgs)
-                buffer_actions.append(acts)
-                collected.append(path)
-            except Exception as e:
-                print(f"Merge read error: {e}")
-                continue
-            total_frames = sum(len(a) for a in buffer_actions)
-            if total_frames >= max_frames:
-                try:
-                    merged_images = np.concatenate(buffer_images, axis=0)
-                    merged_actions = np.concatenate(buffer_actions, axis=0)
-                    fname = os.path.join(data_dir, f"merged_{int(time.time()*1000)}.npz")
-                    with file_write_lock:
-                        np.savez(fname, image=merged_images, action=merged_actions)
-                        for old in collected:
-                            if os.path.exists(old):
-                                os.remove(old)
-                except Exception as e:
-                    print(f"Merge write error: {e}")
-                buffer_images = []
-                buffer_actions = []
-                collected = []
-        remaining = sum(len(a) for a in buffer_actions)
-        if remaining >= min_commit and buffer_images:
-            try:
-                merged_images = np.concatenate(buffer_images, axis=0)
-                merged_actions = np.concatenate(buffer_actions, axis=0)
-                fname = os.path.join(data_dir, f"merged_{int(time.time()*1000)}.npz")
-                with file_write_lock:
-                    np.savez(fname, image=merged_images, action=merged_actions)
-                    for old in collected:
-                        if os.path.exists(old):
-                            os.remove(old)
-            except Exception as e:
-                print(f"Merge final write error: {e}")
+        trim_lmdb(20 * 1024 * 1024 * 1024)
     except Exception as e:
         print(f"Merge error: {e}")
 
@@ -843,17 +744,17 @@ def disk_writer_loop():
     check_time_window = 60.0
     while True:
         try:
-            fname, img_arr, act_arr = save_queue.get()
-            saved = atomic_save_npz(fname, img_arr, act_arr)
-            if saved:
-                try:
-                    append_lmdb_records(img_arr, act_arr)
-                except Exception as e:
-                    print(f"LMDB pipeline error: {e}")
-                try:
-                    append_binary_log(img_arr, act_arr)
-                except Exception as e:
-                    print(f"Binary log pipeline error: {e}")
+            payload = save_queue.get()
+            if payload is None or len(payload) < 2:
+                continue
+            img_arr, act_arr = payload[0], payload[1]
+            if len(img_arr) != len(act_arr) or len(img_arr) == 0:
+                print("LMDB pipeline skipped invalid batch")
+                continue
+            try:
+                append_lmdb_records(img_arr, act_arr)
+            except Exception as e:
+                print(f"LMDB pipeline error: {e}")
             check_counter += 1
             now = time.time()
             if check_counter >= check_interval or now - last_check >= check_time_window:
@@ -946,7 +847,8 @@ def safe_image_data(entry, structured=False):
             else:
                 img = img_data
             if img is not None:
-                return img
+                if isinstance(img, np.ndarray) and img.ndim == 3:
+                    return img
     except Exception as e:
         print(f"Image decode warning: {e}")
     return np.zeros((target_h, target_w, 3), dtype=np.uint8)
@@ -962,7 +864,13 @@ def build_entry_pair(data, idx, structured_npz, structured):
                 actions = actions.item()
             if images is None or actions is None:
                 return None
-            if idx < len(images) and idx < len(actions):
+            try:
+                pair_len = min(len(images), len(actions))
+            except Exception:
+                return None
+            if pair_len <= 0:
+                return None
+            if idx < pair_len:
                 return (images[idx], actions[idx])
             return None
         if structured:
@@ -988,10 +896,20 @@ def dataset_length(data, structured, structured_npz):
             except Exception:
                 return 0
         if structured:
+            if 'action' not in data or 'image' not in data:
+                return 0
             actions = data['action']
+            images = data['image']
             if isinstance(actions, np.ndarray) and actions.ndim == 0:
                 actions = actions.item()
-            return len(actions)
+            if isinstance(images, np.ndarray) and images.ndim == 0:
+                images = images.item()
+            try:
+                act_len = len(actions)
+                img_len = len(images)
+            except Exception:
+                return 0
+            return min(act_len, img_len)
         if isinstance(data, (list, tuple)) and len(data) == 2 and hasattr(data[0], "__len__") and hasattr(data[1], "__len__"):
             return min(len(data[0]), len(data[1]))
         return len(data)
@@ -1149,7 +1067,8 @@ class StreamingGameDataset(IterableDataset):
         return torch.from_numpy(imgs).float().div(255.0), torch.from_numpy(m_ins), torch.tensor(labels, dtype=torch.float32), torch.from_numpy(np.asarray(next_img, dtype=np.uint8)).float().div(255.0)
 
     def __iter__(self):
-        output_queue = queue.Queue(maxsize=8)
+        queue_size = 2 if low_vram_mode or os.name == "nt" else 8
+        output_queue = queue.Queue(maxsize=queue_size)
         stop_event = threading.Event()
 
         def producer():
@@ -1209,6 +1128,9 @@ class StreamingGameDataset(IterableDataset):
                                     structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                                     structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
                                     structured = structured_npz or structured_array
+                                    if structured_npz and (('image' not in data) or ('action' not in data)):
+                                        release_data_handle(data)
+                                        continue
                                     length = dataset_length(data, structured, structured_npz)
                                     if length <= 0:
                                         if structured_npz:
@@ -1324,6 +1246,10 @@ def sample_actions_from_source(path, sample_cap=8):
                 structured_npz = isinstance(data, np.lib.npyio.NpzFile)
                 structured_array = hasattr(data, 'dtype') and getattr(data.dtype, "names", None) and 'action' in data.dtype.names
                 structured = structured_npz or structured_array
+                if structured_npz and (('image' not in data) or ('action' not in data)):
+                    release_data_handle(data)
+                    count += 1
+                    continue
                 if structured:
                     acts = data['action'] if structured_npz else data['action']
                     arr = np.asarray(acts, dtype=np.float32)
@@ -1520,10 +1446,6 @@ def optimize_ai():
         consolidate_data_files()
 
         candidates = []
-        for pattern in ["*.npy", "*.npz"]:
-            candidates.extend(glob.glob(os.path.join(data_dir, pattern)))
-        if os.path.exists(log_path):
-            candidates.append(log_path)
         if os.path.exists(lmdb_path):
             candidates.append(lmdb_path)
         valid_candidates = []
@@ -1730,6 +1652,8 @@ def optimize_ai():
                                 improve_streak = max(0, improve_streak - 1)
                             prev_loss = last_loss_value
                             current_step += batch_sample
+                            if current_step > total_samples:
+                                total_samples = current_step
                             if plateau_counter >= 3 and not finetune_enabled:
                                 model.enable_backbone_finetune(0.25)
                                 finetune_enabled = True
@@ -1743,6 +1667,8 @@ def optimize_ai():
                                 torch.cuda.empty_cache()
                             if low_vram_mode:
                                 gc.collect()
+                                if os.name == "nt":
+                                    force_memory_cleanup(1, 0.02)
                         if stop_optimization_flag.is_set() or early_stop_reason:
                             interrupted = True
                             break
@@ -1752,7 +1678,8 @@ def optimize_ai():
                             optimizer.zero_grad()
                         if improve_streak >= 50 and not extend_done:
                             dynamic_epochs += 1
-                            total_samples += chunk_steps[idx] if idx < len(chunk_steps) else 0
+                            extra = chunk_steps[idx] if idx < len(chunk_steps) else chunk_steps[-1] if chunk_steps else 0
+                            total_samples += extra
                             extend_done = True
                             print(f"延长训练: chunk {idx+1} 增加 1 个 epoch (当前 {dynamic_epochs})")
                         epoch_idx += 1
@@ -2083,9 +2010,8 @@ def record_data_loop():
         if recording_pause_event.is_set():
             if flush_event.is_set():
                 if buffer_images:
-                    fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npz")
                     img_arr, act_arr = prepare_saved_arrays(buffer_images, buffer_actions)
-                    save_queue.put((fname, img_arr, act_arr))
+                    save_queue.put((img_arr, act_arr))
                     buffer_images = []
                     buffer_actions = []
                     save_queue.join()
@@ -2138,9 +2064,8 @@ def record_data_loop():
                 last_pos = (c_state["x"], c_state["y"])
 
                 if len(buffer_images) >= 10000:
-                    fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npz")
                     img_arr, act_arr = prepare_saved_arrays(buffer_images, buffer_actions)
-                    save_queue.put((fname, img_arr, act_arr))
+                    save_queue.put((img_arr, act_arr))
                     buffer_images = []
                     buffer_actions = []
 
@@ -2152,9 +2077,8 @@ def record_data_loop():
                 print(f"Recording Error: {e}")
             if flush_event.is_set():
                 if buffer_images:
-                    fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npz")
                     img_arr, act_arr = prepare_saved_arrays(buffer_images, buffer_actions)
-                    save_queue.put((fname, img_arr, act_arr))
+                    save_queue.put((img_arr, act_arr))
                     buffer_images = []
                     buffer_actions = []
                     save_queue.join()
@@ -2163,9 +2087,8 @@ def record_data_loop():
         else:
             if flush_event.is_set():
                 if buffer_images:
-                    fname = os.path.join(data_dir, f"{int(time.time()*1000)}.npz")
                     img_arr, act_arr = prepare_saved_arrays(buffer_images, buffer_actions)
-                    save_queue.put((fname, img_arr, act_arr))
+                    save_queue.put((img_arr, act_arr))
                     buffer_images = []
                     buffer_actions = []
                     save_queue.join()
