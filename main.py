@@ -40,7 +40,7 @@ def progress_bar(prefix, current, total, suffix=""):
     bar_len = 30
     filled = int(bar_len * ratio)
     bar = "█" * filled + "-" * (bar_len - filled)
-    percent = int(ratio * 100)
+    percent = format(ratio * 100, ".2f")
     sys.stdout.write(f"\r{prefix} [{bar}] {percent}% {suffix}")
     sys.stdout.flush()
     if current >= total:
@@ -180,8 +180,8 @@ def cleanup_before_sleep():
             latest_frame["img"] = None
             latest_frame["ts"] = 0.0
         temp_trajectory.clear()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Cleanup warning during sleep prep: {e}")
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -193,8 +193,8 @@ def force_memory_cleanup(iterations=2, delay=0.05):
             try:
                 torch.cuda.ipc_collect()
                 torch.cuda.synchronize()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"CUDA cleanup step skipped: {e}")
         time.sleep(delay)
 
 data_queue = queue.Queue()
@@ -257,8 +257,8 @@ def recreate_lmdb_env(new_size_gb):
     try:
         if lmdb_env is not None:
             lmdb_env.close()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"LMDB close warning before resize: {e}")
     lmdb_env = None
     return get_lmdb_env(new_size_gb)
 
@@ -529,8 +529,8 @@ def get_sys_usage():
             finally:
                 try:
                     pynvml.nvmlShutdown()
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"NVML shutdown warning: {e}")
         return max(cpu, mem, gpu, vram)
     except Exception as e:
         print(f"Monitor Error: {e}")
@@ -573,14 +573,14 @@ def frame_generator_loop():
                 if camera is not None:
                     try:
                         camera.stop()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"Camera stop warning: {e}")
                     camera = None
                 if sct is not None:
                     try:
                         sct.close()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"Screen capture close warning: {e}")
                     sct = None
                 time.sleep(0.1)
                 continue
@@ -684,14 +684,14 @@ def release_data_handle(data):
     try:
         if hasattr(data, "close"):
             data.close()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Data close warning: {e}")
     try:
         mmap_obj = getattr(data, "_mmap", None)
         if mmap_obj:
             mmap_obj.close()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"mmap close warning: {e}")
 
 def check_disk_space():
     try:
@@ -709,8 +709,8 @@ def check_disk_space():
             if os.path.exists(extra):
                 try:
                     total_size += os.path.getsize(extra)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"Disk size check warning for {extra}: {e}")
 
         limit = 20 * 1024 * 1024 * 1024
         if total_size > limit:
@@ -829,8 +829,8 @@ def atomic_save_npz(fname, img_arr, act_arr, retries=5, backoff=0.25):
             if temp_path and os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
-                except Exception:
-                    pass
+                except Exception as clean_err:
+                    print(f"Temp cleanup warning for {temp_path}: {clean_err}")
             time.sleep(backoff * (attempt + 1))
     if last_error is not None:
         print(f"File save error: {last_error}")
@@ -911,8 +911,8 @@ def safe_action_array(entry):
         if isinstance(value, np.ndarray) and value.ndim == 0:
             try:
                 value = value.item()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Scalar extraction warning: {e}")
         if value is None:
             base = np.zeros(0, dtype=np.float32)
         else:
@@ -947,8 +947,8 @@ def safe_image_data(entry, structured=False):
                 img = img_data
             if img is not None:
                 return img
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Image decode warning: {e}")
     return np.zeros((target_h, target_w, 3), dtype=np.uint8)
 
 def build_entry_pair(data, idx, structured_npz, structured):
@@ -1417,37 +1417,47 @@ def build_sleep_file_mix(candidates, limit=20):
                 human_score = float(np.mean(human_vals))
             if surprise_vals:
                 surprise_score = float(np.mean(surprise_vals))
-        stats.append((path, human_score, surprise_score, int(length), float(mtime)))
+        steps_est = max(1, int(length) - seq_len)
+        stats.append((path, human_score, surprise_score, int(length), float(mtime), steps_est))
     if not stats:
         return [], []
     stats.sort(key=lambda x: x[3], reverse=True)
-    total = min(limit, len(stats))
-    human_n = max(1, int(total * 0.4))
-    recent_n = max(1, int(total * 0.3))
-    surprise_n = max(1, int(total * 0.2))
-    random_n = max(0, total - human_n - recent_n - surprise_n)
-    human_pool = sorted(stats, key=lambda x: (x[1], x[3]), reverse=True)
+    if limit and len(stats) > limit:
+        stats = stats[:limit]
+    total_steps = sum(s[5] for s in stats)
+    if total_steps <= 0:
+        return [], stats
+    human_target = total_steps * 0.4
+    recent_target = total_steps * 0.3
+    surprise_target = total_steps * 0.2
+    history_target = max(0, total_steps - (human_target + recent_target + surprise_target))
+    human_pool = sorted(stats, key=lambda x: (x[1], x[5]), reverse=True)
     recent_pool = sorted(stats, key=lambda x: x[4], reverse=True)
     surprise_pool = sorted(stats, key=lambda x: x[2], reverse=True)
     history_pool = sorted(stats, key=lambda x: x[4])
     selected_paths = set()
     selection = []
 
-    def pick(pool, count):
+    def pick_steps(pool, target_steps, tag):
+        if target_steps <= 0:
+            return
+        used_steps = 0
         for item in pool:
-            if len(selection) >= total or count <= 0:
-                break
             if item[0] in selected_paths:
                 continue
             selection.append(item[0])
             selected_paths.add(item[0])
-            count -= 1
+            used_steps += item[5]
+            if used_steps >= target_steps:
+                break
+        if used_steps < target_steps and pool:
+            print(f"[{tag}] 未达到目标步数，仅累积 {used_steps}/{int(target_steps)} steps")
 
-    pick(human_pool, human_n)
-    pick(recent_pool, recent_n)
-    pick(surprise_pool, surprise_n)
+    pick_steps(human_pool, human_target, "高质样本")
+    pick_steps(recent_pool, recent_target, "近期样本")
+    pick_steps(surprise_pool, surprise_target, "高惊讶度样本")
     random.shuffle(history_pool)
-    pick(history_pool, random_n)
+    pick_steps(history_pool, history_target, "历史样本")
     return selection, stats
 
 
@@ -1457,6 +1467,7 @@ def optimize_ai():
         time.sleep(1.0)
         stop_optimization_flag.clear()
         capture_pause_event.set()
+        opt_start = time.time()
         force_memory_cleanup(3, 0.1)
         if torch.cuda.is_available():
             try:
@@ -1464,8 +1475,8 @@ def optimize_ai():
                 torch.cuda.reset_accumulated_memory_stats()
                 torch.cuda.synchronize()
                 torch.cuda.ipc_collect()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"CUDA stats reset warning: {e}")
         print("Starting Optimization...")
         model_path = os.path.join(model_dir, "ai_model.pth")
         backup_path = os.path.join(model_dir, "ai_model_prev.pth")
@@ -1502,8 +1513,8 @@ def optimize_ai():
                 elif total_mem_gb > 10:
                     accumulation_steps = 10
                     train_batch_size = 12
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"GPU property probe warning: {e}")
         interrupted = False
 
         consolidate_data_files()
@@ -1609,6 +1620,29 @@ def optimize_ai():
         torch.cuda.empty_cache()
 
         total_steps = sum(chunk_steps)
+        max_sleep_steps = 15000
+        if total_mem_gb is not None:
+            if total_mem_gb <= 4:
+                max_sleep_steps = 6000
+            elif total_mem_gb <= 6:
+                max_sleep_steps = 12000
+            else:
+                max_sleep_steps = 20000
+        if total_steps > max_sleep_steps:
+            trimmed = []
+            trimmed_steps = []
+            step_acc = 0
+            for bf, steps in sorted(zip(batch_files, chunk_steps), key=lambda x: x[1], reverse=True):
+                if step_acc >= max_sleep_steps:
+                    break
+                trimmed.append(bf)
+                allowed = min(steps, max_sleep_steps - step_acc)
+                trimmed_steps.append(allowed)
+                step_acc += steps
+            batch_files = trimmed
+            chunk_steps = trimmed_steps
+            total_steps = sum(chunk_steps)
+            print(f"Sleep sampling启用: 预计 {total_steps}/{max_sleep_steps} steps，批次数 {len(batch_files)}")
         if total_steps <= 0 and not interrupted:
             print("No data to train.")
             torch.cuda.empty_cache()
@@ -1628,6 +1662,11 @@ def optimize_ai():
         plateau_counter = 0
         prev_loss = float('inf')
         finetune_enabled = False
+        plateau_patience = 80
+        best_loss = float('inf')
+        improve_streak = 0
+        early_stop_reason = None
+        extend_done = False
         torch.cuda.empty_cache()
         for idx, bf in enumerate(batch_files):
             if stop_optimization_flag.is_set():
@@ -1641,7 +1680,9 @@ def optimize_ai():
                 optimizer.zero_grad()
                 attempt_steps = 0
                 try:
-                    for _ in range(epochs):
+                    dynamic_epochs = epochs
+                    epoch_idx = 0
+                    while epoch_idx < dynamic_epochs:
                         pending_steps = 0
                         for batch_idx, (imgs, mins, labels, next_frames) in enumerate(loader):
                             if stop_optimization_flag.is_set():
@@ -1682,21 +1723,39 @@ def optimize_ai():
                                 plateau_counter += 1
                             else:
                                 plateau_counter = 0
+                            if last_loss_value < best_loss - 1e-4:
+                                best_loss = last_loss_value
+                                improve_streak += 1
+                            else:
+                                improve_streak = max(0, improve_streak - 1)
                             prev_loss = last_loss_value
                             current_step += batch_sample
                             if plateau_counter >= 3 and not finetune_enabled:
                                 model.enable_backbone_finetune(0.25)
                                 finetune_enabled = True
+                            if plateau_counter >= plateau_patience and current_step > total_steps * 0.25:
+                                early_stop_reason = f"Plateau保持 {plateau_counter} 次，提前结束"
+                                stop_optimization_flag.set()
+                                break
                             progress_bar("模型训练阶段", current_step, total_samples, f"Loss: {last_loss_value:.4f} | Chunk {idx+1}/{total_chunks}")
                             del imgs, mins, labels, next_frames, grid_logits, pred_feat, button_logits, target_grid, target_buttons, target_feat, total_loss
                             if low_vram_mode or batch_idx % 2 == 1:
                                 torch.cuda.empty_cache()
                             if low_vram_mode:
                                 gc.collect()
+                        if stop_optimization_flag.is_set() or early_stop_reason:
+                            interrupted = True
+                            break
                         if pending_steps > 0:
                             scaler.step(optimizer)
                             scaler.update()
                             optimizer.zero_grad()
+                        if improve_streak >= 50 and not extend_done:
+                            dynamic_epochs += 1
+                            total_samples += chunk_steps[idx] if idx < len(chunk_steps) else 0
+                            extend_done = True
+                            print(f"延长训练: chunk {idx+1} 增加 1 个 epoch (当前 {dynamic_epochs})")
+                        epoch_idx += 1
                         if stop_optimization_flag.is_set():
                             interrupted = True
                             break
@@ -1759,22 +1818,23 @@ def optimize_ai():
         print(f"> Energy Penalty (Laziness): {laziness_penalty:.3f}  <-- exp(-gamma)")
         print(f"> Last Loss: {last_loss_value:.6f}")
         print(f"> Model Saved To: {model_path}")
-        train_file_count = len(files)
+        used_file_set = {p for group in batch_files for p in group}
+        train_file_count = len(used_file_set)
         estimated_samples = 0
         human_ratio = 0.0
         ai_ratio = 0.0
         recent_ratio = 0.0
         recent_cutoff = time.time() - 7 * 24 * 60 * 60
         if sleep_stats:
-            used_stats = [s for s in sleep_stats if s[0] in files]
+            used_stats = [s for s in sleep_stats if s[0] in used_file_set]
             if used_stats:
-                total_len = sum(max(1, s[3]) for s in used_stats)
-                estimated_samples = total_len
-                human_weighted = sum(max(1, s[3]) * s[1] for s in used_stats)
-                human_ratio = human_weighted / total_len if total_len > 0 else 0.0
+                total_steps_used = sum(max(1, s[5]) for s in used_stats)
+                estimated_samples = total_steps_used
+                human_weighted = sum(max(1, s[5]) * s[1] for s in used_stats)
+                human_ratio = human_weighted / total_steps_used if total_steps_used > 0 else 0.0
                 ai_ratio = 1.0 - human_ratio
-                recent_weighted_len = sum(max(1, s[3]) for s in used_stats if s[4] >= recent_cutoff)
-                recent_ratio = recent_weighted_len / total_len if total_len > 0 else 0.0
+                recent_weighted_len = sum(max(1, s[5]) for s in used_stats if s[4] >= recent_cutoff)
+                recent_ratio = recent_weighted_len / total_steps_used if total_steps_used > 0 else 0.0
         print(f"> 训练文件数量: {train_file_count}")
         print(f"> 估计覆盖经验序列数: {estimated_samples}")
         if sleep_stats:
@@ -1784,20 +1844,30 @@ def optimize_ai():
             print("> 未获取到睡眠混合统计信息，使用原始文件集合。")
         print(f"> 有效 Epoch 数: {epochs}")
         print(f"> Batch Size: {train_batch_size}")
+        print(f"> 实际使用文件数: {train_file_count}")
+        print(f"> 实际训练步数: {current_step}")
+        if estimated_samples > 0:
+            human_steps = int(estimated_samples * human_ratio)
+            ai_steps = int(estimated_samples * ai_ratio)
+            print(f"> 估算人类样本步数: {human_steps} | AI样本步数: {ai_steps}")
+        if early_stop_reason:
+            print(f"> 提前结束提示: {early_stop_reason}")
+        duration = time.time() - opt_start
+        print(f"> 本轮训练用时: {duration:.2f} 秒")
         torch.cuda.empty_cache()
         if torch.cuda.is_available():
             try:
                 torch.cuda.ipc_collect()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"CUDA IPC cleanup warning: {e}")
         gc.collect()
     except Exception as e:
         print(f"Critical Optimization Error: {e}")
         try:
             torch.cuda.empty_cache()
             gc.collect()
-        except Exception:
-            pass
+        except Exception as clean_e:
+            print(f"Cleanup failure after critical error: {clean_e}")
     finally:
         stop_optimization_flag.clear()
         capture_pause_event.clear()
@@ -1840,10 +1910,12 @@ def start_training_mode():
     hidden_state = None
     try:
         model.share_memory()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Share memory warning: {e}")
     time.sleep(1.0)
     stop_training_flag = False
+    train_start = time.time()
+    action_steps = 0
 
     class PIDController:
         def __init__(self, kp, ki, kd):
@@ -1987,6 +2059,7 @@ def start_training_mode():
                         surprise_scaler.step(surprise_optimizer)
                         surprise_scaler.update()
                 surprise_optimizer.zero_grad(set_to_none=True)
+                action_steps += 1
             elapsed = time.time() - start_time
             wait = (1.0 / capture_freq) - elapsed
             if wait > 0:
@@ -1997,6 +2070,8 @@ def start_training_mode():
     flush_buffers()
     ctypes.windll.user32.ShowWindow(hwnd, 9)
     current_mode = MODE_LEARNING
+    duration = time.time() - train_start
+    print(f"训练模式总结: 步数 {action_steps}, 人类样本 0, AI样本 {action_steps}, 用时 {duration:.2f} 秒")
     print("Exited Training Mode. Back to Learning.")
 
 def record_data_loop():
@@ -2109,13 +2184,13 @@ def interpret_command(cmd):
         try:
             recon = cmd.encode(enc, errors="ignore").decode("utf-8", errors="ignore")
             variants.update([recon, recon.lower()])
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Encoding normalize warning ({enc} -> utf-8): {e}")
         try:
             recon = cmd.encode(enc, errors="ignore").decode("gbk", errors="ignore")
             variants.update([recon, recon.lower()])
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Encoding normalize warning ({enc} -> gbk): {e}")
     if any(v in ("睡眠", "sleep") for v in variants):
         return "sleep"
     if any(v in ("训练", "train") for v in variants):
@@ -2158,7 +2233,7 @@ def input_loop():
                 continue
         else:
             try:
-                cmd = input().strip()
+                cmd = input("请输入指令（睡眠/训练）： ").strip()
             except Exception as e:
                 print(f"Input error: {e}")
                 time.sleep(0.1)
@@ -2168,6 +2243,7 @@ def input_loop():
         interpreted = interpret_command(cmd)
         if interpreted == "sleep":
             if current_mode == MODE_LEARNING:
+                print("检测到睡眠指令，正在准备进入睡眠模式...")
                 recording_pause_event.set()
                 capture_pause_event.set()
                 flush_buffers()
@@ -2182,7 +2258,7 @@ def input_loop():
             if current_mode == MODE_LEARNING:
                 flush_buffers()
                 current_mode = MODE_TRAINING
-                print("Entering Training Mode...")
+                print("检测到训练指令，进入训练模式...")
                 t_thread = threading.Thread(target=start_training_mode)
                 t_thread.daemon = True
                 t_thread.start()
