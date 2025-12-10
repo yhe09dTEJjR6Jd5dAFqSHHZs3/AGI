@@ -19,7 +19,7 @@ import math
 import traceback
 from collections import deque
 import tkinter as tk
-from tkinter import scrolledtext
+from tkinter import scrolledtext, ttk
 if os.name == "nt":
     import winreg
     import msvcrt
@@ -68,6 +68,7 @@ def progress_bar(prefix, current, total, suffix=""):
         sys.stdout.flush()
         if current >= total:
             sys.stdout.write("\n")
+    update_window_progress(ratio * 100, f"{prefix} {percent}% {suffix}".strip())
 
 def install_requirements():
     package_map = {
@@ -180,6 +181,7 @@ class SciFiWindow:
         self.root.resizable(False, False)
         self.mode_var = tk.StringVar(value=current_mode)
         self.status_var = tk.StringVar(value="Initializing...")
+        self.progress_var = tk.StringVar(value="0.00%")
         title = tk.Label(self.root, text="AGI Control", fg="#7fffd4", bg="#0a0f1a", font=("Consolas", 16, "bold"))
         title.pack(pady=6)
         mode_frame = tk.Frame(self.root, bg="#0a0f1a")
@@ -195,6 +197,11 @@ class SciFiWindow:
         tk.Button(btn_frame, text="睡眠", command=self.on_sleep, fg="#0a0f1a", bg="#7fffd4", activebackground="#10b981", width=10).pack(side="left", padx=5)
         tk.Button(btn_frame, text="早停", command=self.on_early_stop, fg="#0a0f1a", bg="#fbbf24", activebackground="#f59e0b", width=10).pack(side="left", padx=5)
         tk.Button(btn_frame, text="训练", command=self.on_train, fg="#0a0f1a", bg="#60a5fa", activebackground="#3b82f6", width=10).pack(side="left", padx=5)
+        progress_frame = tk.Frame(self.root, bg="#0a0f1a")
+        progress_frame.pack(fill="x", padx=10, pady=4)
+        self.progress = ttk.Progressbar(progress_frame, orient="horizontal", length=380, mode="determinate", maximum=100)
+        self.progress.pack(side="left", padx=4)
+        tk.Label(progress_frame, textvariable=self.progress_var, fg="#e3f2fd", bg="#0a0f1a", font=("Consolas", 10)).pack(side="left", padx=4)
         log_frame = tk.Frame(self.root, bg="#0a0f1a")
         log_frame.pack(fill="both", expand=True, padx=10, pady=6)
         self.log_area = scrolledtext.ScrolledText(log_frame, state="disabled", fg="#9ae6ff", bg="#0f172a", insertbackground="#7fffd4", font=("Consolas", 9))
@@ -206,10 +213,26 @@ class SciFiWindow:
         try:
             while not self.queue.empty():
                 entry = self.queue.get()
-                self.log_area.configure(state="normal")
-                self.log_area.insert("end", entry + "\n")
-                self.log_area.see("end")
-                self.log_area.configure(state="disabled")
+                if isinstance(entry, tuple) and len(entry) >= 2:
+                    kind, payload = entry
+                    if kind == "log":
+                        self.log_area.configure(state="normal")
+                        self.log_area.insert("end", payload + "\n")
+                        self.log_area.see("end")
+                        self.log_area.configure(state="disabled")
+                    elif kind == "progress":
+                        pct, text = payload
+                        try:
+                            val = float(max(0.0, min(100.0, pct)))
+                            self.progress["value"] = val
+                            self.progress_var.set(text if text else f"{val:.2f}%")
+                        except Exception:
+                            pass
+                else:
+                    self.log_area.configure(state="normal")
+                    self.log_area.insert("end", str(entry) + "\n")
+                    self.log_area.see("end")
+                    self.log_area.configure(state="disabled")
         except Exception:
             pass
         finally:
@@ -217,11 +240,14 @@ class SciFiWindow:
 
     def log(self, msg, level="info"):
         ts = datetime.datetime.now().strftime("%H:%M:%S")
-        self.queue.put(f"[{level.upper()} {ts}] {msg}")
+        self.queue.put(("log", f"[{level.upper()} {ts}] {msg}"))
         self.status_var.set(msg)
 
     def set_mode(self, mode):
         self.mode_var.set(mode)
+
+    def set_progress(self, pct, text=None):
+        self.queue.put(("progress", (pct, text or f"{pct:.2f}%")))
 
     def minimize(self):
         try:
@@ -245,9 +271,6 @@ def init_window():
     global window_ui
     try:
         window_ui = SciFiWindow()
-        t = threading.Thread(target=window_ui.run)
-        t.daemon = True
-        t.start()
         return True
     except Exception as e:
         print(f"UI init error: {e}")
@@ -265,6 +288,13 @@ def update_window_status(msg, level="info"):
     try:
         if window_ui is not None:
             window_ui.status_var.set(msg)
+    except Exception:
+        pass
+
+def update_window_progress(pct, text=None):
+    try:
+        if window_ui is not None:
+            window_ui.set_progress(pct, text)
     except Exception:
         pass
 
@@ -342,7 +372,6 @@ def force_memory_cleanup(iterations=2, delay=0.05):
 
 data_queue = queue.Queue()
 save_queue = queue.Queue()
-command_queue = queue.Queue()
 
 def append_binary_log(img_arr, act_arr):
     try:
@@ -1865,6 +1894,31 @@ def optimize_ai():
                 if early_stop_reason:
                     update_window_status(early_stop_reason, "warn")
 
+        def safe_save_model(final_reason=None, last_snapshot=None, steps_snapshot=None, total_snapshot=None, interrupted_flag=False):
+            try:
+                alpha = float(model.log_var_action.detach().item())
+                beta = float(model.log_var_prediction.detach().item())
+                gamma = float(model.log_var_energy.detach().item())
+                temp_path = os.path.join(model_dir, "ai_model_temp.pth")
+                torch.save({"model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(), "alpha": alpha, "beta": beta, "gamma": gamma, "last_loss": last_snapshot if last_snapshot is not None else 0.0, "steps": steps_snapshot if steps_snapshot is not None else 0, "total_steps": total_snapshot if total_snapshot is not None else 0, "interrupted": interrupted_flag, "timestamp": time.time(), "reason": final_reason or early_stop_reason or user_stop_request_reason}, temp_path)
+                if os.path.exists(model_path):
+                    try:
+                        shutil.copy2(model_path, backup_path)
+                    except Exception:
+                        pass
+                    try:
+                        os.remove(model_path)
+                    except Exception:
+                        pass
+                try:
+                    os.rename(temp_path, model_path)
+                except Exception:
+                    shutil.copy2(temp_path, model_path)
+                return True
+            except Exception as e:
+                print(f"Safe save warning: {e}")
+                return False
+
         consolidate_data_files()
 
         candidates = []
@@ -2213,26 +2267,12 @@ def optimize_ai():
                 chunk_avg_loss = chunk_loss_acc / chunk_sample_count
                 update_meta_with_loss(lmdb_key_plan, bf, chunk_avg_loss)
 
-        temp_path = os.path.join(model_dir, "ai_model_temp.pth")
         print(f"Final Loss Snapshot: {last_loss_value:.6f} | Steps: {current_step}/{total_steps}")
-        alpha = float(model.log_var_action.detach().item())
-        beta = float(model.log_var_prediction.detach().item())
-        gamma = float(model.log_var_energy.detach().item())
-        torch.save({"model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(), "alpha": alpha, "beta": beta, "gamma": gamma, "last_loss": last_loss_value, "steps": current_step, "total_steps": total_steps, "interrupted": interrupted, "timestamp": time.time()}, temp_path)
-        try:
-            if os.path.exists(model_path):
-                shutil.copy2(model_path, backup_path)
-            if os.path.exists(model_path):
-                os.remove(model_path)
-            os.rename(temp_path, model_path)
-            if interrupted:
-                print("Optimization Interrupted (Safe Save).")
-            else:
-                print("Optimization Complete (Safe Save).")
-        except Exception as e:
-            print(f"Save error: {e}")
-            if os.path.exists(backup_path):
-                shutil.copy2(backup_path, model_path)
+        saved_ok = safe_save_model(early_stop_reason, last_loss_value, current_step, total_steps, interrupted)
+        if interrupted:
+            print("Optimization Interrupted (Safe Save).")
+        else:
+            print("Optimization Complete (Safe Save).")
         focus_weight = float(torch.exp(-model.log_var_action.detach()).item())
         curiosity_weight = float(torch.exp(-model.log_var_prediction.detach()).item())
         laziness_penalty = float(torch.exp(-model.log_var_energy.detach()).item())
@@ -2300,6 +2340,11 @@ def optimize_ai():
         except Exception as clean_e:
             print(f"Cleanup failure after critical error: {clean_e}")
     finally:
+        try:
+            if 'model' in locals() and model is not None:
+                safe_save_model("异常提前终止", last_loss_value if 'last_loss_value' in locals() else None, locals().get("current_step"), locals().get("total_steps"), True)
+        except Exception:
+            pass
         stop_optimization_flag.clear()
         capture_pause_event.clear()
         torch.cuda.empty_cache()
@@ -2682,98 +2727,22 @@ def request_early_stop():
         update_window_status(msg, "warn")
         input_allowed_event.set()
 
-def interpret_command(cmd):
-    variants = set()
-    for item in [cmd, cmd.lower()]:
-        variants.add(item)
-    encs = [sys.stdin.encoding, sys.getdefaultencoding(), "utf-8", "gbk"]
-    for enc in encs:
-        if not enc:
-            continue
-        try:
-            recon = cmd.encode(enc, errors="ignore").decode("utf-8", errors="ignore")
-            variants.update([recon, recon.lower()])
-        except Exception as e:
-            print(f"Encoding normalize warning ({enc} -> utf-8): {e}")
-        try:
-            recon = cmd.encode(enc, errors="ignore").decode("gbk", errors="ignore")
-            variants.update([recon, recon.lower()])
-        except Exception as e:
-            print(f"Encoding normalize warning ({enc} -> gbk): {e}")
-    if any(v in ("睡眠", "sleep") for v in variants):
-        return "sleep"
-    if any(v in ("训练", "train") for v in variants):
-        return "train"
-    return None
-
-def enqueue_input():
-    while True:
-        try:
-            input_allowed_event.wait()
-            cmd = input("请输入指令（睡眠/训练）： ").strip()
-            input_allowed_event.clear()
-            command_queue.put(cmd)
-        except Exception as e:
-            print(f"Input error: {e}")
-            time.sleep(0.2)
-
-def input_loop():
-    global current_mode
-    reader_started = False
-    while True:
-        if not reader_started:
-            t_reader = threading.Thread(target=enqueue_input)
-            t_reader.daemon = True
-            t_reader.start()
-            reader_started = True
-        try:
-            cmd = command_queue.get(timeout=0.1)
-        except queue.Empty:
-            continue
-        print(f"收到指令: {cmd}")
-        interpreted = interpret_command(cmd)
-        if interpreted == "sleep":
-            request_sleep_mode()
-        elif interpreted == "train":
-            request_training_mode()
-        else:
-            print(f"未能识别的指令: {cmd}")
-            input_allowed_event.set()
-
-if __name__ == "__main__":
-    ensure_initial_model()
-    set_process_priority()
-    init_window()
-    update_window_mode(current_mode)
-    update_window_status("System initializing...", "info")
+def start_background_services():
+    global mouse_listener, key_listener
     mouse_listener = mouse.Listener(on_move=on_move, on_click=on_click, on_scroll=on_scroll)
     mouse_listener.start()
-    
     key_listener = keyboard.Listener(on_press=on_press_key)
     key_listener.start()
-    
-    t_res = threading.Thread(target=resource_monitor)
-    t_res.daemon = True
+    t_res = threading.Thread(target=resource_monitor, daemon=True)
     t_res.start()
-
-    t_frame = threading.Thread(target=frame_generator_loop)
-    t_frame.daemon = True
+    t_frame = threading.Thread(target=frame_generator_loop, daemon=True)
     t_frame.start()
-
-    t_save = threading.Thread(target=disk_writer_loop)
-    t_save.daemon = True
+    t_save = threading.Thread(target=disk_writer_loop, daemon=True)
     t_save.start()
-
-    t_rec = threading.Thread(target=record_data_loop)
-    t_rec.daemon = True
+    t_rec = threading.Thread(target=record_data_loop, daemon=True)
     t_rec.start()
-    
-    t_input = threading.Thread(target=input_loop)
-    t_input.daemon = True
-    t_input.start()
-
     print("System initialized. Mode: LEARNING")
-
+    update_window_status("系统初始化完成，进入学习模式。", "info")
     while True:
         try:
             if not mouse_listener.is_alive():
@@ -2785,3 +2754,15 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Listener restart error: {e}")
         time.sleep(2)
+
+
+if __name__ == "__main__":
+    ensure_initial_model()
+    set_process_priority()
+    init_window()
+    update_window_mode(current_mode)
+    update_window_status("System initializing...", "info")
+    t_bg_logic = threading.Thread(target=start_background_services, daemon=True)
+    t_bg_logic.start()
+    if window_ui is not None:
+        window_ui.run()
