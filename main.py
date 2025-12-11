@@ -150,6 +150,7 @@ input_allowed_event = threading.Event()
 input_allowed_event.set()
 window_ui = None
 user_stop_request_reason = None
+latest_optimization_summary = None
 
 def set_process_priority():
     try:
@@ -1892,7 +1893,7 @@ def update_meta_with_loss(key_plan, paths, loss_value):
 
 
 def optimize_ai():
-    global low_vram_mode, user_stop_request_reason
+    global low_vram_mode, user_stop_request_reason, latest_optimization_summary
     try:
         if os.name == "nt":
             reset_lmdb_env()
@@ -2359,7 +2360,11 @@ def optimize_ai():
             update_window_status(f"睡眠优化中断: {reason_text}", "warn")
         else:
             print("[Optimization Done]")
-            update_window_status("睡眠优化完成，返回学习模式", "info")
+            summary_msg = f"睡眠优化完成，模型已保存（{model_path}），耗时{duration:.2f}秒，步骤{current_step}/{total_steps}，返回学习模式。"
+            latest_optimization_summary = summary_msg
+            update_window_status(summary_msg, "info")
+            update_window_progress(0, "数据扫描：已完成，等待下一轮", channel="scan")
+            update_window_progress(0, "AI优化：已完成，模型已保存", channel="opt")
         print(f"> Imitation Weight (Focus): {focus_weight:.3f}  <-- exp(-alpha)")
         print(f"> Prediction Weight (Curiosity): {curiosity_weight:.3f}  <-- exp(-beta)")
         print(f"> Energy Penalty (Laziness): {laziness_penalty:.3f}  <-- exp(-gamma)")
@@ -2756,7 +2761,7 @@ def record_data_loop():
             time.sleep(1)
 
 def request_sleep_mode():
-    global current_mode, user_stop_request_reason
+    global current_mode, user_stop_request_reason, latest_optimization_summary
     if current_mode != MODE_LEARNING:
         msg = f"当前模式为{current_mode}，暂无法进入睡眠模式。"
         print(msg)
@@ -2784,7 +2789,11 @@ def request_sleep_mode():
             capture_pause_event.clear()
             input_allowed_event.set()
             update_window_mode(current_mode)
-            update_window_status("Back to Learning.", "info")
+            if latest_optimization_summary:
+                update_window_status(latest_optimization_summary, "info")
+                latest_optimization_summary = None
+            else:
+                update_window_status("Back to Learning.", "info")
     threading.Thread(target=run, daemon=True).start()
 
 def request_training_mode():
