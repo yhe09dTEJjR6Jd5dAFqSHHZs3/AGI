@@ -167,6 +167,18 @@ def flush_buffers(timeout=3):
     flush_event.set()
     finished = flush_done_event.wait(timeout=timeout)
     if not finished:
+        flush_event.clear()
+        flush_done_event.set()
+        try:
+            with save_queue.mutex:
+                save_queue.queue.clear()
+        except Exception:
+            pass
+        try:
+            if mouse_lock.acquire(blocking=False):
+                mouse_lock.release()
+        except Exception:
+            pass
         update_window_status("等待数据刷盘超时，已跳过阻塞写入。", "warn")
     return finished
 
@@ -402,6 +414,7 @@ def cleanup_before_sleep():
             dxcam_camera = None
     except Exception as e:
         print(f"DXCam cleanup exception: {e}")
+    gc.collect()
     for _ in range(3):
         gc.collect()
         try:
@@ -1927,7 +1940,7 @@ def optimize_ai():
                 total_mem_gb = total_bytes / (1024 ** 3)
                 free_mem_gb = free_bytes / (1024 ** 3)
                 if total_mem_gb <= 4:
-                    accumulation_steps = 12
+                    accumulation_steps = 16
                     train_batch_size = 1
                     low_vram_mode = True
                 elif total_mem_gb <= 6:
@@ -1939,7 +1952,7 @@ def optimize_ai():
                 if free_mem_gb is not None and (free_mem_gb < 2.0 or total_mem_gb <= 4):
                     low_vram_mode = True
                     train_batch_size = 1
-                    accumulation_steps = max(accumulation_steps, 10)
+                    accumulation_steps = max(accumulation_steps, 16)
                     if free_mem_gb < 1.5:
                         train_device = torch.device("cpu")
                         update_window_status("可用显存不足，已切换到CPU训练以避免溢出。", "warn")
@@ -2031,6 +2044,8 @@ def optimize_ai():
                     files.append(f)
             except Exception as e:
                 log_exception("Data scan failed", e, f"path={f}")
+            if scanned % 8 == 0:
+                time.sleep(0.001)
         if stop_optimization_flag.is_set():
             interrupted = True
             ensure_stop_reason()
@@ -2043,6 +2058,10 @@ def optimize_ai():
         random.shuffle(files)
         batch_files = [files[i:i+5] for i in range(0, len(files), 5)] if files else []
 
+        meta_entries_cache = load_meta_entries()
+        meta_length_map = {int(e.get("key", -1)): int(e.get("length", 0)) for e in meta_entries_cache if "key" in e}
+        avg_sample_bytes = max(10240, int(target_w * target_h * 3 * 0.6))
+
         def estimate_steps(file_subset):
             total = 0
             for path in file_subset:
@@ -2050,68 +2069,40 @@ def optimize_ai():
                     ensure_stop_reason()
                     break
                 try:
+                    approx_samples = 0
                     if path == log_path:
                         entries = load_index_entries()
-                        if not entries:
-                            continue
-                        for _, _, count in entries:
-                            if count > 0:
-                                total += max(1, int(count) - seq_len)
-                        unknown_entries = [e for e in entries if e[2] <= 0]
-                        if unknown_entries:
-                            samples = unknown_entries[:2]
-                            measured = []
-                            for entry in samples:
-                                if stop_optimization_flag.is_set():
-                                    ensure_stop_reason()
-                                    break
-                                payload = read_log_payload(entry[0], entry[1])
-                                if payload is None:
-                                    continue
-                                buf = io.BytesIO(payload)
-                                data = np.load(buf, allow_pickle=True)
-                                data = unwrap_array(data)
-                                structured_npz = isinstance(data, np.lib.npyio.NpzFile)
-                                structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
-                                structured = structured_npz or structured_array
-                                length = dataset_length(data, structured, structured_npz)
-                                release_data_handle(data)
-                                measured.append(max(1, int(length) - seq_len))
-                            remaining = max(0, len(unknown_entries) - len(samples))
-                            if measured:
-                                avg_steps = float(sum(measured)) / float(len(measured))
-                                total += int(sum(measured))
-                                if remaining > 0:
-                                    total += int(avg_steps * remaining)
-                        continue
-                    if path == lmdb_path:
+                        if entries:
+                            for _, length, count in entries:
+                                if count > 0:
+                                    approx_samples += int(count)
+                                elif length > 0:
+                                    approx_samples += max(1, int(length // max(1, avg_sample_bytes)))
+                        else:
+                            file_size = os.path.getsize(path)
+                            approx_samples = max(1, int(file_size // avg_sample_bytes))
+                    elif path == lmdb_path:
                         keys = lmdb_key_plan.get(path)
                         if keys:
                             for meta_key in keys:
-                                try:
-                                    meta_entries = [m for m in load_meta_entries() if m.get("key") == meta_key]
-                                    if not meta_entries:
-                                        continue
-                                    length = int(meta_entries[0].get("length", 0))
-                                    steps = max(1, length - seq_len)
-                                    total += steps
-                                except Exception as e:
-                                    log_exception("LMDB meta parse failure", e, f"key={meta_key}")
+                                if stop_optimization_flag.is_set():
+                                    ensure_stop_reason()
+                                    break
+                                length_val = int(meta_length_map.get(meta_key, 0))
+                                if length_val > 0:
+                                    approx_samples += length_val
+                        elif meta_entries_cache:
+                            for entry in meta_entries_cache:
+                                approx_samples += int(entry.get("length", 0))
                         else:
-                            length = get_lmdb_length()
-                            steps = max(1, length - seq_len)
-                            total += steps
-                        continue
-                    with file_read_lock:
-                        data = np.load(path, allow_pickle=True, mmap_mode="r")
-                    data = unwrap_array(data)
-                    structured_npz = isinstance(data, np.lib.npyio.NpzFile)
-                    structured_array = hasattr(data, 'dtype') and data.dtype.names and 'action' in data.dtype.names
-                    structured = structured_npz or structured_array
-                    length = dataset_length(data, structured, structured_npz)
-                    steps = max(1, length - seq_len)
+                            approx_samples = max(1, get_lmdb_length())
+                    else:
+                        file_size = os.path.getsize(path)
+                        approx_samples = max(1, int(file_size // avg_sample_bytes))
+                    steps = max(1, int(approx_samples) - seq_len)
                     total += steps
-                    release_data_handle(data)
+                    if total % 50 == 0:
+                        time.sleep(0.001)
                 except Exception as e:
                     log_exception("Step estimation error", e, f"path={path}")
             return total
@@ -2285,8 +2276,10 @@ def optimize_ai():
                                 break
                             progress_bar("模型训练阶段", current_step, total_samples, f"Loss: {last_loss_value:.4f} | Chunk {idx+1}/{total_chunks}")
                             del imgs, mins, labels, next_frames, grid_logits, pred_feat, button_logits, target_grid, target_buttons, target_feat, total_loss
-                            if low_vram_mode or batch_idx % 2 == 1:
+                            if low_vram_mode or batch_idx % 3 == 2:
                                 torch.cuda.empty_cache()
+                            if batch_idx % 16 == 0:
+                                time.sleep(0.001)
                             if low_vram_mode:
                                 gc.collect()
                                 if os.name == "nt":
