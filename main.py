@@ -163,12 +163,12 @@ lmdb_path = os.path.join(data_dir, "experience.lmdb")
 meta_path = os.path.join(data_dir, "experience_meta.json")
 LMDB_LIMIT_BYTES = 20 * 1024 * 1024 * 1024
 
-    for d in [base_dir, data_dir, model_dir, temp_dir]:
-        if not os.path.exists(d):
-            try:
-                os.makedirs(d)
-            except Exception as e:
-                print(f"创建目录 {d} 时出错：{e}")
+for d in [base_dir, data_dir, model_dir, temp_dir]:
+    if not os.path.exists(d):
+        try:
+            os.makedirs(d)
+        except Exception as e:
+            print(f"创建目录 {d} 时出错：{e}")
 
 def ensure_experience_structure():
     try:
