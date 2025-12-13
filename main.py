@@ -360,6 +360,15 @@ class SciFiWindow:
         except Exception:
             pass
 
+    def restore(self):
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.after(200, lambda: self.root.attributes("-topmost", False))
+        except Exception:
+            pass
+
     def on_sleep(self):
         request_sleep_mode()
 
@@ -449,6 +458,13 @@ def get_latest_frame():
 def get_full_frame():
     with frame_lock:
         return latest_frame.get("full"), latest_frame.get("ts")
+
+def clamp_region(cx, cy, w, h, frame_w, frame_h):
+    half_w = w // 2
+    half_h = h // 2
+    left = max(0, min(frame_w - w, int(cx - half_w)))
+    top = max(0, min(frame_h - h, int(cy - half_h)))
+    return left, top, w, h
 
 def cleanup_before_sleep():
     global dxcam_camera
@@ -1266,13 +1282,16 @@ def calculate_data_dir_size():
 def check_disk_space():
     try:
         total_size = calculate_data_dir_size()
-        if total_size > LMDB_LIMIT_BYTES:
+        attempts = 0
+        while total_size > LMDB_LIMIT_BYTES:
             trim_lmdb(LMDB_LIMIT_BYTES)
             compact_lmdb()
             trim_binary_log(LMDB_LIMIT_BYTES)
             total_size = calculate_data_dir_size()
-            if total_size > LMDB_LIMIT_BYTES:
-                update_window_status("经验池空间不足，正在限制数据写入。", "warn")
+            attempts += 1
+            if attempts >= 5 and total_size > LMDB_LIMIT_BYTES:
+                update_window_status("经验池空间不足，清理未达标，已暂停写入。", "error")
+                break
     except Exception as e:
         log_exception("Disk clean error", e)
 
@@ -2781,6 +2800,7 @@ def start_training_mode():
                     print(f"Priority key error: {e}")
             try:
                 frame_img, frame_ts = get_latest_frame()
+                full_frame, _ = get_full_frame()
                 if frame_img is None:
                     time.sleep(0.01)
                     continue
@@ -2793,11 +2813,30 @@ def start_training_mode():
                     r_up_pos = mouse_state["r_up_pos"]
                     traj = list(temp_trajectory)
                 mouse_state["scroll"] = 0
-                img_tensor = cv2.cvtColor(frame_img, cv2.COLOR_BGRA2RGB)
-                img_tensor = img_tensor.transpose(2, 0, 1) / 255.0
+                img_rgb = None
+                if frame_img is not None and frame_img.ndim == 3:
+                    if frame_img.shape[2] == 4:
+                        img_rgb = cv2.cvtColor(frame_img, cv2.COLOR_BGRA2RGB)
+                    elif frame_img.shape[2] == 3:
+                        img_rgb = cv2.cvtColor(frame_img, cv2.COLOR_BGR2RGB)
+                if img_rgb is None and frame_img is not None:
+                    img_rgb = np.zeros((frame_img.shape[0], frame_img.shape[1], 3), dtype=np.uint8)
+                if img_rgb is None:
+                    img_rgb = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+                img_tensor = img_rgb.transpose(2, 0, 1) / 255.0
                 ts_value = frame_ts if frame_ts else start_time
                 def norm_coord(v, dim):
                     return (2.0 * (v / dim)) - 1.0
+                if full_frame is None:
+                    full_frame = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
+                if full_frame.ndim != 3:
+                    full_frame = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
+                if full_frame.shape[2] == 4:
+                    full_rgb = cv2.cvtColor(full_frame, cv2.COLOR_BGRA2RGB)
+                elif full_frame.shape[2] == 3:
+                    full_rgb = cv2.cvtColor(full_frame, cv2.COLOR_BGR2RGB)
+                else:
+                    full_rgb = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
                 traj_flat = sample_trajectory(traj, ts_value, fallback_pos=(curr_x, curr_y))
                 traj_norm = []
                 for i, v in enumerate(traj_flat):
@@ -2805,6 +2844,10 @@ def start_training_mode():
                         traj_norm.append(norm_coord(v, screen_w))
                     else:
                         traj_norm.append(norm_coord(v, screen_h))
+                mouse_box = clamp_region(curr_x, curr_y, max(64, target_w * 2), max(40, target_h * 2), full_rgb.shape[1], full_rgb.shape[0])
+                focus_center = attention_focus if attention_focus is not None else (curr_x, curr_y)
+                att_box = clamp_region(focus_center[0], focus_center[1], max(64, target_w * 2), max(40, target_h * 2), full_rgb.shape[1], full_rgb.shape[0])
+                full_box = (0, 0, screen_w, screen_h)
                 m_vec = [
                     norm_coord(curr_x, screen_w), norm_coord(curr_y, screen_h),
                     1.0 if l_down else 0.0,
@@ -2823,10 +2866,29 @@ def start_training_mode():
                     norm_coord(mouse_state["r_down_pos"][0], screen_w),
                     norm_coord(mouse_state["r_down_pos"][1], screen_h),
                     norm_coord(r_up_pos[0], screen_w),
-                    norm_coord(r_up_pos[1], screen_h)
+                    norm_coord(r_up_pos[1], screen_h),
+                    norm_coord(mouse_box[0], screen_w),
+                    norm_coord(mouse_box[1], screen_h),
+                    (mouse_box[2] / screen_w) if mouse_box[2] else 0.0,
+                    (mouse_box[3] / screen_h) if mouse_box[3] else 0.0,
+                    norm_coord(att_box[0], screen_w),
+                    norm_coord(att_box[1], screen_h),
+                    (att_box[2] / screen_w) if att_box[2] else 0.0,
+                    (att_box[3] / screen_h) if att_box[3] else 0.0,
+                    norm_coord(full_box[0], screen_w),
+                    norm_coord(full_box[1], screen_h),
+                    (full_box[2] / screen_w) if full_box[2] else 0.0,
+                    (full_box[3] / screen_h) if full_box[3] else 0.0
                 ]
                 m_vec.extend(traj_norm)
                 m_vec.append(1.0)
+                if len(m_vec) != mouse_feature_dim:
+                    original_len = len(m_vec)
+                    if len(m_vec) < mouse_feature_dim:
+                        m_vec.extend([0.0] * (mouse_feature_dim - len(m_vec)))
+                    else:
+                        m_vec = m_vec[:mouse_feature_dim]
+                    update_window_status(f"鼠标特征长度异常：{original_len}，已调整为 {len(m_vec)}。", "error")
                 input_buffer_img.append(img_tensor)
                 input_buffer_mouse.append(m_vec)
                 prev_pos = (curr_x, curr_y)
@@ -2871,8 +2933,13 @@ def start_training_mode():
                     elif pred_buttons[1] <= 0.5 and r_down:
                         mouse_ctrl.release(mouse.Button.right)
                     actual_frame, _ = get_latest_frame()
-                    if actual_frame is not None:
-                        actual_rgb = cv2.cvtColor(actual_frame, cv2.COLOR_BGRA2RGB) if actual_frame.shape[2] == 4 else actual_frame
+                    if actual_frame is not None and actual_frame.ndim == 3:
+                        if actual_frame.shape[2] == 4:
+                            actual_rgb = cv2.cvtColor(actual_frame, cv2.COLOR_BGRA2RGB)
+                        elif actual_frame.shape[2] == 3:
+                            actual_rgb = cv2.cvtColor(actual_frame, cv2.COLOR_BGR2RGB)
+                        else:
+                            actual_rgb = np.zeros((actual_frame.shape[0], actual_frame.shape[1], 3), dtype=np.uint8)
                         actual_tensor = torch.FloatTensor(actual_rgb.transpose(2, 0, 1) / 255.0).unsqueeze(0).to(train_device)
                         with autocast(device_type="cuda", enabled=train_device.type == "cuda"):
                             actual_feat = model.encode_features(actual_tensor)
@@ -2890,6 +2957,8 @@ def start_training_mode():
             except Exception as e:
                 log_exception("Training Runtime Error", e)
                 update_window_status(f"训练过程中出现异常: {e}", "error")
+                if window_ui is not None:
+                    window_ui.restore()
                 break
         flush_buffers()
         current_mode = MODE_LEARNING
@@ -2910,14 +2979,7 @@ def record_data_loop():
     buffer_actions = []
     last_pos = (0, 0)
     chunk_target = random.randint(60, 100)
-    prev_full_frame = None
-
-    def clamp_region(cx, cy, w, h, frame_w, frame_h):
-        half_w = w // 2
-        half_h = h // 2
-        left = max(0, min(frame_w - w, int(cx - half_w)))
-        top = max(0, min(frame_h - h, int(cy - half_h)))
-        return left, top, w, h
+    prev_full_frame_small = None
 
     while True:
         if recording_pause_event.is_set():
@@ -2957,8 +3019,11 @@ def record_data_loop():
                 mouse_box = clamp_region(c_state["x"], c_state["y"], max(64, target_w * 2), max(40, target_h * 2), full_rgb.shape[1], full_rgb.shape[0])
                 mouse_crop = full_rgb[mouse_box[1]:mouse_box[1]+mouse_box[3], mouse_box[0]:mouse_box[0]+mouse_box[2]]
                 diff_center = None
-                if prev_full_frame is not None and prev_full_frame.shape == full_rgb.shape:
-                    diff = cv2.absdiff(full_rgb, prev_full_frame)
+                diff_w = max(1, screen_w // 4)
+                diff_h = max(1, screen_h // 4)
+                diff_frame = cv2.resize(full_rgb, (diff_w, diff_h))
+                if prev_full_frame_small is not None and prev_full_frame_small.shape == diff_frame.shape:
+                    diff = cv2.absdiff(diff_frame, prev_full_frame_small)
                     diff_gray = cv2.cvtColor(diff, cv2.COLOR_RGB2GRAY)
                     heat = cv2.resize(diff_gray, (64, 40))
                     min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(heat)
@@ -3018,7 +3083,7 @@ def record_data_loop():
                 action_entry.append(1.0 if current_mode == MODE_TRAINING else 0.0)
                 buffer_actions.append(action_entry)
                 last_pos = (c_state["x"], c_state["y"])
-                prev_full_frame = full_rgb.copy()
+                prev_full_frame_small = diff_frame
 
                 if len(buffer_images) >= chunk_target:
                     while save_queue.qsize() > 50:
