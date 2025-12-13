@@ -168,6 +168,7 @@ input_allowed_event.set()
 window_ui = None
 user_stop_request_reason = None
 latest_optimization_summary = None
+attention_focus = None
 
 def set_process_priority():
     try:
@@ -384,7 +385,7 @@ seq_len = 12
 screen_w, screen_h = 2560, 1600
 target_w, target_h = 256, 160
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-mouse_feature_dim = 40
+mouse_feature_dim = 52
 grid_w, grid_h = 32, 20
 grid_size = grid_w * grid_h
 if torch.cuda.is_available():
@@ -399,7 +400,7 @@ mouse_state = {
 mouse_lock = threading.Lock()
 temp_trajectory = deque(maxlen=200)
 frame_lock = threading.Lock()
-latest_frame = {"img": None, "ts": 0.0}
+latest_frame = {"img": None, "ts": 0.0, "full": None}
 file_read_lock = threading.Lock()
 file_write_lock = threading.Lock()
 log_lock = threading.Lock()
@@ -411,14 +412,20 @@ lmdb_start = 0
 current_map_size_gb = 2
 dxcam_camera = None
 
-def update_latest_frame(img, ts):
+def update_latest_frame(img, ts, full=None):
     with frame_lock:
         latest_frame["img"] = img
         latest_frame["ts"] = ts
+        if full is not None:
+            latest_frame["full"] = full
 
 def get_latest_frame():
     with frame_lock:
         return latest_frame["img"], latest_frame["ts"]
+
+def get_full_frame():
+    with frame_lock:
+        return latest_frame.get("full"), latest_frame.get("ts")
 
 def cleanup_before_sleep():
     global dxcam_camera
@@ -1059,7 +1066,7 @@ def frame_generator_loop():
                     img_small = img_small[:, :target_w]
                 if img_small.shape[0] > target_h:
                     img_small = img_small[:target_h, :]
-                update_latest_frame(img_small, start)
+                update_latest_frame(img_small, start, frame)
                 desired = max(30, capture_freq * 2)
                 wait = (1.0 / desired) - (time.time() - start)
                 if wait > 0:
@@ -1076,7 +1083,7 @@ def frame_generator_loop():
                 img_small = img_small[:, :target_w]
             if img_small.shape[0] > target_h:
                 img_small = img_small[:target_h, :]
-            update_latest_frame(img_small, start)
+            update_latest_frame(img_small, start, img)
             desired = max(30, capture_freq * 2)
             wait = (1.0 / desired) - (time.time() - start)
             if wait > 0:
@@ -1271,11 +1278,27 @@ def prepare_saved_arrays(buffer_images, buffer_actions):
         arr = np.asarray(unwrap_array(img), dtype=np.uint8)
         if arr.ndim == 2:
             arr = np.stack([arr] * 3, axis=-1)
-        if arr.shape[0] != target_h or arr.shape[1] != target_w:
-            arr = cv2.resize(arr, (target_w, target_h))
-        if arr.shape[2] > 3:
-            arr = arr[:, :, :3]
-        imgs.append(arr)
+        if arr.ndim == 3:
+            if arr.shape[0] != target_h or arr.shape[1] != target_w:
+                arr = cv2.resize(arr, (target_w, target_h))
+            if arr.shape[2] > 3:
+                arr = arr[:, :, :3]
+            imgs.append(np.expand_dims(arr, axis=0))
+        elif arr.ndim == 4:
+            views = []
+            for v in arr:
+                v_arr = np.asarray(v, dtype=np.uint8)
+                if v_arr.ndim == 2:
+                    v_arr = np.stack([v_arr] * 3, axis=-1)
+                if v_arr.shape[0] != target_h or v_arr.shape[1] != target_w:
+                    v_arr = cv2.resize(v_arr, (target_w, target_h))
+                if v_arr.shape[2] > 3:
+                    v_arr = v_arr[:, :, :3]
+                views.append(v_arr)
+            if views:
+                imgs.append(np.stack(views, axis=0))
+        else:
+            imgs.append(np.zeros((1, target_h, target_w, 3), dtype=np.uint8))
     act_len = max((len(np.asarray(unwrap_array(a)).flatten()) for a in buffer_actions), default=0)
     acts = []
     for a in buffer_actions:
@@ -1320,7 +1343,7 @@ def safe_action_array(entry):
 
 def safe_image_data(entry, structured=False):
     try:
-        if isinstance(entry, np.ndarray) and entry.ndim == 3:
+        if isinstance(entry, np.ndarray) and entry.ndim in (3, 4):
             return entry
         if structured:
             if hasattr(entry, "dtype") and getattr(entry.dtype, "names", None) and "image" in entry.dtype.names:
@@ -1430,6 +1453,8 @@ class StreamingGameDataset(IterableDataset):
                 arr = np.asarray(img) if img is not None else None
                 if arr is None or arr.size == 0:
                     return np.zeros((3, target_h, target_w), dtype=np.uint8)
+                if arr.ndim == 4:
+                    arr = arr[0]
                 if arr.ndim == 2:
                     arr = np.stack([arr] * 3, axis=-1)
                 elif arr.ndim == 3 and arr.shape[2] == 1:
@@ -1474,15 +1499,27 @@ class StreamingGameDataset(IterableDataset):
                 r_down_y = norm_coord(aval(14), screen_h)
                 r_up_x = norm_coord(aval(18), screen_w)
                 r_up_y = norm_coord(aval(19), screen_h)
+                mouse_left = norm_coord(aval(20), screen_w)
+                mouse_top = norm_coord(aval(21), screen_h)
+                mouse_w = aval(22) / screen_w
+                mouse_h = aval(23) / screen_h
+                att_left = norm_coord(aval(24), screen_w)
+                att_top = norm_coord(aval(25), screen_h)
+                att_w = aval(26) / screen_w
+                att_h = aval(27) / screen_h
+                full_left = norm_coord(aval(28), screen_w)
+                full_top = norm_coord(aval(29), screen_h)
+                full_w = aval(30) / screen_w
+                full_h = aval(31) / screen_h
                 traj_vals = []
-                for ti in range(20, 40, 2):
+                for ti in range(32, 52, 2):
                     traj_vals.append(norm_coord(aval(ti), screen_w))
                     traj_vals.append(norm_coord(aval(ti + 1), screen_h))
                 time_since_l_down = max(0.0, ts_now - aval(6)) if aval(6) > 0 else 0.0
                 time_since_l_up = max(0.0, ts_now - aval(9)) if aval(9) > 0 else 0.0
                 time_since_r_down = max(0.0, ts_now - aval(12)) if aval(12) > 0 else 0.0
                 time_since_r_up = max(0.0, ts_now - aval(15)) if aval(15) > 0 else 0.0
-                is_ai = aval(40)
+                is_ai = aval(52)
             else:
                 ts_now = item.get("ts", 0.0)
                 mx = norm_coord(item.get("mouse_x", 0.0), screen_w)
@@ -1496,6 +1533,8 @@ class StreamingGameDataset(IterableDataset):
                 l_up_pos = item.get("l_up_pos", (0.0, 0.0))
                 r_down_pos = item.get("r_down_pos", (0.0, 0.0))
                 r_up_pos = item.get("r_up_pos", (0.0, 0.0))
+                mouse_box = item.get("mouse_box", (0.0, 0.0, target_w * 2, target_h * 2))
+                att_box = item.get("att_box", (0.0, 0.0, target_w * 2, target_h * 2))
                 l_down_x = norm_coord(l_down_pos[0], screen_w)
                 l_down_y = norm_coord(l_down_pos[1], screen_h)
                 l_up_x = norm_coord(l_up_pos[0], screen_w)
@@ -1504,6 +1543,18 @@ class StreamingGameDataset(IterableDataset):
                 r_down_y = norm_coord(r_down_pos[1], screen_h)
                 r_up_x = norm_coord(r_up_pos[0], screen_w)
                 r_up_y = norm_coord(r_up_pos[1], screen_h)
+                mouse_left = norm_coord(mouse_box[0], screen_w)
+                mouse_top = norm_coord(mouse_box[1], screen_h)
+                mouse_w = (mouse_box[2] / screen_w) if mouse_box[2] else 0.0
+                mouse_h = (mouse_box[3] / screen_h) if mouse_box[3] else 0.0
+                att_left = norm_coord(att_box[0], screen_w)
+                att_top = norm_coord(att_box[1], screen_h)
+                att_w = (att_box[2] / screen_w) if att_box[2] else 0.0
+                att_h = (att_box[3] / screen_h) if att_box[3] else 0.0
+                full_left = norm_coord(0.0, screen_w)
+                full_top = norm_coord(0.0, screen_h)
+                full_w = 1.0
+                full_h = 1.0
                 raw_traj = item.get("trajectory", [])
                 if raw_traj:
                     traj_values = raw_traj
@@ -1544,7 +1595,19 @@ class StreamingGameDataset(IterableDataset):
                 r_down_x,
                 r_down_y,
                 r_up_x,
-                r_up_y
+                r_up_y,
+                mouse_left,
+                mouse_top,
+                mouse_w,
+                mouse_h,
+                att_left,
+                att_top,
+                att_w,
+                att_h,
+                full_left,
+                full_top,
+                full_w,
+                full_h
             ]
             m_vec.extend(traj_vals)
             m_vec.append(is_ai)
@@ -2497,7 +2560,7 @@ def optimize_ai():
         gc.collect()
 
 def start_training_mode():
-    global stop_training_flag, current_mode
+    global stop_training_flag, current_mode, attention_focus
     time.sleep(1.0)
     stop_optimization_flag.clear()
     stop_training_flag = False
@@ -2662,6 +2725,7 @@ def start_training_mode():
                     cell_y = pred_cell // grid_w
                     target_x = int(((cell_x + 0.5) / grid_w) * screen_w)
                     target_y = int(((cell_y + 0.5) / grid_h) * screen_h)
+                    attention_focus = (target_x, target_y)
                     hidden_state = hidden_out.detach()
                     target_history.append((target_x, target_y))
                     avg_x = sum(p[0] for p in target_history) / len(target_history)
@@ -2716,6 +2780,7 @@ def start_training_mode():
         update_window_status(f"训练结束，步数{action_steps}，返回学习模式。", "info")
     finally:
         release_mouse_outputs()
+        attention_focus = None
         current_mode = MODE_LEARNING
         input_allowed_event.set()
 
@@ -2724,6 +2789,14 @@ def record_data_loop():
     buffer_actions = []
     last_pos = (0, 0)
     chunk_target = random.randint(60, 100)
+    prev_full_frame = None
+
+    def clamp_region(cx, cy, w, h, frame_w, frame_h):
+        half_w = w // 2
+        half_h = h // 2
+        left = max(0, min(frame_w - w, int(cx - half_w)))
+        top = max(0, min(frame_h - h, int(cy - half_h)))
+        return left, top, w, h
 
     while True:
         if recording_pause_event.is_set():
@@ -2745,19 +2818,47 @@ def record_data_loop():
             try:
                 start_time = time.time()
                 frame_img, frame_ts = get_latest_frame()
-                if frame_img is None:
+                full_frame, full_ts = get_full_frame()
+                if frame_img is None and full_frame is None:
                     time.sleep(0.01)
                     continue
-
+                ts_value = frame_ts if frame_ts else (full_ts if full_ts else start_time)
                 with mouse_lock:
                     c_state = mouse_state.copy()
                     mouse_state["scroll"] = 0
                     traj = list(temp_trajectory)
-
-                ts_value = frame_ts if frame_ts else start_time
+                if full_frame is None:
+                    full_frame = cv2.resize(frame_img, (screen_w, screen_h)) if frame_img is not None else np.zeros((screen_h, screen_w, 4), dtype=np.uint8)
+                if full_frame.shape[2] == 4:
+                    full_rgb = cv2.cvtColor(full_frame, cv2.COLOR_BGRA2RGB)
+                else:
+                    full_rgb = cv2.cvtColor(full_frame, cv2.COLOR_BGR2RGB) if full_frame.shape[2] == 3 else np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
+                mouse_box = clamp_region(c_state["x"], c_state["y"], max(64, target_w * 2), max(40, target_h * 2), full_rgb.shape[1], full_rgb.shape[0])
+                mouse_crop = full_rgb[mouse_box[1]:mouse_box[1]+mouse_box[3], mouse_box[0]:mouse_box[0]+mouse_box[2]]
+                diff_center = None
+                if prev_full_frame is not None and prev_full_frame.shape == full_rgb.shape:
+                    diff = cv2.absdiff(full_rgb, prev_full_frame)
+                    diff_gray = cv2.cvtColor(diff, cv2.COLOR_RGB2GRAY)
+                    heat = cv2.resize(diff_gray, (64, 40))
+                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(heat)
+                    diff_center = (int((max_loc[0] / 64) * screen_w), int((max_loc[1] / 40) * screen_h)) if max_val > 0 else None
+                focus_center = None
+                if attention_focus is not None:
+                    focus_center = attention_focus
+                if focus_center is not None:
+                    att_center = focus_center
+                elif diff_center is not None:
+                    att_center = diff_center
+                else:
+                    att_center = (c_state["x"], c_state["y"])
+                att_box = clamp_region(att_center[0], att_center[1], max(64, target_w * 2), max(40, target_h * 2), full_rgb.shape[1], full_rgb.shape[0])
+                att_crop = full_rgb[att_box[1]:att_box[1]+att_box[3], att_box[0]:att_box[0]+att_box[2]]
+                full_view = cv2.resize(full_rgb, (target_w, target_h))
+                mouse_view = cv2.resize(mouse_crop, (target_w, target_h)) if mouse_crop.size > 0 else np.zeros((target_h, target_w, 3), dtype=np.uint8)
+                att_view = cv2.resize(att_crop, (target_w, target_h)) if att_crop.size > 0 else np.zeros((target_h, target_w, 3), dtype=np.uint8)
+                combined_views = np.stack([full_view, mouse_view, att_view], axis=0).astype(np.uint8)
+                buffer_images.append(combined_views)
                 traj_flat = sample_trajectory(traj, ts_value, fallback_pos=(c_state["x"], c_state["y"]))
-                img_rgb = cv2.cvtColor(frame_img, cv2.COLOR_BGRA2RGB) if frame_img.shape[2] == 4 else frame_img
-                buffer_images.append(img_rgb.astype(np.uint8))
                 action_entry = [
                     ts_value,
                     c_state["x"],
@@ -2778,12 +2879,25 @@ def record_data_loop():
                     c_state["x"] - last_pos[0],
                     c_state["y"] - last_pos[1],
                     c_state["r_up_pos"][0],
-                    c_state["r_up_pos"][1]
+                    c_state["r_up_pos"][1],
+                    mouse_box[0],
+                    mouse_box[1],
+                    mouse_box[2],
+                    mouse_box[3],
+                    att_box[0],
+                    att_box[1],
+                    att_box[2],
+                    att_box[3],
+                    0,
+                    0,
+                    screen_w,
+                    screen_h
                 ]
                 action_entry.extend(traj_flat)
                 action_entry.append(1.0 if current_mode == MODE_TRAINING else 0.0)
                 buffer_actions.append(action_entry)
                 last_pos = (c_state["x"], c_state["y"])
+                prev_full_frame = full_rgb.copy()
 
                 if len(buffer_images) >= chunk_target:
                     img_arr, act_arr = prepare_saved_arrays(buffer_images, buffer_actions)
