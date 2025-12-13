@@ -1984,6 +1984,7 @@ def optimize_ai():
         user_stop_request_reason = None
         capture_pause_event.set()
         opt_start = time.time()
+        duration = 0.0
         force_memory_cleanup(3, 0.1)
         if torch.cuda.is_available():
             try:
@@ -2416,10 +2417,13 @@ def optimize_ai():
         curiosity_weight = float(torch.exp(-model.log_var_prediction.detach()).item())
         laziness_penalty = float(torch.exp(-model.log_var_energy.detach()).item())
         reason_text = early_stop_reason or user_stop_request_reason or f"Keyboard interrupt after {current_step}/{total_steps} steps"
+        duration = time.time() - opt_start
         if interrupted:
             print("[Optimization Interrupted]")
             print(f"> Reason: {reason_text}")
             update_window_status(f"睡眠优化中断: {reason_text}", "warn")
+            update_window_progress(0, "数据扫描：已完成，等待下一轮", channel="scan")
+            update_window_progress(0, "AI优化：已中断，等待下一轮", channel="opt")
         else:
             print("[Optimization Done]")
             summary_msg = f"睡眠优化完成，模型已保存（{model_path}），耗时{duration:.2f}秒，步骤{current_step}/{total_steps}，返回学习模式。"
@@ -2466,7 +2470,6 @@ def optimize_ai():
             print(f"> 估算人类样本步数: {human_steps} | AI样本步数: {ai_steps}")
         if early_stop_reason:
             print(f"> 提前结束提示: {early_stop_reason}")
-        duration = time.time() - opt_start
         print(f"> 本轮训练用时: {duration:.2f} 秒")
         torch.cuda.empty_cache()
         if torch.cuda.is_available():
