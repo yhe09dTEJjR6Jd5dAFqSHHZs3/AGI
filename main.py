@@ -71,7 +71,7 @@ def resolve_desktop_path():
             if path:
                 return path
         except Exception as e:
-            print(f"Desktop path resolve error: {e}")
+            print(f"桌面路径解析失败：{e}")
     return os.path.join(os.path.expanduser("~"), "Desktop")
 
 def progress_bar(prefix, current, total, suffix="", channel="opt"):
@@ -125,7 +125,7 @@ def install_requirements():
         try:
             __import__(import_name)
         except ImportError:
-            print(f"Installing {package}...")
+            print(f"正在安装 {package}...")
             try:
                 subprocess.check_call([sys.executable, "-m", "pip", "install", "-i", "https://pypi.tuna.tsinghua.edu.cn/simple", package])
             except Exception as e:
@@ -163,12 +163,12 @@ lmdb_path = os.path.join(data_dir, "experience.lmdb")
 meta_path = os.path.join(data_dir, "experience_meta.json")
 LMDB_LIMIT_BYTES = 20 * 1024 * 1024 * 1024
 
-for d in [base_dir, data_dir, model_dir, temp_dir]:
-    if not os.path.exists(d):
-        try:
-            os.makedirs(d)
-        except Exception as e:
-            print(f"Error creating directory {d}: {e}")
+    for d in [base_dir, data_dir, model_dir, temp_dir]:
+        if not os.path.exists(d):
+            try:
+                os.makedirs(d)
+            except Exception as e:
+                print(f"创建目录 {d} 时出错：{e}")
 
 def ensure_experience_structure():
     try:
@@ -178,17 +178,26 @@ def ensure_experience_structure():
                 with open(path, "ab"):
                     pass
             except Exception as e:
-                print(f"File prep warning for {path}: {e}")
+                print(f"准备文件 {path} 时出现警告：{e}")
         if not os.path.exists(meta_path):
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump([], f)
         update_window_status("初始化完成，已创建经验池文件结构。", "info")
     except Exception as e:
-        print(f"Experience structure error: {e}")
+        print(f"经验池结构创建异常：{e}")
 
 MODE_LEARNING = "LEARNING"
 MODE_SLEEP = "SLEEP"
 MODE_TRAINING = "TRAINING"
+MODE_DISPLAY = {
+    MODE_LEARNING: "学习",
+    MODE_SLEEP: "睡眠",
+    MODE_TRAINING: "训练",
+}
+
+
+def display_mode(mode):
+    return MODE_DISPLAY.get(mode, str(mode))
 current_mode = MODE_LEARNING
 stop_training_flag = False
 flush_event = threading.Event()
@@ -212,7 +221,7 @@ def set_process_priority():
         else:
             proc.nice(psutil.NORMAL_PRIORITY_CLASS if hasattr(psutil, "NORMAL_PRIORITY_CLASS") else 5)
     except Exception as e:
-        print(f"Priority set error: {e}")
+        print(f"设置进程优先级失败：{e}")
 
 def flush_buffers(timeout=3):
     update_window_status("正在刷盘/写经验池...", "info")
@@ -231,7 +240,7 @@ def report_to_window(msg, level="info"):
         if window_ui is not None:
             window_ui.log(msg, level)
     except Exception as e:
-        print(f"Window report error: {e}")
+        print(f"窗口日志输出失败：{e}")
 
 def window_log(msg, level="info", to_status=False):
     report_to_window(msg, level)
@@ -251,25 +260,25 @@ class SciFiWindow:
     def __init__(self):
         self.queue = queue.Queue()
         self.root = tk.Tk()
-        self.root.title("Nebula Core")
+        self.root.title("星云核心")
         self.root.geometry("540x480")
         self.root.configure(bg="#0a0f1a")
         self.root.resizable(False, False)
-        self.mode_var = tk.StringVar(value=current_mode)
-        self.status_var = tk.StringVar(value="Initializing...")
+        self.mode_var = tk.StringVar(value=display_mode(current_mode))
+        self.status_var = tk.StringVar(value="初始化中...")
         self.scan_progress_var = tk.StringVar(value="0.00%")
         self.scan_text_var = tk.StringVar(value="数据扫描：待开始")
         self.opt_progress_var = tk.StringVar(value="0.00%")
         self.opt_text_var = tk.StringVar(value="AI优化：待开始")
-        title = tk.Label(self.root, text="AGI Control", fg="#7fffd4", bg="#0a0f1a", font=("Consolas", 16, "bold"))
+        title = tk.Label(self.root, text="AGI 控制台", fg="#7fffd4", bg="#0a0f1a", font=("Consolas", 16, "bold"))
         title.pack(pady=6)
         mode_frame = tk.Frame(self.root, bg="#0a0f1a")
         mode_frame.pack(fill="x", padx=10)
-        tk.Label(mode_frame, text="Mode", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 12)).pack(side="left")
+        tk.Label(mode_frame, text="模式", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 12)).pack(side="left")
         tk.Label(mode_frame, textvariable=self.mode_var, fg="#e3f2fd", bg="#0a0f1a", font=("Consolas", 12, "bold")).pack(side="left", padx=8)
         status_frame = tk.Frame(self.root, bg="#0a0f1a")
         status_frame.pack(fill="x", padx=10, pady=4)
-        tk.Label(status_frame, text="Status", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 11)).pack(side="left")
+        tk.Label(status_frame, text="状态", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 11)).pack(side="left")
         tk.Label(status_frame, textvariable=self.status_var, fg="#d4fc79", bg="#0a0f1a", font=("Consolas", 10), wraplength=340, justify="left").pack(side="left", padx=6)
         btn_frame = tk.Frame(self.root, bg="#0a0f1a")
         btn_frame.pack(fill="x", padx=10, pady=6)
@@ -330,8 +339,8 @@ class SciFiWindow:
                     self.log_area.insert("end", str(entry) + "\n")
                     self.log_area.see("end")
                     self.log_area.configure(state="disabled")
-        except Exception as e:
-            print(f"UI queue processing error: {e}")
+    except Exception as e:
+        print(f"界面队列处理异常：{e}")
         finally:
             self.root.after(200, self.process_queue)
 
@@ -369,15 +378,15 @@ def init_window():
         window_ui = SciFiWindow()
         return True
     except Exception as e:
-        print(f"UI init error: {e}")
+        print(f"界面初始化失败：{e}")
         return False
 
 def update_window_mode(mode):
     try:
         if window_ui is not None:
-            window_ui.queue.put(("mode", mode))
+            window_ui.queue.put(("mode", display_mode(mode)))
     except Exception as e:
-        print(f"Mode update error: {e}")
+        print(f"模式显示更新失败：{e}")
 
 def update_window_status(msg, level="info"):
     report_to_window(msg, level)
@@ -385,14 +394,14 @@ def update_window_status(msg, level="info"):
         if window_ui is not None:
             window_ui.queue.put(("status", msg))
     except Exception as e:
-        print(f"Status update error: {e}")
+        print(f"状态更新失败：{e}")
 
 def update_window_progress(pct, text=None, channel="opt"):
     try:
         if window_ui is not None:
             window_ui.set_progress(channel, pct, text)
     except Exception as e:
-        print(f"Progress update error: {e}")
+        print(f"进度条更新失败：{e}")
 
 capture_freq = 10
 seq_len = 12
@@ -2681,8 +2690,11 @@ def start_training_mode():
     model_path = os.path.join(model_dir, "ai_model.pth")
     try:
         if not os.path.exists(model_path):
-            print("No model found. Aborting training.")
+            print("未找到可用模型，训练已取消。")
             update_window_status("未找到模型，训练已取消。", "error")
+            current_mode = MODE_LEARNING
+            update_window_mode(current_mode)
+            input_allowed_event.set()
             return
 
         train_device = device
@@ -2881,14 +2893,16 @@ def start_training_mode():
                 break
         flush_buffers()
         current_mode = MODE_LEARNING
+        update_window_mode(current_mode)
         duration = time.time() - train_start
         print(f"训练模式总结: 步数 {action_steps}, 人类样本 0, AI样本 {action_steps}, 用时 {duration:.2f} 秒")
-        print("Exited Training Mode. Back to Learning.")
+        print("训练模式结束，切换回学习模式。")
         update_window_status(f"训练结束，步数{action_steps}，返回学习模式。", "info")
     finally:
         release_mouse_outputs()
         attention_focus = None
         current_mode = MODE_LEARNING
+        update_window_mode(current_mode)
         input_allowed_event.set()
 
 def record_data_loop():
@@ -3053,7 +3067,7 @@ def record_data_loop():
 def request_sleep_mode():
     global current_mode, user_stop_request_reason, latest_optimization_summary
     if current_mode != MODE_LEARNING:
-        msg = f"当前模式为{current_mode}，暂无法进入睡眠模式。"
+        msg = f"当前模式为{display_mode(current_mode)}，暂无法进入睡眠模式。"
         print(msg)
         update_window_status(msg, "warn")
         input_allowed_event.set()
@@ -3090,7 +3104,7 @@ def request_sleep_mode():
 def request_training_mode():
     global current_mode, stop_training_flag
     if current_mode != MODE_LEARNING:
-        msg = f"当前模式为{current_mode}，暂无法进入训练模式。"
+        msg = f"当前模式为{display_mode(current_mode)}，暂无法进入训练模式。"
         print(msg)
         update_window_status(msg, "warn")
         input_allowed_event.set()
@@ -3115,7 +3129,7 @@ def request_early_stop():
         print(msg)
         update_window_status(msg, "warn")
     else:
-        msg = f"当前模式为{current_mode}，早停请求未生效。"
+        msg = f"当前模式为{display_mode(current_mode)}，早停请求未生效。"
         print(msg)
         update_window_status(msg, "warn")
         input_allowed_event.set()
@@ -3134,7 +3148,7 @@ def start_background_services():
     t_save.start()
     t_rec = threading.Thread(target=record_data_loop, daemon=True)
     t_rec.start()
-    print("System initialized. Mode: LEARNING")
+    print("系统初始化完成，当前模式：学习")
     update_window_status("系统初始化完成，进入学习模式。", "info")
     while True:
         try:
@@ -3155,7 +3169,7 @@ if __name__ == "__main__":
     init_window()
     ensure_experience_structure()
     update_window_mode(current_mode)
-    update_window_status("System initializing...", "info")
+    update_window_status("系统初始化中...", "info")
     t_bg_logic = threading.Thread(target=start_background_services, daemon=True)
     t_bg_logic.start()
     if window_ui is not None:
