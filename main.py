@@ -207,6 +207,7 @@ flush_done_event = threading.Event()
 recording_pause_event = threading.Event()
 stop_optimization_flag = threading.Event()
 capture_pause_event = threading.Event()
+write_paused_event = threading.Event()
 low_vram_mode = False
 input_allowed_event = threading.Event()
 input_allowed_event.set()
@@ -1289,16 +1290,22 @@ def calculate_data_dir_size():
 def check_disk_space():
     try:
         total_size = calculate_data_dir_size()
-        attempts = 0
         while total_size > LMDB_LIMIT_BYTES:
+            before = total_size
             trim_lmdb(LMDB_LIMIT_BYTES)
             compact_lmdb()
             trim_binary_log(LMDB_LIMIT_BYTES)
             total_size = calculate_data_dir_size()
-            attempts += 1
-            if attempts >= 5 and total_size > LMDB_LIMIT_BYTES:
-                update_window_status("经验池空间不足，清理未达标，已暂停写入。", "error")
+            if total_size < LMDB_LIMIT_BYTES:
+                write_paused_event.clear()
+                update_window_status("经验池空间已恢复，写入继续。", "info")
                 break
+            if total_size >= before:
+                write_paused_event.set()
+                update_window_status("经验池空间不足，清理未达标，已暂停写入。", "error")
+                return
+        if total_size <= LMDB_LIMIT_BYTES:
+            write_paused_event.clear()
     except Exception as e:
         log_exception("Disk clean error", e)
 
@@ -1347,6 +1354,9 @@ def disk_writer_loop():
             payload = save_queue.get()
             if payload is None or len(payload) < 2:
                 continue
+            while write_paused_event.is_set():
+                update_window_status("经验池写入已暂停，等待清理...", "error")
+                time.sleep(1.0)
             img_arr, act_arr = payload[0], payload[1]
             source_type = payload[2] if len(payload) > 2 else "human"
             if len(img_arr) != len(act_arr) or len(img_arr) == 0:
