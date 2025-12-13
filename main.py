@@ -339,8 +339,8 @@ class SciFiWindow:
                     self.log_area.insert("end", str(entry) + "\n")
                     self.log_area.see("end")
                     self.log_area.configure(state="disabled")
-    except Exception as e:
-        print(f"界面队列处理异常：{e}")
+        except Exception as e:
+            print(f"界面队列处理异常：{e}")
         finally:
             self.root.after(200, self.process_queue)
 
