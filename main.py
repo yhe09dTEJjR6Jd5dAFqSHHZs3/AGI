@@ -11,6 +11,7 @@ import random
 import glob
 import gc
 import warnings
+from tkinter import messagebox
 import io
 import struct
 import tempfile
@@ -25,7 +26,21 @@ if os.name == "nt":
     import winreg
     import msvcrt
 
-warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings(
+    "ignore",
+    message=r"The pynvml package is deprecated\. Please install nvidia-ml-py instead\.",
+    category=FutureWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"`torch\.cuda\.amp\.GradScaler\(.*\)` is deprecated\. Please use `torch\.amp\.GradScaler\('cuda', .*\)` instead\.",
+    category=FutureWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"torch\.utils\.checkpoint: the use_reentrant parameter should be passed explicitly\. In version 2\.5 we will raise an exception if use_reentrant is not passed\. use_reentrant=False is recommended, but if you need to preserve the current default behavior, you can pass use_reentrant=True\.",
+    category=UserWarning,
+)
 warnings.filterwarnings("ignore", module="pynvml")
 
 progress_bar_lock = threading.Lock()
@@ -72,6 +87,25 @@ def progress_bar(prefix, current, total, suffix="", channel="opt"):
         progress_bar_last[channel] = now
     update_window_progress(ratio * 100, f"{prefix} {percent}% {suffix}".strip(), channel=channel)
 
+install_failure_message = None
+
+
+def show_install_error(package, err):
+    global install_failure_message
+    cmd = f"{sys.executable} -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple {package}"
+    message = f"缺失库：{package}\n失败原因：{err}\n下一步操作：请手动运行：{cmd}"
+    install_failure_message = message
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("依赖安装失败", message)
+        root.destroy()
+    except Exception:
+        pass
+    print(message)
+    sys.exit(1)
+
+
 def install_requirements():
     package_map = {
         "torch": "torch",
@@ -95,7 +129,7 @@ def install_requirements():
             try:
                 subprocess.check_call([sys.executable, "-m", "pip", "install", "-i", "https://pypi.tuna.tsinghua.edu.cn/simple", package])
             except Exception as e:
-                print(f"Error installing {package}: {e}")
+                show_install_error(package, e)
 
 install_requirements()
 
@@ -184,33 +218,13 @@ def flush_buffers(timeout=3):
     update_window_status("正在刷盘/写经验池...", "info")
     flush_done_event.clear()
     flush_event.set()
-    finished = flush_done_event.wait(timeout=timeout)
-    if not finished:
-        flush_event.clear()
-        flush_done_event.set()
-        try:
-            with save_queue.mutex:
-                while save_queue.queue:
-                    try:
-                        save_queue.get_nowait()
-                        if getattr(save_queue, "unfinished_tasks", 0) > 0:
-                            save_queue.unfinished_tasks = max(0, save_queue.unfinished_tasks - 1)
-                    except Exception:
-                        break
-                if getattr(save_queue, "unfinished_tasks", 0) == 0:
-                    try:
-                        save_queue.all_tasks_done.notify_all()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        try:
-            if mouse_lock.acquire(blocking=False):
-                mouse_lock.release()
-        except Exception:
-            pass
-        update_window_status("等待数据刷盘超时，已跳过阻塞写入。", "warn")
-    return finished
+    while not flush_done_event.wait(timeout=timeout):
+        recording_pause_event.set()
+        capture_pause_event.set()
+        update_window_status("等待数据刷盘中，录制已暂停以避免丢数...", "warn")
+    recording_pause_event.clear()
+    capture_pause_event.clear()
+    return True
 
 def report_to_window(msg, level="info"):
     try:
@@ -845,7 +859,26 @@ def trim_lmdb(limit_bytes):
                 global lmdb_start
                 lmdb_start = target_start
     except Exception as e:
-        print(f"LMDB trim error: {e}")
+        log_exception("LMDB trim error", e)
+
+
+def compact_lmdb():
+    try:
+        env = get_lmdb_env()
+        temp_copy_path = lmdb_path + ".compact"
+        with lmdb_lock:
+            env.sync()
+            env.copy(temp_copy_path, compact=True)
+        try:
+            env.close()
+        except Exception:
+            pass
+        reset_lmdb_env()
+        with file_write_lock:
+            os.replace(temp_copy_path, lmdb_path)
+        reset_lmdb_env()
+    except Exception as e:
+        log_exception("LMDB compact error", e)
 
 def trim_binary_log(limit_bytes):
     try:
@@ -1021,10 +1054,10 @@ def get_sys_usage():
                 try:
                     pynvml.nvmlShutdown()
                 except Exception as e:
-                    print(f"NVML shutdown warning: {e}")
+                    log_exception("NVML shutdown warning", e)
         return max(cpu, mem, gpu, vram)
     except Exception as e:
-        print(f"Monitor Error: {e}")
+        log_exception("Monitor Error", e)
         return 50
 
 def resource_monitor():
@@ -1051,7 +1084,7 @@ def resource_monitor():
 
             time.sleep(1)
         except Exception as e:
-            print(f"Resource Monitor Error: {e}")
+            log_exception("Resource Monitor Error", e)
             time.sleep(1)
 
 def frame_generator_loop():
@@ -1066,13 +1099,13 @@ def frame_generator_loop():
                     try:
                         camera.stop()
                     except Exception as e:
-                        print(f"Camera stop warning: {e}")
+                        log_exception("Camera stop warning", e)
                     camera = dxcam_camera
                 if sct is not None:
                     try:
                         sct.close()
                     except Exception as e:
-                        print(f"Screen capture close warning: {e}")
+                        log_exception("Screen capture close warning", e)
                     sct = None
                 time.sleep(0.1)
                 continue
@@ -1121,7 +1154,7 @@ def frame_generator_loop():
             if wait > 0:
                 time.sleep(wait)
     except Exception as e:
-        print(f"Frame Generator Error: {e}")
+        log_exception("Frame Generator Error", e)
 
 def on_move(x, y):
     with mouse_lock:
@@ -1209,23 +1242,30 @@ def release_data_handle(data):
     except Exception as e:
         print(f"mmap close warning: {e}")
 
+
+def calculate_data_dir_size():
+    total_size = 0
+    for root_dir, _, files in os.walk(data_dir):
+        for fname in files:
+            fpath = os.path.join(root_dir, fname)
+            try:
+                total_size += os.path.getsize(fpath)
+            except Exception as e:
+                log_exception("Disk size check warning", e, fpath)
+    return total_size
+
 def check_disk_space():
     try:
-        total_size = 0
-        for root_dir, _, files in os.walk(data_dir):
-            for fname in files:
-                fpath = os.path.join(root_dir, fname)
-                try:
-                    total_size += os.path.getsize(fpath)
-                except Exception as e:
-                    print(f"Disk size check warning for {fpath}: {e}")
+        total_size = calculate_data_dir_size()
         if total_size > LMDB_LIMIT_BYTES:
             trim_lmdb(LMDB_LIMIT_BYTES)
+            compact_lmdb()
             trim_binary_log(LMDB_LIMIT_BYTES)
+            total_size = calculate_data_dir_size()
             if total_size > LMDB_LIMIT_BYTES:
                 update_window_status("经验池空间不足，正在限制数据写入。", "warn")
     except Exception as e:
-        print(f"Disk clean error: {e}")
+        log_exception("Disk clean error", e)
 
 def consolidate_data_files(max_frames=10000, min_commit=4000):
     try:
@@ -1281,7 +1321,7 @@ def disk_writer_loop():
                 append_lmdb_records(img_arr, act_arr, source_type)
                 total_samples_written += len(img_arr)
             except Exception as e:
-                print(f"LMDB pipeline error: {e}")
+                log_exception("LMDB pipeline error", e)
             check_counter += 1
             now = time.time()
             if check_counter >= check_interval or now - last_check >= check_time_window:
@@ -1292,7 +1332,7 @@ def disk_writer_loop():
                 update_window_status(f"写盘中，剩余任务{save_queue.qsize()}，累计样本{total_samples_written}", "info")
                 last_status = now
         except Exception as e:
-            print(f"Save Error: {e}")
+            log_exception("Save Error", e)
         finally:
             save_queue.task_done()
 
@@ -2102,7 +2142,7 @@ def update_meta_with_loss(key_plan, paths, loss_value):
                 with open(meta_path, "w", encoding="utf-8") as f:
                     json.dump(data, f)
     except Exception as e:
-        print(f"Meta loss feedback error: {e}")
+        log_exception("Meta loss feedback error", e)
 
 
 def optimize_ai():
@@ -2124,7 +2164,7 @@ def optimize_ai():
                 torch.cuda.synchronize()
                 torch.cuda.ipc_collect()
             except Exception as e:
-                print(f"CUDA stats reset warning: {e}")
+                log_exception("CUDA stats reset warning", e)
         print("Starting Optimization...")
         update_window_status("启动睡眠优化...", "info")
         model_path = os.path.join(model_dir, "ai_model.pth")
@@ -2160,7 +2200,7 @@ def optimize_ai():
                     else:
                         update_window_status("检测到显存紧张，已启用低显存训练配置。", "warn")
             except Exception as e:
-                print(f"GPU property probe warning: {e}")
+                log_exception("GPU property probe warning", e)
         model = UniversalAI().to(train_device)
         optimizer = optim.Adam(model.parameters(), lr=1e-4)
         if os.path.exists(model_path):
@@ -2171,7 +2211,7 @@ def optimize_ai():
                     if "optimizer_state" in state:
                         optimizer.load_state_dict(state["optimizer_state"])
             except Exception as e:
-                print(f"Model load warning: {e}")
+                log_exception("Model load warning", e)
 
         model.train()
         mse_loss = nn.MSELoss()
@@ -2210,7 +2250,7 @@ def optimize_ai():
                     shutil.copy2(temp_path, model_path)
                 return True
             except Exception as e:
-                print(f"Safe save warning: {e}")
+                log_exception("Safe save warning", e)
                 return False
 
         consolidate_data_files()
@@ -2525,7 +2565,7 @@ def optimize_ai():
                     else:
                         current_step = max(0, current_step - attempt_steps)
                         interrupted = True
-                        print(f"Training error: {e}")
+                        log_exception("Training error", e)
                         stop_optimization_flag.set()
                         ensure_stop_reason("训练过程中出现错误，提前停止")
                 finally:
@@ -2558,6 +2598,7 @@ def optimize_ai():
             update_window_status(f"睡眠优化中断: {reason_text}", "warn")
             update_window_progress(0, "数据扫描：已完成，等待下一轮", channel="scan")
             update_window_progress(0, "AI优化：已中断，等待下一轮", channel="opt")
+            latest_optimization_summary = f"睡眠优化中断：{reason_text}，模型已保存到 {model_path if saved_ok else backup_path}" if saved_ok or os.path.exists(backup_path) else f"睡眠优化中断：{reason_text}，模型保存状态未知"
         else:
             print("[Optimization Done]")
             summary_msg = f"睡眠优化完成，模型已保存（{model_path}），耗时{duration:.2f}秒，步骤{current_step}/{total_steps}，返回学习模式。"
@@ -2610,15 +2651,15 @@ def optimize_ai():
             try:
                 torch.cuda.ipc_collect()
             except Exception as e:
-                print(f"CUDA IPC cleanup warning: {e}")
+                log_exception("CUDA IPC cleanup warning", e)
         gc.collect()
     except Exception as e:
-        print(f"Critical Optimization Error: {e}")
+        log_exception("Critical Optimization Error", e)
         try:
             torch.cuda.empty_cache()
             gc.collect()
         except Exception as clean_e:
-            print(f"Cleanup failure after critical error: {clean_e}")
+            log_exception("Cleanup failure after critical error", clean_e)
     finally:
         try:
             if 'model' in locals() and model is not None:
@@ -2636,15 +2677,11 @@ def start_training_mode():
     stop_optimization_flag.clear()
     stop_training_flag = False
     force_memory_cleanup(2, 0.05)
-    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-    time.sleep(0.2)
-    ctypes.windll.user32.ShowWindow(hwnd, 6)
 
     model_path = os.path.join(model_dir, "ai_model.pth")
     try:
         if not os.path.exists(model_path):
             print("No model found. Aborting training.")
-            ctypes.windll.user32.ShowWindow(hwnd, 9)
             update_window_status("未找到模型，训练已取消。", "error")
             return
 
@@ -2657,7 +2694,7 @@ def start_training_mode():
                     train_device = torch.device("cpu")
                     update_window_status("训练模式切换至CPU以避免显存溢出。", "warn")
             except Exception as e:
-                print(f"Training VRAM probe warning: {e}")
+                log_exception("Training VRAM probe warning", e)
 
         model = UniversalAI().to(train_device)
         try:
@@ -2665,7 +2702,7 @@ def start_training_mode():
             if state is not None:
                 model.load_state_dict(state.get("model_state", {}))
         except Exception as e:
-            print(f"Model load error: {e}")
+            log_exception("Model load error", e)
         model.train()
         surprise_optimizer = optim.AdamW(model.parameters(), lr=5e-5)
         surprise_scaler = GradScaler("cuda", enabled=train_device.type == "cuda")
@@ -2680,7 +2717,7 @@ def start_training_mode():
         try:
             model.share_memory()
         except Exception as e:
-            print(f"Share memory warning: {e}")
+            log_exception("Share memory warning", e)
         time.sleep(1.0)
         stop_training_flag = False
         train_start = time.time()
@@ -2839,11 +2876,10 @@ def start_training_mode():
                 if wait > 0:
                     time.sleep(wait)
             except Exception as e:
-                print(f"Training Runtime Error: {e}")
+                log_exception("Training Runtime Error", e)
                 update_window_status(f"训练过程中出现异常: {e}", "error")
                 break
         flush_buffers()
-        ctypes.windll.user32.ShowWindow(hwnd, 9)
         current_mode = MODE_LEARNING
         duration = time.time() - train_start
         print(f"训练模式总结: 步数 {action_steps}, 人类样本 0, AI样本 {action_steps}, 用时 {duration:.2f} 秒")
@@ -2971,6 +3007,9 @@ def record_data_loop():
                 prev_full_frame = full_rgb.copy()
 
                 if len(buffer_images) >= chunk_target:
+                    while save_queue.qsize() > 50:
+                        update_window_status("写入阻塞，录制暂停等待磁盘恢复...", "warn")
+                        time.sleep(0.1)
                     img_arr, act_arr = prepare_saved_arrays(buffer_images, buffer_actions)
                     source_type = "ai" if current_mode == MODE_TRAINING else "human"
                     save_queue.put((img_arr, act_arr, source_type))
@@ -2983,7 +3022,7 @@ def record_data_loop():
                 if wait > 0:
                     time.sleep(wait)
             except Exception as e:
-                print(f"Recording Error: {e}")
+                log_exception("Recording Error", e)
             if flush_event.is_set():
                 if buffer_images:
                     img_arr, act_arr = prepare_saved_arrays(buffer_images, buffer_actions)
@@ -3040,11 +3079,12 @@ def request_sleep_mode():
             capture_pause_event.clear()
             input_allowed_event.set()
             update_window_mode(current_mode)
+            fallback_reason = user_stop_request_reason or "睡眠流程结束，已回到学习模式。"
             if latest_optimization_summary:
                 update_window_status(latest_optimization_summary, "info")
                 latest_optimization_summary = None
             else:
-                update_window_status("Back to Learning.", "info")
+                update_window_status(fallback_reason, "info")
     threading.Thread(target=run, daemon=True).start()
 
 def request_training_mode():
