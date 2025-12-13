@@ -646,23 +646,55 @@ def load_meta_entries(use_lock=True):
     try:
         if not os.path.exists(meta_path):
             return []
+        raw = None
         if use_lock:
             with meta_lock:
                 with open(meta_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        with open(meta_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+                    raw = json.load(f)
+        else:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        if isinstance(raw, list):
+            return [normalize_meta_entry(dict(item)) for item in raw]
+        return []
     except Exception as e:
         print(f"Meta read error: {e}")
         return []
 
 
-def append_meta_entry(key_val, length, source_type, action_score):
+def build_fragment_plan(length, salience_val, error_val):
+    fragments = []
+    if length <= 0:
+        return fragments
+    max_fragments = max(1, min(12, int(math.ceil(length / max(1, seq_len)))))
+    indices = np.linspace(0, max(0, length - seq_len), max_fragments, dtype=int)
+    used = set()
+    for idx in indices:
+        if idx in used:
+            continue
+        used.add(int(idx))
+        fragments.append({"start": int(idx), "salience": float(salience_val), "error": float(error_val), "last_trained": 0.0, "cooldown_until": 0.0})
+    if not fragments:
+        fragments.append({"start": 0, "salience": float(salience_val), "error": float(error_val), "last_trained": 0.0, "cooldown_until": 0.0})
+    return fragments
+
+def normalize_meta_entry(entry):
+    entry.setdefault("salience_score", float(entry.get("action_score", 0.0)))
+    entry.setdefault("error_score", 0.0)
+    entry.setdefault("state", "NEW")
+    entry.setdefault("cooldown_until", 0.0)
+    entry.setdefault("fragments", build_fragment_plan(int(entry.get("length", 0)), entry.get("salience_score", 0.0), entry.get("error_score", 0.0)))
+    if entry.get("type") == "human" and entry.get("state") == "NEW":
+        entry["state"] = "TAGGED"
+    return entry
+
+def append_meta_entry(key_val, length, source_type, salience_score, error_score=0.0):
     try:
-        entry = {"key": int(key_val), "length": int(length), "timestamp": time.time(), "type": source_type, "action_score": float(action_score)}
+        base_entry = {"key": int(key_val), "length": int(length), "timestamp": time.time(), "type": source_type, "salience_score": float(salience_score), "error_score": float(error_score), "state": "TAGGED" if salience_score > 0.4 or source_type == "human" else "NEW", "cooldown_until": 0.0}
+        base_entry["fragments"] = build_fragment_plan(length, salience_score, error_score)
         with meta_lock:
             data = load_meta_entries(use_lock=False)
-            data.append(entry)
+            data.append(base_entry)
             if len(data) > 20000:
                 data = data[-20000:]
             with open(meta_path, "w", encoding="utf-8") as f:
@@ -670,7 +702,7 @@ def append_meta_entry(key_val, length, source_type, action_score):
     except Exception as e:
         print(f"Meta append error: {e}")
 
-def compute_action_score(actions):
+def compute_salience_score(actions):
     try:
         arr = np.asarray(actions, dtype=np.float32)
     except Exception:
@@ -722,8 +754,8 @@ def append_lmdb_records(img_arr, act_arr, source_type="human"):
                     txn.put(key, payload)
                     lmdb_counter += 1
                     txn.put(b"__counter__", lmdb_counter.to_bytes(8, "little"))
-            score = compute_action_score(act_arr)
-            append_meta_entry(lmdb_counter - 1, len(img_arr), source_type, score)
+            salience = compute_salience_score(act_arr)
+            append_meta_entry(lmdb_counter - 1, len(img_arr), source_type, salience, 0.0)
             return
         except lmdb.MapFullError:
             with lmdb_lock:
@@ -1436,7 +1468,7 @@ class StreamingGameDataset(IterableDataset):
         self.seq_len = seq_len
         self.lmdb_keys = lmdb_keys or {}
 
-    def _prepare_item(self, slice_data, next_entry, structured, structured_npz):
+    def _prepare_item(self, slice_data, next_entry, structured, structured_npz, stage="NREM"):
         slice_len = len(slice_data)
         imgs = np.empty((slice_len, 3, target_h, target_w), dtype=np.uint8)
         m_ins = np.empty((slice_len, mouse_feature_dim), dtype=np.float32)
@@ -1640,7 +1672,14 @@ class StreamingGameDataset(IterableDataset):
             labels = [0.0, 0.0, 0.0]
             next_img = np.zeros((3, target_h, target_w), dtype=np.uint8)
 
-        return torch.from_numpy(imgs).float().div(255.0), torch.from_numpy(m_ins), torch.tensor(labels, dtype=torch.float32), torch.from_numpy(np.asarray(next_img, dtype=np.uint8)).float().div(255.0)
+        if stage == "REM":
+            noise = np.random.normal(0.0, 0.03, imgs.shape).astype(np.float32)
+            imgs = np.clip(imgs.astype(np.float32) / 255.0 + noise, 0.0, 1.0)
+            drop_mask = np.random.binomial(1, 0.9, m_ins.shape).astype(np.float32)
+            m_ins = m_ins * drop_mask
+        else:
+            imgs = imgs.astype(np.float32) / 255.0
+        return torch.from_numpy(imgs), torch.from_numpy(m_ins), torch.tensor(labels, dtype=torch.float32), torch.from_numpy(np.asarray(next_img, dtype=np.uint8)).float().div(255.0)
 
     def __iter__(self):
         queue_size = 2 if low_vram_mode or os.name == "nt" else 8
@@ -1693,7 +1732,7 @@ class StreamingGameDataset(IterableDataset):
                                             next_entry = build_entry_pair(data, next_idx, structured_npz, structured)
                                         if not slice_data:
                                             continue
-                                        item = self._prepare_item(slice_data, next_entry, structured, structured_npz)
+                                        item = self._prepare_item(slice_data, next_entry, structured, structured_npz, "NREM")
                                         output_queue.put(item)
                                     release_data_handle(data)
                                 except Exception as e:
@@ -1701,7 +1740,8 @@ class StreamingGameDataset(IterableDataset):
                             continue
                         if path == lmdb_path:
                             try:
-                                keys = self.lmdb_keys.get(lmdb_path)
+                                plan_map = self.lmdb_keys.get(lmdb_path, {}) if isinstance(self.lmdb_keys, dict) else {}
+                                keys = list(plan_map.keys()) if plan_map else None
                                 for meta_key, payload in iterate_lmdb_entries(keys, return_keys=True):
                                     if should_stop():
                                         break
@@ -1720,8 +1760,16 @@ class StreamingGameDataset(IterableDataset):
                                             if structured_npz:
                                                 data.close()
                                             continue
-                                        max_start = max(1, length - self.seq_len)
-                                        for start_idx in range(max_start):
+                                        fragment_plan = plan_map.get(meta_key, []) if isinstance(plan_map, dict) else []
+                                        if fragment_plan:
+                                            start_indices = []
+                                            for frag in fragment_plan:
+                                                s_val = max(0, min(int(frag.get("start", 0)), max(0, length - 1)))
+                                                start_indices.append((s_val, frag.get("stage", "NREM")))
+                                        else:
+                                            max_start = max(1, length - self.seq_len)
+                                            start_indices = [(s, "NREM") for s in range(max_start)]
+                                        for start_idx, stage in start_indices:
                                             if should_stop():
                                                 break
                                             slice_data = []
@@ -1738,7 +1786,7 @@ class StreamingGameDataset(IterableDataset):
                                                 next_entry = build_entry_pair(data, next_idx, structured_npz, structured)
                                             if not slice_data:
                                                 continue
-                                            item = self._prepare_item(slice_data, next_entry, structured, structured_npz)
+                                            item = self._prepare_item(slice_data, next_entry, structured, structured_npz, stage)
                                             output_queue.put(item)
                                         release_data_handle(data)
                                     except Exception as e:
@@ -1776,7 +1824,7 @@ class StreamingGameDataset(IterableDataset):
                                 next_entry = build_entry_pair(data, next_idx, structured_npz, structured)
                             if not slice_data:
                                 continue
-                            item = self._prepare_item(slice_data, next_entry, structured, structured_npz)
+                            item = self._prepare_item(slice_data, next_entry, structured, structured_npz, "NREM")
                             output_queue.put(item)
                         release_data_handle(data)
                     except Exception as e:
@@ -1920,100 +1968,103 @@ def sample_actions_from_source(path, sample_cap=8):
     return total_len, samples
 
 
+def weighted_sample_without_replacement(items, weights, k):
+    chosen = []
+    pool = list(zip(items, weights))
+    while pool and len(chosen) < k:
+        total = sum(max(w, 0.0) for _, w in pool)
+        if total <= 0:
+            break
+        r = random.random() * total
+        acc = 0.0
+        picked_idx = None
+        for i, (_, w) in enumerate(pool):
+            acc += max(w, 0.0)
+            if acc >= r:
+                picked_idx = i
+                break
+        if picked_idx is None:
+            break
+        chosen.append(pool[picked_idx][0])
+        pool.pop(picked_idx)
+    return chosen
+
 def build_sleep_file_mix(candidates, limit=20):
     stats = []
     lmdb_selection = {}
-    for path in candidates:
-        if path == lmdb_path:
-            meta_entries = load_meta_entries()
-            if not meta_entries:
-                continue
-            for m in meta_entries:
-                length = int(m.get("length", 0))
-                if length <= 0:
-                    continue
-                ts = float(m.get("timestamp", 0))
-                human_score = 1.0 if m.get("type") == "human" else 0.3
-                surprise_score = float(m.get("action_score", 0.0))
-                steps_est = max(1, length - seq_len)
-                stats.append((path, human_score, surprise_score, length, ts, steps_est, m.get("key")))
-        else:
-            length, samples = sample_actions_from_source(path)
-            try:
-                mtime = os.path.getmtime(path)
-            except Exception:
-                mtime = 0
-            if length <= 0 and not samples:
-                continue
-            human_score = 0.0
-            surprise_score = 0.0
-            if samples:
-                flat_samples = []
-                for a in samples:
-                    try:
-                        v = np.asarray(a, dtype=np.float32).reshape(-1)
-                    except Exception:
-                        v = safe_action_array(a)
-                    flat_samples.append(v)
-                human_vals = []
-                surprise_vals = []
-                for v in flat_samples:
-                    size = int(getattr(v, "size", 0))
-                    if size <= 0:
-                        continue
-                    if size > mouse_feature_dim:
-                        human_vals.append(1.0 if v[mouse_feature_dim] < 0.5 else 0.0)
-                    else:
-                        human_vals.append(0.5)
-                    if size > 18:
-                        surprise_vals.append(float(np.mean(np.abs(v[16:18]))))
-                    else:
-                        surprise_vals.append(0.0)
-                if human_vals:
-                    human_score = float(np.mean(human_vals))
-                if surprise_vals:
-                    surprise_score = float(np.mean(surprise_vals))
-            steps_est = max(1, int(length) - seq_len)
-            stats.append((path, human_score, surprise_score, int(length), float(mtime), steps_est, None))
-    if not stats:
-        return [], [], {}
-    if not stats:
-        return [], [], {}
+    fragment_bank = []
     now_ts = time.time()
-    weights = []
-    for path, human_score, surprise_score, length, ts, steps_est, key in stats:
-        recency_bias = math.exp(-max(0.0, now_ts - ts) / (2 * 24 * 3600)) if ts > 0 else 0.05
-        history_bonus = 0.08 if ts > 0 and (now_ts - ts) > (14 * 24 * 3600) else 0.0
-        density = math.log1p(max(1.0, steps_est)) / math.log(2.0)
-        weight = 0.55 * recency_bias + 0.2 * human_score + 0.2 * (1.0 + surprise_score) + 0.05 * density + history_bonus
-        weights.append(max(weight, 0.01))
-    sample_count = min(limit if limit else len(stats), len(stats))
-    picks = random.choices(range(len(stats)), weights=weights, k=sample_count)
-    selection = []
-    selected_paths = set()
-    oldest_idx = min(range(len(stats)), key=lambda i: stats[i][4])
-    if oldest_idx not in picks and len(stats) > 1:
-        picks[-1] = oldest_idx
-    for idx in picks:
-        path, _, _, _, ts, steps_est, key = stats[idx]
-        if path == lmdb_path:
-            lmdb_selection.setdefault(path, []).append(key)
-        if path not in selected_paths:
-            selection.append(path)
-            selected_paths.add(path)
-    return selection, stats, lmdb_selection
+    for path in candidates:
+        if path != lmdb_path:
+            continue
+        meta_entries = load_meta_entries()
+        if not meta_entries:
+            continue
+        for m in meta_entries:
+            m = normalize_meta_entry(dict(m))
+            length = int(m.get("length", 0))
+            if length <= 0:
+                continue
+            ts = float(m.get("timestamp", 0))
+            human_score = 1.0 if m.get("type") == "human" else 0.3
+            salience_score = float(m.get("salience_score", 0.0))
+            error_score = float(m.get("error_score", 0.0))
+            state = m.get("state", "NEW")
+            fragments = m.get("fragments") or build_fragment_plan(length, salience_score, error_score)
+            steps_est = max(1, len(fragments))
+            stats.append((path, human_score, salience_score, length, ts, steps_est, m.get("key")))
+            for frag in fragments:
+                frag_start = int(frag.get("start", 0))
+                frag_sal = float(frag.get("salience", salience_score))
+                frag_err = float(frag.get("error", error_score))
+                cooldown_until = float(frag.get("cooldown_until", 0.0))
+                last_trained = float(frag.get("last_trained", 0.0))
+                recency_bias = math.exp(-max(0.0, now_ts - ts) / (2 * 24 * 3600)) if ts > 0 else 0.05
+                cooldown_factor = 0.25 if cooldown_until > now_ts else 1.0
+                novelty = 1.0 + frag_err
+                sal_factor = 1.0 + frag_sal
+                reuse_penalty = 0.7 if now_ts - last_trained < 3600 else 1.0
+                state_bias = {"TAGGED": 1.3, "CONSOLIDATED": 0.9, "ARCHIVED": 0.6}.get(state, 1.0)
+                weight = max(0.01, recency_bias * 0.4 + sal_factor * 0.3 + novelty * 0.3)
+                weight *= cooldown_factor * reuse_penalty * state_bias
+                fragment_bank.append({"path": path, "key": m.get("key"), "start": frag_start, "state": state, "weight": weight, "salience": frag_sal, "error": frag_err, "cooldown_until": cooldown_until})
+    if not fragment_bank:
+        return [], [], {}
+    total_target = min(max(10, limit * 3), len(fragment_bank))
+    state_quota = {"TAGGED": 0.45, "NEW": 0.25, "CONSOLIDATED": 0.2, "ARCHIVED": 0.1}
+    selected_fragments = []
+    remaining_pool = fragment_bank
+    for state, ratio in state_quota.items():
+        pool_state = [f for f in remaining_pool if f.get("state") == state]
+        if not pool_state:
+            continue
+        weights = [f.get("weight", 0.0) for f in pool_state]
+        quota_count = min(len(pool_state), int(total_target * ratio))
+        picks = weighted_sample_without_replacement(pool_state, weights, quota_count)
+        selected_fragments.extend(picks)
+        remaining_pool = [f for f in remaining_pool if f not in picks]
+    if len(selected_fragments) < total_target and remaining_pool:
+        extra_need = total_target - len(selected_fragments)
+        weights = [f.get("weight", 0.0) for f in remaining_pool]
+        selected_fragments.extend(weighted_sample_without_replacement(remaining_pool, weights, extra_need))
+    if not selected_fragments:
+        return [], [], {}
+    selected_fragments.sort(key=lambda x: x.get("weight", 0.0), reverse=True)
+    split_point = max(1, int(len(selected_fragments) * 0.6))
+    for idx, frag in enumerate(selected_fragments):
+        stage = "NREM" if idx < split_point else "REM"
+        plan_entry = {"start": frag.get("start", 0), "stage": stage}
+        lmdb_selection.setdefault(lmdb_path, {}).setdefault(frag.get("key"), []).append(plan_entry)
+    selection_paths = [lmdb_path]
+    return selection_paths, stats, lmdb_selection
 
 
 def update_meta_with_loss(key_plan, paths, loss_value):
     try:
         if loss_value <= 0:
             return
-        targets = set()
-        for p in paths:
-            if p == lmdb_path:
-                keys = key_plan.get(p)
-                if keys:
-                    targets.update(keys)
+        plan_map = key_plan.get(lmdb_path, {}) if isinstance(key_plan, dict) else {}
+        targets = {k for k in plan_map.keys()}
         if not targets:
             return
         with meta_lock:
@@ -2026,9 +2077,26 @@ def update_meta_with_loss(key_plan, paths, loss_value):
             now_ts = time.time()
             for entry in data:
                 if entry.get("key") in targets:
-                    old_score = float(entry.get("action_score", 0.0))
-                    entry["action_score"] = 0.7 * old_score + 0.3 * min(5.0, float(loss_value))
-                    entry["timestamp"] = max(float(entry.get("timestamp", now_ts)), now_ts - 0.1)
+                    normalized = normalize_meta_entry(entry)
+                    old_error = float(normalized.get("error_score", 0.0))
+                    normalized["error_score"] = 0.7 * old_error + 0.3 * min(5.0, float(loss_value))
+                    normalized["timestamp"] = max(float(normalized.get("timestamp", now_ts)), now_ts - 0.1)
+                    start_targets = [p.get("start", 0) for p in plan_map.get(entry.get("key"), [])]
+                    for frag in normalized.get("fragments", []):
+                        if start_targets and frag.get("start") not in start_targets:
+                            continue
+                        frag_error = float(frag.get("error", 0.0))
+                        frag["error"] = 0.6 * frag_error + 0.4 * float(loss_value)
+                        frag["last_trained"] = now_ts
+                        frag["cooldown_until"] = now_ts + 900
+                    if normalized.get("state") == "NEW" and (normalized.get("salience_score", 0.0) > 0.4 or loss_value > 0.6):
+                        normalized["state"] = "TAGGED"
+                    elif normalized.get("state") == "TAGGED" and loss_value < 0.25:
+                        normalized["state"] = "CONSOLIDATED"
+                    elif normalized.get("state") == "CONSOLIDATED" and loss_value < 0.12:
+                        normalized["state"] = "ARCHIVED"
+                    entry.clear()
+                    entry.update(normalized)
                     changed = True
             if changed:
                 with open(meta_path, "w", encoding="utf-8") as f:
@@ -2215,15 +2283,18 @@ def optimize_ai():
                             file_size = os.path.getsize(path)
                             approx_samples = max(1, int(file_size // avg_sample_bytes))
                     elif path == lmdb_path:
-                        keys = lmdb_key_plan.get(path)
+                        keys = lmdb_key_plan.get(path) if isinstance(lmdb_key_plan, dict) else None
                         if keys:
-                            for meta_key in keys:
+                            for meta_key, fragments in keys.items():
                                 if stop_optimization_flag.is_set():
                                     ensure_stop_reason()
                                     break
-                                length_val = int(meta_length_map.get(meta_key, 0))
-                                if length_val > 0:
-                                    approx_samples += length_val
+                                frag_count = len(fragments) if isinstance(fragments, list) else 0
+                                if frag_count > 0:
+                                    approx_samples += frag_count
+                                else:
+                                    length_val = int(meta_length_map.get(meta_key, 0))
+                                    approx_samples += max(1, length_val)
                         elif meta_entries_cache:
                             for entry in meta_entries_cache:
                                 approx_samples += int(entry.get("length", 0))
@@ -2232,7 +2303,7 @@ def optimize_ai():
                     else:
                         file_size = os.path.getsize(path)
                         approx_samples = max(1, int(file_size // avg_sample_bytes))
-                    steps = max(1, int(approx_samples) - seq_len)
+                    steps = max(1, int(approx_samples))
                     total += steps
                     if total % 50 == 0:
                         time.sleep(0.001)
