@@ -2834,7 +2834,7 @@ def request_sleep_mode():
     input_allowed_event.clear()
     user_stop_request_reason = None
     def run():
-        global current_mode
+        global current_mode, latest_optimization_summary
         try:
             update_window_status("检测到睡眠指令，正在准备进入睡眠模式...", "info")
             recording_pause_event.set()
