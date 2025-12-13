@@ -404,7 +404,7 @@ file_read_lock = threading.Lock()
 file_write_lock = threading.Lock()
 log_lock = threading.Lock()
 lmdb_lock = threading.Lock()
-meta_lock = threading.Lock()
+meta_lock = threading.RLock()
 lmdb_env = None
 lmdb_counter = 0
 lmdb_start = 0
@@ -635,22 +635,26 @@ def reset_lmdb_env():
         lmdb_env = None
     gc.collect()
 
-def load_meta_entries():
+def load_meta_entries(use_lock=True):
     try:
         if not os.path.exists(meta_path):
             return []
-        with meta_lock:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+        if use_lock:
+            with meta_lock:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        with open(meta_path, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception as e:
         print(f"Meta read error: {e}")
         return []
+
 
 def append_meta_entry(key_val, length, source_type, action_score):
     try:
         entry = {"key": int(key_val), "length": int(length), "timestamp": time.time(), "type": source_type, "action_score": float(action_score)}
         with meta_lock:
-            data = load_meta_entries()
+            data = load_meta_entries(use_lock=False)
             data.append(entry)
             if len(data) > 20000:
                 data = data[-20000:]
