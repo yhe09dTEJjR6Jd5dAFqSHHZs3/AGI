@@ -47,6 +47,8 @@ progress_bar_lock = threading.Lock()
 progress_bar_last = {}
 progress_bar_min_interval = 0.12
 
+original_print = builtins.print
+
 def log_exception(context, err=None, extra=None):
     parts = [context]
     if err is not None:
@@ -223,16 +225,17 @@ def set_process_priority():
     except Exception as e:
         print(f"设置进程优先级失败：{e}")
 
-def flush_buffers(timeout=3):
+def flush_buffers(timeout=3, keep_paused=False):
     update_window_status("正在刷盘/写经验池...", "info")
     flush_done_event.clear()
     flush_event.set()
+    recording_pause_event.set()
+    capture_pause_event.set()
     while not flush_done_event.wait(timeout=timeout):
-        recording_pause_event.set()
-        capture_pause_event.set()
         update_window_status("等待数据刷盘中，录制已暂停以避免丢数...", "warn")
-    recording_pause_event.clear()
-    capture_pause_event.clear()
+    if not keep_paused:
+        recording_pause_event.clear()
+        capture_pause_event.clear()
     return True
 
 def report_to_window(msg, level="info"):
@@ -253,8 +256,11 @@ def window_print(*args, level="info", status=False, **kwargs):
     sep = kwargs.get("sep", " ")
     message = sep.join(str(a) for a in args)
     window_log(message, level, status)
-
-builtins.print = window_print
+    if window_ui is None:
+        try:
+            original_print(message)
+        except Exception:
+            pass
 
 class SciFiWindow:
     def __init__(self):
@@ -385,6 +391,7 @@ def init_window():
     global window_ui
     try:
         window_ui = SciFiWindow()
+        builtins.print = window_print
         return True
     except Exception as e:
         print(f"界面初始化失败：{e}")
@@ -3145,7 +3152,7 @@ def request_sleep_mode():
             update_window_status("检测到睡眠指令，正在准备进入睡眠模式...", "info")
             recording_pause_event.set()
             capture_pause_event.set()
-            flush_buffers()
+            flush_buffers(keep_paused=True)
             cleanup_before_sleep()
             current_mode = MODE_SLEEP
             update_window_mode(current_mode)
