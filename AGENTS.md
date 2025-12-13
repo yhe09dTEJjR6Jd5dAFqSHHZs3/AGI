@@ -43,7 +43,7 @@ CPU：12th Gen Intel(R) Core(TM) i7-12650H
 GPU：NVIDIA GeForce RTX 3050 Ti
 显存：4GB
 
-当经验池大小＞20GB时，删除最旧数据，直到经验池大小＜20GB。
+当经验池大小＞20GB时，丢弃最旧数据，直到经验池大小＜20GB。
 
 需要预防的报错：
 
