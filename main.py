@@ -127,6 +127,7 @@ log_path = os.path.join(data_dir, "experience.log")
 index_path = os.path.join(data_dir, "experience.idx")
 lmdb_path = os.path.join(data_dir, "experience.lmdb")
 meta_path = os.path.join(data_dir, "experience_meta.json")
+LMDB_LIMIT_BYTES = 20 * 1024 * 1024 * 1024
 
 for d in [base_dir, data_dir, model_dir, temp_dir]:
     if not os.path.exists(d):
@@ -171,7 +172,18 @@ def flush_buffers(timeout=3):
         flush_done_event.set()
         try:
             with save_queue.mutex:
-                save_queue.queue.clear()
+                while save_queue.queue:
+                    try:
+                        save_queue.get_nowait()
+                        if getattr(save_queue, "unfinished_tasks", 0) > 0:
+                            save_queue.unfinished_tasks = max(0, save_queue.unfinished_tasks - 1)
+                    except Exception:
+                        break
+                if getattr(save_queue, "unfinished_tasks", 0) == 0:
+                    try:
+                        save_queue.all_tasks_done.notify_all()
+                    except Exception:
+                        pass
         except Exception:
             pass
         try:
@@ -379,7 +391,7 @@ meta_lock = threading.Lock()
 lmdb_env = None
 lmdb_counter = 0
 lmdb_start = 0
-current_map_size_gb = 10
+current_map_size_gb = 20
 dxcam_camera = None
 
 def update_latest_frame(img, ts):
@@ -678,10 +690,10 @@ def append_lmdb_records(img_arr, act_arr, source_type="human"):
             append_meta_entry(lmdb_counter - 1, len(img_arr), source_type, score)
             return
         except lmdb.MapFullError:
+            trim_lmdb(LMDB_LIMIT_BYTES)
             with lmdb_lock:
-                current_map_size_gb = int(max(current_map_size_gb * 1.5, current_map_size_gb + 1))
                 recreate_lmdb_env(current_map_size_gb)
-            print(f"LMDB resized to {current_map_size_gb}GB")
+            print("LMDB trimmed to free space")
             retry += 1
         except Exception as e:
             print(f"LMDB append error: {e}")
@@ -732,9 +744,6 @@ def trim_lmdb(limit_bytes):
     try:
         if not os.path.exists(lmdb_path):
             return
-        size = os.path.getsize(lmdb_path)
-        if size <= limit_bytes:
-            return
         env = get_lmdb_env()
         with lmdb_lock:
             with env.begin(write=True) as txn:
@@ -744,10 +753,23 @@ def trim_lmdb(limit_bytes):
                 end_val = int.from_bytes(counter_bytes, "little") if counter_bytes else 0
                 keep = int(limit_bytes * 0.8)
                 target_start = start_val
-                while target_start < end_val and os.path.getsize(lmdb_path) > keep:
+                stat = env.stat()
+                page_size = stat.get("psize", 4096)
+                used_pages = stat.get("leaf_pages", 0) + stat.get("branch_pages", 0) + stat.get("overflow_pages", 0)
+                used_bytes = page_size * used_pages
+                file_size = os.path.getsize(lmdb_path)
+                while target_start < end_val and max(used_bytes, file_size) > keep:
+                    if stop_optimization_flag.is_set():
+                        update_window_status("早停触发，已中断经验池清理。", "warn")
+                        break
                     key = target_start.to_bytes(8, "little")
                     txn.delete(key)
                     target_start += 1
+                    if target_start % 512 == 0:
+                        stat = env.stat()
+                        used_pages = stat.get("leaf_pages", 0) + stat.get("branch_pages", 0) + stat.get("overflow_pages", 0)
+                        used_bytes = page_size * used_pages
+                        file_size = os.path.getsize(lmdb_path)
                 txn.put(b"__start__", target_start.to_bytes(8, "little"))
                 global lmdb_start
                 lmdb_start = target_start
@@ -1043,6 +1065,7 @@ def on_click(x, y, button, pressed):
             mouse_state["l_down"] = pressed
             if pressed:
                 mouse_state["l_down_ts"] = t
+                mouse_state["l_down_pos"] = (x, y)
             else:
                 mouse_state["l_up_pos"] = (x, y)
                 mouse_state["l_up_ts"] = t
@@ -1050,6 +1073,7 @@ def on_click(x, y, button, pressed):
             mouse_state["r_down"] = pressed
             if pressed:
                 mouse_state["r_down_ts"] = t
+                mouse_state["r_down_pos"] = (x, y)
             else:
                 mouse_state["r_up_pos"] = (x, y)
                 mouse_state["r_up_ts"] = t
@@ -1122,15 +1146,17 @@ def check_disk_space():
                 total_size += os.path.getsize(lmdb_path)
             except Exception as e:
                 print(f"Disk size check warning for LMDB: {e}")
-        limit = 20 * 1024 * 1024 * 1024
-        if total_size > limit:
-            trim_lmdb(limit)
+        if total_size > LMDB_LIMIT_BYTES:
+            trim_lmdb(LMDB_LIMIT_BYTES)
     except Exception as e:
         print(f"Disk clean error: {e}")
 
 def consolidate_data_files(max_frames=10000, min_commit=4000):
     try:
-        trim_lmdb(20 * 1024 * 1024 * 1024)
+        update_window_status("正在整理经验池，开始清理旧数据...", "info")
+        update_window_progress(0, "整理经验池：进行中", channel="scan")
+        trim_lmdb(LMDB_LIMIT_BYTES)
+        update_window_progress(0, "数据扫描：准备开始", channel="scan")
     except Exception as e:
         print(f"Merge error: {e}")
 
@@ -2643,6 +2669,7 @@ def start_training_mode():
         print("Exited Training Mode. Back to Learning.")
         update_window_status(f"训练结束，步数{action_steps}，返回学习模式。", "info")
     finally:
+        release_mouse_outputs()
         current_mode = MODE_LEARNING
         input_allowed_event.set()
 
