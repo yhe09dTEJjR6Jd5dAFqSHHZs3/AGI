@@ -474,6 +474,23 @@ def clamp_region(cx, cy, w, h, frame_w, frame_h):
     top = max(0, min(frame_h - h, int(cy - half_h)))
     return left, top, w, h
 
+def fuse_views_for_model(views):
+    processed = []
+    for v in views:
+        v_arr = np.asarray(v, dtype=np.uint8)
+        if v_arr.ndim == 2:
+            v_arr = np.stack([v_arr] * 3, axis=-1)
+        if v_arr.ndim == 3 and v_arr.shape[2] > 3:
+            v_arr = v_arr[:, :, :3]
+        if v_arr.shape[0] != target_h or v_arr.shape[1] != target_w:
+            v_arr = cv2.resize(v_arr, (target_w, target_h))
+        processed.append(v_arr)
+    if not processed:
+        return np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    mosaic = np.concatenate(processed, axis=1)
+    mosaic = cv2.resize(mosaic, (target_w, target_h))
+    return mosaic
+
 def cleanup_before_sleep():
     global dxcam_camera
     try:
@@ -1571,21 +1588,40 @@ class StreamingGameDataset(IterableDataset):
                 if arr is None or arr.size == 0:
                     return np.zeros((3, target_h, target_w), dtype=np.uint8)
                 if arr.ndim == 4:
-                    arr = arr[0]
-                if arr.ndim == 2:
-                    arr = np.stack([arr] * 3, axis=-1)
-                elif arr.ndim == 3 and arr.shape[2] == 1:
-                    arr = np.repeat(arr, 3, axis=2)
-                elif arr.ndim < 3:
-                    arr = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-                if arr.ndim == 3 and arr.shape[2] > 3:
-                    arr = arr[:, :, :3]
-                if arr.shape[0] != target_h or arr.shape[1] != target_w:
-                    arr = cv2.resize(arr, (target_w, target_h))
-                if arr.ndim == 3 and arr.shape[2] == 4:
-                    arr = cv2.cvtColor(arr, cv2.COLOR_BGRA2RGB)
-                if arr.ndim != 3 or arr.shape[2] < 3:
-                    arr = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+                    views = []
+                    for v in arr:
+                        v_arr = np.asarray(v, dtype=np.uint8)
+                        if v_arr.ndim == 2:
+                            v_arr = np.stack([v_arr] * 3, axis=-1)
+                        if v_arr.ndim == 3 and v_arr.shape[2] == 1:
+                            v_arr = np.repeat(v_arr, 3, axis=2)
+                        if v_arr.ndim == 3 and v_arr.shape[2] > 3:
+                            v_arr = v_arr[:, :, :3]
+                        if v_arr.shape[0] != target_h or v_arr.shape[1] != target_w:
+                            v_arr = cv2.resize(v_arr, (target_w, target_h))
+                        if v_arr.ndim == 3 and v_arr.shape[2] == 4:
+                            v_arr = cv2.cvtColor(v_arr, cv2.COLOR_BGRA2RGB)
+                        if v_arr.ndim == 3 and v_arr.shape[2] == 3:
+                            views.append(v_arr)
+                    if views:
+                        arr = fuse_views_for_model(views)
+                    else:
+                        arr = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+                else:
+                    if arr.ndim == 2:
+                        arr = np.stack([arr] * 3, axis=-1)
+                    elif arr.ndim == 3 and arr.shape[2] == 1:
+                        arr = np.repeat(arr, 3, axis=2)
+                    elif arr.ndim < 3:
+                        arr = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+                    if arr.ndim == 3 and arr.shape[2] > 3:
+                        arr = arr[:, :, :3]
+                    if arr.shape[0] != target_h or arr.shape[1] != target_w:
+                        arr = cv2.resize(arr, (target_w, target_h))
+                    if arr.ndim == 3 and arr.shape[2] == 4:
+                        arr = cv2.cvtColor(arr, cv2.COLOR_BGRA2RGB)
+                    if arr.ndim != 3 or arr.shape[2] < 3:
+                        arr = np.zeros((target_h, target_w, 3), dtype=np.uint8)
             except Exception as e:
                 log_exception("Image normalize error", e)
                 arr = np.zeros((target_h, target_w, 3), dtype=np.uint8)
@@ -2830,17 +2866,6 @@ def start_training_mode():
                     r_up_pos = mouse_state["r_up_pos"]
                     traj = list(temp_trajectory)
                 mouse_state["scroll"] = 0
-                img_rgb = None
-                if frame_img is not None and frame_img.ndim == 3:
-                    if frame_img.shape[2] == 4:
-                        img_rgb = cv2.cvtColor(frame_img, cv2.COLOR_BGRA2RGB)
-                    elif frame_img.shape[2] == 3:
-                        img_rgb = cv2.cvtColor(frame_img, cv2.COLOR_BGR2RGB)
-                if img_rgb is None and frame_img is not None:
-                    img_rgb = np.zeros((frame_img.shape[0], frame_img.shape[1], 3), dtype=np.uint8)
-                if img_rgb is None:
-                    img_rgb = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-                img_tensor = img_rgb.transpose(2, 0, 1) / 255.0
                 ts_value = frame_ts if frame_ts else start_time
                 def norm_coord(v, dim):
                     return (2.0 * (v / dim)) - 1.0
@@ -2865,6 +2890,13 @@ def start_training_mode():
                 focus_center = attention_focus if attention_focus is not None else (curr_x, curr_y)
                 att_box = clamp_region(focus_center[0], focus_center[1], max(64, target_w * 2), max(40, target_h * 2), full_rgb.shape[1], full_rgb.shape[0])
                 full_box = (0, 0, screen_w, screen_h)
+                mouse_crop = full_rgb[mouse_box[1]:mouse_box[1]+mouse_box[3], mouse_box[0]:mouse_box[0]+mouse_box[2]]
+                att_crop = full_rgb[att_box[1]:att_box[1]+att_box[3], att_box[0]:att_box[0]+att_box[2]]
+                full_view = cv2.resize(full_rgb, (target_w, target_h))
+                mouse_view = cv2.resize(mouse_crop, (target_w, target_h)) if mouse_crop.size > 0 else np.zeros((target_h, target_w, 3), dtype=np.uint8)
+                att_view = cv2.resize(att_crop, (target_w, target_h)) if att_crop.size > 0 else np.zeros((target_h, target_w, 3), dtype=np.uint8)
+                fused_view = fuse_views_for_model([full_view, mouse_view, att_view])
+                img_tensor = fused_view.transpose(2, 0, 1) / 255.0
                 m_vec = [
                     norm_coord(curr_x, screen_w), norm_coord(curr_y, screen_h),
                     1.0 if l_down else 0.0,
