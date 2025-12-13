@@ -136,6 +136,22 @@ for d in [base_dir, data_dir, model_dir, temp_dir]:
         except Exception as e:
             print(f"Error creating directory {d}: {e}")
 
+def ensure_experience_structure():
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+        for path in [log_path, index_path]:
+            try:
+                with open(path, "ab"):
+                    pass
+            except Exception as e:
+                print(f"File prep warning for {path}: {e}")
+        if not os.path.exists(meta_path):
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump([], f)
+        update_window_status("初始化完成，已创建经验池文件结构。", "info")
+    except Exception as e:
+        print(f"Experience structure error: {e}")
+
 MODE_LEARNING = "LEARNING"
 MODE_SLEEP = "SLEEP"
 MODE_TRAINING = "TRAINING"
@@ -164,6 +180,7 @@ def set_process_priority():
         print(f"Priority set error: {e}")
 
 def flush_buffers(timeout=3):
+    update_window_status("正在刷盘/写经验池...", "info")
     flush_done_event.clear()
     flush_event.set()
     finished = flush_done_event.wait(timeout=timeout)
@@ -198,8 +215,8 @@ def report_to_window(msg, level="info"):
     try:
         if window_ui is not None:
             window_ui.log(msg, level)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Window report error: {e}")
 
 def window_log(msg, level="info", to_status=False):
     report_to_window(msg, level)
@@ -280,32 +297,32 @@ class SciFiWindow:
                         self.log_area.configure(state="disabled")
                     elif kind == "progress":
                         channel, pct, text = payload
-                        try:
-                            val = float(max(0.0, min(100.0, pct)))
-                            if channel == "scan":
-                                self.scan_progress["value"] = val
-                                self.scan_progress_var.set(f"{val:.2f}%")
-                                self.scan_text_var.set(text if text else f"数据扫描 {val:.2f}%")
-                            else:
-                                self.opt_progress["value"] = val
-                                self.opt_progress_var.set(f"{val:.2f}%")
-                                self.opt_text_var.set(text if text else f"AI优化 {val:.2f}%")
-                        except Exception:
-                            pass
+                        val = float(max(0.0, min(100.0, pct)))
+                        if channel == "scan":
+                            self.scan_progress["value"] = val
+                            self.scan_progress_var.set(f"{val:.2f}%")
+                            self.scan_text_var.set(text if text else f"数据扫描 {val:.2f}%")
+                        else:
+                            self.opt_progress["value"] = val
+                            self.opt_progress_var.set(f"{val:.2f}%")
+                            self.opt_text_var.set(text if text else f"AI优化 {val:.2f}%")
+                    elif kind == "status":
+                        self.status_var.set(str(payload))
+                    elif kind == "mode":
+                        self.mode_var.set(str(payload))
                 else:
                     self.log_area.configure(state="normal")
                     self.log_area.insert("end", str(entry) + "\n")
                     self.log_area.see("end")
                     self.log_area.configure(state="disabled")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"UI queue processing error: {e}")
         finally:
             self.root.after(200, self.process_queue)
 
     def log(self, msg, level="info"):
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         self.queue.put(("log", f"[{level.upper()} {ts}] {msg}"))
-        self.status_var.set(msg)
 
     def set_mode(self, mode):
         self.mode_var.set(mode)
@@ -343,24 +360,24 @@ def init_window():
 def update_window_mode(mode):
     try:
         if window_ui is not None:
-            window_ui.set_mode(mode)
-    except Exception:
-        pass
+            window_ui.queue.put(("mode", mode))
+    except Exception as e:
+        print(f"Mode update error: {e}")
 
 def update_window_status(msg, level="info"):
     report_to_window(msg, level)
     try:
         if window_ui is not None:
-            window_ui.status_var.set(msg)
-    except Exception:
-        pass
+            window_ui.queue.put(("status", msg))
+    except Exception as e:
+        print(f"Status update error: {e}")
 
 def update_window_progress(pct, text=None, channel="opt"):
     try:
         if window_ui is not None:
             window_ui.set_progress(channel, pct, text)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Progress update error: {e}")
 
 capture_freq = 10
 seq_len = 12
@@ -391,7 +408,7 @@ meta_lock = threading.Lock()
 lmdb_env = None
 lmdb_counter = 0
 lmdb_start = 0
-current_map_size_gb = 20
+current_map_size_gb = 2
 dxcam_camera = None
 
 def update_latest_frame(img, ts):
@@ -426,32 +443,30 @@ def cleanup_before_sleep():
             dxcam_camera = None
     except Exception as e:
         print(f"DXCam cleanup exception: {e}")
-    gc.collect()
+    start = time.time()
     for _ in range(3):
         gc.collect()
         try:
             torch.cuda.empty_cache()
-            if torch.cuda.is_available():
-                torch.cuda.ipc_collect()
-                torch.cuda.synchronize()
         except Exception as ce:
             print(f"Sleep cleanup CUDA warning: {ce}")
+        if time.time() - start > 2.0:
+            update_window_status("GPU清理耗时过长，已跳过深度同步。", "warn")
+            break
         time.sleep(0.05)
 
 def force_memory_cleanup(iterations=2, delay=0.05):
     for _ in range(iterations):
         gc.collect()
-        torch.cuda.empty_cache()
-        if torch.cuda.is_available():
-            try:
-                torch.cuda.ipc_collect()
-                torch.cuda.synchronize()
-            except Exception as e:
-                print(f"CUDA cleanup step skipped: {e}")
+        try:
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"CUDA cleanup step skipped: {e}")
         time.sleep(delay)
 
 data_queue = queue.Queue()
 save_queue = queue.Queue()
+total_samples_written = 0
 
 def wait_for_save_queue(timeout=3.0):
     try:
@@ -589,6 +604,16 @@ def get_lmdb_env(map_size_gb=None):
             txn.put(b"__start__", lmdb_start.to_bytes(8, "little"))
     return lmdb_env
 
+def expand_lmdb_size():
+    global current_map_size_gb
+    if current_map_size_gb >= 20:
+        return current_map_size_gb
+    new_size = min(20, max(current_map_size_gb * 2, current_map_size_gb + 1))
+    current_map_size_gb = new_size
+    recreate_lmdb_env(current_map_size_gb)
+    update_window_status(f"经验池容量扩展至{current_map_size_gb:.2f}GB", "info")
+    return current_map_size_gb
+
 def recreate_lmdb_env(new_size_gb):
     global lmdb_env
     try:
@@ -690,10 +715,13 @@ def append_lmdb_records(img_arr, act_arr, source_type="human"):
             append_meta_entry(lmdb_counter - 1, len(img_arr), source_type, score)
             return
         except lmdb.MapFullError:
-            trim_lmdb(LMDB_LIMIT_BYTES)
             with lmdb_lock:
-                recreate_lmdb_env(current_map_size_gb)
-            print("LMDB trimmed to free space")
+                if current_map_size_gb < 20:
+                    expand_lmdb_size()
+                else:
+                    trim_lmdb(LMDB_LIMIT_BYTES)
+                    recreate_lmdb_env(current_map_size_gb)
+            print("LMDB trimmed or expanded to free space")
             retry += 1
         except Exception as e:
             print(f"LMDB append error: {e}")
@@ -1141,13 +1169,18 @@ def release_data_handle(data):
 def check_disk_space():
     try:
         total_size = 0
-        if os.path.exists(lmdb_path):
-            try:
-                total_size += os.path.getsize(lmdb_path)
-            except Exception as e:
-                print(f"Disk size check warning for LMDB: {e}")
+        for root_dir, _, files in os.walk(data_dir):
+            for fname in files:
+                fpath = os.path.join(root_dir, fname)
+                try:
+                    total_size += os.path.getsize(fpath)
+                except Exception as e:
+                    print(f"Disk size check warning for {fpath}: {e}")
         if total_size > LMDB_LIMIT_BYTES:
             trim_lmdb(LMDB_LIMIT_BYTES)
+            trim_binary_log(LMDB_LIMIT_BYTES)
+            if total_size > LMDB_LIMIT_BYTES:
+                update_window_status("经验池空间不足，正在限制数据写入。", "warn")
     except Exception as e:
         print(f"Disk clean error: {e}")
 
@@ -1185,8 +1218,10 @@ def atomic_save_npz(fname, img_arr, act_arr, retries=5, backoff=0.25):
     return False
 
 def disk_writer_loop():
+    global total_samples_written
     check_counter = 0
     last_check = time.time()
+    last_status = time.time()
     check_interval = 10
     check_time_window = 60.0
     while True:
@@ -1201,6 +1236,7 @@ def disk_writer_loop():
                 continue
             try:
                 append_lmdb_records(img_arr, act_arr, source_type)
+                total_samples_written += len(img_arr)
             except Exception as e:
                 print(f"LMDB pipeline error: {e}")
             check_counter += 1
@@ -1209,6 +1245,9 @@ def disk_writer_loop():
                 check_disk_space()
                 last_check = now
                 check_counter = 0
+            if now - last_status >= 5.0:
+                update_window_status(f"写盘中，剩余任务{save_queue.qsize()}，累计样本{total_samples_written}", "info")
+                last_status = now
         except Exception as e:
             print(f"Save Error: {e}")
         finally:
@@ -2882,6 +2921,7 @@ if __name__ == "__main__":
     ensure_initial_model()
     set_process_priority()
     init_window()
+    ensure_experience_structure()
     update_window_mode(current_mode)
     update_window_status("System initializing...", "info")
     t_bg_logic = threading.Thread(target=start_background_services, daemon=True)
