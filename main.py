@@ -215,6 +215,8 @@ window_ui = None
 user_stop_request_reason = None
 latest_optimization_summary = None
 attention_focus = None
+attention_velocity = (0.0, 0.0)
+attention_strength = 0.0
 
 def set_process_priority():
     try:
@@ -225,6 +227,41 @@ def set_process_priority():
             proc.nice(psutil.NORMAL_PRIORITY_CLASS if hasattr(psutil, "NORMAL_PRIORITY_CLASS") else 5)
     except Exception as e:
         print(f"设置进程优先级失败：{e}")
+
+def blend_attention(points):
+    total = sum(w for _, w in points if w > 0)
+    if total <= 0:
+        return None
+    x = sum(p[0] * w for p, w in points) / total
+    y = sum(p[1] * w for p, w in points) / total
+    return (int(x), int(y))
+
+def update_attention_focus(mouse_pos, diff_center, diff_strength, target_center=None):
+    global attention_focus, attention_velocity, attention_strength
+    weights = []
+    weights.append((mouse_pos, 0.2))
+    if target_center is not None:
+        weights.append((target_center, 0.45))
+    if diff_center is not None:
+        weights.append((diff_center, max(0.15, min(0.55, 0.15 + diff_strength * 0.8))))
+    if attention_focus is not None:
+        weights.append((attention_focus, 0.25))
+    center = blend_attention(weights)
+    if center is None:
+        attention_focus = mouse_pos
+        attention_velocity = (0.0, 0.0)
+        attention_strength = 0.0
+        return mouse_pos
+    if attention_focus is None:
+        attention_focus = center
+        attention_velocity = (0.0, 0.0)
+    dx = center[0] - attention_focus[0]
+    dy = center[1] - attention_focus[1]
+    attention_velocity = (attention_velocity[0] * 0.6 + dx * 0.4, attention_velocity[1] * 0.6 + dy * 0.4)
+    smoothed = (int(center[0] + attention_velocity[0] * 0.25), int(center[1] + attention_velocity[1] * 0.25))
+    attention_focus = (max(0, min(screen_w - 1, smoothed[0])), max(0, min(screen_h - 1, smoothed[1])))
+    attention_strength = sum(w for _, w in weights)
+    return attention_focus
 
 def flush_buffers(timeout=3, keep_paused=False):
     update_window_status("正在刷盘/写经验池...", "info")
@@ -1007,6 +1044,7 @@ class UniversalAI(nn.Module):
         self.memory_unit = nn.GRU(self.model_dim, self.model_dim, batch_first=True)
         self.action_head = nn.Linear(self.model_dim, grid_size)
         self.button_head = nn.Linear(self.model_dim, 2)
+        self.scroll_head = nn.Linear(self.model_dim, 1)
         self.feature_decoder = nn.Sequential(nn.Linear(self.model_dim, 256), nn.ReLU(), nn.Linear(256, 128))
         self.log_var_action = nn.Parameter(torch.tensor(0.0))
         self.log_var_prediction = nn.Parameter(torch.tensor(0.0))
@@ -1033,8 +1071,9 @@ class UniversalAI(nn.Module):
         action_token = mem_out[:, -1, :]
         grid_logits = self.action_head(action_token)
         button_logits = self.button_head(action_token)
+        scroll_pred = self.scroll_head(action_token)
         pred_features = self.feature_decoder(action_token)
-        return grid_logits, pred_features, button_logits, hidden_out
+        return grid_logits, pred_features, button_logits, scroll_pred, hidden_out
 
     def encode_features(self, img):
         with torch.no_grad():
@@ -1779,18 +1818,21 @@ class StreamingGameDataset(IterableDataset):
                 gx = int(max(0, min(grid_w - 1, (nx / screen_w) * grid_w)))
                 gy = int(max(0, min(grid_h - 1, (ny / screen_h) * grid_h)))
                 grid_idx = gy * grid_w + gx
-                labels = [grid_idx, nval(3), nval(4)]
+                scroll_target = max(-1.0, min(1.0, nval(5) / 240.0))
+                labels = [grid_idx, nval(3), nval(4), scroll_target]
             else:
                 nx = next_entry.get("mouse_x", 0.0)
                 ny = next_entry.get("mouse_y", 0.0)
                 gx = int(max(0, min(grid_w - 1, (nx / screen_w) * grid_w)))
                 gy = int(max(0, min(grid_h - 1, (ny / screen_h) * grid_h)))
                 grid_idx = gy * grid_w + gx
-                labels = [grid_idx, 1.0 if next_entry.get("l_down", False) else 0.0, 1.0 if next_entry.get("r_down", False) else 0.0]
+                scroll_val = next_entry.get("scroll", 0.0)
+                scroll_target = max(-1.0, min(1.0, scroll_val / 240.0))
+                labels = [grid_idx, 1.0 if next_entry.get("l_down", False) else 0.0, 1.0 if next_entry.get("r_down", False) else 0.0, scroll_target]
             next_img_raw = load_image(next_entry)
             next_img = normalize_image(next_img_raw)
         else:
-            labels = [0.0, 0.0, 0.0]
+            labels = [0.0, 0.0, 0.0, 0.0]
             next_img = np.zeros((3, target_h, target_w), dtype=np.uint8)
 
         if stage == "REM":
@@ -2555,14 +2597,16 @@ def optimize_ai():
                                 log_var_action = torch.clamp(model.log_var_action, -6.0, 6.0)
                                 log_var_prediction = torch.clamp(model.log_var_prediction, -6.0, 6.0)
                                 log_var_energy = torch.clamp(model.log_var_energy, -6.0, 6.0)
-                                grid_logits, pred_feat, button_logits, _ = model(imgs, mins, None)
+                                grid_logits, pred_feat, button_logits, scroll_pred, _ = model(imgs, mins, None)
                                 target_grid = labels[:, 0].long()
-                                target_buttons = labels[:, 1:]
+                                target_buttons = labels[:, 1:3]
+                                target_scroll = labels[:, 3].view(-1)
                                 grid_loss = nn.functional.cross_entropy(grid_logits, target_grid)
-                                imitation_loss = grid_loss + bce_loss(button_logits, target_buttons)
+                                scroll_loss = nn.functional.smooth_l1_loss(torch.tanh(scroll_pred.squeeze(-1)), target_scroll)
+                                imitation_loss = grid_loss + bce_loss(button_logits, target_buttons) + 0.5 * scroll_loss
                                 target_feat = model.encode_features(next_frames)
                                 pred_loss = mse_loss(pred_feat, target_feat)
-                                energy_loss = torch.mean(torch.norm(button_logits, dim=1) + 1e-4 * torch.norm(grid_logits, dim=1))
+                                energy_loss = torch.mean(torch.norm(button_logits, dim=1) + torch.abs(scroll_pred.view(-1)) + 1e-4 * torch.norm(grid_logits, dim=1))
                                 total_loss = 0.5 * torch.exp(-log_var_action) * imitation_loss + 0.5 * log_var_action
                                 total_loss = total_loss + 0.5 * torch.exp(-log_var_prediction) * pred_loss + 0.5 * log_var_prediction
                                 total_loss = total_loss + 0.5 * torch.exp(-log_var_energy) * energy_loss + 0.5 * log_var_energy
@@ -2600,7 +2644,7 @@ def optimize_ai():
                                 stop_optimization_flag.set()
                                 break
                             progress_bar("模型训练阶段", current_step, total_samples, f"Loss: {last_loss_value:.4f} | Chunk {idx+1}/{total_chunks}")
-                            del imgs, mins, labels, next_frames, grid_logits, pred_feat, button_logits, target_grid, target_buttons, target_feat, total_loss
+                            del imgs, mins, labels, next_frames, grid_logits, pred_feat, button_logits, scroll_pred, target_grid, target_buttons, target_scroll, target_feat, total_loss
                             if low_vram_mode or batch_idx % 3 == 2:
                                 torch.cuda.empty_cache()
                             if batch_idx % 16 == 0:
@@ -2838,6 +2882,8 @@ def start_training_mode():
         jitter_amplitude = 1.5
         jitter_floor = 0.15
         jitter_decay = 0.995
+        prev_full_frame_small = None
+        scroll_buffer = 0.0
 
         while not stop_training_flag:
             if stop_training_flag:
@@ -2879,6 +2925,20 @@ def start_training_mode():
                     full_rgb = cv2.cvtColor(full_frame, cv2.COLOR_BGR2RGB)
                 else:
                     full_rgb = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
+                diff_center = None
+                diff_strength = 0.0
+                diff_w = max(1, screen_w // 4)
+                diff_h = max(1, screen_h // 4)
+                diff_frame = cv2.resize(full_rgb, (diff_w, diff_h))
+                if prev_full_frame_small is not None and prev_full_frame_small.shape == diff_frame.shape:
+                    diff = cv2.absdiff(diff_frame, prev_full_frame_small)
+                    diff_gray = cv2.cvtColor(diff, cv2.COLOR_RGB2GRAY)
+                    heat = cv2.resize(diff_gray, (64, 40))
+                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(heat)
+                    if max_val > 0:
+                        diff_center = (int((max_loc[0] / 64) * screen_w), int((max_loc[1] / 40) * screen_h))
+                        diff_strength = float(max_val) / 255.0
+                prev_full_frame_small = diff_frame
                 traj_flat = sample_trajectory(traj, ts_value, fallback_pos=(curr_x, curr_y))
                 traj_norm = []
                 for i, v in enumerate(traj_flat):
@@ -2887,7 +2947,8 @@ def start_training_mode():
                     else:
                         traj_norm.append(norm_coord(v, screen_h))
                 mouse_box = clamp_region(curr_x, curr_y, max(64, target_w * 2), max(40, target_h * 2), full_rgb.shape[1], full_rgb.shape[0])
-                focus_center = attention_focus if attention_focus is not None else (curr_x, curr_y)
+                hint_center = attention_focus if attention_focus is not None else None
+                focus_center = update_attention_focus((curr_x, curr_y), diff_center, diff_strength, hint_center)
                 att_box = clamp_region(focus_center[0], focus_center[1], max(64, target_w * 2), max(40, target_h * 2), full_rgb.shape[1], full_rgb.shape[0])
                 full_box = (0, 0, screen_w, screen_h)
                 mouse_crop = full_rgb[mouse_box[1]:mouse_box[1]+mouse_box[3], mouse_box[0]:mouse_box[0]+mouse_box[2]]
@@ -2949,14 +3010,15 @@ def start_training_mode():
                     t_mins = torch.FloatTensor(np.array([input_buffer_mouse])).to(train_device)
                     surprise_optimizer.zero_grad(set_to_none=True)
                     with autocast(device_type="cuda", enabled=train_device.type == "cuda"):
-                        grid_logits, pred_feat, button_logits, hidden_out = model(t_imgs, t_mins, hidden_state)
+                        grid_logits, pred_feat, button_logits, scroll_pred, hidden_out = model(t_imgs, t_mins, hidden_state)
                     grid_probs = torch.softmax(grid_logits[0], dim=-1)
                     pred_cell = torch.argmax(grid_probs).item()
                     cell_x = pred_cell % grid_w
                     cell_y = pred_cell // grid_w
                     target_x = int(((cell_x + 0.5) / grid_w) * screen_w)
                     target_y = int(((cell_y + 0.5) / grid_h) * screen_h)
-                    attention_focus = (target_x, target_y)
+                    target_hint = (target_x, target_y)
+                    attention_focus = update_attention_focus((curr_x, curr_y), diff_center, diff_strength, target_hint)
                     hidden_state = hidden_out.detach()
                     target_history.append((target_x, target_y))
                     avg_x = sum(p[0] for p in target_history) / len(target_history)
@@ -2972,6 +3034,7 @@ def start_training_mode():
                     final_x = int(min(max(0, filtered_x + jitter_x), screen_w - 1))
                     final_y = int(min(max(0, filtered_y + jitter_y), screen_h - 1))
                     pred_buttons = torch.sigmoid(button_logits[0]).detach().cpu().numpy()
+                    pred_scroll = torch.tanh(scroll_pred[0]).detach().cpu().numpy()[0]
                     mouse_ctrl.position = (final_x, final_y)
                     if pred_buttons[0] > 0.5 and not l_down:
                         mouse_ctrl.press(mouse.Button.left)
@@ -2981,6 +3044,12 @@ def start_training_mode():
                         mouse_ctrl.press(mouse.Button.right)
                     elif pred_buttons[1] <= 0.5 and r_down:
                         mouse_ctrl.release(mouse.Button.right)
+                    scroll_buffer = scroll_buffer * 0.7 + float(pred_scroll) * 0.3
+                    if abs(scroll_buffer) > 0.25:
+                        step = int(max(-3, min(3, round(scroll_buffer * 3))))
+                        if step != 0:
+                            mouse_ctrl.scroll(0, step)
+                            scroll_buffer *= 0.4
                     actual_frame, _ = get_latest_frame()
                     if actual_frame is not None and actual_frame.ndim == 3:
                         if actual_frame.shape[2] == 4:
@@ -3071,21 +3140,19 @@ def record_data_loop():
                 diff_w = max(1, screen_w // 4)
                 diff_h = max(1, screen_h // 4)
                 diff_frame = cv2.resize(full_rgb, (diff_w, diff_h))
+                diff_strength = 0.0
                 if prev_full_frame_small is not None and prev_full_frame_small.shape == diff_frame.shape:
                     diff = cv2.absdiff(diff_frame, prev_full_frame_small)
                     diff_gray = cv2.cvtColor(diff, cv2.COLOR_RGB2GRAY)
                     heat = cv2.resize(diff_gray, (64, 40))
                     min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(heat)
-                    diff_center = (int((max_loc[0] / 64) * screen_w), int((max_loc[1] / 40) * screen_h)) if max_val > 0 else None
+                    if max_val > 0:
+                        diff_center = (int((max_loc[0] / 64) * screen_w), int((max_loc[1] / 40) * screen_h))
+                        diff_strength = float(max_val) / 255.0
                 focus_center = None
                 if attention_focus is not None:
                     focus_center = attention_focus
-                if focus_center is not None:
-                    att_center = focus_center
-                elif diff_center is not None:
-                    att_center = diff_center
-                else:
-                    att_center = (c_state["x"], c_state["y"])
+                att_center = update_attention_focus((c_state["x"], c_state["y"]), diff_center, diff_strength, focus_center)
                 att_box = clamp_region(att_center[0], att_center[1], max(64, target_w * 2), max(40, target_h * 2), full_rgb.shape[1], full_rgb.shape[0])
                 att_crop = full_rgb[att_box[1]:att_box[1]+att_box[3], att_box[0]:att_box[0]+att_box[2]]
                 full_view = cv2.resize(full_rgb, (target_w, target_h))
