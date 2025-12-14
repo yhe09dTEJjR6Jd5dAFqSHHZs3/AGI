@@ -8,6 +8,7 @@ import datetime
 import shutil
 import ctypes
 import random
+import hashlib
 import glob
 import gc
 import warnings
@@ -109,6 +110,7 @@ def show_install_error(package, err):
     cmd = f"{sys.executable} -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple {package}"
     message = f"缺失库：{package}\n失败原因：{err}\n下一步操作：请手动运行：{cmd}"
     install_failure_message = message
+    update_window_status(message, "error")
     try:
         root = tk.Tk()
         root.withdraw()
@@ -167,27 +169,6 @@ def install_requirements():
                 pass
     except Exception:
         pass
-
-install_requirements()
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import IterableDataset, DataLoader
-from torch.amp import autocast, GradScaler
-from torch.utils.checkpoint import checkpoint
-import numpy as np
-import cv2
-import mss
-import psutil
-import torchvision.models as models
-from pynput import mouse, keyboard
-import pynvml
-import lmdb
-if os.name == "nt":
-    import dxcam
-else:
-    dxcam = None
 
 desktop_path = resolve_desktop_path()
 base_dir = os.path.join(desktop_path, "AAA")
@@ -493,12 +474,37 @@ class SciFiWindow:
 def init_window():
     global window_ui
     try:
-        window_ui = SciFiWindow()
+        if window_ui is None:
+            window_ui = SciFiWindow()
+            builtins.print = window_print
         builtins.print = window_print
         return True
     except Exception as e:
         print(f"界面初始化失败：{e}")
         return False
+
+init_window()
+update_window_status("正在检查依赖...", "info")
+install_requirements()
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import IterableDataset, DataLoader
+from torch.amp import autocast, GradScaler
+from torch.utils.checkpoint import checkpoint
+import numpy as np
+import cv2
+import mss
+import psutil
+import torchvision.models as models
+from pynput import mouse, keyboard
+import pynvml
+import lmdb
+if os.name == "nt":
+    import dxcam
+else:
+    dxcam = None
 
 def update_window_mode(mode):
     try:
@@ -524,7 +530,8 @@ def update_window_progress(pct, text=None, channel="opt"):
 
 capture_freq = 10
 seq_len = 12
-screen_w, screen_h = 2560, 1600
+screen_w, screen_h = 1920, 1080
+monitor_info = {"id": 0, "left": 0, "top": 0, "width": screen_w, "height": screen_h, "scale": 1.0}
 target_w, target_h = 256, 160
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 mouse_feature_dim = 62
@@ -557,6 +564,41 @@ lmdb_counter = 0
 lmdb_start = 0
 current_map_size_gb = 2
 dxcam_camera = None
+
+def get_dpi_scale():
+    try:
+        if os.name == "nt":
+            ctypes.windll.user32.SetProcessDPIAware()
+            dpi = ctypes.windll.user32.GetDpiForSystem()
+            return max(0.5, float(dpi) / 96.0)
+    except Exception as e:
+        print(f"DPI 查询失败：{e}")
+    return 1.0
+
+def refresh_display_info():
+    global screen_w, screen_h, monitor_info
+    info = {"id": 0, "left": 0, "top": 0, "width": screen_w, "height": screen_h, "scale": 1.0}
+    try:
+        info["scale"] = get_dpi_scale()
+    except Exception as e:
+        print(f"DPI获取警告：{e}")
+    try:
+        with mss.mss() as sct:
+            monitors = sct.monitors
+            primary = monitors[1] if len(monitors) > 1 else monitors[0]
+            info.update({
+                "id": primary.get("id", 1 if len(monitors) > 1 else 0),
+                "left": int(primary.get("left", 0)),
+                "top": int(primary.get("top", 0)),
+                "width": int(primary.get("width", screen_w)),
+                "height": int(primary.get("height", screen_h))
+            })
+    except Exception as e:
+        print(f"监视器信息获取失败：{e}")
+    screen_w = info["width"]
+    screen_h = info["height"]
+    monitor_info = info
+    update_window_status(f"显示配置：Monitor {info['id']} {info['width']}x{info['height']} scale {info['scale']:.2f}", "info")
 
 def update_latest_frame(img, ts, full=None):
     with frame_lock:
@@ -816,7 +858,7 @@ def normalize_meta_entry(entry):
 
 def append_meta_entry(key_val, length, source_type, salience_score, error_score=0.0):
     try:
-        base_entry = {"key": int(key_val), "length": int(length), "timestamp": time.time(), "type": source_type, "salience_score": float(salience_score), "error_score": float(error_score), "state": "TAGGED" if salience_score > 0.4 or source_type == "human" else "NEW", "cooldown_until": 0.0}
+        base_entry = {"key": int(key_val), "length": int(length), "timestamp": time.time(), "type": source_type, "salience_score": float(salience_score), "error_score": float(error_score), "state": "TAGGED" if salience_score > 0.4 or source_type == "human" else "NEW", "cooldown_until": 0.0, "schema_version": 1}
         base_entry["fragments"] = build_fragment_plan(length, salience_score, error_score)
         with meta_lock:
             data = load_meta_entries(use_lock=False)
@@ -1225,7 +1267,8 @@ def frame_generator_loop():
                 continue
             if use_dx and camera is None:
                 try:
-                    dxcam_camera = dxcam_camera if dxcam_camera is not None else dxcam.create(output_idx=0)
+                    idx = max(0, int(monitor_info.get("id", 1)) - 1)
+                    dxcam_camera = dxcam_camera if dxcam_camera is not None else dxcam.create(output_idx=idx)
                     camera = dxcam_camera
                     camera.start(target_fps=max(30, capture_freq * 2), video_mode=True, dup=False)
                 except Exception:
@@ -1254,7 +1297,10 @@ def frame_generator_loop():
             if sct is None:
                 sct = mss.mss()
             start = time.time()
-            img = np.array(sct.grab({"top": 0, "left": 0, "width": screen_w, "height": screen_h}))
+            region = {"top": monitor_info.get("top", 0), "left": monitor_info.get("left", 0), "width": screen_w, "height": screen_h}
+            if monitor_info.get("id", 0):
+                region["mon"] = monitor_info.get("id", 0)
+            img = np.array(sct.grab(region))
             step_x = max(1, screen_w // target_w)
             step_y = max(1, screen_h // target_h)
             img_small = img[::step_y, ::step_x]
@@ -2410,7 +2456,27 @@ def optimize_ai():
                 beta = float(model.log_var_prediction.detach().item())
                 gamma = float(model.log_var_energy.detach().item())
                 temp_path = os.path.join(model_dir, "ai_model_temp.pth")
-                torch.save({"model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(), "alpha": alpha, "beta": beta, "gamma": gamma, "last_loss": last_snapshot if last_snapshot is not None else 0.0, "steps": steps_snapshot if steps_snapshot is not None else 0, "total_steps": total_snapshot if total_snapshot is not None else 0, "interrupted": interrupted_flag, "timestamp": time.time(), "reason": final_reason or early_stop_reason or user_stop_request_reason}, temp_path)
+                payload = {"model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(), "alpha": alpha, "beta": beta, "gamma": gamma, "last_loss": last_snapshot if last_snapshot is not None else 0.0, "steps": steps_snapshot if steps_snapshot is not None else 0, "total_steps": total_snapshot if total_snapshot is not None else 0, "interrupted": interrupted_flag, "timestamp": time.time(), "reason": final_reason or early_stop_reason or user_stop_request_reason}
+                torch.save(payload, temp_path)
+                try:
+                    with open(temp_path, "rb") as f:
+                        os.fsync(f.fileno())
+                except Exception:
+                    pass
+                size_bytes = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+                digest = hashlib.sha256()
+                try:
+                    with open(temp_path, "rb") as f:
+                        for chunk in iter(lambda: f.read(8192), b""):
+                            digest.update(chunk)
+                except Exception as e:
+                    log_exception("模型hash失败", e)
+                verified_load = False
+                try:
+                    torch.load(temp_path, map_location="cpu")
+                    verified_load = True
+                except Exception as e:
+                    log_exception("模型回读校验失败", e)
                 if os.path.exists(model_path):
                     try:
                         shutil.copy2(model_path, backup_path)
@@ -2421,10 +2487,16 @@ def optimize_ai():
                     except Exception:
                         pass
                 try:
-                    os.rename(temp_path, model_path)
+                    os.replace(temp_path, model_path)
                 except Exception:
                     shutil.copy2(temp_path, model_path)
-                return True
+                try:
+                    with open(model_path, "rb") as f:
+                        os.fsync(f.fileno())
+                except Exception:
+                    pass
+                update_window_status(f"模型保存完成 size={size_bytes} hash={digest.hexdigest()} verified={verified_load}", "info")
+                return verified_load
             except Exception as e:
                 log_exception("Safe save warning", e)
                 return False
@@ -2974,8 +3046,10 @@ def start_training_mode():
                 if frame_img is None:
                     time.sleep(0.01)
                     continue
+                origin_x = monitor_info.get("left", 0)
+                origin_y = monitor_info.get("top", 0)
                 with mouse_lock:
-                    curr_x, curr_y = mouse_state["x"], mouse_state["y"]
+                    curr_x, curr_y = mouse_state["x"] - origin_x, mouse_state["y"] - origin_y
                     l_down = mouse_state["l_down"]
                     r_down = mouse_state["r_down"]
                     scroll_age = start_time - mouse_state.get("scroll_ts", 0.0)
@@ -3012,7 +3086,7 @@ def start_training_mode():
                         diff_center = (int((max_loc[0] / 64) * screen_w), int((max_loc[1] / 40) * screen_h))
                         diff_strength = float(max_val) / 255.0
                 prev_full_frame_small = diff_frame
-                traj_flat = sample_trajectory(traj, ts_value, fallback_pos=(curr_x, curr_y))
+                traj_flat = sample_trajectory([(p[0] - origin_x, p[1] - origin_y, p[2]) for p in traj], ts_value, fallback_pos=(curr_x, curr_y))
                 traj_norm = []
                 for i, v in enumerate(traj_flat):
                     if i % 2 == 0:
@@ -3042,14 +3116,14 @@ def start_training_mode():
                     max(0.0, ts_value - mouse_state["r_down_ts"]) if mouse_state["r_down_ts"] > 0 else 0.0,
                     max(0.0, ts_value - mouse_state["l_up_ts"]) if mouse_state["l_up_ts"] > 0 else 0.0,
                     max(0.0, ts_value - mouse_state["r_up_ts"]) if mouse_state["r_up_ts"] > 0 else 0.0,
-                    norm_coord(mouse_state["l_down_pos"][0], screen_w),
-                    norm_coord(mouse_state["l_down_pos"][1], screen_h),
-                    norm_coord(l_up_pos[0], screen_w),
-                    norm_coord(l_up_pos[1], screen_h),
-                    norm_coord(mouse_state["r_down_pos"][0], screen_w),
-                    norm_coord(mouse_state["r_down_pos"][1], screen_h),
-                    norm_coord(r_up_pos[0], screen_w),
-                    norm_coord(r_up_pos[1], screen_h),
+                    norm_coord(mouse_state["l_down_pos"][0] - origin_x, screen_w),
+                    norm_coord(mouse_state["l_down_pos"][1] - origin_y, screen_h),
+                    norm_coord(l_up_pos[0] - origin_x, screen_w),
+                    norm_coord(l_up_pos[1] - origin_y, screen_h),
+                    norm_coord(mouse_state["r_down_pos"][0] - origin_x, screen_w),
+                    norm_coord(mouse_state["r_down_pos"][1] - origin_y, screen_h),
+                    norm_coord(r_up_pos[0] - origin_x, screen_w),
+                    norm_coord(r_up_pos[1] - origin_y, screen_h),
                     norm_coord(mouse_box[0], screen_w),
                     norm_coord(mouse_box[1], screen_h),
                     (mouse_box[2] / screen_w) if mouse_box[2] else 0.0,
@@ -3206,14 +3280,18 @@ def record_data_loop():
                         c_state["scroll"] = 0
                     mouse_state["scroll"] = 0
                     mouse_state["scroll_ts"] = 0.0
-                    traj = list(temp_trajectory)
+                    traj = [(p[0] - monitor_info.get("left", 0), p[1] - monitor_info.get("top", 0), p[2]) for p in list(temp_trajectory)]
+                origin_x = monitor_info.get("left", 0)
+                origin_y = monitor_info.get("top", 0)
+                rel_x = c_state["x"] - origin_x
+                rel_y = c_state["y"] - origin_y
                 if full_frame is None:
                     full_frame = cv2.resize(frame_img, (screen_w, screen_h)) if frame_img is not None else np.zeros((screen_h, screen_w, 4), dtype=np.uint8)
                 if full_frame.shape[2] == 4:
                     full_rgb = cv2.cvtColor(full_frame, cv2.COLOR_BGRA2RGB)
                 else:
                     full_rgb = cv2.cvtColor(full_frame, cv2.COLOR_BGR2RGB) if full_frame.shape[2] == 3 else np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
-                mouse_box = clamp_region(c_state["x"], c_state["y"], max(64, target_w * 2), max(40, target_h * 2), full_rgb.shape[1], full_rgb.shape[0])
+                mouse_box = clamp_region(rel_x, rel_y, max(64, target_w * 2), max(40, target_h * 2), full_rgb.shape[1], full_rgb.shape[0])
                 mouse_crop = full_rgb[mouse_box[1]:mouse_box[1]+mouse_box[3], mouse_box[0]:mouse_box[0]+mouse_box[2]]
                 diff_center = None
                 diff_w = max(1, screen_w // 4)
@@ -3231,7 +3309,7 @@ def record_data_loop():
                 focus_center = None
                 if attention_focus is not None:
                     focus_center = attention_focus
-                att_center = update_attention_focus((c_state["x"], c_state["y"]), diff_center, diff_strength, focus_center)
+                att_center = update_attention_focus((rel_x, rel_y), diff_center, diff_strength, focus_center)
                 att_box = clamp_region(att_center[0], att_center[1], max(64, target_w * 2), max(40, target_h * 2), full_rgb.shape[1], full_rgb.shape[0])
                 att_crop = full_rgb[att_box[1]:att_box[1]+att_box[3], att_box[0]:att_box[0]+att_box[2]]
                 full_view = cv2.resize(full_rgb, (target_w, target_h))
@@ -3239,28 +3317,28 @@ def record_data_loop():
                 att_view = cv2.resize(att_crop, (target_w, target_h)) if att_crop.size > 0 else np.zeros((target_h, target_w, 3), dtype=np.uint8)
                 combined_views = np.stack([full_view, mouse_view, att_view], axis=0).astype(np.uint8)
                 buffer_images.append(combined_views)
-                traj_flat = sample_trajectory(traj, ts_value, fallback_pos=(c_state["x"], c_state["y"]))
+                traj_flat = sample_trajectory(traj, ts_value, fallback_pos=(rel_x, rel_y))
                 action_entry = [
                     ts_value,
-                    c_state["x"],
-                    c_state["y"],
+                    rel_x,
+                    rel_y,
                     1.0 if c_state["l_down"] else 0.0,
                     1.0 if c_state["r_down"] else 0.0,
                     c_state["scroll"],
                     c_state["l_down_ts"],
-                    c_state["l_down_pos"][0],
-                    c_state["l_down_pos"][1],
+                    c_state["l_down_pos"][0] - origin_x,
+                    c_state["l_down_pos"][1] - origin_y,
                     c_state["l_up_ts"],
-                    c_state["l_up_pos"][0],
-                    c_state["l_up_pos"][1],
+                    c_state["l_up_pos"][0] - origin_x,
+                    c_state["l_up_pos"][1] - origin_y,
                     c_state["r_down_ts"],
-                    c_state["r_down_pos"][0],
-                    c_state["r_down_pos"][1],
+                    c_state["r_down_pos"][0] - origin_x,
+                    c_state["r_down_pos"][1] - origin_y,
                     c_state["r_up_ts"],
-                    c_state["x"] - last_pos[0],
-                    c_state["y"] - last_pos[1],
-                    c_state["r_up_pos"][0],
-                    c_state["r_up_pos"][1],
+                    rel_x - last_pos[0],
+                    rel_y - last_pos[1],
+                    c_state["r_up_pos"][0] - origin_x,
+                    c_state["r_up_pos"][1] - origin_y,
                     mouse_box[0],
                     mouse_box[1],
                     mouse_box[2],
@@ -3272,12 +3350,16 @@ def record_data_loop():
                     0,
                     0,
                     screen_w,
-                    screen_h
+                    screen_h,
+                    monitor_info.get("id", 0),
+                    monitor_info.get("left", 0),
+                    monitor_info.get("top", 0),
+                    monitor_info.get("scale", 1.0)
                 ]
                 action_entry.extend(traj_flat)
                 action_entry.append(1.0 if current_mode == MODE_TRAINING else 0.0)
                 buffer_actions.append(action_entry)
-                last_pos = (c_state["x"], c_state["y"])
+                last_pos = (rel_x, rel_y)
                 prev_full_frame_small = diff_frame
 
                 if len(buffer_images) >= chunk_target:
@@ -3427,6 +3509,7 @@ def start_background_services():
 if __name__ == "__main__":
     ensure_initial_model()
     set_process_priority()
+    refresh_display_info()
     init_window()
     ensure_experience_structure()
     update_window_mode(current_mode)
