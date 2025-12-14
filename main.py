@@ -48,6 +48,9 @@ progress_bar_last = {}
 progress_bar_min_interval = 0.12
 
 original_print = builtins.print
+frame_thread = None
+save_thread = None
+record_thread = None
 
 def log_exception(context, err=None, extra=None):
     parts = [context]
@@ -56,11 +59,20 @@ def log_exception(context, err=None, extra=None):
     if extra:
         parts.append(str(extra))
     message = " | ".join(parts)
+    try:
+        global last_error_detail
+        last_error_detail = message
+    except Exception:
+        pass
     report_to_window(message, "error")
     update_window_status(message, "error")
     tb = traceback.format_exc()
     if tb:
         detail = tb.strip()
+        try:
+            last_error_detail = detail
+        except Exception:
+            pass
         report_to_window(detail, "error")
         update_window_status(detail, "error")
 
@@ -131,7 +143,30 @@ def install_requirements():
             try:
                 subprocess.check_call([sys.executable, "-m", "pip", "install", "-i", "https://pypi.tuna.tsinghua.edu.cn/simple", package])
             except Exception as e:
-                show_install_error(package, e)
+                try:
+                    print(f"镜像安装失败，回退默认源安装 {package}...")
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+                except Exception as fallback_err:
+                    show_install_error(package, fallback_err)
+    try:
+        import importlib
+        torch_mod = importlib.import_module("torch")
+        if torch_mod.cuda.is_available():
+            try:
+                pynvml.nvmlInit()
+                pynvml.nvmlDeviceGetHandleByIndex(0)
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+        else:
+            try:
+                pynvml.nvmlInit()
+                pynvml.nvmlShutdown()
+                update_window_status("检测到NVIDIA GPU但CUDA不可用，请安装匹配CUDA的torch版本。", "warn")
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 install_requirements()
 
@@ -246,7 +281,9 @@ def update_attention_focus(mouse_pos, diff_center, diff_strength, target_center=
         weights.append((diff_center, max(0.15, min(0.55, 0.15 + diff_strength * 0.8))))
     if attention_focus is not None:
         weights.append((attention_focus, 0.25))
-    center = blend_attention(weights)
+    total_weight = sum(w for _, w in weights if w > 0)
+    normalized = [(p, w / total_weight) for p, w in weights if total_weight > 0] if total_weight > 0 else weights
+    center = blend_attention(normalized)
     if center is None:
         attention_focus = mouse_pos
         attention_velocity = (0.0, 0.0)
@@ -260,21 +297,49 @@ def update_attention_focus(mouse_pos, diff_center, diff_strength, target_center=
     attention_velocity = (attention_velocity[0] * 0.6 + dx * 0.4, attention_velocity[1] * 0.6 + dy * 0.4)
     smoothed = (int(center[0] + attention_velocity[0] * 0.25), int(center[1] + attention_velocity[1] * 0.25))
     attention_focus = (max(0, min(screen_w - 1, smoothed[0])), max(0, min(screen_h - 1, smoothed[1])))
-    attention_strength = sum(w for _, w in weights)
+    base_strength = max(0.0, min(1.0, diff_strength))
+    if target_center is not None:
+        base_strength = max(base_strength, 0.35)
+    attention_strength = base_strength
     return attention_focus
 
-def flush_buffers(timeout=3, keep_paused=False):
+def ensure_background_threads():
+    global frame_thread, save_thread, record_thread
+    try:
+        if frame_thread is None or not frame_thread.is_alive():
+            frame_thread = threading.Thread(target=frame_generator_loop, daemon=True)
+            frame_thread.start()
+            update_window_status("帧采集线程已重启", "warn")
+        if save_thread is None or not save_thread.is_alive():
+            save_thread = threading.Thread(target=disk_writer_loop, daemon=True)
+            save_thread.start()
+            update_window_status("写盘线程已重启", "warn")
+        if record_thread is None or not record_thread.is_alive():
+            record_thread = threading.Thread(target=record_data_loop, daemon=True)
+            record_thread.start()
+            update_window_status("录制线程已重启", "warn")
+    except Exception as e:
+        log_exception("线程健康检查失败", e)
+
+def flush_buffers(timeout=3, keep_paused=False, max_total_wait=45):
     update_window_status("正在刷盘/写经验池...", "info")
     flush_done_event.clear()
     flush_event.set()
     recording_pause_event.set()
     capture_pause_event.set()
+    start_wait = time.time()
     while not flush_done_event.wait(timeout=timeout):
+        if time.time() - start_wait >= max_total_wait:
+            update_window_status("刷盘超时，已强制恢复（可能存在未落盘数据）", "error")
+            recording_pause_event.set()
+            capture_pause_event.set()
+            ensure_background_threads()
+            break
         update_window_status("等待数据刷盘中，录制已暂停以避免丢数...", "warn")
     if not keep_paused:
         recording_pause_event.clear()
         capture_pause_event.clear()
-    return True
+    return flush_done_event.is_set()
 
 def report_to_window(msg, level="info"):
     try:
@@ -462,7 +527,7 @@ seq_len = 12
 screen_w, screen_h = 2560, 1600
 target_w, target_h = 256, 160
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-mouse_feature_dim = 52
+mouse_feature_dim = 62
 grid_w, grid_h = 32, 20
 grid_size = grid_w * grid_h
 if torch.cuda.is_available():
@@ -472,8 +537,12 @@ mouse_state = {
     "x": 0, "y": 0,
     "l_down": False, "l_down_ts": 0.0, "l_down_pos": (0,0), "l_up_pos": (0,0), "l_up_ts": 0.0,
     "r_down": False, "r_down_ts": 0.0, "r_down_pos": (0,0), "r_up_pos": (0,0), "r_up_ts": 0.0,
-    "scroll": 0
+    "scroll": 0, "scroll_ts": 0.0
 }
+last_error_detail = ""
+last_full_scan_time = 0.0
+trim_attempts = 0
+last_compact_time = 0.0
 mouse_lock = threading.Lock()
 temp_trajectory = deque(maxlen=200)
 frame_lock = threading.Lock()
@@ -589,54 +658,10 @@ def wait_for_save_queue(timeout=3.0):
         return False
 
 def append_binary_log(img_arr, act_arr):
-    try:
-        buf = io.BytesIO()
-        np.savez_compressed(buf, image=img_arr, action=act_arr)
-        payload = buf.getvalue()
-        header = struct.pack("<Q", len(payload))
-        sample_count = 0
-        try:
-            sample_count = min(len(img_arr), len(act_arr))
-        except Exception:
-            sample_count = 0
-        load_index_entries(upgrade=True)
-        with log_lock:
-            with open(log_path, "ab") as f:
-                offset = f.tell()
-                f.write(header)
-                f.write(payload)
-            with open(index_path, "ab") as idx:
-                idx.write(struct.pack("<QQQ", offset, len(payload), int(sample_count)))
-    except Exception as e:
-        print(f"Binary log append error: {e}")
+    return
 
 def iterate_binary_log(path):
-    try:
-        if not os.path.exists(path):
-            return []
-        entries = load_index_entries()
-        if not entries:
-            return []
-        for offset, length, _ in entries:
-            try:
-                with log_lock:
-                    with open(path, "rb") as f:
-                        f.seek(offset)
-                        header = f.read(8)
-                        if not header or len(header) < 8:
-                            break
-                        payload_len = struct.unpack("<Q", header)[0]
-                        if payload_len <= 0:
-                            continue
-                        payload = f.read(payload_len)
-                        if len(payload) < payload_len:
-                            break
-                yield payload
-            except Exception as read_err:
-                print(f"Binary log read warning: {read_err}")
-    except Exception as e:
-        print(f"Binary log read error: {e}")
-        return []
+    return []
 
 def load_index_entries(upgrade=False):
     try:
@@ -1274,6 +1299,7 @@ def on_click(x, y, button, pressed):
 def on_scroll(x, y, dx, dy):
     with mouse_lock:
         mouse_state["scroll"] = dy
+        mouse_state["scroll_ts"] = time.time()
 
 def release_mouse_outputs():
     try:
@@ -1333,29 +1359,53 @@ def release_data_handle(data):
 
 
 def calculate_data_dir_size():
+    global last_full_scan_time
+    critical_files = [lmdb_path, log_path, index_path]
     total_size = 0
-    for root_dir, _, files in os.walk(data_dir):
-        for fname in files:
-            fpath = os.path.join(root_dir, fname)
-            try:
+    for fpath in critical_files:
+        try:
+            if os.path.exists(fpath):
                 total_size += os.path.getsize(fpath)
-            except Exception as e:
-                log_exception("Disk size check warning", e, fpath)
+        except Exception as e:
+            log_exception("Disk size quick check warning", e, fpath)
+    now = time.time()
+    if now - last_full_scan_time > 1800:
+        try:
+            for root_dir, _, files in os.walk(data_dir):
+                for fname in files:
+                    fpath = os.path.join(root_dir, fname)
+                    try:
+                        total_size += os.path.getsize(fpath)
+                    except Exception as e:
+                        log_exception("Disk size check warning", e, fpath)
+            last_full_scan_time = now
+        except Exception as e:
+            log_exception("Disk size walk failure", e)
     return total_size
 
 def check_disk_space():
+    global trim_attempts, last_compact_time
     try:
         total_size = calculate_data_dir_size()
         while total_size > LMDB_LIMIT_BYTES:
             before = total_size
             trim_lmdb(LMDB_LIMIT_BYTES)
-            compact_lmdb()
-            trim_binary_log(LMDB_LIMIT_BYTES)
+            trim_attempts += 1
             total_size = calculate_data_dir_size()
-            if total_size < LMDB_LIMIT_BYTES:
+            if total_size <= LMDB_LIMIT_BYTES:
                 write_paused_event.clear()
                 update_window_status("经验池空间已恢复，写入继续。", "info")
-                break
+                trim_attempts = 0
+                return
+            if trim_attempts >= 2 or time.time() - last_compact_time > 7200:
+                compact_lmdb()
+                last_compact_time = time.time()
+                trim_attempts = 0
+                total_size = calculate_data_dir_size()
+                if total_size <= LMDB_LIMIT_BYTES:
+                    write_paused_event.clear()
+                    update_window_status("经验池空间已恢复，写入继续。", "info")
+                    return
             if total_size >= before:
                 write_paused_event.set()
                 update_window_status("经验池空间不足，清理未达标，已暂停写入。", "error")
@@ -2035,8 +2085,11 @@ def sample_trajectory(traj, ts_now, max_points=10, window=0.1, fallback_pos=(0, 
     while len(recent) < max_points:
         recent.append(recent[-1])
     flat = []
-    for px, py, _ in recent:
-        flat.extend([px, py])
+    last_ts = recent[0][2]
+    for px, py, ts in recent:
+        dt = max(0.0, ts - last_ts)
+        flat.extend([px, py, dt])
+        last_ts = ts
     return flat
 
 def sample_actions_from_source(path, sample_cap=8):
@@ -2884,12 +2937,30 @@ def start_training_mode():
         jitter_decay = 0.995
         prev_full_frame_small = None
         scroll_buffer = 0.0
+        surprise_sum = 0.0
+        surprise_count = 0
+
+        def training_save_checkpoint(reason):
+            try:
+                alpha = float(model.log_var_action.detach().item())
+                beta = float(model.log_var_prediction.detach().item())
+                gamma = float(model.log_var_energy.detach().item())
+                temp_path = os.path.join(model_dir, "ai_model_temp_train.pth")
+                torch.save({"model_state": model.state_dict(), "optimizer_state": surprise_optimizer.state_dict(), "alpha": alpha, "beta": beta, "gamma": gamma, "steps": action_steps, "surprise_avg": (surprise_sum / max(1, surprise_count)), "timestamp": time.time(), "reason": reason}, temp_path)
+                final_path = os.path.join(model_dir, "ai_model.pth")
+                with file_write_lock:
+                    os.replace(temp_path, final_path)
+            except Exception as e:
+                log_exception("训练模型保存失败", e)
 
         while not stop_training_flag:
             if stop_training_flag:
                 break
             time.sleep(0)
             start_time = time.time()
+            if current_mode != MODE_TRAINING or not input_allowed_event.is_set():
+                stop_training_flag = True
+                break
             if os.name == "nt":
                 try:
                     if ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x8000:
@@ -2907,11 +2978,13 @@ def start_training_mode():
                     curr_x, curr_y = mouse_state["x"], mouse_state["y"]
                     l_down = mouse_state["l_down"]
                     r_down = mouse_state["r_down"]
-                    scroll = mouse_state["scroll"]
+                    scroll_age = start_time - mouse_state.get("scroll_ts", 0.0)
+                    scroll = mouse_state["scroll"] if scroll_age <= 0.4 else 0
                     l_up_pos = mouse_state["l_up_pos"]
                     r_up_pos = mouse_state["r_up_pos"]
                     traj = list(temp_trajectory)
                 mouse_state["scroll"] = 0
+                mouse_state["scroll_ts"] = 0.0
                 ts_value = frame_ts if frame_ts else start_time
                 def norm_coord(v, dim):
                     return (2.0 * (v / dim)) - 1.0
@@ -3066,6 +3139,8 @@ def start_training_mode():
                             surprise_scaler.scale(surprise_loss).backward()
                             surprise_scaler.step(surprise_optimizer)
                             surprise_scaler.update()
+                            surprise_sum += float(surprise_loss.item())
+                            surprise_count += 1
                 surprise_optimizer.zero_grad(set_to_none=True)
                 action_steps += 1
                 elapsed = time.time() - start_time
@@ -3091,6 +3166,7 @@ def start_training_mode():
         current_mode = MODE_LEARNING
         update_window_mode(current_mode)
         input_allowed_event.set()
+        training_save_checkpoint("训练模式结束")
 
 def record_data_loop():
     buffer_images = []
@@ -3126,7 +3202,10 @@ def record_data_loop():
                 ts_value = frame_ts if frame_ts else (full_ts if full_ts else start_time)
                 with mouse_lock:
                     c_state = mouse_state.copy()
+                    if start_time - c_state.get("scroll_ts", 0.0) > 0.4:
+                        c_state["scroll"] = 0
                     mouse_state["scroll"] = 0
+                    mouse_state["scroll_ts"] = 0.0
                     traj = list(temp_trajectory)
                 if full_frame is None:
                     full_frame = cv2.resize(frame_img, (screen_w, screen_h)) if frame_img is not None else np.zeros((screen_h, screen_w, 4), dtype=np.uint8)
@@ -3316,19 +3395,19 @@ def request_early_stop():
         input_allowed_event.set()
 
 def start_background_services():
-    global mouse_listener, key_listener
+    global mouse_listener, key_listener, frame_thread, save_thread, record_thread
     mouse_listener = mouse.Listener(on_move=on_move, on_click=on_click, on_scroll=on_scroll)
     mouse_listener.start()
     key_listener = keyboard.Listener(on_press=on_press_key)
     key_listener.start()
     t_res = threading.Thread(target=resource_monitor, daemon=True)
     t_res.start()
-    t_frame = threading.Thread(target=frame_generator_loop, daemon=True)
-    t_frame.start()
-    t_save = threading.Thread(target=disk_writer_loop, daemon=True)
-    t_save.start()
-    t_rec = threading.Thread(target=record_data_loop, daemon=True)
-    t_rec.start()
+    frame_thread = threading.Thread(target=frame_generator_loop, daemon=True)
+    frame_thread.start()
+    save_thread = threading.Thread(target=disk_writer_loop, daemon=True)
+    save_thread.start()
+    record_thread = threading.Thread(target=record_data_loop, daemon=True)
+    record_thread.start()
     print("系统初始化完成，当前模式：学习")
     update_window_status("系统初始化完成，进入学习模式。", "info")
     while True:
@@ -3339,6 +3418,7 @@ def start_background_services():
             if not key_listener.is_alive():
                 key_listener = keyboard.Listener(on_press=on_press_key)
                 key_listener.start()
+            ensure_background_threads()
         except Exception as e:
             print(f"Listener restart error: {e}")
         time.sleep(2)
