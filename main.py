@@ -1899,6 +1899,10 @@ class StreamingGameDataset(IterableDataset):
             ]
             m_vec.extend(traj_vals)
             m_vec.append(is_ai)
+            if len(m_vec) < mouse_feature_dim:
+                m_vec.extend([0.0] * (mouse_feature_dim - len(m_vec)))
+            elif len(m_vec) > mouse_feature_dim:
+                m_vec = m_vec[:mouse_feature_dim]
             m_ins[idx] = np.asarray(m_vec, dtype=np.float32)
 
         if next_entry is not None:
