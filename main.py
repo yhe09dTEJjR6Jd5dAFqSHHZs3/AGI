@@ -1899,11 +1899,11 @@ class StreamingGameDataset(IterableDataset):
             ]
             m_vec.extend(traj_vals)
             m_vec.append(is_ai)
-            if len(m_vec) < mouse_feature_dim:
-                m_vec.extend([0.0] * (mouse_feature_dim - len(m_vec)))
-            elif len(m_vec) > mouse_feature_dim:
-                m_vec = m_vec[:mouse_feature_dim]
-            m_ins[idx] = np.asarray(m_vec, dtype=np.float32)
+            m_arr = np.asarray(m_vec, dtype=np.float32).reshape(-1)
+            feature_row = np.zeros(mouse_feature_dim, dtype=np.float32)
+            limit = min(mouse_feature_dim, m_arr.size)
+            feature_row[:limit] = m_arr[:limit]
+            m_ins[idx] = feature_row
 
         if next_entry is not None:
             if structured:
