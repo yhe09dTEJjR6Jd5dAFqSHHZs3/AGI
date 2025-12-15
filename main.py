@@ -63,8 +63,9 @@ def log_exception(context, err=None, extra=None):
     try:
         global last_error_detail
         last_error_detail = message
-    except Exception:
-        pass
+    except Exception as write_err:
+        report_to_window(f"记录错误上下文失败：{write_err}", "error")
+        update_window_status(f"记录错误上下文失败：{write_err}", "error")
     report_to_window(message, "error")
     update_window_status(message, "error")
     tb = traceback.format_exc()
@@ -72,8 +73,9 @@ def log_exception(context, err=None, extra=None):
         detail = tb.strip()
         try:
             last_error_detail = detail
-        except Exception:
-            pass
+        except Exception as write_err:
+            report_to_window(f"记录堆栈失败：{write_err}", "error")
+            update_window_status(f"记录堆栈失败：{write_err}", "error")
         report_to_window(detail, "error")
         update_window_status(detail, "error")
 
@@ -116,8 +118,9 @@ def show_install_error(package, err):
         root.withdraw()
         messagebox.showerror("依赖安装失败", message)
         root.destroy()
-    except Exception:
-        pass
+    except Exception as dialog_err:
+        report_to_window(f"依赖安装错误提示失败：{dialog_err}", "error")
+        update_window_status(f"依赖安装错误提示失败：{dialog_err}", "error")
     print(message)
     sys.exit(1)
 
@@ -200,6 +203,8 @@ def ensure_experience_structure():
         if not os.path.exists(meta_path):
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump([], f)
+        if not initialize_lmdb_env():
+            update_window_status("LMDB 初始化失败，已记录错误。", "error")
         update_window_status("初始化完成，已创建经验池文件结构。", "info")
     except Exception as e:
         print(f"经验池结构创建异常：{e}")
@@ -809,6 +814,17 @@ def get_lmdb_env(map_size_gb=None):
             txn.put(b"__counter__", lmdb_counter.to_bytes(8, "little"))
             txn.put(b"__start__", lmdb_start.to_bytes(8, "little"))
     return lmdb_env
+
+def initialize_lmdb_env():
+    try:
+        with lmdb_lock:
+            env = get_lmdb_env()
+            env.sync()
+        update_window_status("LMDB 已初始化。", "info")
+        return True
+    except Exception as e:
+        log_exception("LMDB 初始化失败", e)
+        return False
 
 def expand_lmdb_size():
     global current_map_size_gb
