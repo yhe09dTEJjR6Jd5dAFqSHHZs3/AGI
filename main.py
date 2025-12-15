@@ -353,7 +353,8 @@ class SciFiWindow:
         self.root.title("星云核心")
         self.root.geometry("540x480")
         self.root.configure(bg="#0a0f1a")
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
+        self.root.minsize(420, 360)
         self.mode_var = tk.StringVar(value=display_mode(current_mode))
         self.status_var = tk.StringVar(value="初始化中...")
         self.train_steps_var = tk.StringVar(value="训练步数：0")
@@ -370,11 +371,13 @@ class SciFiWindow:
         status_frame = tk.Frame(self.root, bg="#0a0f1a")
         status_frame.pack(fill="x", padx=10, pady=4)
         tk.Label(status_frame, text="状态", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 11)).pack(side="left")
-        tk.Label(status_frame, textvariable=self.status_var, fg="#d4fc79", bg="#0a0f1a", font=("Consolas", 10), wraplength=340, justify="left").pack(side="left", padx=6)
+        self.status_label = tk.Label(status_frame, textvariable=self.status_var, fg="#d4fc79", bg="#0a0f1a", font=("Consolas", 10), justify="left")
+        self.status_label.pack(side="left", padx=6, fill="x", expand=True)
         train_frame = tk.Frame(self.root, bg="#0a0f1a")
         train_frame.pack(fill="x", padx=10, pady=2)
         tk.Label(train_frame, text="训练进度", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 10)).pack(side="left")
-        tk.Label(train_frame, textvariable=self.train_steps_var, fg="#c4f1f9", bg="#0a0f1a", font=("Consolas", 10), wraplength=320, justify="left").pack(side="left", padx=6)
+        self.train_label = tk.Label(train_frame, textvariable=self.train_steps_var, fg="#c4f1f9", bg="#0a0f1a", font=("Consolas", 10), justify="left")
+        self.train_label.pack(side="left", padx=6, fill="x", expand=True)
         btn_frame = tk.Frame(self.root, bg="#0a0f1a")
         btn_frame.pack(fill="x", padx=10, pady=6)
         tk.Button(btn_frame, text="睡眠", command=self.on_sleep, fg="#0a0f1a", bg="#7fffd4", activebackground="#10b981", width=10).pack(side="left", padx=5)
@@ -385,15 +388,15 @@ class SciFiWindow:
         scan_frame = tk.Frame(progress_frame, bg="#0a0f1a")
         scan_frame.pack(fill="x", pady=2)
         tk.Label(scan_frame, text="数据扫描", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 10)).pack(side="left", padx=4)
-        self.scan_progress = ttk.Progressbar(scan_frame, orient="horizontal", length=320, mode="determinate", maximum=100)
-        self.scan_progress.pack(side="left", padx=4)
+        self.scan_progress = ttk.Progressbar(scan_frame, orient="horizontal", mode="determinate", maximum=100)
+        self.scan_progress.pack(side="left", padx=4, fill="x", expand=True)
         tk.Label(scan_frame, textvariable=self.scan_progress_var, fg="#e3f2fd", bg="#0a0f1a", font=("Consolas", 10)).pack(side="left", padx=4)
         tk.Label(progress_frame, textvariable=self.scan_text_var, fg="#d4fc79", bg="#0a0f1a", font=("Consolas", 9), anchor="w").pack(fill="x", padx=6)
         opt_frame = tk.Frame(progress_frame, bg="#0a0f1a")
         opt_frame.pack(fill="x", pady=2)
         tk.Label(opt_frame, text="AI优化", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 10)).pack(side="left", padx=4)
-        self.opt_progress = ttk.Progressbar(opt_frame, orient="horizontal", length=320, mode="determinate", maximum=100)
-        self.opt_progress.pack(side="left", padx=4)
+        self.opt_progress = ttk.Progressbar(opt_frame, orient="horizontal", mode="determinate", maximum=100)
+        self.opt_progress.pack(side="left", padx=4, fill="x", expand=True)
         tk.Label(opt_frame, textvariable=self.opt_progress_var, fg="#e3f2fd", bg="#0a0f1a", font=("Consolas", 10)).pack(side="left", padx=4)
         tk.Label(progress_frame, textvariable=self.opt_text_var, fg="#d4fc79", bg="#0a0f1a", font=("Consolas", 9), anchor="w").pack(fill="x", padx=6)
         log_frame = tk.Frame(self.root, bg="#0a0f1a")
@@ -401,6 +404,8 @@ class SciFiWindow:
         self.log_area = scrolledtext.ScrolledText(log_frame, state="disabled", fg="#9ae6ff", bg="#0f172a", insertbackground="#7fffd4", font=("Consolas", 9))
         self.log_area.pack(fill="both", expand=True)
         self.root.protocol("WM_DELETE_WINDOW", self.minimize)
+        self.root.bind("<Configure>", self.update_layout)
+        self.update_layout()
         self.root.after(200, self.process_queue)
 
     def process_queue(self):
@@ -450,6 +455,17 @@ class SciFiWindow:
 
     def set_progress(self, channel, pct, text=None):
         self.queue.put(("progress", (channel, pct, text or f"{pct:.2f}%")))
+
+    def update_layout(self, event=None):
+        try:
+            width = max(self.root.winfo_width() - 140, 200)
+            self.status_label.configure(wraplength=width)
+            self.train_label.configure(wraplength=width)
+            bar_width = max(self.root.winfo_width() - 220, 120)
+            self.scan_progress.configure(length=bar_width)
+            self.opt_progress.configure(length=bar_width)
+        except Exception:
+            pass
 
     def minimize(self):
         try:
@@ -3101,6 +3117,7 @@ def start_training_mode():
         scroll_buffer = 0.0
         surprise_sum = 0.0
         surprise_count = 0
+        input_allowed_event.set()
 
         def training_save_checkpoint(reason):
             try:
@@ -3116,13 +3133,8 @@ def start_training_mode():
                 log_exception("训练模型保存失败", e)
 
         while not stop_training_flag:
-            if stop_training_flag:
-                break
             time.sleep(0)
             start_time = time.time()
-            if current_mode != MODE_TRAINING or not input_allowed_event.is_set():
-                stop_training_flag = True
-                break
             if os.name == "nt":
                 try:
                     if ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x8000:
