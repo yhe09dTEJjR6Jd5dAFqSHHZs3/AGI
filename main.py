@@ -483,10 +483,6 @@ def init_window():
         print(f"界面初始化失败：{e}")
         return False
 
-init_window()
-update_window_status("正在检查依赖...", "info")
-install_requirements()
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -527,6 +523,10 @@ def update_window_progress(pct, text=None, channel="opt"):
             window_ui.set_progress(channel, pct, text)
     except Exception as e:
         print(f"进度条更新失败：{e}")
+
+init_window()
+update_window_status("正在检查依赖...", "info")
+install_requirements()
 
 capture_freq = 10
 seq_len = 12
