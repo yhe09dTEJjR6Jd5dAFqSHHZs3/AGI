@@ -356,6 +356,7 @@ class SciFiWindow:
         self.root.resizable(False, False)
         self.mode_var = tk.StringVar(value=display_mode(current_mode))
         self.status_var = tk.StringVar(value="初始化中...")
+        self.train_steps_var = tk.StringVar(value="训练步数：0")
         self.scan_progress_var = tk.StringVar(value="0.00%")
         self.scan_text_var = tk.StringVar(value="数据扫描：待开始")
         self.opt_progress_var = tk.StringVar(value="0.00%")
@@ -370,6 +371,10 @@ class SciFiWindow:
         status_frame.pack(fill="x", padx=10, pady=4)
         tk.Label(status_frame, text="状态", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 11)).pack(side="left")
         tk.Label(status_frame, textvariable=self.status_var, fg="#d4fc79", bg="#0a0f1a", font=("Consolas", 10), wraplength=340, justify="left").pack(side="left", padx=6)
+        train_frame = tk.Frame(self.root, bg="#0a0f1a")
+        train_frame.pack(fill="x", padx=10, pady=2)
+        tk.Label(train_frame, text="训练进度", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 10)).pack(side="left")
+        tk.Label(train_frame, textvariable=self.train_steps_var, fg="#c4f1f9", bg="#0a0f1a", font=("Consolas", 10), wraplength=320, justify="left").pack(side="left", padx=6)
         btn_frame = tk.Frame(self.root, bg="#0a0f1a")
         btn_frame.pack(fill="x", padx=10, pady=6)
         tk.Button(btn_frame, text="睡眠", command=self.on_sleep, fg="#0a0f1a", bg="#7fffd4", activebackground="#10b981", width=10).pack(side="left", padx=5)
@@ -424,6 +429,8 @@ class SciFiWindow:
                         self.status_var.set(str(payload))
                     elif kind == "mode":
                         self.mode_var.set(str(payload))
+                    elif kind == "train_steps":
+                        self.train_steps_var.set(str(payload))
                 else:
                     self.log_area.configure(state="normal")
                     self.log_area.insert("end", str(entry) + "\n")
@@ -523,6 +530,13 @@ def update_window_progress(pct, text=None, channel="opt"):
             window_ui.set_progress(channel, pct, text)
     except Exception as e:
         print(f"进度条更新失败：{e}")
+
+def update_window_training_steps(text):
+    try:
+        if window_ui is not None:
+            window_ui.queue.put(("train_steps", text))
+    except Exception as e:
+        print(f"训练步数显示更新失败：{e}")
 
 init_window()
 update_window_status("正在检查依赖...", "info")
@@ -686,6 +700,7 @@ def force_memory_cleanup(iterations=2, delay=0.05):
 data_queue = queue.Queue()
 save_queue = queue.Queue()
 total_samples_written = 0
+total_samples_dropped = 0
 
 def wait_for_save_queue(timeout=3.0):
     try:
@@ -979,6 +994,28 @@ def iterate_lmdb_entries(keys=None, return_keys=False):
     except Exception as e:
         log_exception("LMDB iterate error", e)
 
+def cleanup_meta_after_trim(env, min_key):
+    try:
+        with meta_lock:
+            data = load_meta_entries(use_lock=False)
+            if not data:
+                return
+            cleaned = []
+            with env.begin() as txn:
+                for entry in data:
+                    key_val = int(entry.get("key", -1))
+                    if key_val < min_key:
+                        continue
+                    key_bytes = key_val.to_bytes(8, "little")
+                    if txn.get(key_bytes) is None:
+                        continue
+                    cleaned.append(normalize_meta_entry(dict(entry)))
+            if len(cleaned) != len(data):
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump(cleaned, f)
+    except Exception as e:
+        log_exception("Meta cleanup warning", e)
+
 def trim_lmdb(limit_bytes):
     try:
         if not os.path.exists(lmdb_path):
@@ -1012,6 +1049,7 @@ def trim_lmdb(limit_bytes):
                 txn.put(b"__start__", target_start.to_bytes(8, "little"))
                 global lmdb_start
                 lmdb_start = target_start
+            cleanup_meta_after_trim(env, target_start)
     except Exception as e:
         log_exception("LMDB trim error", e)
 
@@ -1363,6 +1401,8 @@ def handle_training_escape(msg):
     current_mode = MODE_LEARNING
     update_window_mode(current_mode)
     update_window_status(msg, "warn")
+    if window_ui is not None:
+        window_ui.restore()
     input_allowed_event.set()
 
 def on_press_key(key):
@@ -1495,7 +1535,7 @@ def atomic_save_npz(fname, img_arr, act_arr, retries=5, backoff=0.25):
     return False
 
 def disk_writer_loop():
-    global total_samples_written
+    global total_samples_written, total_samples_dropped
     check_counter = 0
     last_check = time.time()
     last_status = time.time()
@@ -1513,12 +1553,14 @@ def disk_writer_loop():
             source_type = payload[2] if len(payload) > 2 else "human"
             if len(img_arr) != len(act_arr) or len(img_arr) == 0:
                 print("LMDB pipeline skipped invalid batch")
+                total_samples_dropped += len(img_arr)
                 continue
             try:
                 append_lmdb_records(img_arr, act_arr, source_type)
                 total_samples_written += len(img_arr)
             except Exception as e:
                 log_exception("LMDB pipeline error", e)
+                total_samples_dropped += len(img_arr)
             check_counter += 1
             now = time.time()
             if check_counter >= check_interval or now - last_check >= check_time_window:
@@ -1526,7 +1568,11 @@ def disk_writer_loop():
                 last_check = now
                 check_counter = 0
             if now - last_status >= 5.0:
-                update_window_status(f"写盘中，剩余任务{save_queue.qsize()}，累计样本{total_samples_written}", "info")
+                status_msg = f"写盘中，剩余任务{save_queue.qsize()}，累计样本{total_samples_written}"
+                if current_mode == MODE_TRAINING:
+                    report_to_window(status_msg, "info")
+                else:
+                    update_window_status(status_msg, "info")
                 last_status = now
         except Exception as e:
             log_exception("Save Error", e)
@@ -2372,7 +2418,7 @@ def update_meta_with_loss(key_plan, paths, loss_value):
 
 
 def optimize_ai():
-    global low_vram_mode, user_stop_request_reason, latest_optimization_summary
+    global low_vram_mode, user_stop_request_reason, latest_optimization_summary, total_samples_written, total_samples_dropped
     try:
         if os.name == "nt":
             reset_lmdb_env()
@@ -2381,6 +2427,9 @@ def optimize_ai():
         user_stop_request_reason = None
         capture_pause_event.set()
         opt_start = time.time()
+        session_id = f"sleep-{int(opt_start)}-{random.randint(1000, 9999)}"
+        session_start_written = total_samples_written
+        session_start_dropped = total_samples_dropped
         duration = 0.0
         force_memory_cleanup(3, 0.1)
         if torch.cuda.is_available():
@@ -2460,7 +2509,7 @@ def optimize_ai():
                 beta = float(model.log_var_prediction.detach().item())
                 gamma = float(model.log_var_energy.detach().item())
                 temp_path = os.path.join(model_dir, "ai_model_temp.pth")
-                payload = {"model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(), "alpha": alpha, "beta": beta, "gamma": gamma, "last_loss": last_snapshot if last_snapshot is not None else 0.0, "steps": steps_snapshot if steps_snapshot is not None else 0, "total_steps": total_snapshot if total_snapshot is not None else 0, "interrupted": interrupted_flag, "timestamp": time.time(), "reason": final_reason or early_stop_reason or user_stop_request_reason}
+                payload = {"model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(), "alpha": alpha, "beta": beta, "gamma": gamma, "last_loss": last_snapshot if last_snapshot is not None else 0.0, "steps": steps_snapshot if steps_snapshot is not None else 0, "total_steps": total_snapshot if total_snapshot is not None else 0, "interrupted": interrupted_flag, "timestamp": time.time(), "reason": final_reason or early_stop_reason or user_stop_request_reason, "train_batch_size": train_batch_size, "accumulation_steps": accumulation_steps, "effective_batch": effective_batch}
                 torch.save(payload, temp_path)
                 try:
                     with open(temp_path, "rb") as f:
@@ -2894,12 +2943,42 @@ def optimize_ai():
         print(f"> 实际使用文件数: {train_file_count}")
         print(f"> 实际训练步数: {current_step}")
         if estimated_samples > 0:
-            human_steps = int(estimated_samples * human_ratio)
-            ai_steps = int(estimated_samples * ai_ratio)
+            type_map = {int(e.get("key", -1)): e.get("type", "") for e in meta_entries_cache if isinstance(meta_entries_cache, list) and "key" in e}
+            human_steps = 0
+            ai_steps = 0
+            if sleep_stats:
+                for entry in used_stats:
+                    if len(entry) >= 7:
+                        meta_key = entry[6]
+                        steps_est = max(1, int(entry[5]))
+                        if type_map.get(int(meta_key)) == "human":
+                            human_steps += steps_est
+                        elif type_map.get(int(meta_key)) == "ai":
+                            ai_steps += steps_est
+            if human_steps == 0 and ai_steps == 0:
+                human_steps = max(0, round(estimated_samples * human_ratio))
+                ai_steps = max(0, round(estimated_samples * ai_ratio)) if ai_ratio > 0 else 0
+                if ai_steps > 0:
+                    ai_steps = max(1, ai_steps)
+            total_steps_adjusted = human_steps + ai_steps
+            if total_steps_adjusted != estimated_samples and estimated_samples > 0:
+                diff = estimated_samples - total_steps_adjusted
+                if ai_ratio > 0:
+                    ai_steps += diff
+                else:
+                    human_steps += diff
+            ai_steps = max(0, ai_steps)
+            human_steps = max(0, human_steps)
             print(f"> 估算人类样本步数: {human_steps} | AI样本步数: {ai_steps}")
         if early_stop_reason:
             print(f"> 提前结束提示: {early_stop_reason}")
         print(f"> 本轮训练用时: {duration:.2f} 秒")
+        session_end = time.time()
+        delta_written = max(0, total_samples_written - session_start_written)
+        delta_dropped = max(0, total_samples_dropped - session_start_dropped)
+        sleep_summary = f"睡眠会话 {session_id} | 开始 {datetime.datetime.fromtimestamp(opt_start).strftime('%H:%M:%S')} | 结束 {datetime.datetime.fromtimestamp(session_end).strftime('%H:%M:%S')} | 优化步数 {current_step} | 写入样本 {delta_written} | 丢弃样本 {delta_dropped}"
+        print(sleep_summary)
+        update_window_status(sleep_summary, "info")
         torch.cuda.empty_cache()
         if torch.cuda.is_available():
             try:
@@ -2926,7 +3005,7 @@ def optimize_ai():
         gc.collect()
 
 def start_training_mode():
-    global stop_training_flag, current_mode, attention_focus
+    global stop_training_flag, current_mode, attention_focus, total_samples_written, total_samples_dropped
     time.sleep(1.0)
     stop_optimization_flag.clear()
     stop_training_flag = False
@@ -2978,7 +3057,14 @@ def start_training_mode():
         time.sleep(1.0)
         stop_training_flag = False
         train_start = time.time()
+        session_id = f"train-{int(train_start)}-{random.randint(1000, 9999)}"
+        session_start_written = total_samples_written
+        session_start_dropped = total_samples_dropped
         action_steps = 0
+        frame_attempts = 0
+        frame_failures = 0
+        adaptive_delay = 0.0
+        update_window_training_steps(f"训练会话 {session_id} 已启动，步数 {action_steps}")
 
         class PIDController:
             def __init__(self, kp, ki, kd):
@@ -3045,10 +3131,16 @@ def start_training_mode():
                 except Exception as e:
                     print(f"Priority key error: {e}")
             try:
+                frame_attempts += 1
                 frame_img, frame_ts = get_latest_frame()
                 full_frame, _ = get_full_frame()
                 if frame_img is None:
-                    time.sleep(0.01)
+                    frame_failures += 1
+                    if frame_attempts % 20 == 0:
+                        failure_rate = frame_failures / max(1, frame_attempts)
+                        adaptive_delay = min(0.2, failure_rate * 0.5) if failure_rate > 0.25 else adaptive_delay * 0.5
+                        update_window_training_steps(f"训练会话 {session_id} 采样失败率 {failure_rate*100:.1f}% 步数 {action_steps}")
+                    time.sleep(max(0.01, adaptive_delay))
                     continue
                 origin_x = monitor_info.get("left", 0)
                 origin_y = monitor_info.get("top", 0)
@@ -3221,8 +3313,15 @@ def start_training_mode():
                             surprise_count += 1
                 surprise_optimizer.zero_grad(set_to_none=True)
                 action_steps += 1
+                if action_steps % 10 == 0:
+                    failure_rate = frame_failures / max(1, frame_attempts)
+                    update_window_training_steps(f"训练会话 {session_id} 步数 {action_steps}，失败率 {failure_rate*100:.1f}%")
                 elapsed = time.time() - start_time
+                failure_rate = frame_failures / max(1, frame_attempts)
+                adaptive_delay = min(adaptive_delay * 0.9, 0.2) if failure_rate < 0.1 else max(adaptive_delay, failure_rate * 0.02)
                 wait = (1.0 / capture_freq) - elapsed
+                if adaptive_delay > 0:
+                    wait = max(wait, adaptive_delay)
                 if wait > 0:
                     time.sleep(wait)
             except Exception as e:
@@ -3232,17 +3331,24 @@ def start_training_mode():
                     window_ui.restore()
                 break
         flush_buffers()
+        session_end = time.time()
+        duration = session_end - train_start
+        delta_written = max(0, total_samples_written - session_start_written)
+        delta_dropped = max(0, total_samples_dropped - session_start_dropped)
+        session_summary = f"训练会话 {session_id} | 开始 {datetime.datetime.fromtimestamp(train_start).strftime('%H:%M:%S')} | 结束 {datetime.datetime.fromtimestamp(session_end).strftime('%H:%M:%S')} | 动作步数 {action_steps} | 写入样本 {delta_written} | 丢弃样本 {delta_dropped}"
+        update_window_training_steps(session_summary)
         current_mode = MODE_LEARNING
         update_window_mode(current_mode)
-        duration = time.time() - train_start
-        print(f"训练模式总结: 步数 {action_steps}, 人类样本 0, AI样本 {action_steps}, 用时 {duration:.2f} 秒")
+        print(f"训练模式总结: 步数 {action_steps}, 人类样本 0, AI样本 {action_steps}, 用时 {duration:.2f} 秒，写入 {delta_written}，丢弃 {delta_dropped}")
         print("训练模式结束，切换回学习模式。")
-        update_window_status(f"训练结束，步数{action_steps}，返回学习模式。", "info")
+        update_window_status(f"训练结束，步数{action_steps}，写入{delta_written}，丢弃{delta_dropped}，返回学习模式。", "info")
     finally:
         release_mouse_outputs()
         attention_focus = None
         current_mode = MODE_LEARNING
         update_window_mode(current_mode)
+        if window_ui is not None:
+            window_ui.restore()
         input_allowed_event.set()
         training_save_checkpoint("训练模式结束")
 
@@ -3252,6 +3358,9 @@ def record_data_loop():
     last_pos = (0, 0)
     chunk_target = random.randint(60, 100)
     prev_full_frame_small = None
+    frame_attempts = 0
+    frame_failures = 0
+    adaptive_delay = 0.0
 
     while True:
         if recording_pause_event.is_set():
@@ -3272,9 +3381,15 @@ def record_data_loop():
         if current_mode == MODE_LEARNING or current_mode == MODE_TRAINING:
             try:
                 start_time = time.time()
+                frame_attempts += 1
                 frame_img, frame_ts = get_latest_frame()
                 full_frame, full_ts = get_full_frame()
                 if frame_img is None and full_frame is None:
+                    frame_failures += 1
+                    if frame_attempts % 40 == 0:
+                        failure_rate = frame_failures / max(1, frame_attempts)
+                        adaptive_delay = min(0.2, failure_rate * 0.5) if failure_rate > 0.3 else adaptive_delay * 0.6
+                    time.sleep(max(0.01, adaptive_delay))
                     time.sleep(0.01)
                     continue
                 ts_value = frame_ts if frame_ts else (full_ts if full_ts else start_time)
