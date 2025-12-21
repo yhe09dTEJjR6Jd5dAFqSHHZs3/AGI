@@ -564,7 +564,7 @@ update_window_status("正在检查依赖...", "info")
 install_requirements()
 
 capture_freq = 10
-seq_len = 12
+seq_len = 20
 screen_w, screen_h = 1920, 1080
 monitor_info = {"id": 0, "left": 0, "top": 0, "width": screen_w, "height": screen_h, "scale": 1.0}
 target_w, target_h = 256, 160
@@ -572,6 +572,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 mouse_feature_dim = 62
 grid_w, grid_h = 32, 20
 grid_size = grid_w * grid_h
+coarse_w, coarse_h = 16, 10
+coarse_size = coarse_w * coarse_h
+primitive_classes = 5
+view_channels = 9
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
 
@@ -658,7 +662,7 @@ def clamp_region(cx, cy, w, h, frame_w, frame_h):
     return left, top, w, h
 
 def fuse_views_for_model(views):
-    processed = []
+    stacked = []
     for v in views:
         v_arr = np.asarray(v, dtype=np.uint8)
         if v_arr.ndim == 2:
@@ -666,13 +670,17 @@ def fuse_views_for_model(views):
         if v_arr.ndim == 3 and v_arr.shape[2] > 3:
             v_arr = v_arr[:, :, :3]
         if v_arr.shape[0] != target_h or v_arr.shape[1] != target_w:
-            v_arr = cv2.resize(v_arr, (target_w, target_h))
-        processed.append(v_arr)
-    if not processed:
-        return np.zeros((target_h, target_w, 3), dtype=np.uint8)
-    mosaic = np.concatenate(processed, axis=1)
-    mosaic = cv2.resize(mosaic, (target_w, target_h))
-    return mosaic
+            v_arr = cv2.resize(v_arr, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
+        stacked.append(v_arr)
+    while len(stacked) < 3:
+        stacked.append(np.zeros((target_h, target_w, 3), dtype=np.uint8))
+    stacked = stacked[:3]
+    merged = np.concatenate(stacked, axis=2)
+    if merged.shape[2] != view_channels:
+        repeat_factor = max(1, view_channels // merged.shape[2])
+        merged = np.repeat(merged, repeat_factor, axis=2)
+        merged = merged[:, :, :view_channels]
+    return merged
 
 def cleanup_before_sleep():
     global dxcam_camera
@@ -722,6 +730,55 @@ data_queue = queue.Queue()
 save_queue = queue.Queue()
 total_samples_written = 0
 total_samples_dropped = 0
+
+class EventMemory:
+    def __init__(self, maxlen=64):
+        self.buffer = deque(maxlen=maxlen)
+        self.lock = threading.Lock()
+
+    def push(self, feat, primitive, ts):
+        try:
+            with self.lock:
+                self.buffer.append({"feat": feat.detach().cpu(), "primitive": int(primitive), "ts": float(ts)})
+        except Exception as e:
+            log_exception("EventMemory push", e)
+
+    def summary(self, device, batch_size):
+        try:
+            with self.lock:
+                if not self.buffer:
+                    feat = torch.zeros(batch_size, 128 + primitive_classes + 1, device=device)
+                    return feat
+                feats = []
+                now = time.time()
+                for item in self.buffer:
+                    age = max(0.0, now - item.get("ts", now))
+                    one_hot = torch.zeros(primitive_classes, device=device)
+                    idx = max(0, min(primitive_classes - 1, item.get("primitive", 0)))
+                    one_hot[idx] = 1.0
+                    f_vec = item.get("feat")
+                    if f_vec is None:
+                        f_vec = torch.zeros(128)
+                    f_t = f_vec.to(device)
+                    if f_t.dim() == 1:
+                        f_t = f_t.unsqueeze(0)
+                    if f_t.size(1) > 128:
+                        f_t = f_t[:, :128]
+                    elif f_t.size(1) < 128:
+                        pad = torch.zeros(f_t.size(0), 128 - f_t.size(1), device=device)
+                        f_t = torch.cat([f_t, pad], dim=1)
+                    age_tensor = torch.full((f_t.size(0), 1), age, device=device)
+                    feat_vec = torch.cat([f_t, one_hot.unsqueeze(0).expand(f_t.size(0), -1), age_tensor], dim=1)
+                    feats.append(feat_vec)
+                concat = torch.cat(feats, dim=0)
+                pooled = torch.mean(concat, dim=0, keepdim=True)
+                pooled = pooled.repeat(batch_size, 1)
+                return pooled
+        except Exception as e:
+            log_exception("EventMemory summary", e)
+            return torch.zeros(batch_size, 128 + primitive_classes + 1, device=device)
+
+event_memory = EventMemory()
 
 def wait_for_save_queue(timeout=3.0):
     try:
@@ -1164,13 +1221,24 @@ class UniversalAI(nn.Module):
         except Exception:
             weights = None
         backbone = models.mobilenet_v3_small(weights=weights)
+        first_conv = backbone.features[0][0]
+        if view_channels != 3:
+            new_conv = nn.Conv2d(view_channels, first_conv.out_channels, kernel_size=first_conv.kernel_size, stride=first_conv.stride, padding=first_conv.padding, bias=first_conv.bias is not None)
+            with torch.no_grad():
+                repeat_factor = max(1, view_channels // first_conv.in_channels)
+                weight = first_conv.weight.repeat(1, repeat_factor, 1, 1)
+                weight = weight[:, :view_channels, :, :] / repeat_factor
+                new_conv.weight.copy_(weight)
+                if first_conv.bias is not None:
+                    new_conv.bias.copy_(first_conv.bias)
+            backbone.features[0][0] = new_conv
         self.feature_extractor = backbone.features
         for p in self.feature_extractor.parameters():
             p.requires_grad = False
         self.feature_extractor.eval()
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         with torch.no_grad():
-            dummy = torch.zeros(1, 3, target_h, target_w)
+            dummy = torch.zeros(1, view_channels, target_h, target_w)
             conv_out = self.pool(self.feature_extractor(dummy))
             self.fc_input_dim = conv_out.view(1, -1).size(1)
         self.mouse_dim = mouse_feature_dim
@@ -1179,16 +1247,20 @@ class UniversalAI(nn.Module):
         self.input_proj = nn.Linear(self.fc_input_dim + self.mouse_dim, self.model_dim)
         self.pos_embedding = nn.Parameter(torch.zeros(1, 512, self.model_dim))
         self.memory_unit = nn.GRU(self.model_dim, self.model_dim, batch_first=True)
-        self.action_head = nn.Linear(self.model_dim, grid_size)
+        self.action_head = nn.Linear(self.model_dim, coarse_size)
+        self.offset_head = nn.Linear(self.model_dim, 2)
         self.button_head = nn.Linear(self.model_dim, 2)
         self.scroll_head = nn.Linear(self.model_dim, 1)
+        self.primitive_head = nn.Linear(self.model_dim, primitive_classes)
         self.feature_decoder = nn.Sequential(nn.Linear(self.model_dim, 256), nn.ReLU(), nn.Linear(256, 128))
         self.log_var_action = nn.Parameter(torch.tensor(0.0))
         self.log_var_prediction = nn.Parameter(torch.tensor(0.0))
         self.log_var_energy = nn.Parameter(torch.tensor(0.0))
         self.use_checkpoint = True
+        self.memory_token = nn.Parameter(torch.zeros(1, 1, self.model_dim))
+        self.event_proj = nn.Linear(128 + primitive_classes + 1, self.model_dim)
 
-    def forward(self, img, mouse_input, hidden=None):
+    def forward(self, img, mouse_input, hidden=None, event_summary=None):
         batch_size, seq, c, h, w = img.size()
         img_reshaped = img.view(batch_size * seq, c, h, w)
         feat = self.pool(self.feature_extractor(img_reshaped))
@@ -1197,7 +1269,11 @@ class UniversalAI(nn.Module):
         x = self.input_proj(combined)
         pos = self.pos_embedding[:, :seq, :]
         x = x + pos
-        mask = torch.triu(torch.ones(seq, seq, device=x.device), diagonal=1)
+        if event_summary is None:
+            event_summary = torch.zeros(batch_size, self.event_proj.in_features, device=x.device)
+        event_token = self.event_proj(event_summary).unsqueeze(1) + self.memory_token
+        x = torch.cat([x, event_token], dim=1)
+        mask = torch.triu(torch.ones(seq + 1, seq + 1, device=x.device), diagonal=1)
         mask = mask.masked_fill(mask == 1, float('-inf'))
         for block in self.blocks:
             if self.use_checkpoint and self.training:
@@ -1207,10 +1283,12 @@ class UniversalAI(nn.Module):
         mem_out, hidden_out = self.memory_unit(x, hidden)
         action_token = mem_out[:, -1, :]
         grid_logits = self.action_head(action_token)
+        offset_pred = torch.tanh(self.offset_head(action_token))
         button_logits = self.button_head(action_token)
         scroll_pred = self.scroll_head(action_token)
+        primitive_logits = self.primitive_head(action_token)
         pred_features = self.feature_decoder(action_token)
-        return grid_logits, pred_features, button_logits, scroll_pred, hidden_out
+        return grid_logits, offset_pred, pred_features, button_logits, scroll_pred, primitive_logits, hidden_out
 
     def encode_features(self, img):
         with torch.no_grad():
@@ -1785,11 +1863,38 @@ class StreamingGameDataset(IterableDataset):
 
     def _prepare_item(self, slice_data, next_entry, structured, structured_npz, stage="NREM"):
         slice_len = len(slice_data)
-        imgs = np.empty((slice_len, 3, target_h, target_w), dtype=np.uint8)
+        imgs = np.empty((slice_len, view_channels, target_h, target_w), dtype=np.uint8)
         m_ins = np.empty((slice_len, mouse_feature_dim), dtype=np.float32)
 
         def norm_coord(v, dim):
             return (2.0 * (v / dim)) - 1.0
+
+        def calc_offset(nx, ny):
+            cell_w = screen_w / coarse_w
+            cell_h = screen_h / coarse_h
+            gx = int(max(0, min(coarse_w - 1, (nx / screen_w) * coarse_w)))
+            gy = int(max(0, min(coarse_h - 1, (ny / screen_h) * coarse_h)))
+            cx = (gx + 0.5) * cell_w
+            cy = (gy + 0.5) * cell_h
+            off_x = max(-1.0, min(1.0, (nx - cx) / (cell_w * 0.5)))
+            off_y = max(-1.0, min(1.0, (ny - cy) / (cell_h * 0.5)))
+            return gx, gy, off_x, off_y
+
+        def classify_primitive(ts_now, l_down_flag, l_down_ts, l_up_ts, delta_x, delta_y):
+            hold = ts_now - l_down_ts if l_down_ts > 0 else 0.0
+            since_up = ts_now - l_up_ts if l_up_ts > 0 else 1e6
+            move_mag = math.hypot(delta_x, delta_y)
+            if l_down_flag and hold > 0.5 and move_mag > 5.0:
+                return 3
+            if l_down_flag and hold > 0.8:
+                return 4
+            if not l_down_flag and since_up < 0.35:
+                if since_up < 0.2:
+                    return 2
+                return 1
+            if l_down_flag and hold < 0.3 and move_mag < 2.0:
+                return 1
+            return 0
 
         def load_image(item):
             return safe_image_data(item, structured)
@@ -1799,7 +1904,7 @@ class StreamingGameDataset(IterableDataset):
             try:
                 arr = np.asarray(img) if img is not None else None
                 if arr is None or arr.size == 0:
-                    return np.zeros((3, target_h, target_w), dtype=np.uint8)
+                    return np.zeros((view_channels, target_h, target_w), dtype=np.uint8)
                 if arr.ndim == 4:
                     views = []
                     for v in arr:
@@ -1819,7 +1924,7 @@ class StreamingGameDataset(IterableDataset):
                     if views:
                         arr = fuse_views_for_model(views)
                     else:
-                        arr = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+                        arr = np.zeros((target_h, target_w, view_channels), dtype=np.uint8)
                 else:
                     if arr.ndim == 2:
                         arr = np.stack([arr] * 3, axis=-1)
@@ -1835,9 +1940,12 @@ class StreamingGameDataset(IterableDataset):
                         arr = cv2.cvtColor(arr, cv2.COLOR_BGRA2RGB)
                     if arr.ndim != 3 or arr.shape[2] < 3:
                         arr = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+                    if arr.shape[2] != view_channels:
+                        arr = np.repeat(arr, max(1, view_channels // arr.shape[2]), axis=2)
+                        arr = arr[:, :, :view_channels]
             except Exception as e:
                 log_exception("Image normalize error", e)
-                arr = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+                arr = np.zeros((target_h, target_w, view_channels), dtype=np.uint8)
             return arr.transpose(2, 0, 1).astype(np.uint8, copy=False)
 
         for idx, item in enumerate(slice_data):
@@ -1993,25 +2101,25 @@ class StreamingGameDataset(IterableDataset):
 
                 nx = nval(1)
                 ny = nval(2)
-                gx = int(max(0, min(grid_w - 1, (nx / screen_w) * grid_w)))
-                gy = int(max(0, min(grid_h - 1, (ny / screen_h) * grid_h)))
-                grid_idx = gy * grid_w + gx
+                gx, gy, off_x, off_y = calc_offset(nx, ny)
+                grid_idx = gy * coarse_w + gx
                 scroll_target = max(-1.0, min(1.0, nval(5) / 240.0))
-                labels = [grid_idx, nval(3), nval(4), scroll_target]
+                primitive_label = classify_primitive(nval(0), nval(3) > 0.5, nval(6), nval(9), nval(16), nval(17))
+                labels = [grid_idx, off_x, off_y, nval(3), nval(4), scroll_target, float(primitive_label)]
             else:
                 nx = next_entry.get("mouse_x", 0.0)
                 ny = next_entry.get("mouse_y", 0.0)
-                gx = int(max(0, min(grid_w - 1, (nx / screen_w) * grid_w)))
-                gy = int(max(0, min(grid_h - 1, (ny / screen_h) * grid_h)))
-                grid_idx = gy * grid_w + gx
+                gx, gy, off_x, off_y = calc_offset(nx, ny)
+                grid_idx = gy * coarse_w + gx
                 scroll_val = next_entry.get("scroll", 0.0)
                 scroll_target = max(-1.0, min(1.0, scroll_val / 240.0))
-                labels = [grid_idx, 1.0 if next_entry.get("l_down", False) else 0.0, 1.0 if next_entry.get("r_down", False) else 0.0, scroll_target]
+                primitive_label = classify_primitive(next_entry.get("ts", 0.0), next_entry.get("l_down", False), next_entry.get("l_down_ts", 0.0), next_entry.get("l_up_ts", 0.0), next_entry.get("delta_x", 0.0), next_entry.get("delta_y", 0.0))
+                labels = [grid_idx, off_x, off_y, 1.0 if next_entry.get("l_down", False) else 0.0, 1.0 if next_entry.get("r_down", False) else 0.0, scroll_target, float(primitive_label)]
             next_img_raw = load_image(next_entry)
             next_img = normalize_image(next_img_raw)
         else:
-            labels = [0.0, 0.0, 0.0, 0.0]
-            next_img = np.zeros((3, target_h, target_w), dtype=np.uint8)
+            labels = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            next_img = np.zeros((view_channels, target_h, target_w), dtype=np.uint8)
 
         if stage == "REM":
             noise = np.random.normal(0.0, 0.03, imgs.shape).astype(np.float32)
@@ -2807,13 +2915,18 @@ def optimize_ai():
                                 log_var_action = torch.clamp(model.log_var_action, -6.0, 6.0)
                                 log_var_prediction = torch.clamp(model.log_var_prediction, -6.0, 6.0)
                                 log_var_energy = torch.clamp(model.log_var_energy, -6.0, 6.0)
-                                grid_logits, pred_feat, button_logits, scroll_pred, _ = model(imgs, mins, None)
+                                event_summary = event_memory.summary(train_device, imgs.size(0))
+                                grid_logits, offset_pred, pred_feat, button_logits, scroll_pred, primitive_logits, _ = model(imgs, mins, None, event_summary)
                                 target_grid = labels[:, 0].long()
-                                target_buttons = labels[:, 1:3]
-                                target_scroll = labels[:, 3].view(-1)
+                                target_offset = labels[:, 1:3]
+                                target_buttons = labels[:, 3:5]
+                                target_scroll = labels[:, 5].view(-1)
+                                target_primitive = labels[:, 6].long()
                                 grid_loss = nn.functional.cross_entropy(grid_logits, target_grid)
+                                offset_loss = nn.functional.smooth_l1_loss(offset_pred, target_offset)
                                 scroll_loss = nn.functional.smooth_l1_loss(torch.tanh(scroll_pred.squeeze(-1)), target_scroll)
-                                imitation_loss = grid_loss + bce_loss(button_logits, target_buttons) + 0.5 * scroll_loss
+                                primitive_loss = nn.functional.cross_entropy(primitive_logits, target_primitive)
+                                imitation_loss = grid_loss + offset_loss + bce_loss(button_logits, target_buttons) + 0.5 * scroll_loss + primitive_loss
                                 target_feat = model.encode_features(next_frames)
                                 pred_loss = mse_loss(pred_feat, target_feat)
                                 energy_loss = torch.mean(torch.norm(button_logits, dim=1) + torch.abs(scroll_pred.view(-1)) + 1e-4 * torch.norm(grid_logits, dim=1))
@@ -2854,7 +2967,7 @@ def optimize_ai():
                                 stop_optimization_flag.set()
                                 break
                             progress_bar("模型训练阶段", current_step, total_samples, f"Loss: {last_loss_value:.4f} | Chunk {idx+1}/{total_chunks}")
-                            del imgs, mins, labels, next_frames, grid_logits, pred_feat, button_logits, scroll_pred, target_grid, target_buttons, target_scroll, target_feat, total_loss
+                            del imgs, mins, labels, next_frames, grid_logits, offset_pred, pred_feat, button_logits, scroll_pred, primitive_logits, target_grid, target_offset, target_buttons, target_scroll, target_primitive, target_feat, total_loss
                             if low_vram_mode or batch_idx % 3 == 2:
                                 torch.cuda.empty_cache()
                             if batch_idx % 16 == 0:
@@ -3279,15 +3392,23 @@ def start_training_mode():
                 if len(input_buffer_img) == seq_len:
                     t_imgs = torch.FloatTensor(np.array([input_buffer_img])).to(train_device)
                     t_mins = torch.FloatTensor(np.array([input_buffer_mouse])).to(train_device)
+                    event_summary = event_memory.summary(train_device, t_imgs.size(0))
                     surprise_optimizer.zero_grad(set_to_none=True)
                     with autocast(device_type="cuda", enabled=train_device.type == "cuda"):
-                        grid_logits, pred_feat, button_logits, scroll_pred, hidden_out = model(t_imgs, t_mins, hidden_state)
+                        grid_logits, offset_pred, pred_feat, button_logits, scroll_pred, primitive_logits, hidden_out = model(t_imgs, t_mins, hidden_state, event_summary)
                     grid_probs = torch.softmax(grid_logits[0], dim=-1)
                     pred_cell = torch.argmax(grid_probs).item()
-                    cell_x = pred_cell % grid_w
-                    cell_y = pred_cell // grid_w
-                    target_x = int(((cell_x + 0.5) / grid_w) * screen_w)
-                    target_y = int(((cell_y + 0.5) / grid_h) * screen_h)
+                    cell_x = pred_cell % coarse_w
+                    cell_y = pred_cell // coarse_w
+                    cell_w = screen_w / coarse_w
+                    cell_h = screen_h / coarse_h
+                    off = offset_pred[0].detach().cpu().numpy()
+                    center_x = (cell_x + 0.5) * cell_w
+                    center_y = (cell_y + 0.5) * cell_h
+                    target_x = int(min(max(0, center_x + off[0] * (cell_w * 0.5)), screen_w - 1))
+                    target_y = int(min(max(0, center_y + off[1] * (cell_h * 0.5)), screen_h - 1))
+                    primitive_probs = torch.softmax(primitive_logits[0], dim=-1)
+                    primitive_class = torch.argmax(primitive_probs).item()
                     target_hint = (target_x, target_y)
                     attention_focus = update_attention_focus((curr_x, curr_y), diff_center, diff_strength, target_hint)
                     hidden_state = hidden_out.detach()
@@ -3307,13 +3428,27 @@ def start_training_mode():
                     pred_buttons = torch.sigmoid(button_logits[0]).detach().cpu().numpy()
                     pred_scroll = torch.tanh(scroll_pred[0]).detach().cpu().numpy()[0]
                     mouse_ctrl.position = (final_x, final_y)
-                    if pred_buttons[0] > 0.5 and not l_down:
-                        mouse_ctrl.press(mouse.Button.left)
-                    elif pred_buttons[0] <= 0.5 and l_down:
-                        mouse_ctrl.release(mouse.Button.left)
-                    if pred_buttons[1] > 0.5 and not r_down:
+                    now_ts = time.time()
+                    if primitive_class == 1:
+                        if now_ts - mouse_state.get("l_up_ts", 0.0) > 0.05:
+                            mouse_ctrl.press(mouse.Button.left)
+                            mouse_ctrl.release(mouse.Button.left)
+                            mouse_state["l_up_ts"] = now_ts
+                    elif primitive_class == 2:
+                        if now_ts - mouse_state.get("l_up_ts", 0.0) > 0.05:
+                            mouse_ctrl.click(mouse.Button.left, 2)
+                            mouse_state["l_up_ts"] = now_ts
+                    elif primitive_class in (3, 4):
+                        if not l_down:
+                            mouse_ctrl.press(mouse.Button.left)
+                        if primitive_class == 4 and now_ts - mouse_state.get("l_down_ts", 0.0) > 1.5:
+                            mouse_ctrl.release(mouse.Button.left)
+                    else:
+                        if l_down and pred_buttons[0] < 0.4:
+                            mouse_ctrl.release(mouse.Button.left)
+                    if pred_buttons[1] > 0.6 and not r_down:
                         mouse_ctrl.press(mouse.Button.right)
-                    elif pred_buttons[1] <= 0.5 and r_down:
+                    elif pred_buttons[1] <= 0.4 and r_down:
                         mouse_ctrl.release(mouse.Button.right)
                     scroll_buffer = scroll_buffer * 0.7 + float(pred_scroll) * 0.3
                     if abs(scroll_buffer) > 0.25:
@@ -3332,6 +3467,7 @@ def start_training_mode():
                         actual_tensor = torch.FloatTensor(actual_rgb.transpose(2, 0, 1) / 255.0).unsqueeze(0).to(train_device)
                         with autocast(device_type="cuda", enabled=train_device.type == "cuda"):
                             actual_feat = model.encode_features(actual_tensor)
+                            event_memory.push(actual_feat, primitive_class, now_ts)
                             surprise_loss = mse_surprise(pred_feat, actual_feat)
                         if surprise_loss.item() > 0.001:
                             surprise_scaler.scale(surprise_loss).backward()
