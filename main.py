@@ -223,6 +223,7 @@ def display_mode(mode):
     return MODE_DISPLAY.get(mode, str(mode))
 current_mode = MODE_LEARNING
 stop_training_flag = False
+training_exit_reason = ""
 flush_event = threading.Event()
 flush_done_event = threading.Event()
 recording_pause_event = threading.Event()
@@ -356,58 +357,78 @@ class SciFiWindow:
         self.queue = queue.Queue()
         self.root = tk.Tk()
         self.root.title("星云核心")
-        self.root.geometry("540x480")
+        self.root.geometry("560x520")
         self.root.configure(bg="#0a0f1a")
         self.root.resizable(True, True)
         self.root.minsize(420, 360)
+        self.main_frame = tk.Frame(self.root, bg="#0a0f1a")
+        self.main_frame.pack(fill="both", expand=True)
+        self.main_frame.pack_propagate(False)
+        self.main_frame.grid_columnconfigure(0, weight=1)
+        for idx in range(7):
+            self.main_frame.grid_rowconfigure(idx, weight=0)
+        self.main_frame.grid_rowconfigure(7, weight=1)
         self.mode_var = tk.StringVar(value=display_mode(current_mode))
         self.status_var = tk.StringVar(value="初始化中...")
         self.train_steps_var = tk.StringVar(value="训练步数：0")
+        self.train_reason_var = tk.StringVar(value="退出原因：待定")
         self.scan_progress_var = tk.StringVar(value="0.00%")
         self.scan_text_var = tk.StringVar(value="数据扫描：待开始")
         self.opt_progress_var = tk.StringVar(value="0.00%")
         self.opt_text_var = tk.StringVar(value="AI优化：待开始")
-        title = tk.Label(self.root, text="AGI 控制台", fg="#7fffd4", bg="#0a0f1a", font=("Consolas", 16, "bold"))
-        title.pack(pady=6)
-        mode_frame = tk.Frame(self.root, bg="#0a0f1a")
-        mode_frame.pack(fill="x", padx=10)
-        tk.Label(mode_frame, text="模式", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 12)).pack(side="left")
-        tk.Label(mode_frame, textvariable=self.mode_var, fg="#e3f2fd", bg="#0a0f1a", font=("Consolas", 12, "bold")).pack(side="left", padx=8)
-        status_frame = tk.Frame(self.root, bg="#0a0f1a")
-        status_frame.pack(fill="x", padx=10, pady=4)
-        tk.Label(status_frame, text="状态", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 11)).pack(side="left")
-        self.status_label = tk.Label(status_frame, textvariable=self.status_var, fg="#d4fc79", bg="#0a0f1a", font=("Consolas", 10), justify="left")
-        self.status_label.pack(side="left", padx=6, fill="x", expand=True)
-        train_frame = tk.Frame(self.root, bg="#0a0f1a")
-        train_frame.pack(fill="x", padx=10, pady=2)
-        tk.Label(train_frame, text="训练进度", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 10)).pack(side="left")
-        self.train_label = tk.Label(train_frame, textvariable=self.train_steps_var, fg="#c4f1f9", bg="#0a0f1a", font=("Consolas", 10), justify="left")
-        self.train_label.pack(side="left", padx=6, fill="x", expand=True)
-        btn_frame = tk.Frame(self.root, bg="#0a0f1a")
-        btn_frame.pack(fill="x", padx=10, pady=6)
-        tk.Button(btn_frame, text="睡眠", command=self.on_sleep, fg="#0a0f1a", bg="#7fffd4", activebackground="#10b981", width=10).pack(side="left", padx=5)
-        tk.Button(btn_frame, text="早停", command=self.on_early_stop, fg="#0a0f1a", bg="#fbbf24", activebackground="#f59e0b", width=10).pack(side="left", padx=5)
-        tk.Button(btn_frame, text="训练", command=self.on_train, fg="#0a0f1a", bg="#60a5fa", activebackground="#3b82f6", width=10).pack(side="left", padx=5)
-        progress_frame = tk.Frame(self.root, bg="#0a0f1a")
-        progress_frame.pack(fill="x", padx=10, pady=4)
+        title = tk.Label(self.main_frame, text="AGI 控制台", fg="#7fffd4", bg="#0a0f1a", font=("Consolas", 16, "bold"))
+        title.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 6))
+        mode_frame = tk.Frame(self.main_frame, bg="#0a0f1a")
+        mode_frame.grid(row=1, column=0, sticky="ew", padx=12)
+        mode_frame.grid_columnconfigure(1, weight=1)
+        tk.Label(mode_frame, text="模式", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 12)).grid(row=0, column=0, sticky="w")
+        tk.Label(mode_frame, textvariable=self.mode_var, fg="#e3f2fd", bg="#0a0f1a", font=("Consolas", 12, "bold")).grid(row=0, column=1, sticky="w", padx=8)
+        status_frame = tk.Frame(self.main_frame, bg="#0a0f1a")
+        status_frame.grid(row=2, column=0, sticky="ew", padx=12, pady=4)
+        status_frame.grid_columnconfigure(1, weight=1)
+        tk.Label(status_frame, text="状态", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 11)).grid(row=0, column=0, sticky="nw")
+        self.status_label = tk.Label(status_frame, textvariable=self.status_var, fg="#d4fc79", bg="#0a0f1a", font=("Consolas", 10), justify="left", anchor="w")
+        self.status_label.grid(row=0, column=1, sticky="ew", padx=8)
+        train_frame = tk.Frame(self.main_frame, bg="#0a0f1a")
+        train_frame.grid(row=3, column=0, sticky="ew", padx=12, pady=2)
+        train_frame.grid_columnconfigure(1, weight=1)
+        tk.Label(train_frame, text="训练进度", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 10)).grid(row=0, column=0, sticky="w")
+        self.train_label = tk.Label(train_frame, textvariable=self.train_steps_var, fg="#c4f1f9", bg="#0a0f1a", font=("Consolas", 10), justify="left", anchor="w")
+        self.train_label.grid(row=0, column=1, sticky="ew", padx=8)
+        self.train_reason_label = tk.Label(train_frame, textvariable=self.train_reason_var, fg="#fca5a5", bg="#0a0f1a", font=("Consolas", 9), justify="left", anchor="w")
+        self.train_reason_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        btn_frame = tk.Frame(self.main_frame, bg="#0a0f1a")
+        btn_frame.grid(row=4, column=0, sticky="ew", padx=12, pady=6)
+        for idx in range(3):
+            btn_frame.grid_columnconfigure(idx, weight=1, uniform="buttons")
+        tk.Button(btn_frame, text="睡眠", command=self.on_sleep, fg="#0a0f1a", bg="#7fffd4", activebackground="#10b981", width=10).grid(row=0, column=0, padx=5, sticky="ew")
+        tk.Button(btn_frame, text="早停", command=self.on_early_stop, fg="#0a0f1a", bg="#fbbf24", activebackground="#f59e0b", width=10).grid(row=0, column=1, padx=5, sticky="ew")
+        tk.Button(btn_frame, text="训练", command=self.on_train, fg="#0a0f1a", bg="#60a5fa", activebackground="#3b82f6", width=10).grid(row=0, column=2, padx=5, sticky="ew")
+        progress_frame = tk.Frame(self.main_frame, bg="#0a0f1a")
+        progress_frame.grid(row=5, column=0, sticky="ew", padx=12, pady=4)
+        progress_frame.grid_columnconfigure(1, weight=1)
         scan_frame = tk.Frame(progress_frame, bg="#0a0f1a")
-        scan_frame.pack(fill="x", pady=2)
-        tk.Label(scan_frame, text="数据扫描", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 10)).pack(side="left", padx=4)
+        scan_frame.grid(row=0, column=0, sticky="ew")
+        scan_frame.grid_columnconfigure(1, weight=1)
+        tk.Label(scan_frame, text="数据扫描", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 10)).grid(row=0, column=0, sticky="w", padx=(0, 6))
         self.scan_progress = ttk.Progressbar(scan_frame, orient="horizontal", mode="determinate", maximum=100)
-        self.scan_progress.pack(side="left", padx=4, fill="x", expand=True)
-        tk.Label(scan_frame, textvariable=self.scan_progress_var, fg="#e3f2fd", bg="#0a0f1a", font=("Consolas", 10)).pack(side="left", padx=4)
-        tk.Label(progress_frame, textvariable=self.scan_text_var, fg="#d4fc79", bg="#0a0f1a", font=("Consolas", 9), anchor="w").pack(fill="x", padx=6)
+        self.scan_progress.grid(row=0, column=1, sticky="ew", padx=4)
+        tk.Label(scan_frame, textvariable=self.scan_progress_var, fg="#e3f2fd", bg="#0a0f1a", font=("Consolas", 10)).grid(row=0, column=2, sticky="w", padx=4)
+        tk.Label(progress_frame, textvariable=self.scan_text_var, fg="#d4fc79", bg="#0a0f1a", font=("Consolas", 9), anchor="w").grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 6))
         opt_frame = tk.Frame(progress_frame, bg="#0a0f1a")
-        opt_frame.pack(fill="x", pady=2)
-        tk.Label(opt_frame, text="AI优化", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 10)).pack(side="left", padx=4)
+        opt_frame.grid(row=2, column=0, sticky="ew")
+        opt_frame.grid_columnconfigure(1, weight=1)
+        tk.Label(opt_frame, text="AI优化", fg="#70e1ff", bg="#0a0f1a", font=("Consolas", 10)).grid(row=0, column=0, sticky="w", padx=(0, 6))
         self.opt_progress = ttk.Progressbar(opt_frame, orient="horizontal", mode="determinate", maximum=100)
-        self.opt_progress.pack(side="left", padx=4, fill="x", expand=True)
-        tk.Label(opt_frame, textvariable=self.opt_progress_var, fg="#e3f2fd", bg="#0a0f1a", font=("Consolas", 10)).pack(side="left", padx=4)
-        tk.Label(progress_frame, textvariable=self.opt_text_var, fg="#d4fc79", bg="#0a0f1a", font=("Consolas", 9), anchor="w").pack(fill="x", padx=6)
-        log_frame = tk.Frame(self.root, bg="#0a0f1a")
-        log_frame.pack(fill="both", expand=True, padx=10, pady=6)
+        self.opt_progress.grid(row=0, column=1, sticky="ew", padx=4)
+        tk.Label(opt_frame, textvariable=self.opt_progress_var, fg="#e3f2fd", bg="#0a0f1a", font=("Consolas", 10)).grid(row=0, column=2, sticky="w", padx=4)
+        tk.Label(progress_frame, textvariable=self.opt_text_var, fg="#d4fc79", bg="#0a0f1a", font=("Consolas", 9), anchor="w").grid(row=3, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        log_frame = tk.Frame(self.main_frame, bg="#0a0f1a")
+        log_frame.grid(row=7, column=0, sticky="nsew", padx=12, pady=8)
+        log_frame.grid_rowconfigure(0, weight=1)
+        log_frame.grid_columnconfigure(0, weight=1)
         self.log_area = scrolledtext.ScrolledText(log_frame, state="disabled", fg="#9ae6ff", bg="#0f172a", insertbackground="#7fffd4", font=("Consolas", 9))
-        self.log_area.pack(fill="both", expand=True)
+        self.log_area.grid(row=0, column=0, sticky="nsew")
         self.root.protocol("WM_DELETE_WINDOW", self.minimize)
         self.root.bind("<Configure>", self.update_layout)
         self.update_layout()
@@ -441,6 +462,8 @@ class SciFiWindow:
                         self.mode_var.set(str(payload))
                     elif kind == "train_steps":
                         self.train_steps_var.set(str(payload))
+                    elif kind == "train_reason":
+                        self.train_reason_var.set(str(payload))
                 else:
                     self.log_area.configure(state="normal")
                     self.log_area.insert("end", str(entry) + "\n")
@@ -463,12 +486,16 @@ class SciFiWindow:
 
     def update_layout(self, event=None):
         try:
-            width = max(self.root.winfo_width() - 140, 200)
-            self.status_label.configure(wraplength=width)
-            self.train_label.configure(wraplength=width)
-            bar_width = max(self.root.winfo_width() - 220, 120)
+            area_width = max(self.main_frame.winfo_width() - 140, 220)
+            self.status_label.configure(wraplength=area_width)
+            self.train_label.configure(wraplength=area_width)
+            self.train_reason_label.configure(wraplength=area_width)
+            bar_width = max(self.main_frame.winfo_width() - 220, 160)
             self.scan_progress.configure(length=bar_width)
             self.opt_progress.configure(length=bar_width)
+            current_w = max(self.root.winfo_width(), 420)
+            current_h = max(self.root.winfo_height(), 360)
+            self.root.minsize(current_w, current_h)
         except Exception:
             pass
 
@@ -558,6 +585,13 @@ def update_window_training_steps(text):
             window_ui.queue.put(("train_steps", text))
     except Exception as e:
         print(f"训练步数显示更新失败：{e}")
+
+def update_training_exit_reason(text):
+    try:
+        if window_ui is not None:
+            window_ui.queue.put(("train_reason", text))
+    except Exception as e:
+        print(f"训练退出原因更新失败：{e}")
 
 init_window()
 update_window_status("正在检查依赖...", "info")
@@ -1504,13 +1538,15 @@ def release_mouse_outputs():
         log_exception("Mouse release failure", e)
 
 def handle_training_escape(msg):
-    global current_mode, stop_training_flag
+    global current_mode, stop_training_flag, training_exit_reason
     stop_training_flag = True
+    training_exit_reason = msg
     release_mouse_outputs()
     flush_buffers()
     current_mode = MODE_LEARNING
     update_window_mode(current_mode)
     update_window_status(msg, "warn")
+    update_training_exit_reason(msg)
     if window_ui is not None:
         window_ui.restore()
     input_allowed_event.set()
@@ -3150,10 +3186,12 @@ def optimize_ai():
         gc.collect()
 
 def start_training_mode():
-    global stop_training_flag, current_mode, attention_focus, total_samples_written, total_samples_dropped
+    global stop_training_flag, current_mode, attention_focus, total_samples_written, total_samples_dropped, training_exit_reason
     time.sleep(1.0)
     stop_optimization_flag.clear()
     stop_training_flag = False
+    training_exit_reason = ""
+    exit_reason = "训练模式结束"
     force_memory_cleanup(2, 0.05)
 
     model_path = os.path.join(model_dir, "ai_model.pth")
@@ -3161,6 +3199,8 @@ def start_training_mode():
         if not os.path.exists(model_path):
             print("未找到可用模型，训练已取消。")
             update_window_status("未找到模型，训练已取消。", "error")
+            training_exit_reason = "未找到模型，训练已取消"
+            update_training_exit_reason(training_exit_reason)
             current_mode = MODE_LEARNING
             update_window_mode(current_mode)
             input_allowed_event.set()
@@ -3210,6 +3250,7 @@ def start_training_mode():
         frame_failures = 0
         adaptive_delay = 0.0
         update_window_training_steps(f"训练会话 {session_id} 已启动，步数 {action_steps}")
+        update_training_exit_reason("训练进行中...")
 
         class PIDController:
             def __init__(self, kp, ki, kd):
@@ -3264,13 +3305,6 @@ def start_training_mode():
         while not stop_training_flag:
             time.sleep(0)
             start_time = time.time()
-            if os.name == "nt":
-                try:
-                    if ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x8000:
-                        stop_training_flag = True
-                        break
-                except Exception as e:
-                    print(f"Priority key error: {e}")
             try:
                 frame_attempts += 1
                 frame_img, frame_ts = get_latest_frame()
@@ -3490,22 +3524,27 @@ def start_training_mode():
                     time.sleep(wait)
             except Exception as e:
                 log_exception("Training Runtime Error", e)
+                exit_reason = f"训练异常: {e}"
+                training_exit_reason = exit_reason
+                update_training_exit_reason(exit_reason)
                 update_window_status(f"训练过程中出现异常: {e}", "error")
                 if window_ui is not None:
                     window_ui.restore()
                 break
         flush_buffers()
         session_end = time.time()
+        exit_reason = training_exit_reason or exit_reason
         duration = session_end - train_start
         delta_written = max(0, total_samples_written - session_start_written)
         delta_dropped = max(0, total_samples_dropped - session_start_dropped)
-        session_summary = f"训练会话 {session_id} | 开始 {datetime.datetime.fromtimestamp(train_start).strftime('%H:%M:%S')} | 结束 {datetime.datetime.fromtimestamp(session_end).strftime('%H:%M:%S')} | 动作步数 {action_steps} | 写入样本 {delta_written} | 丢弃样本 {delta_dropped}"
+        session_summary = f"训练会话 {session_id} | 开始 {datetime.datetime.fromtimestamp(train_start).strftime('%H:%M:%S')} | 结束 {datetime.datetime.fromtimestamp(session_end).strftime('%H:%M:%S')} | 动作步数 {action_steps} | 写入样本 {delta_written} | 丢弃样本 {delta_dropped} | 退出原因 {exit_reason}"
         update_window_training_steps(session_summary)
         current_mode = MODE_LEARNING
         update_window_mode(current_mode)
         print(f"训练模式总结: 步数 {action_steps}, 人类样本 0, AI样本 {action_steps}, 用时 {duration:.2f} 秒，写入 {delta_written}，丢弃 {delta_dropped}")
         print("训练模式结束，切换回学习模式。")
-        update_window_status(f"训练结束，步数{action_steps}，写入{delta_written}，丢弃{delta_dropped}，返回学习模式。", "info")
+        update_training_exit_reason(exit_reason)
+        update_window_status(f"训练结束，步数{action_steps}，写入{delta_written}，丢弃{delta_dropped}，原因：{exit_reason}，返回学习模式。", "info")
     finally:
         release_mouse_outputs()
         attention_focus = None
@@ -3514,7 +3553,7 @@ def start_training_mode():
         if window_ui is not None:
             window_ui.restore()
         input_allowed_event.set()
-        training_save_checkpoint("训练模式结束")
+        training_save_checkpoint(exit_reason if 'exit_reason' in locals() else "训练模式结束")
 
 def record_data_loop():
     buffer_images = []
