@@ -493,9 +493,7 @@ class SciFiWindow:
             bar_width = max(self.main_frame.winfo_width() - 220, 160)
             self.scan_progress.configure(length=bar_width)
             self.opt_progress.configure(length=bar_width)
-            current_w = max(self.root.winfo_width(), 420)
-            current_h = max(self.root.winfo_height(), 360)
-            self.root.minsize(current_w, current_h)
+            self.root.minsize(420, 360)
         except Exception:
             pass
 
@@ -3499,6 +3497,9 @@ def start_training_mode():
                         else:
                             actual_rgb = np.zeros((actual_frame.shape[0], actual_frame.shape[1], 3), dtype=np.uint8)
                         actual_tensor = torch.FloatTensor(actual_rgb.transpose(2, 0, 1) / 255.0).unsqueeze(0).to(train_device)
+                        if actual_tensor.size(1) != view_channels:
+                            repeat_factor = max(1, math.ceil(view_channels / actual_tensor.size(1)))
+                            actual_tensor = actual_tensor.repeat(1, repeat_factor, 1, 1)[:, :view_channels, :, :]
                         with autocast(device_type="cuda", enabled=train_device.type == "cuda"):
                             actual_feat = model.encode_features(actual_tensor)
                             event_memory.push(actual_feat, primitive_class, now_ts)
