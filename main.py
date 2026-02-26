@@ -156,11 +156,59 @@ FIREFOX_WINDOW_CACHE = {"hwnd": None, "last_rect": None}
 SCREEN_WIDTH, SCREEN_HEIGHT = 0, 0
 
 
-def ensure_init_files() -> None:
-    """初始化阶段：严格检查 AAA/AI模型/经验池，缺失即创建。"""
+def ensure_init_files() -> bool:
+    """初始化阶段：严格检查 AAA/AI模型/经验池，缺失时给出下载与准备指引。"""
     try:
-        AAA_DIR.mkdir(parents=True, exist_ok=True)
-        EXPERIENCE_DIR.mkdir(parents=True, exist_ok=True)
+        missing_targets: List[str] = []
+
+        if not AAA_DIR.exists():
+            missing_targets.append("AAA 文件夹")
+            logging.error("未找到目录：%s", AAA_DIR)
+        else:
+            logging.info("检测到 AAA 目录：%s", AAA_DIR)
+
+        if not EXPERIENCE_DIR.exists() or not EXPERIENCE_DIR.is_dir():
+            missing_targets.append("经验池")
+            logging.error("未找到经验池目录：%s", EXPERIENCE_DIR)
+            logging.error(
+                "经验池准备方法：\n"
+                "  1) 打开资源管理器进入 %s\n"
+                "  2) 新建文件夹并命名为 经验池\n"
+                "  3) 可选：下载公开网页视觉数据作为初始经验（ZIP）\n"
+                "     URL: https://huggingface.co/datasets/HuggingFaceM4/WebSight/resolve/main/sample_web_experience.zip\n"
+                "  4) 下载后解压到 %s（建议保留 exp_*.jpg / exp_*.json 命名）",
+                AAA_DIR,
+                EXPERIENCE_DIR,
+            )
+        else:
+            logging.info("检测到经验池目录：%s", EXPERIENCE_DIR)
+
+        model_dir_exists = any((AAA_DIR / name).is_dir() for name in ["moondream2", "phi3_vision"])
+        if not MODEL_FILE.exists() and not model_dir_exists:
+            missing_targets.append("AI模型")
+            logging.error("未找到 AI 模型文件（%s）或模型目录（moondream2/phi3_vision）。", MODEL_FILE)
+            logging.error(
+                "AI 模型下载方法（推荐 moondream2）：\n"
+                "  1) 访问模型页: https://huggingface.co/vikhyatk/moondream2\n"
+                "  2) 安装 Git LFS（如未安装）: https://git-lfs.com/\n"
+                "  3) 在 PowerShell 执行：\n"
+                "     cd %s\n"
+                "     git lfs install\n"
+                "     git clone https://huggingface.co/vikhyatk/moondream2\n"
+                "  4) 确认目录存在：%s\\moondream2\n"
+                "备选模型（显存更高需求）：https://huggingface.co/microsoft/Phi-3-vision-128k-instruct",
+                AAA_DIR,
+                AAA_DIR,
+            )
+        else:
+            if MODEL_FILE.exists():
+                logging.info("检测到 AI 模型配置文件：%s", MODEL_FILE)
+            if model_dir_exists:
+                logging.info("检测到本地视觉模型目录（moondream2 或 phi3_vision）。")
+
+        if missing_targets:
+            logging.error("初始化检查未通过，缺失项：%s", "、".join(missing_targets))
+            return False
 
         if not MODEL_FILE.exists():
             base_model = {
@@ -178,11 +226,9 @@ def ensure_init_files() -> None:
                 },
             }
             MODEL_FILE.write_text(json.dumps(base_model, ensure_ascii=False, indent=2), encoding="utf-8")
-            logging.info("已创建本地 AI 模型文件（支持缺失模型自动下载）：%s", MODEL_FILE)
-        else:
-            logging.info("检测到本地 AI 模型文件：%s", MODEL_FILE)
+            logging.info("已补齐 AI 模型配置文件：%s", MODEL_FILE)
 
-        logging.info("检测到经验池目录：%s", EXPERIENCE_DIR)
+        return True
     except Exception:
         logging.error("初始化阶段失败，详细错误：\n%s", traceback.format_exc())
         raise
@@ -946,7 +992,9 @@ def main() -> None:
 
     refresh_screen_size()
     ensure_package("nvidia_smi", "nvidia-ml-py")
-    ensure_init_files()
+    if not ensure_init_files():
+        logging.error("请按上方步骤补齐初始化文件后重新启动程序。")
+        return
     init_experience_pool_index()
     reconcile_experience_pool_index()
     init_ocr()
