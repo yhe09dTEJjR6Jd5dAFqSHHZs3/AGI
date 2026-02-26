@@ -99,6 +99,7 @@ except Exception:
 pyautogui.FAILSAFE = False
 
 STOP_EVENT = threading.Event()
+TRIM_LOCK = threading.Lock()
 
 
 def ensure_init_files() -> None:
@@ -201,9 +202,22 @@ def window_to_rect(win) -> BrowserRect:
     return rect
 
 
+def get_safe_rect(rect: BrowserRect) -> Tuple[int, int, int, int]:
+    """将浏览器区域与屏幕分辨率取交集，避免越界截图/越界鼠标。"""
+    left = max(0, rect.left)
+    top = max(0, rect.top)
+    right = min(SCREEN_WIDTH, rect.right)
+    bottom = min(SCREEN_HEIGHT, rect.bottom)
+    return left, top, right, bottom
+
+
 def grab_browser_snapshot(rect: BrowserRect):
     """抓取浏览器区域截图并提取轻量特征。"""
-    image = ImageGrab.grab((rect.left, rect.top, rect.right, rect.bottom))
+    safe_box = get_safe_rect(rect)
+    if safe_box[2] <= safe_box[0] or safe_box[3] <= safe_box[1]:
+        raise ValueError("浏览器完全在屏幕外或不可见，无法截图。")
+
+    image = ImageGrab.grab(safe_box)
     sample = image.resize((96, 60)).convert("L")
     pixels = list(sample.getdata())
     avg = sum(pixels) / len(pixels)
@@ -381,11 +395,18 @@ def sanitize_text_for_keyboard(text: str) -> str:
 
 
 def clamp_mouse_to_browser(rect: BrowserRect, x_ratio: float, y_ratio: float) -> Tuple[int, int]:
-    x = rect.left + int(rect.width * max(0.0, min(1.0, x_ratio)))
-    y = rect.top + int(rect.height * max(0.0, min(1.0, y_ratio)))
+    left, top, right, bottom = get_safe_rect(rect)
+    if right <= left or bottom <= top:
+        raise ValueError("浏览器可见区域为空，无法执行鼠标操作。")
 
-    x = max(rect.left + 2, min(x, rect.right - 2))
-    y = max(rect.top + 2, min(y, rect.bottom - 2))
+    visible_width = right - left
+    visible_height = bottom - top
+
+    x = left + int(visible_width * max(0.0, min(1.0, x_ratio)))
+    y = top + int(visible_height * max(0.0, min(1.0, y_ratio)))
+
+    x = max(left + 2, min(x, right - 2))
+    y = max(top + 2, min(y, bottom - 2))
     return x, y
 
 
@@ -412,10 +433,14 @@ def execute_action(action: Dict, rect: BrowserRect) -> None:
         elif name == "hotkey":
             keys = action.get("keys", [])
             if isinstance(keys, list) and keys:
-                if len(keys) == 1:
-                    pyautogui.press(str(keys[0]))
+                safe_keys = [str(k).lower() for k in keys if str(k).lower() not in ["esc", "escape"]]
+                if safe_keys:
+                    if len(safe_keys) == 1:
+                        pyautogui.press(safe_keys[0])
+                    else:
+                        pyautogui.hotkey(*safe_keys)
                 else:
-                    pyautogui.hotkey(*[str(k) for k in keys])
+                    logging.warning("hotkey 动作包含被禁止按键 ESC，已拦截：%s", keys)
 
             text = sanitize_text_for_keyboard(str(action.get("text", "")))
             if text:
@@ -491,6 +516,22 @@ def sleep_interruptible(seconds: float) -> None:
         time.sleep(min(0.03, remain))
 
 
+def async_trim_experience_pool() -> None:
+    """后台清理经验池，避免主循环阻塞。"""
+
+    def worker() -> None:
+        if not TRIM_LOCK.acquire(blocking=False):
+            logging.info("经验池清理任务正在进行，跳过本轮触发。")
+            return
+        try:
+            trim_experience_pool()
+        finally:
+            TRIM_LOCK.release()
+
+    thread = threading.Thread(target=worker, daemon=True, name="exp-trim-worker")
+    thread.start()
+
+
 def main() -> None:
     logging.info("=" * 60)
     logging.info("浏览器 AI 启动（单文件离线版）")
@@ -523,7 +564,7 @@ def main() -> None:
             loop_count += 1
 
             if loop_count % 100 == 0:
-                trim_experience_pool()
+                async_trim_experience_pool()
             sleep_interruptible(0.3)
 
         except Exception:
