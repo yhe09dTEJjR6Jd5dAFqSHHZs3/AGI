@@ -215,7 +215,14 @@ def list_recent_experiences(limit: int = 120) -> List[Dict]:
 
 def choose_action(features: Dict, recent_records: List[Dict]) -> Dict:
     """离线“模型”：结合视觉特征 + 经验池做策略决策。"""
-    recent_actions = [r.get("action") for r in recent_records if isinstance(r, dict)]
+    def action_name(record: Dict) -> str:
+        raw_action = record.get("action")
+        if isinstance(raw_action, dict):
+            value = raw_action.get("action")
+            return value if isinstance(value, str) else ""
+        return raw_action if isinstance(raw_action, str) else ""
+
+    recent_actions = [action_name(r) for r in recent_records if isinstance(r, dict)]
     action_counts = Counter(a for a in recent_actions if a)
 
     brightness = features["brightness"]
