@@ -4,6 +4,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 import traceback
 import warnings
@@ -84,6 +85,8 @@ except Exception:
 
 
 pyautogui.FAILSAFE = False
+
+STOP_EVENT = threading.Event()
 
 
 def ensure_init_files() -> None:
@@ -228,6 +231,33 @@ def choose_action(features: Dict, recent_records: List[Dict]) -> Dict:
     brightness = features["brightness"]
     texture = features["texture"]
 
+    # 通过近几次视觉变化估计“动作有效性”，提高探索智能度
+    recent_rewards: Dict[str, float] = {"click": 0.0, "scroll": 0.0, "type": 0.0}
+    reward_counts: Dict[str, int] = {"click": 0, "scroll": 0, "type": 0}
+    for idx in range(min(len(recent_records) - 1, 40)):
+        cur = recent_records[idx]
+        nxt = recent_records[idx + 1]
+        if not isinstance(cur, dict) or not isinstance(nxt, dict):
+            continue
+        name = action_name(cur)
+        if name not in recent_rewards:
+            continue
+        try:
+            cur_f = cur.get("features", {})
+            nxt_f = nxt.get("features", {})
+            delta_b = abs(float(cur_f.get("brightness", 0.0)) - float(nxt_f.get("brightness", 0.0)))
+            delta_t = abs(float(cur_f.get("texture", 0.0)) - float(nxt_f.get("texture", 0.0)))
+            reward = delta_b * 0.4 + delta_t * 1.6
+            recent_rewards[name] += reward
+            reward_counts[name] += 1
+        except Exception:
+            logging.warning("奖励估计失败，跳过一条经验：%s", cur.get("time", "unknown"))
+
+    mean_reward = {
+        name: (recent_rewards[name] / reward_counts[name]) if reward_counts[name] else 0.0
+        for name in recent_rewards
+    }
+
     # 避免陷入重复动作
     last_three = recent_actions[:3]
     repeated_scroll = len(last_three) == 3 and all(a == "scroll" for a in last_three)
@@ -255,7 +285,17 @@ def choose_action(features: Dict, recent_records: List[Dict]) -> Dict:
         terms = ["最新消息", "教程", "AI", "帮助", "示例"]
         return {"action": "type", "text": random.choice(terms), "press_enter": True, "reason": "页面较空，尝试输入关键词"}
 
-    if random.random() < 0.5:
+    # 带奖励偏好的动作选择：更倾向历史上“视觉变化”更明显的动作
+    if mean_reward["type"] > max(mean_reward["click"], mean_reward["scroll"]) and random.random() < 0.22:
+        terms = ["帮助", "设置", "功能", "说明", "AI"]
+        return {
+            "action": "type",
+            "text": random.choice(terms),
+            "press_enter": True,
+            "reason": f"历史经验显示输入行为收益较高({mean_reward['type']:.1f})",
+        }
+
+    if mean_reward["scroll"] >= mean_reward["click"] and random.random() < 0.55:
         return {"action": "scroll", "amount": -random.randint(250, 520), "reason": "常规探索"}
 
     return {
@@ -286,12 +326,12 @@ def execute_action(action: Dict, rect: BrowserRect) -> None:
     try:
         if name == "click":
             x, y = clamp_mouse_to_browser(rect, float(action.get("x_ratio", 0.5)), float(action.get("y_ratio", 0.5)))
-            pyautogui.moveTo(x, y, duration=0.25)
+            pyautogui.moveTo(x, y, duration=0.08)
             pyautogui.click()
 
         elif name == "scroll":
             center_x, center_y = clamp_mouse_to_browser(rect, 0.5, 0.5)
-            pyautogui.moveTo(center_x, center_y, duration=0.15)
+            pyautogui.moveTo(center_x, center_y, duration=0.06)
             pyautogui.scroll(int(action.get("amount", -320)))
 
         elif name == "type":
@@ -331,11 +371,36 @@ def save_experience(image, action: Dict, features: Dict, rect: BrowserRect) -> N
 
 
 def esc_pressed() -> bool:
+    return STOP_EVENT.is_set()
+
+
+def on_esc_press() -> None:
+    """用户按 ESC 后立刻终止程序。"""
+    if STOP_EVENT.is_set():
+        return
+    STOP_EVENT.set()
+    logging.error("检测到 ESC，立即终止程序。")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
+
+
+def setup_esc_kill_switch() -> None:
     try:
-        return keyboard.is_pressed("esc")
+        keyboard.add_hotkey("esc", on_esc_press, suppress=False, trigger_on_release=False)
+        logging.info("ESC 终止热键已启用（即时生效）。")
     except Exception:
-        logging.error("ESC 检测异常：\n%s", traceback.format_exc())
-        return False
+        logging.error("ESC 热键注册失败：\n%s", traceback.format_exc())
+        raise
+
+
+def sleep_interruptible(seconds: float) -> None:
+    end = time.time() + max(0.0, seconds)
+    while not STOP_EVENT.is_set():
+        remain = end - time.time()
+        if remain <= 0:
+            return
+        time.sleep(min(0.03, remain))
 
 
 def main() -> None:
@@ -345,6 +410,7 @@ def main() -> None:
     logging.info("=" * 60)
 
     ensure_init_files()
+    setup_esc_kill_switch()
     browser = launch_or_get_firefox_window()
 
     loop_count = 0
@@ -366,11 +432,11 @@ def main() -> None:
             save_experience(screenshot, action, features, rect)
 
             loop_count += 1
-            time.sleep(0.8)
+            sleep_interruptible(0.3)
 
         except Exception:
             logging.error("主循环异常：\n%s", traceback.format_exc())
-            time.sleep(1.2)
+            sleep_interruptible(0.4)
 
     logging.info("程序已安全退出。")
 
