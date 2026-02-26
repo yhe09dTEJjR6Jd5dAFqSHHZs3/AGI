@@ -145,8 +145,8 @@ def ensure_init_files() -> None:
 def init_ocr() -> None:
     global OCR_READER
     try:
-        OCR_READER = easyocr.Reader(["ch_sim", "en"], gpu=False, verbose=False)
-        logging.info("OCR 初始化完成（EasyOCR，中文+英文）。")
+        OCR_READER = easyocr.Reader(["ch_sim", "en"], gpu=True, verbose=False)
+        logging.info("OCR 初始化完成（EasyOCR，中文+英文，GPU加速已开启）。")
     except Exception:
         logging.error("OCR 初始化失败，详细错误：\n%s", traceback.format_exc())
         raise
@@ -442,12 +442,32 @@ def choose_action(
         return {"action": "scroll", "amount": -360, "reason": "页面偏暗，向下探索更多内容"}
 
     if clickable_points and random.random() < 0.72:
-        x_ratio, y_ratio = random.choice(clickable_points)
+        recent_clicks = [
+            (float(r.get("action", {}).get("x_ratio", 0)), float(r.get("action", {}).get("y_ratio", 0)))
+            for r in recent_records[:10]
+            if isinstance(r, dict)
+            and isinstance(r.get("action"), dict)
+            and r.get("action", {}).get("action") == "click"
+        ]
+
+        distance_threshold = 0.08
+        fresh_clickable = [
+            (x_ratio, y_ratio)
+            for x_ratio, y_ratio in clickable_points
+            if all(
+                ((x_ratio - click_x) ** 2 + (y_ratio - click_y) ** 2) ** 0.5 >= distance_threshold
+                for click_x, click_y in recent_clicks
+            )
+        ]
+
+        candidate_points = fresh_clickable if fresh_clickable else clickable_points
+        x_ratio, y_ratio = random.choice(candidate_points)
+        reason = "CV 检测到新交互区域，优先探索未点击位置" if fresh_clickable else "CV 检测到疑似控件中心，执行精准点击"
         return {
             "action": "click",
             "x_ratio": x_ratio,
             "y_ratio": y_ratio,
-            "reason": "CV 检测到疑似控件中心，执行精准点击",
+            "reason": reason,
         }
 
     if texture > 28 and action_counts.get("click", 0) <= action_counts.get("scroll", 0):
