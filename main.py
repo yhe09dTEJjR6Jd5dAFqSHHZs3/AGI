@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import glob
 import logging
 import traceback
 import warnings
@@ -66,8 +67,48 @@ try:
         except metadata.PackageNotFoundError:
             return None
 
-    def _pip_install(requirements):
+    def _purge_modules(prefixes):
+        removed = []
+        for module_name in list(sys.modules.keys()):
+            if any(module_name == p or module_name.startswith(f"{p}.") for p in prefixes):
+                removed.append(module_name)
+                sys.modules.pop(module_name, None)
+        if removed:
+            logging.info(f"已清理模块缓存: {', '.join(sorted(removed)[:8])} ... 共 {len(removed)} 个")
+
+    def _cleanup_tokenizers_shadowing():
+        """清理常见的 tokenizers/decoders 命名冲突与损坏缓存。"""
+        import site
+
+        candidates = []
+        for site_dir in site.getsitepackages() + [site.getusersitepackages()]:
+            candidates.extend(glob.glob(os.path.join(site_dir, "decoders*")))
+            candidates.extend(glob.glob(os.path.join(site_dir, "tokenizers*")))
+
+        for item in sorted(set(candidates)):
+            base = os.path.basename(item).lower()
+            # 第三方 decoders 包会污染 `from tokenizers import decoders`
+            should_remove = (
+                base == "decoders" or base.startswith("decoders-")
+                or base.startswith("tokenizers-") or base == "tokenizers"
+            )
+            if not should_remove:
+                continue
+
+            try:
+                if os.path.isdir(item):
+                    import shutil
+                    shutil.rmtree(item, ignore_errors=False)
+                else:
+                    os.remove(item)
+                logging.warning(f"已清理可能冲突/损坏的包缓存: {item}")
+            except Exception as cleanup_error:
+                logging.warning(f"清理冲突文件失败（可忽略，后续会强制重装）: {item} -> {cleanup_error}")
+
+    def _pip_install(requirements, force_reinstall=False):
         cmd = [sys.executable, "-m", "pip", "install", "--upgrade"] + requirements
+        if force_reinstall:
+            cmd.extend(["--force-reinstall", "--no-cache-dir"])
         logging.warning(f"检测到依赖问题，尝试自动修复: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -97,6 +138,9 @@ try:
             from tokenizers import decoders as _tokenizer_decoders
             if not hasattr(_tokenizer_decoders, "DecodeStream"):
                 raise ImportError("tokenizers.decoders 缺少 DecodeStream，疑似安装损坏")
+            decoders_file = getattr(_tokenizer_decoders, "__file__", "")
+            if "site-packages" in decoders_file and "tokenizers" not in decoders_file.lower():
+                raise ImportError(f"tokenizers.decoders 指向了异常路径: {decoders_file}")
         except Exception as tokenizer_error:
             raise ImportError(
                 f"tokenizers 导入异常（常见于包损坏/版本冲突）: {tokenizer_error}"
@@ -114,6 +158,10 @@ try:
         logging.error(traceback.format_exc())
         if not AUTO_FIX_DEPS:
             raise first_error
+        _purge_modules(["tokenizers", "transformers", "decoders"])
+        _cleanup_tokenizers_shadowing()
+        # 先移除可疑包，再强制无缓存重装，避免 ABI/缓存污染
+        subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "decoders"], capture_output=True, text=True)
         _pip_install([
             "pip",
             f"transformers>={MIN_TRANSFORMERS}",
@@ -122,8 +170,9 @@ try:
             "qwen-vl-utils",
             "bitsandbytes",
             "torchvision",
-        ])
+        ], force_reinstall=True)
         importlib.invalidate_caches()
+        _purge_modules(["tokenizers", "transformers", "decoders"])
         transformers, Qwen2VLForConditionalGeneration, AutoProcessor = _import_transformers_stack()
 
     from qwen_vl_utils import process_vision_info
