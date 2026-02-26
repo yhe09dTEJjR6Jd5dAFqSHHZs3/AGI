@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -12,7 +13,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 # =========================
 # Win11 高分屏坐标修复（必须在 pyautogui 导入前）
@@ -84,11 +85,13 @@ class BrowserRect:
 
 # 延迟导入，错误打印详细信息
 try:
-    import keyboard
     import cv2
+    import easyocr
+    import keyboard
     import numpy as np
     import pyautogui
     import pygetwindow as gw
+    import pytweening
     from PIL import ImageGrab
 except Exception:
     logging.error("依赖导入失败，详细错误如下：")
@@ -100,6 +103,11 @@ pyautogui.FAILSAFE = False
 
 STOP_EVENT = threading.Event()
 TRIM_LOCK = threading.Lock()
+POOL_DB_LOCK = threading.Lock()
+
+OCR_READER = None
+POOL_DB_FILE = EXPERIENCE_DIR / "experience_index.sqlite3"
+CURRENT_POOL_SIZE = 0
 
 
 def ensure_init_files() -> None:
@@ -111,7 +119,7 @@ def ensure_init_files() -> None:
         if not MODEL_FILE.exists():
             base_model = {
                 "name": "LocalBrowserAI",
-                "version": "2.0-offline",
+                "version": "2.1-offline-ocr",
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "policy": {
                     "no_network_model_download": True,
@@ -119,8 +127,8 @@ def ensure_init_files() -> None:
                     "only_mouse_inside_browser": True,
                 },
                 "knowledge": {
-                    "goals": ["探索页面", "优先点击可交互区域", "避免无效重复动作"],
-                    "safe_actions": ["click", "scroll", "type", "wait"],
+                    "goals": ["探索页面", "优先点击可交互区域", "避免无效重复动作", "理解页面文字"],
+                    "safe_actions": ["click", "scroll", "type", "wait", "hotkey"],
                 },
             }
             MODEL_FILE.write_text(json.dumps(base_model, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -134,36 +142,115 @@ def ensure_init_files() -> None:
         raise
 
 
-def experience_size_bytes() -> int:
-    total = 0
-    for root, _, files in os.walk(EXPERIENCE_DIR):
-        for f in files:
-            p = Path(root) / f
-            if p.is_file():
-                total += p.stat().st_size
-    return total
+def init_ocr() -> None:
+    global OCR_READER
+    try:
+        OCR_READER = easyocr.Reader(["ch_sim", "en"], gpu=False, verbose=False)
+        logging.info("OCR 初始化完成（EasyOCR，中文+英文）。")
+    except Exception:
+        logging.error("OCR 初始化失败，详细错误：\n%s", traceback.format_exc())
+        raise
+
+
+def init_experience_pool_index() -> None:
+    """初始化经验池索引，避免每次全量扫描经验池目录。"""
+    global CURRENT_POOL_SIZE
+    try:
+        with sqlite3.connect(POOL_DB_FILE) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS files (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    created_ts REAL NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_files_created_ts ON files(created_ts)")
+
+            row = conn.execute("SELECT COUNT(1), COALESCE(SUM(size), 0) FROM files").fetchone()
+            indexed_count = int(row[0]) if row else 0
+            indexed_size = int(row[1]) if row else 0
+
+            if indexed_count == 0:
+                logging.info("首次构建经验池索引，扫描历史文件中...")
+                records = []
+                for p in EXPERIENCE_DIR.iterdir():
+                    if not p.is_file():
+                        continue
+                    if not p.name.startswith("exp_"):
+                        continue
+                    if p.suffix.lower() not in {".jpg", ".json"}:
+                        continue
+                    stat = p.stat()
+                    records.append((str(p), int(stat.st_size), float(stat.st_mtime)))
+
+                if records:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO files(path, size, created_ts) VALUES (?, ?, ?)",
+                        records,
+                    )
+                    conn.commit()
+                    indexed_size = sum(size for _, size, _ in records)
+                logging.info("经验池索引已构建，共 %s 条。", len(records))
+
+            CURRENT_POOL_SIZE = indexed_size
+            logging.info("经验池当前大小：%.2fGB", CURRENT_POOL_SIZE / (1024 ** 3))
+    except Exception:
+        logging.error("经验池索引初始化失败：\n%s", traceback.format_exc())
+        raise
+
+
+def add_file_to_pool_index(file_path: Path) -> None:
+    global CURRENT_POOL_SIZE
+    try:
+        stat = file_path.stat()
+        size = int(stat.st_size)
+        created_ts = float(stat.st_mtime)
+        with POOL_DB_LOCK:
+            with sqlite3.connect(POOL_DB_FILE) as conn:
+                old = conn.execute("SELECT size FROM files WHERE path = ?", (str(file_path),)).fetchone()
+                if old:
+                    CURRENT_POOL_SIZE -= int(old[0])
+                conn.execute(
+                    "INSERT OR REPLACE INTO files(path, size, created_ts) VALUES (?, ?, ?)",
+                    (str(file_path), size, created_ts),
+                )
+                conn.commit()
+            CURRENT_POOL_SIZE += size
+    except Exception:
+        logging.error("经验池索引写入失败：%s\n%s", file_path, traceback.format_exc())
 
 
 def trim_experience_pool() -> None:
-    """经验池超过 20GB 时，删除最旧数据直到 <20GB。"""
+    """经验池超过 20GB 时，删除最旧数据直到 <20GB（基于索引队列）。"""
+    global CURRENT_POOL_SIZE
     try:
-        total = experience_size_bytes()
-        if total <= MAX_EXPERIENCE_BYTES:
+        if CURRENT_POOL_SIZE <= MAX_EXPERIENCE_BYTES:
             return
 
-        logging.warning("经验池大小 %.2fGB > 20GB，开始删除最旧数据...", total / (1024 ** 3))
-        files: List[Path] = [p for p in EXPERIENCE_DIR.iterdir() if p.is_file()]
-        files.sort(key=lambda p: p.stat().st_mtime)
+        logging.warning("经验池大小 %.2fGB > 20GB，开始删除最旧数据...", CURRENT_POOL_SIZE / (1024 ** 3))
+        with POOL_DB_LOCK:
+            with sqlite3.connect(POOL_DB_FILE) as conn:
+                while CURRENT_POOL_SIZE > MAX_EXPERIENCE_BYTES:
+                    row = conn.execute("SELECT path, size FROM files ORDER BY created_ts ASC LIMIT 1").fetchone()
+                    if not row:
+                        break
 
-        for p in files:
-            if total < MAX_EXPERIENCE_BYTES:
-                break
-            size = p.stat().st_size
-            p.unlink(missing_ok=False)
-            total -= size
-            logging.info("已删除旧经验：%s (%.2fMB)", p.name, size / (1024 ** 2))
+                    file_path = Path(row[0])
+                    file_size = int(row[1])
+                    try:
+                        if file_path.exists():
+                            file_path.unlink()
+                    except Exception:
+                        logging.error("删除旧经验文件失败：%s\n%s", file_path, traceback.format_exc())
 
-        logging.info("经验池清理完成，当前大小：%.2fGB", total / (1024 ** 3))
+                    conn.execute("DELETE FROM files WHERE path = ?", (str(file_path),))
+                    conn.commit()
+                    CURRENT_POOL_SIZE -= file_size
+                    logging.info("已删除旧经验：%s (%.2fMB)", file_path.name, file_size / (1024 ** 2))
+
+        logging.info("经验池清理完成，当前大小：%.2fGB", CURRENT_POOL_SIZE / (1024 ** 3))
     except Exception:
         logging.error("经验池清理失败：\n%s", traceback.format_exc())
 
@@ -250,14 +337,31 @@ def find_clickable_elements(image) -> List[Tuple[float, float]]:
             M = cv2.moments(cnt)
             if M["m00"] == 0:
                 continue
-            cX = int(M["m10"] / M["m00"])
-            cY = int(M["m01"] / M["m00"])
-            if 0 <= cX < w and 0 <= cY < h:
-                clickable_points.append((round(cX / w, 4), round(cY / h, 4)))
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            if 0 <= cx < w and 0 <= cy < h:
+                clickable_points.append((round(cx / w, 4), round(cy / h, 4)))
     except Exception:
         logging.error("CV 提取可点击元素失败：\n%s", traceback.format_exc())
 
     return clickable_points
+
+
+def run_ocr_text_detection(image) -> List[Dict]:
+    """OCR 感知：识别页面文字，帮助 AI 理解页面语义。"""
+    if OCR_READER is None:
+        return []
+    try:
+        results = OCR_READER.readtext(np.array(image))
+        parsed: List[Dict] = []
+        for box, text, confidence in results:
+            if not text:
+                continue
+            parsed.append({"text": str(text), "confidence": float(confidence), "box": box})
+        return parsed
+    except Exception:
+        logging.error("OCR 识别失败：\n%s", traceback.format_exc())
+        return []
 
 
 def list_recent_experiences(limit: int = 120) -> List[Dict]:
@@ -271,8 +375,14 @@ def list_recent_experiences(limit: int = 120) -> List[Dict]:
     return records
 
 
-def choose_action(features: Dict, recent_records: List[Dict], clickable_points: List[Tuple[float, float]]) -> Dict:
-    """离线“模型”：结合视觉特征 + 经验池做策略决策。"""
+def choose_action(
+    features: Dict,
+    recent_records: List[Dict],
+    clickable_points: List[Tuple[float, float]],
+    ocr_results: List[Dict],
+) -> Dict:
+    """离线“模型”：结合视觉特征 + OCR 文本 + 经验池做策略决策。"""
+
     def action_name(record: Dict) -> str:
         raw_action = record.get("action")
         if isinstance(raw_action, dict):
@@ -286,7 +396,13 @@ def choose_action(features: Dict, recent_records: List[Dict], clickable_points: 
     brightness = features["brightness"]
     texture = features["texture"]
 
-    # 通过近几次视觉变化估计“动作有效性”，提高探索智能度
+    ocr_text_joined = " ".join(item.get("text", "") for item in ocr_results).lower()
+    if any(keyword in ocr_text_joined for keyword in ["captcha", "验证码", "cloudflare", "验证您是人类"]):
+        return {"action": "hotkey", "keys": ["f5"], "reason": "OCR 检测到验证页面，尝试刷新并等待人工干预"}
+
+    if any(keyword in ocr_text_joined for keyword in ["登录", "sign in", "log in"]) and random.random() < 0.45:
+        return {"action": "scroll", "amount": -200, "reason": "OCR 识别到登录文本，先微调滚动定位输入框"}
+
     recent_rewards: Dict[str, float] = {"click": 0.0, "scroll": 0.0, "type": 0.0}
     reward_counts: Dict[str, int] = {"click": 0, "scroll": 0, "type": 0}
     for idx in range(min(len(recent_records) - 1, 40)):
@@ -313,7 +429,6 @@ def choose_action(features: Dict, recent_records: List[Dict], clickable_points: 
         for name in recent_rewards
     }
 
-    # 避免陷入重复动作
     last_three = recent_actions[:3]
     repeated_scroll = len(last_three) == 3 and all(a == "scroll" for a in last_three)
     repeated_click = len(last_three) == 3 and all(a == "click" for a in last_three)
@@ -323,11 +438,10 @@ def choose_action(features: Dict, recent_records: List[Dict], clickable_points: 
     if repeated_click:
         return {"action": "hotkey", "keys": ["pgdn"], "reason": "连续点击无效，改用翻页探索"}
 
-    # 根据页面亮度/纹理做启发式判断
     if brightness < 60:
         return {"action": "scroll", "amount": -360, "reason": "页面偏暗，向下探索更多内容"}
 
-    if clickable_points and random.random() < 0.7:
+    if clickable_points and random.random() < 0.72:
         x_ratio, y_ratio = random.choice(clickable_points)
         return {
             "action": "click",
@@ -344,7 +458,6 @@ def choose_action(features: Dict, recent_records: List[Dict], clickable_points: 
             "reason": "页面信息密度较高，优先点击潜在交互元素",
         }
 
-    # 低纹理页面：尝试输入搜索词（禁止 ESC）
     if texture < 15 and random.random() < 0.25:
         terms = ["最新消息", "教程", "AI", "帮助", "示例"]
         return {
@@ -352,10 +465,9 @@ def choose_action(features: Dict, recent_records: List[Dict], clickable_points: 
             "keys": ["ctrl", "l"],
             "text": random.choice(terms),
             "press_enter": True,
-            "reason": "页面较空，先定位地址栏再输入，避免虚空打字",
+            "reason": "页面较空，先定位地址栏再输入",
         }
 
-    # 带奖励偏好的动作选择：更倾向历史上“视觉变化”更明显的动作
     if mean_reward["type"] > max(mean_reward["click"], mean_reward["scroll"]) and random.random() < 0.22:
         terms = ["帮助", "设置", "功能", "说明", "AI"]
         return {
@@ -363,7 +475,7 @@ def choose_action(features: Dict, recent_records: List[Dict], clickable_points: 
             "keys": ["ctrl", "f"],
             "text": random.choice(terms),
             "press_enter": True,
-            "reason": f"历史经验显示输入行为收益较高({mean_reward['type']:.1f})，优先页面搜索",
+            "reason": f"历史经验显示输入收益较高({mean_reward['type']:.1f})，优先页面搜索",
         }
 
     if mean_reward["scroll"] >= mean_reward["click"] and random.random() < 0.55:
@@ -389,7 +501,6 @@ def choose_action(features: Dict, recent_records: List[Dict], clickable_points: 
 
 
 def sanitize_text_for_keyboard(text: str) -> str:
-    # 严格防止 ESC：过滤 esc/escape（各种大小写）
     clean = re.sub(r"escape|esc", "", text, flags=re.IGNORECASE)
     return clean
 
@@ -410,17 +521,42 @@ def clamp_mouse_to_browser(rect: BrowserRect, x_ratio: float, y_ratio: float) ->
     return x, y
 
 
+def human_like_move_to(start_x: int, start_y: int, end_x: int, end_y: int, jitter_px: float = 1.6) -> None:
+    """使用贝塞尔曲线 + 非线性缓动模拟人类鼠标轨迹。"""
+    distance = ((end_x - start_x) ** 2 + (end_y - start_y) ** 2) ** 0.5
+    duration = random.uniform(0.3, 0.7)
+    steps = max(12, int(distance / 22))
+
+    c1x = start_x + (end_x - start_x) * random.uniform(0.2, 0.4) + random.uniform(-40, 40)
+    c1y = start_y + (end_y - start_y) * random.uniform(0.2, 0.4) + random.uniform(-30, 30)
+    c2x = start_x + (end_x - start_x) * random.uniform(0.6, 0.85) + random.uniform(-40, 40)
+    c2y = start_y + (end_y - start_y) * random.uniform(0.6, 0.85) + random.uniform(-30, 30)
+
+    for i in range(1, steps + 1):
+        t_raw = i / steps
+        t = pytweening.easeInOutQuad(t_raw)
+        omt = 1 - t
+        x = omt ** 3 * start_x + 3 * omt ** 2 * t * c1x + 3 * omt * t ** 2 * c2x + t ** 3 * end_x
+        y = omt ** 3 * start_y + 3 * omt ** 2 * t * c1y + 3 * omt * t ** 2 * c2y + t ** 3 * end_y
+        if i < steps:
+            x += random.uniform(-jitter_px, jitter_px)
+            y += random.uniform(-jitter_px, jitter_px)
+        pyautogui.moveTo(int(x), int(y), duration=max(0.002, duration / steps), tween=pytweening.easeInOutQuad)
+
+
 def execute_action(action: Dict, rect: BrowserRect) -> None:
     name = action.get("action", "wait")
     try:
         if name == "click":
             x, y = clamp_mouse_to_browser(rect, float(action.get("x_ratio", 0.5)), float(action.get("y_ratio", 0.5)))
-            pyautogui.moveTo(x, y, duration=0.08)
+            cur_x, cur_y = pyautogui.position()
+            human_like_move_to(cur_x, cur_y, x, y)
             pyautogui.click()
 
         elif name == "scroll":
             center_x, center_y = clamp_mouse_to_browser(rect, 0.5, 0.5)
-            pyautogui.moveTo(center_x, center_y, duration=0.06)
+            cur_x, cur_y = pyautogui.position()
+            human_like_move_to(cur_x, cur_y, center_x, center_y, jitter_px=1.2)
             pyautogui.scroll(int(action.get("amount", -320)))
 
         elif name == "type":
@@ -479,6 +615,10 @@ def save_experience(image, action: Dict, features: Dict, rect: BrowserRect) -> N
     try:
         image.save(img_file, format="JPEG", quality=78)
         json_file.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        add_file_to_pool_index(img_file)
+        add_file_to_pool_index(json_file)
+        if CURRENT_POOL_SIZE > MAX_EXPERIENCE_BYTES:
+            async_trim_experience_pool()
     except Exception:
         logging.error("保存经验失败：\n%s", traceback.format_exc())
 
@@ -534,11 +674,13 @@ def async_trim_experience_pool() -> None:
 
 def main() -> None:
     logging.info("=" * 60)
-    logging.info("浏览器 AI 启动（单文件离线版）")
+    logging.info("浏览器 AI 启动（单文件离线版 + OCR + 人类轨迹）")
     logging.info("按 ESC 终止程序")
     logging.info("=" * 60)
 
     ensure_init_files()
+    init_experience_pool_index()
+    init_ocr()
     setup_esc_kill_switch()
     browser = launch_or_get_firefox_window()
 
@@ -553,16 +695,17 @@ def main() -> None:
             rect = window_to_rect(browser)
             screenshot, features = grab_browser_snapshot(rect)
             clickable_points = find_clickable_elements(screenshot)
+            ocr_results = run_ocr_text_detection(screenshot)
+            features["ocr_text_count"] = len(ocr_results)
 
             experiences = list_recent_experiences(limit=160)
-            action = choose_action(features, experiences, clickable_points)
+            action = choose_action(features, experiences, clickable_points, ocr_results)
 
             logging.info("第 %s 轮决策：%s", loop_count, action)
             execute_action(action, rect)
             save_experience(screenshot, action, features, rect)
 
             loop_count += 1
-
             if loop_count % 100 == 0:
                 async_trim_experience_pool()
             sleep_interruptible(0.3)
