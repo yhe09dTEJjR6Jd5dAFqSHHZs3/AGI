@@ -6,6 +6,8 @@ import logging
 import traceback
 import warnings
 import subprocess
+import importlib
+from importlib import metadata
 from datetime import datetime
 
 # ==========================================
@@ -22,6 +24,10 @@ logging.basicConfig(
     format='[%(asctime)s] %(levelname)s: %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
+
+AUTO_FIX_DEPS = os.environ.get("AGI_AUTO_FIX_DEPS", "1") == "1"
+MIN_TRANSFORMERS = "4.45.0"
+MIN_TOKENIZERS = "0.20.0"
 
 # ==========================================
 # 2. 全局异常处理，绝对避免静默失败
@@ -52,14 +58,74 @@ try:
     import torchvision
     import bitsandbytes # 4-bit 量化必须
     import accelerate
-    import transformers
     from packaging import version
 
-    # 检查 transformers 版本是否支持 Qwen2-VL
-    if version.parse(transformers.__version__) < version.parse("4.45.0"):
-        raise ImportError(f"transformers 版本过低 ({transformers.__version__})。请运行: pip install --upgrade transformers")
+    def _get_installed_version(pkg_name):
+        try:
+            return metadata.version(pkg_name)
+        except metadata.PackageNotFoundError:
+            return None
 
-    from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+    def _pip_install(requirements):
+        cmd = [sys.executable, "-m", "pip", "install", "--upgrade"] + requirements
+        logging.warning(f"检测到依赖问题，尝试自动修复: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            logging.error("❌ 自动修复依赖失败。pip stderr 如下：")
+            logging.error(result.stderr.strip())
+            raise RuntimeError("自动修复依赖失败")
+        logging.info("✅ 依赖库自动修复完成，准备重新导入。")
+
+    def _import_transformers_stack():
+        import transformers as _transformers
+
+        if version.parse(_transformers.__version__) < version.parse(MIN_TRANSFORMERS):
+            raise ImportError(
+                f"transformers 版本过低 ({_transformers.__version__})，需要 >= {MIN_TRANSFORMERS}"
+            )
+
+        # 某些环境会出现 tokenizers/decoders ABI 不匹配导致 DecodeStream 丢失
+        tokenizers_version = _get_installed_version("tokenizers")
+        if tokenizers_version is None:
+            raise ImportError("未检测到 tokenizers 包，请先安装。")
+        if version.parse(tokenizers_version) < version.parse(MIN_TOKENIZERS):
+            raise ImportError(
+                f"tokenizers 版本过低 ({tokenizers_version})，需要 >= {MIN_TOKENIZERS}"
+            )
+
+        try:
+            from tokenizers import decoders as _tokenizer_decoders
+            if not hasattr(_tokenizer_decoders, "DecodeStream"):
+                raise ImportError("tokenizers.decoders 缺少 DecodeStream，疑似安装损坏")
+        except Exception as tokenizer_error:
+            raise ImportError(
+                f"tokenizers 导入异常（常见于包损坏/版本冲突）: {tokenizer_error}"
+            ) from tokenizer_error
+
+        from transformers import Qwen2VLForConditionalGeneration as _Qwen2VLForConditionalGeneration
+        from transformers import AutoProcessor as _AutoProcessor
+
+        return _transformers, _Qwen2VLForConditionalGeneration, _AutoProcessor
+
+    try:
+        transformers, Qwen2VLForConditionalGeneration, AutoProcessor = _import_transformers_stack()
+    except Exception as first_error:
+        logging.error("首次导入 transformers/Qwen2-VL 失败，详细原因：")
+        logging.error(traceback.format_exc())
+        if not AUTO_FIX_DEPS:
+            raise first_error
+        _pip_install([
+            "pip",
+            f"transformers>={MIN_TRANSFORMERS}",
+            f"tokenizers>={MIN_TOKENIZERS}",
+            "accelerate",
+            "qwen-vl-utils",
+            "bitsandbytes",
+            "torchvision",
+        ])
+        importlib.invalidate_caches()
+        transformers, Qwen2VLForConditionalGeneration, AutoProcessor = _import_transformers_stack()
+
     from qwen_vl_utils import process_vision_info
 
     logging.info("✅ 所有依赖库检查通过！")
@@ -68,7 +134,7 @@ except ImportError as e:
     logging.error("❌ 依赖库导入失败！")
     logging.error(f"直接原因: {e}")
     logging.error("请确保执行了以下命令：")
-    logging.error("pip install --upgrade transformers accelerate qwen-vl-utils bitsandbytes torchvision")
+    logging.error("pip install --upgrade transformers tokenizers accelerate qwen-vl-utils bitsandbytes torchvision")
     logging.error("完整报错堆栈如下：")
     traceback.print_exc()
     sys.exit(1)
