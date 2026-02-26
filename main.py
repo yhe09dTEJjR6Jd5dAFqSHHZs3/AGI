@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 import warnings
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -28,9 +29,7 @@ except Exception:
 # =========================
 # 全局告警处理（按需求预防）
 # =========================
-warnings.filterwarnings("ignore", category=FutureWarning, message=r".*pynvml package is deprecated.*")
-warnings.filterwarnings("ignore", category=FutureWarning, message=r".*torch\.cuda\.amp\.GradScaler.*")
-warnings.filterwarnings("ignore", category=UserWarning, message=r".*torch\.utils\.checkpoint.*use_reentrant.*")
+warnings.filterwarnings("default")
 
 # =========================
 # 日志：禁止静默失败
@@ -63,10 +62,8 @@ EXPERIENCE_DIR = AAA_DIR / "经验池"
 FIREFOX_PATH = Path(r"E:\FirefoxPortable\FirefoxPortable.exe")
 MAX_EXPERIENCE_BYTES = 20 * 1024 * 1024 * 1024
 
-SCREEN_WIDTH = 2560
-SCREEN_HEIGHT = 1600
-OCR_INTERVAL = 5
 LOCAL_REGION_SIZE = 512
+RECONCILE_INTERVAL_SECONDS = 300
 
 
 @dataclass
@@ -93,6 +90,20 @@ try:
     import pyautogui
     import pygetwindow as gw
     import pytweening
+
+    def setup_comtypes_cache() -> None:
+        try:
+            import shutil
+
+            gen_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "LocalBrowserAI" / "comtypes_gen"
+            if gen_dir.exists():
+                shutil.rmtree(gen_dir, ignore_errors=True)
+            gen_dir.mkdir(parents=True, exist_ok=True)
+            os.environ["COMTYPES_CACHE"] = str(gen_dir)
+        except Exception:
+            logging.warning("设置 comtypes 缓存目录失败：\n%s", traceback.format_exc())
+
+    setup_comtypes_cache()
     import uiautomation as automation
     from PIL import ImageGrab
 except Exception:
@@ -101,6 +112,33 @@ except Exception:
     raise
 
 pyautogui.FAILSAFE = False
+
+
+def refresh_screen_size() -> None:
+    global SCREEN_WIDTH, SCREEN_HEIGHT
+    try:
+        size = pyautogui.size()
+        SCREEN_WIDTH, SCREEN_HEIGHT = int(size.width), int(size.height)
+    except Exception:
+        SCREEN_WIDTH, SCREEN_HEIGHT = 2560, 1600
+        logging.error("动态获取分辨率失败，回退为默认 2560x1600：\n%s", traceback.format_exc())
+
+
+def ensure_package(module_name: str, pip_name: Optional[str] = None) -> bool:
+    try:
+        __import__(module_name)
+        return True
+    except Exception:
+        target = pip_name or module_name
+        logging.warning("依赖 %s 缺失，尝试自动安装：%s", module_name, target)
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", target])
+            __import__(module_name)
+            logging.info("依赖安装成功：%s", target)
+            return True
+        except Exception:
+            logging.error("自动安装依赖失败（%s）：\n%s", target, traceback.format_exc())
+            return False
 
 STOP_EVENT = threading.Event()
 TRIM_LOCK = threading.Lock()
@@ -112,10 +150,14 @@ CURRENT_POOL_SIZE = 0
 VLM_AVAILABLE = False
 VLM_MODEL = None
 VLM_PROCESSOR = None
+LAST_RECONCILE_TS = 0.0
+LAST_ACTIONS: List[Dict] = []
+FIREFOX_WINDOW_CACHE = {"hwnd": None, "last_rect": None}
+SCREEN_WIDTH, SCREEN_HEIGHT = 0, 0
 
 
 def ensure_init_files() -> None:
-    """初始化阶段：严格检查 AAA/AI模型/经验池，缺失即创建（不联网下载模型）。"""
+    """初始化阶段：严格检查 AAA/AI模型/经验池，缺失即创建。"""
     try:
         AAA_DIR.mkdir(parents=True, exist_ok=True)
         EXPERIENCE_DIR.mkdir(parents=True, exist_ok=True)
@@ -123,10 +165,10 @@ def ensure_init_files() -> None:
         if not MODEL_FILE.exists():
             base_model = {
                 "name": "LocalBrowserAI",
-                "version": "3.0-vlm-uia-rag",
+                "version": "3.4-vlm-uia-rag",
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "policy": {
-                    "no_network_model_download": True,
+                    "auto_model_download_if_missing": True,
                     "allow_keyboard_keys_except_esc": True,
                     "only_mouse_inside_browser": True,
                 },
@@ -136,7 +178,7 @@ def ensure_init_files() -> None:
                 },
             }
             MODEL_FILE.write_text(json.dumps(base_model, ensure_ascii=False, indent=2), encoding="utf-8")
-            logging.info("已创建本地 AI 模型文件（离线，不联网下载）：%s", MODEL_FILE)
+            logging.info("已创建本地 AI 模型文件（支持缺失模型自动下载）：%s", MODEL_FILE)
         else:
             logging.info("检测到本地 AI 模型文件：%s", MODEL_FILE)
 
@@ -157,15 +199,36 @@ def init_ocr() -> None:
 
 
 def init_vlm() -> None:
-    """轻量级VLM初始化：优先本地权重，不可用时自动降级但不中断主流程。"""
+    """VLM 初始化：本地优先，缺失自动下载，失败时降级规则语义。"""
     global VLM_AVAILABLE, VLM_MODEL, VLM_PROCESSOR
-    candidates = [
-        AAA_DIR / "moondream2",
-        AAA_DIR / "phi3_vision",
-    ]
-    model_root = next((p for p in candidates if p.exists() and p.is_dir()), None)
-    if model_root is None:
-        logging.warning("未检测到本地VLM权重目录（%s），使用规则语义回退。", candidates)
+    model_map = {
+        "moondream2": "vikhyatk/moondream2",
+        "phi3_vision": "microsoft/Phi-3-vision-128k-instruct",
+    }
+    model_dir_name = next((k for k in ["moondream2", "phi3_vision"] if (AAA_DIR / k).is_dir()), "moondream2")
+    model_root = AAA_DIR / model_dir_name
+
+    if not model_root.exists():
+        if not ensure_package("huggingface_hub"):
+            logging.warning("缺少 huggingface_hub，无法自动下载模型，使用规则语义回退。")
+            return
+        try:
+            from huggingface_hub import snapshot_download
+
+            logging.warning("未检测到本地模型目录 %s，尝试自动下载 %s ...", model_root, model_map[model_dir_name])
+            snapshot_download(
+                repo_id=model_map[model_dir_name],
+                local_dir=str(model_root),
+                resume_download=True,
+                local_dir_use_symlinks=False,
+            )
+            logging.info("模型下载完成：%s", model_root)
+        except Exception:
+            logging.error("自动下载模型失败，降级到规则语义：\n%s", traceback.format_exc())
+            return
+
+    if not ensure_package("transformers"):
+        logging.warning("缺少 transformers，无法加载 VLM，使用规则语义回退。")
         return
 
     try:
@@ -230,6 +293,40 @@ def init_experience_pool_index() -> None:
         raise
 
 
+
+
+def reconcile_experience_pool_index() -> None:
+    """周期性校验经验池索引与磁盘，避免 DB 漂移。"""
+    global CURRENT_POOL_SIZE, LAST_RECONCILE_TS
+    try:
+        disk_records = {}
+        for p in EXPERIENCE_DIR.iterdir():
+            if p.is_file() and p.name.startswith("exp_") and p.suffix.lower() in {".jpg", ".json"}:
+                stat = p.stat()
+                disk_records[str(p)] = (int(stat.st_size), float(stat.st_mtime))
+
+        with POOL_DB_LOCK:
+            with sqlite3.connect(POOL_DB_FILE) as conn:
+                db_rows = conn.execute("SELECT path, size, created_ts FROM files").fetchall()
+                db_map = {row[0]: (int(row[1]), float(row[2])) for row in db_rows}
+
+                for path, (size, cts) in disk_records.items():
+                    if path not in db_map or db_map[path][0] != size:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO files(path, size, created_ts) VALUES (?, ?, ?)",
+                            (path, size, cts),
+                        )
+                for path in set(db_map.keys()) - set(disk_records.keys()):
+                    conn.execute("DELETE FROM files WHERE path = ?", (path,))
+                conn.commit()
+
+        CURRENT_POOL_SIZE = sum(v[0] for v in disk_records.values())
+        LAST_RECONCILE_TS = time.time()
+        logging.info("经验池索引已对齐磁盘：%d 文件，%.2fGB", len(disk_records), CURRENT_POOL_SIZE / (1024**3))
+    except Exception:
+        logging.error("经验池索引对齐失败：\n%s", traceback.format_exc())
+
+
 def add_file_to_pool_index(file_path: Path) -> None:
     global CURRENT_POOL_SIZE
     try:
@@ -284,9 +381,19 @@ def trim_experience_pool() -> None:
         logging.error("经验池清理失败：\n%s", traceback.format_exc())
 
 
-def launch_or_get_firefox_window():
-    """获取 Firefox 窗口，不存在则尝试启动便携版。"""
+def launch_or_get_firefox_window(force_activate: bool = False):
+    """获取 Firefox 窗口，不存在则尝试启动便携版；优先复用缓存 hwnd。"""
     try:
+        cached_hwnd = FIREFOX_WINDOW_CACHE.get("hwnd")
+        if cached_hwnd:
+            for w in gw.getAllWindows():
+                if getattr(w, "_hWnd", None) == cached_hwnd:
+                    if w.isMinimized:
+                        w.restore()
+                    if force_activate:
+                        w.activate()
+                    return w
+
         wins = gw.getWindowsWithTitle("Mozilla Firefox")
         if not wins:
             if FIREFOX_PATH.exists():
@@ -303,8 +410,10 @@ def launch_or_get_firefox_window():
         win = wins[0]
         if win.isMinimized:
             win.restore()
-        win.activate()
-        time.sleep(0.2)
+        if force_activate:
+            win.activate()
+            time.sleep(0.2)
+        FIREFOX_WINDOW_CACHE["hwnd"] = getattr(win, "_hWnd", None)
         return win
     except Exception:
         logging.error("浏览器获取失败：\n%s", traceback.format_exc())
@@ -366,19 +475,19 @@ def _normalize_rect(rect: BrowserRect, x: int, y: int) -> Tuple[float, float]:
     return ((x - safe_left) / w, (y - safe_top) / h)
 
 
-def get_clickable_elements_by_uia(rect: BrowserRect) -> List[Dict]:
-    """使用 Windows UI Automation 获取可交互元素，替代 OpenCV 轮廓检测。"""
+def get_clickable_elements_by_uia(rect: BrowserRect, hwnd: Optional[int]) -> List[Dict]:
+    """使用窗口句柄抓取 UIA 根节点，感知阶段不移动鼠标。"""
     items: List[Dict] = []
     try:
-        center_x, center_y = clamp_mouse_to_browser(rect, 0.5, 0.5)
-        pyautogui.moveTo(center_x, center_y, duration=0.05)
-        focus_control = automation.ControlFromCursor()
+        if not hwnd:
+            return items
+        focus_control = automation.ControlFromHandle(hwnd)
         if focus_control is None:
             return items
 
         seen = set()
         queue = [focus_control]
-        max_nodes = 180
+        max_nodes = 220
         while queue and len(seen) < max_nodes:
             ctrl = queue.pop(0)
             key = f"{ctrl.ControlTypeName}:{ctrl.Name}:{id(ctrl)}"
@@ -399,19 +508,17 @@ def get_clickable_elements_by_uia(rect: BrowserRect) -> List[Dict]:
                 if ctype in {"buttoncontrol", "hyperlinkcontrol", "editcontrol", "menuitemcontrol", "tabitemcontrol"}:
                     cx, cy = (l + r) // 2, (t + b) // 2
                     x_ratio, y_ratio = _normalize_rect(rect, cx, cy)
-                    items.append(
-                        {
-                            "name": (ctrl.Name or "").strip(),
-                            "type": ctype,
-                            "x_ratio": round(float(x_ratio), 4),
-                            "y_ratio": round(float(y_ratio), 4),
-                            "rect": [l, t, r, b],
-                        }
-                    )
+                    items.append({
+                        "name": (ctrl.Name or "").strip(),
+                        "type": ctype,
+                        "x_ratio": round(x_ratio, 4),
+                        "y_ratio": round(y_ratio, 4),
+                        "rect": [l, t, r, b],
+                    })
 
                 children = ctrl.GetChildren()
                 if children:
-                    queue.extend(children[:40])
+                    queue.extend(children[:50])
             except Exception:
                 logging.error("UIA 子节点解析失败：\n%s", traceback.format_exc())
 
@@ -524,12 +631,62 @@ def retrieve_similar_experiences(current_embedding: np.ndarray, records: List[Di
     return [r for _, r in scored[:top_k]]
 
 
+def page_changed(prev_hist: Optional[List[int]], curr_hist: List[int], threshold: float = 0.08) -> bool:
+    if not prev_hist:
+        return True
+    a = np.asarray(prev_hist, dtype=np.float32)
+    b = np.asarray(curr_hist, dtype=np.float32)
+    a = a / max(1.0, float(a.sum()))
+    b = b / max(1.0, float(b.sum()))
+    return float(np.mean(np.abs(a - b))) > threshold
+
+
+def pick_ocr_click_target(ocr_results: List[Dict], rect: BrowserRect) -> Optional[Dict]:
+    keywords = ["确定", "下一步", "同意", "搜索", "关闭", "登录", "继续", "开始"]
+    best = None
+    best_score = -1.0
+    for it in ocr_results:
+        txt = str(it.get("text", ""))
+        conf = float(it.get("confidence", it.get("conf", 0.0)))
+        box = it.get("box", [])
+        if len(box) < 4:
+            continue
+        xs = [pt[0] for pt in box]
+        ys = [pt[1] for pt in box]
+        cx, cy = int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
+        x_ratio, y_ratio = _normalize_rect(rect, cx, cy)
+        hit = any(k in txt for k in keywords)
+        score = conf + (0.35 if hit else 0.0)
+        if score > best_score and 0.02 < x_ratio < 0.98 and 0.02 < y_ratio < 0.98:
+            best_score = score
+            best = {"x_ratio": x_ratio, "y_ratio": y_ratio, "text": txt, "conf": conf, "keyword_hit": hit}
+    return best
+
+
+def penalize_repeated_action(action: Dict) -> Dict:
+    if action.get("action") != "click":
+        return action
+    x, y = float(action.get("x_ratio", 0.5)), float(action.get("y_ratio", 0.5))
+    now = time.time()
+    repeat = 0
+    for rec in LAST_ACTIONS[-8:]:
+        if rec.get("action") == "click" and now - float(rec.get("ts", 0.0)) < 8.0:
+            if abs(float(rec.get("x_ratio", 0)) - x) < 0.05 and abs(float(rec.get("y_ratio", 0)) - y) < 0.05:
+                repeat += 1
+    if repeat >= 2:
+        action["x_ratio"] = max(0.08, min(0.92, x + random.uniform(-0.15, 0.15)))
+        action["y_ratio"] = max(0.08, min(0.92, y + random.uniform(-0.15, 0.15)))
+        action["reason"] = f"{action.get('reason','')}（避免重复点击抖动）"
+    return action
+
+
 def choose_action(
     features: Dict,
     similar_records: List[Dict],
     ui_elements: List[Dict],
     ocr_results: List[Dict],
     scene: Dict,
+    rect: BrowserRect,
 ) -> Dict:
     labels = set(scene.get("labels", []))
     ocr_text = scene.get("ocr_text", "")
@@ -538,22 +695,12 @@ def choose_action(
         close_candidates = [e for e in ui_elements if e.get("name", "").lower() in {"close", "关闭", "x"}]
         if close_candidates:
             c = random.choice(close_candidates)
-            return {
-                "action": "click",
-                "x_ratio": c["x_ratio"],
-                "y_ratio": c["y_ratio"],
-                "reason": "检测到广告弹窗，优先关闭",
-            }
+            return {"action": "click", "x_ratio": c["x_ratio"], "y_ratio": c["y_ratio"], "reason": "检测到广告弹窗"}
 
     if "login_form" in labels:
         input_box = next((e for e in ui_elements if "editcontrol" in e.get("type", "")), None)
         if input_box:
-            return {
-                "action": "click",
-                "x_ratio": input_box["x_ratio"],
-                "y_ratio": input_box["y_ratio"],
-                "reason": "检测到登录场景，先聚焦输入框",
-            }
+            return {"action": "click", "x_ratio": input_box["x_ratio"], "y_ratio": input_box["y_ratio"], "reason": "登录框聚焦"}
 
     action_votes: Dict[str, float] = {"click": 0.0, "scroll": 0.0, "type": 0.0}
     for rec in similar_records:
@@ -566,37 +713,31 @@ def choose_action(
     if similar_records and max(action_votes.values()) > 0.5:
         best = max(action_votes, key=action_votes.get)
         if best == "click" and ui_elements:
-            target = random.choice(ui_elements)
-            return {
-                "action": "click",
-                "x_ratio": target["x_ratio"],
-                "y_ratio": target["y_ratio"],
-                "reason": "RAG 命中相似场景，复用高分点击动作",
-            }
+            t = random.choice(ui_elements)
+            return {"action": "click", "x_ratio": t["x_ratio"], "y_ratio": t["y_ratio"], "reason": "RAG 复用动作"}
         if best == "scroll":
-            return {"action": "scroll", "amount": -320, "reason": "RAG 命中相似场景，复用滚动动作"}
+            return {"action": "scroll", "amount": -320, "reason": "RAG 建议滚动"}
 
     if "captcha" in ocr_text or "验证码" in ocr_text:
-        return {"action": "hotkey", "keys": ["f5"], "reason": "检测到验证页面，刷新并等待"}
+        return {"action": "hotkey", "keys": ["f5"], "reason": "验证码页面刷新"}
 
-    if ui_elements and random.random() < 0.75:
+    if ui_elements and random.random() < 0.82:
         target = random.choice(ui_elements)
+        return {"action": "click", "x_ratio": target["x_ratio"], "y_ratio": target["y_ratio"], "reason": "UIA 元素点击"}
+
+    ocr_target = pick_ocr_click_target(ocr_results, rect)
+    if ocr_target:
         return {
             "action": "click",
-            "x_ratio": target["x_ratio"],
-            "y_ratio": target["y_ratio"],
-            "reason": "UIA 检测到可交互元素，优先点击",
+            "x_ratio": round(float(ocr_target["x_ratio"]), 4),
+            "y_ratio": round(float(ocr_target["y_ratio"]), 4),
+            "reason": f"OCR 兜底点击:{ocr_target['text'][:12]}",
         }
 
     if features.get("brightness", 120) < 70:
-        return {"action": "scroll", "amount": -280, "reason": "页面偏暗且信息少，尝试滚动"}
+        return {"action": "scroll", "amount": -280, "reason": "页面偏暗尝试滚动"}
 
-    return {
-        "action": "click",
-        "x_ratio": round(random.uniform(0.2, 0.8), 3),
-        "y_ratio": round(random.uniform(0.2, 0.8), 3),
-        "reason": "默认探索",
-    }
+    return {"action": "click", "x_ratio": round(random.uniform(0.2, 0.8), 3), "y_ratio": round(random.uniform(0.2, 0.8), 3), "reason": "默认探索"}
 
 
 def sanitize_text_for_keyboard(text: str) -> str:
@@ -696,12 +837,14 @@ def execute_action(action: Dict, rect: BrowserRect) -> None:
         logging.error("执行动作失败：%s\n%s", action, traceback.format_exc())
 
 
-def estimate_reward(next_features: Dict, previous_features: Dict, action: Dict) -> float:
+def estimate_reward(next_features: Dict, previous_features: Dict, action: Dict, changed: bool) -> float:
     reward = 0.0
     reward += min(0.6, abs(next_features.get("brightness", 0) - previous_features.get("brightness", 0)) / 255.0)
     reward += min(0.6, abs(next_features.get("texture", 0) - previous_features.get("texture", 0)) / 80.0)
     if action.get("action") == "click":
         reward += 0.15
+    if not changed:
+        reward -= 0.28
     return round(float(reward - 0.15), 4)
 
 
@@ -750,10 +893,17 @@ def on_esc_press() -> None:
     if STOP_EVENT.is_set():
         return
     STOP_EVENT.set()
-    logging.error("检测到 ESC，立即终止程序。")
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(0)
+    logging.error("检测到 ESC，准备立即终止（优先安全退出，1秒后兜底硬退出）。")
+
+    def force_exit() -> None:
+        time.sleep(1.0)
+        if STOP_EVENT.is_set():
+            logging.error("主线程未在1秒内结束，执行兜底硬退出。")
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
+
+    threading.Thread(target=force_exit, daemon=True, name="esc-force-exit").start()
 
 
 def setup_esc_kill_switch() -> None:
@@ -790,19 +940,22 @@ def async_trim_experience_pool() -> None:
 
 def main() -> None:
     logging.info("=" * 64)
-    logging.info("浏览器 AI 启动（单文件版：VLM + UIA + RAG + FPS优化）")
+    logging.info("浏览器 AI 启动（单文件版：VLM + UIA + RAG + 自愈索引）")
     logging.info("按 ESC 终止程序")
     logging.info("=" * 64)
 
+    refresh_screen_size()
+    ensure_package("nvidia_smi", "nvidia-ml-py")
     ensure_init_files()
     init_experience_pool_index()
+    reconcile_experience_pool_index()
     init_ocr()
     init_vlm()
     setup_esc_kill_switch()
-    browser = launch_or_get_firefox_window()
+    browser = launch_or_get_firefox_window(force_activate=True)
 
     loop_count = 0
-    prev_features = {"brightness": 0.0, "texture": 0.0}
+    prev_features = {"brightness": 0.0, "texture": 0.0, "histogram_bins": [0] * 8}
     cached_ocr: List[Dict] = []
 
     while True:
@@ -812,19 +965,22 @@ def main() -> None:
 
         try:
             loop_start = time.perf_counter()
-            browser = launch_or_get_firefox_window()
+            refresh_screen_size()
+            browser = launch_or_get_firefox_window(force_activate=False)
             rect = window_to_rect(browser)
             screenshot, features = grab_browser_snapshot(rect)
             local_region, _ = get_local_region(screenshot, rect)
 
-            if loop_count % OCR_INTERVAL == 0:
+            changed = page_changed(prev_features.get("histogram_bins"), features.get("histogram_bins", []), threshold=0.06)
+            if changed or not cached_ocr:
                 full_scan = screenshot.resize((max(320, screenshot.width // 2), max(220, screenshot.height // 2)))
                 ocr_global = run_ocr_text_detection(full_scan)
                 ocr_local = run_ocr_text_detection(local_region)
                 cached_ocr = ocr_global + ocr_local
             ocr_results = cached_ocr
 
-            ui_elements = get_clickable_elements_by_uia(rect)
+            hwnd = getattr(browser, "_hWnd", None)
+            ui_elements = get_clickable_elements_by_uia(rect, hwnd)
             scene = summarize_scene_with_vlm(local_region, ocr_results, ui_elements)
             features["ocr_text_count"] = len(ocr_results)
             features["ui_count"] = len(ui_elements)
@@ -833,25 +989,38 @@ def main() -> None:
             embedding = compute_embedding(features, ui_elements, ocr_results, scene)
             experiences = list_recent_experiences(limit=240)
             similar_records = retrieve_similar_experiences(embedding, experiences, top_k=10)
-            action = choose_action(features, similar_records, ui_elements, ocr_results, scene)
+            action = choose_action(features, similar_records, ui_elements, ocr_results, scene, rect)
+            action = penalize_repeated_action(action)
 
             logging.info(
-                "第 %s 轮: scene=%s, ui=%s, ocr=%s, action=%s",
+                "第 %s 轮: scene=%s, ui=%s, ocr=%s, changed=%s, action=%s",
                 loop_count,
                 scene.get("labels"),
                 len(ui_elements),
                 len(ocr_results),
+                changed,
                 action,
             )
 
             execute_action(action, rect)
-            reward = estimate_reward(features, prev_features, action)
+            LAST_ACTIONS.append({
+                "ts": time.time(),
+                "action": action.get("action"),
+                "x_ratio": action.get("x_ratio", 0.0),
+                "y_ratio": action.get("y_ratio", 0.0),
+            })
+            if len(LAST_ACTIONS) > 64:
+                del LAST_ACTIONS[:-64]
+
+            reward = estimate_reward(features, prev_features, action, changed)
             save_experience(screenshot, action, features, rect, embedding, scene, ui_elements, reward)
 
             prev_features = features
             loop_count += 1
             if loop_count % 90 == 0:
                 async_trim_experience_pool()
+            if time.time() - LAST_RECONCILE_TS > RECONCILE_INTERVAL_SECONDS:
+                reconcile_experience_pool_index()
 
             loop_spent = time.perf_counter() - loop_start
             target_sleep = max(0.05, 0.22 - min(0.12, loop_spent / 6.0))
