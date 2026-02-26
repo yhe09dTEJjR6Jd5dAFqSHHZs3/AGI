@@ -27,8 +27,57 @@ logging.basicConfig(
 )
 
 AUTO_FIX_DEPS = os.environ.get("AGI_AUTO_FIX_DEPS", "1") == "1"
+MAX_REPAIR_RESTARTS = 2
+REPAIR_RESTART_COUNT = int(os.environ.get("AGI_REPAIR_RESTART_COUNT", "0"))
+FORCE_REPAIR_ON_START = os.environ.get("AGI_FORCE_REPAIR_ON_START", "0") == "1"
 MIN_TRANSFORMERS = "4.45.0"
 MIN_TOKENIZERS = "0.20.0"
+
+
+def _pip_install(requirements, force_reinstall=False):
+    cmd = [sys.executable, "-m", "pip", "install", "--upgrade"] + requirements
+    if force_reinstall:
+        cmd.extend(["--force-reinstall", "--no-cache-dir"])
+    logging.warning(f"检测到依赖问题，尝试自动修复: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logging.error("❌ 自动修复依赖失败。pip stdout/stderr 如下：")
+        logging.error(result.stdout.strip())
+        logging.error(result.stderr.strip())
+        raise RuntimeError("自动修复依赖失败")
+    logging.info("✅ 依赖库自动修复完成。")
+
+
+def _restart_current_process(force_repair=False):
+    if REPAIR_RESTART_COUNT >= MAX_REPAIR_RESTARTS:
+        raise RuntimeError("依赖修复重启次数已达上限，请手动检查 Python 环境。")
+
+    os.environ["AGI_REPAIR_RESTART_COUNT"] = str(REPAIR_RESTART_COUNT + 1)
+    if force_repair:
+        os.environ["AGI_FORCE_REPAIR_ON_START"] = "1"
+    logging.warning("准备重启当前 Python 进程以应用依赖修复...")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def _repair_dependencies_before_import():
+    if not FORCE_REPAIR_ON_START:
+        return
+
+    logging.info("检测到重启修复标记，先在全新进程中重装关键依赖...")
+    _pip_install([
+        "pip",
+        f"transformers>={MIN_TRANSFORMERS}",
+        f"tokenizers>={MIN_TOKENIZERS}",
+        "accelerate",
+        "qwen-vl-utils",
+        "bitsandbytes",
+        "torchvision",
+    ], force_reinstall=True)
+    os.environ["AGI_FORCE_REPAIR_ON_START"] = "0"
+    _restart_current_process(force_repair=False)
+
+
+_repair_dependencies_before_import()
 
 # ==========================================
 # 2. 全局异常处理，绝对避免静默失败
@@ -105,18 +154,6 @@ try:
             except Exception as cleanup_error:
                 logging.warning(f"清理冲突文件失败（可忽略，后续会强制重装）: {item} -> {cleanup_error}")
 
-    def _pip_install(requirements, force_reinstall=False):
-        cmd = [sys.executable, "-m", "pip", "install", "--upgrade"] + requirements
-        if force_reinstall:
-            cmd.extend(["--force-reinstall", "--no-cache-dir"])
-        logging.warning(f"检测到依赖问题，尝试自动修复: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            logging.error("❌ 自动修复依赖失败。pip stderr 如下：")
-            logging.error(result.stderr.strip())
-            raise RuntimeError("自动修复依赖失败")
-        logging.info("✅ 依赖库自动修复完成，准备重新导入。")
-
     def _import_transformers_stack():
         import transformers as _transformers
 
@@ -160,20 +197,9 @@ try:
             raise first_error
         _purge_modules(["tokenizers", "transformers", "decoders"])
         _cleanup_tokenizers_shadowing()
-        # 先移除可疑包，再强制无缓存重装，避免 ABI/缓存污染
         subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "decoders"], capture_output=True, text=True)
-        _pip_install([
-            "pip",
-            f"transformers>={MIN_TRANSFORMERS}",
-            f"tokenizers>={MIN_TOKENIZERS}",
-            "accelerate",
-            "qwen-vl-utils",
-            "bitsandbytes",
-            "torchvision",
-        ], force_reinstall=True)
-        importlib.invalidate_caches()
-        _purge_modules(["tokenizers", "transformers", "decoders"])
-        transformers, Qwen2VLForConditionalGeneration, AutoProcessor = _import_transformers_stack()
+        logging.warning("检测到可能的 tokenizers ABI/文件锁问题，将重启到干净进程后再重装依赖。")
+        _restart_current_process(force_repair=True)
 
     from qwen_vl_utils import process_vision_info
 
