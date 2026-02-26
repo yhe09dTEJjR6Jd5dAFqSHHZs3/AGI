@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -9,11 +10,10 @@ import threading
 import time
 import traceback
 import warnings
-from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # =========================
 # Win11 高分屏坐标修复（必须在 pyautogui 导入前）
@@ -65,6 +65,8 @@ MAX_EXPERIENCE_BYTES = 20 * 1024 * 1024 * 1024
 
 SCREEN_WIDTH = 2560
 SCREEN_HEIGHT = 1600
+OCR_INTERVAL = 5
+LOCAL_REGION_SIZE = 512
 
 
 @dataclass
@@ -85,19 +87,18 @@ class BrowserRect:
 
 # 延迟导入，错误打印详细信息
 try:
-    import cv2
     import easyocr
     import keyboard
     import numpy as np
     import pyautogui
     import pygetwindow as gw
     import pytweening
+    import uiautomation as automation
     from PIL import ImageGrab
 except Exception:
     logging.error("依赖导入失败，详细错误如下：")
     logging.error(traceback.format_exc())
     raise
-
 
 pyautogui.FAILSAFE = False
 
@@ -108,6 +109,9 @@ POOL_DB_LOCK = threading.Lock()
 OCR_READER = None
 POOL_DB_FILE = EXPERIENCE_DIR / "experience_index.sqlite3"
 CURRENT_POOL_SIZE = 0
+VLM_AVAILABLE = False
+VLM_MODEL = None
+VLM_PROCESSOR = None
 
 
 def ensure_init_files() -> None:
@@ -119,7 +123,7 @@ def ensure_init_files() -> None:
         if not MODEL_FILE.exists():
             base_model = {
                 "name": "LocalBrowserAI",
-                "version": "2.1-offline-ocr",
+                "version": "3.0-vlm-uia-rag",
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "policy": {
                     "no_network_model_download": True,
@@ -127,8 +131,8 @@ def ensure_init_files() -> None:
                     "only_mouse_inside_browser": True,
                 },
                 "knowledge": {
-                    "goals": ["探索页面", "优先点击可交互区域", "避免无效重复动作", "理解页面文字"],
-                    "safe_actions": ["click", "scroll", "type", "wait", "hotkey"],
+                    "goals": ["理解页面", "优先高价值交互", "记忆历史操作", "避免重复无效动作"],
+                    "safe_actions": ["click", "scroll", "type", "wait", "hotkey", "search_new_tab"],
                 },
             }
             MODEL_FILE.write_text(json.dumps(base_model, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -150,6 +154,31 @@ def init_ocr() -> None:
     except Exception:
         logging.error("OCR 初始化失败，详细错误：\n%s", traceback.format_exc())
         raise
+
+
+def init_vlm() -> None:
+    """轻量级VLM初始化：优先本地权重，不可用时自动降级但不中断主流程。"""
+    global VLM_AVAILABLE, VLM_MODEL, VLM_PROCESSOR
+    candidates = [
+        AAA_DIR / "moondream2",
+        AAA_DIR / "phi3_vision",
+    ]
+    model_root = next((p for p in candidates if p.exists() and p.is_dir()), None)
+    if model_root is None:
+        logging.warning("未检测到本地VLM权重目录（%s），使用规则语义回退。", candidates)
+        return
+
+    try:
+        from transformers import AutoModelForCausalLM, AutoProcessor
+
+        VLM_PROCESSOR = AutoProcessor.from_pretrained(str(model_root), trust_remote_code=True, local_files_only=True)
+        VLM_MODEL = AutoModelForCausalLM.from_pretrained(
+            str(model_root), trust_remote_code=True, local_files_only=True, device_map="auto"
+        )
+        VLM_AVAILABLE = True
+        logging.info("VLM 初始化完成：%s", model_root)
+    except Exception:
+        logging.error("VLM 初始化失败，降级到规则语义：\n%s", traceback.format_exc())
 
 
 def init_experience_pool_index() -> None:
@@ -195,7 +224,7 @@ def init_experience_pool_index() -> None:
                 logging.info("经验池索引已构建，共 %s 条。", len(records))
 
             CURRENT_POOL_SIZE = indexed_size
-            logging.info("经验池当前大小：%.2fGB", CURRENT_POOL_SIZE / (1024 ** 3))
+            logging.info("经验池当前大小：%.2fGB", CURRENT_POOL_SIZE / (1024**3))
     except Exception:
         logging.error("经验池索引初始化失败：\n%s", traceback.format_exc())
         raise
@@ -229,7 +258,7 @@ def trim_experience_pool() -> None:
         if CURRENT_POOL_SIZE <= MAX_EXPERIENCE_BYTES:
             return
 
-        logging.warning("经验池大小 %.2fGB > 20GB，开始删除最旧数据...", CURRENT_POOL_SIZE / (1024 ** 3))
+        logging.warning("经验池大小 %.2fGB > 20GB，开始删除最旧数据...", CURRENT_POOL_SIZE / (1024**3))
         with POOL_DB_LOCK:
             with sqlite3.connect(POOL_DB_FILE) as conn:
                 while CURRENT_POOL_SIZE > MAX_EXPERIENCE_BYTES:
@@ -248,9 +277,9 @@ def trim_experience_pool() -> None:
                     conn.execute("DELETE FROM files WHERE path = ?", (str(file_path),))
                     conn.commit()
                     CURRENT_POOL_SIZE -= file_size
-                    logging.info("已删除旧经验：%s (%.2fMB)", file_path.name, file_size / (1024 ** 2))
+                    logging.info("已删除旧经验：%s (%.2fMB)", file_path.name, file_size / (1024**2))
 
-        logging.info("经验池清理完成，当前大小：%.2fGB", CURRENT_POOL_SIZE / (1024 ** 3))
+        logging.info("经验池清理完成，当前大小：%.2fGB", CURRENT_POOL_SIZE / (1024**3))
     except Exception:
         logging.error("经验池清理失败：\n%s", traceback.format_exc())
 
@@ -290,7 +319,6 @@ def window_to_rect(win) -> BrowserRect:
 
 
 def get_safe_rect(rect: BrowserRect) -> Tuple[int, int, int, int]:
-    """将浏览器区域与屏幕分辨率取交集，避免越界截图/越界鼠标。"""
     left = max(0, rect.left)
     top = max(0, rect.top)
     right = min(SCREEN_WIDTH, rect.right)
@@ -299,56 +327,101 @@ def get_safe_rect(rect: BrowserRect) -> Tuple[int, int, int, int]:
 
 
 def grab_browser_snapshot(rect: BrowserRect):
-    """抓取浏览器区域截图并提取轻量特征。"""
     safe_box = get_safe_rect(rect)
     if safe_box[2] <= safe_box[0] or safe_box[3] <= safe_box[1]:
         raise ValueError("浏览器完全在屏幕外或不可见，无法截图。")
 
     image = ImageGrab.grab(safe_box)
     sample = image.resize((96, 60)).convert("L")
-    pixels = list(sample.getdata())
-    avg = sum(pixels) / len(pixels)
-
-    hist = Counter(int(p // 32) for p in pixels)
-    texture = sum(abs(pixels[i] - pixels[i - 1]) for i in range(1, len(pixels))) / len(pixels)
+    pixels = np.asarray(sample, dtype=np.float32).flatten()
+    avg = float(np.mean(pixels))
+    texture = float(np.mean(np.abs(np.diff(pixels)))) if len(pixels) > 2 else 0.0
+    hist_vals, _ = np.histogram(pixels, bins=8, range=(0, 256))
     return image, {
         "brightness": avg,
         "texture": texture,
-        "histogram_bins": dict(hist),
+        "histogram_bins": hist_vals.astype(int).tolist(),
     }
 
 
-def find_clickable_elements(image) -> List[Tuple[float, float]]:
-    """用轻量 CV 提取潜在可点击区域中心点（返回相对坐标 ratio）。"""
-    clickable_points: List[Tuple[float, float]] = []
+def get_local_region(image, rect: BrowserRect):
+    left, top, right, bottom = get_safe_rect(rect)
+    abs_mouse_x, abs_mouse_y = pyautogui.position()
+    local_left = max(left, abs_mouse_x - LOCAL_REGION_SIZE // 2)
+    local_top = max(top, abs_mouse_y - LOCAL_REGION_SIZE // 2)
+    local_right = min(right, local_left + LOCAL_REGION_SIZE)
+    local_bottom = min(bottom, local_top + LOCAL_REGION_SIZE)
+    if local_right <= local_left or local_bottom <= local_top:
+        return image, (left, top)
+
+    rel_box = (local_left - left, local_top - top, local_right - left, local_bottom - top)
+    local_image = image.crop(rel_box)
+    return local_image, (local_left, local_top)
+
+
+def _normalize_rect(rect: BrowserRect, x: int, y: int) -> Tuple[float, float]:
+    safe_left, safe_top, safe_right, safe_bottom = get_safe_rect(rect)
+    w = max(1, safe_right - safe_left)
+    h = max(1, safe_bottom - safe_top)
+    return ((x - safe_left) / w, (y - safe_top) / h)
+
+
+def get_clickable_elements_by_uia(rect: BrowserRect) -> List[Dict]:
+    """使用 Windows UI Automation 获取可交互元素，替代 OpenCV 轮廓检测。"""
+    items: List[Dict] = []
     try:
-        img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
-        edges = cv2.Canny(img_cv, 50, 150)
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        center_x, center_y = clamp_mouse_to_browser(rect, 0.5, 0.5)
+        pyautogui.moveTo(center_x, center_y, duration=0.05)
+        focus_control = automation.ControlFromCursor()
+        if focus_control is None:
+            return items
 
-        h, w = img_cv.shape[:2]
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < 120:
+        seen = set()
+        queue = [focus_control]
+        max_nodes = 180
+        while queue and len(seen) < max_nodes:
+            ctrl = queue.pop(0)
+            key = f"{ctrl.ControlTypeName}:{ctrl.Name}:{id(ctrl)}"
+            if key in seen:
                 continue
-            x, y, cw, ch = cv2.boundingRect(cnt)
-            if cw < 12 or ch < 10:
-                continue
-            M = cv2.moments(cnt)
-            if M["m00"] == 0:
-                continue
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-            if 0 <= cx < w and 0 <= cy < h:
-                clickable_points.append((round(cx / w, 4), round(cy / h, 4)))
+            seen.add(key)
+
+            try:
+                br = ctrl.BoundingRectangle
+                if not br:
+                    continue
+                l, t, r, b = int(br.left), int(br.top), int(br.right), int(br.bottom)
+                if r <= l or b <= t:
+                    continue
+                if l < rect.left or t < rect.top or r > rect.right or b > rect.bottom:
+                    continue
+                ctype = (ctrl.ControlTypeName or "").lower()
+                if ctype in {"buttoncontrol", "hyperlinkcontrol", "editcontrol", "menuitemcontrol", "tabitemcontrol"}:
+                    cx, cy = (l + r) // 2, (t + b) // 2
+                    x_ratio, y_ratio = _normalize_rect(rect, cx, cy)
+                    items.append(
+                        {
+                            "name": (ctrl.Name or "").strip(),
+                            "type": ctype,
+                            "x_ratio": round(float(x_ratio), 4),
+                            "y_ratio": round(float(y_ratio), 4),
+                            "rect": [l, t, r, b],
+                        }
+                    )
+
+                children = ctrl.GetChildren()
+                if children:
+                    queue.extend(children[:40])
+            except Exception:
+                logging.error("UIA 子节点解析失败：\n%s", traceback.format_exc())
+
+        return items
     except Exception:
-        logging.error("CV 提取可点击元素失败：\n%s", traceback.format_exc())
-
-    return clickable_points
+        logging.error("UIA 提取可交互元素失败：\n%s", traceback.format_exc())
+        return []
 
 
 def run_ocr_text_detection(image) -> List[Dict]:
-    """OCR 感知：识别页面文字，帮助 AI 理解页面语义。"""
     if OCR_READER is None:
         return []
     try:
@@ -364,7 +437,64 @@ def run_ocr_text_detection(image) -> List[Dict]:
         return []
 
 
-def list_recent_experiences(limit: int = 120) -> List[Dict]:
+def summarize_scene_with_vlm(image, ocr_results: List[Dict], ui_elements: List[Dict]) -> Dict:
+    """VLM理解场景：例如识别登录框、广告关闭按钮等。"""
+    ocr_text = " ".join(x.get("text", "") for x in ocr_results).lower()
+    labels = []
+
+    if VLM_AVAILABLE and VLM_MODEL is not None and VLM_PROCESSOR is not None:
+        try:
+            prompt = (
+                "请识别当前浏览器页面的主要场景，并给出简短标签，"
+                "例如 login_form / ad_popup / article / search_result。只返回逗号分隔标签。"
+            )
+            inputs = VLM_PROCESSOR(text=prompt, images=image, return_tensors="pt")
+            outputs = VLM_MODEL.generate(**inputs, max_new_tokens=24)
+            text = VLM_PROCESSOR.batch_decode(outputs, skip_special_tokens=True)[0].lower()
+            labels = [x.strip() for x in re.split(r"[,;\n]", text) if x.strip()]
+        except Exception:
+            logging.error("VLM 推理失败，回退到规则语义：\n%s", traceback.format_exc())
+
+    if not labels:
+        if any(k in ocr_text for k in ["登录", "sign in", "log in", "password", "账号", "邮箱"]):
+            labels.append("login_form")
+        if any(k in ocr_text for k in ["advertisement", "sponsored", "广告", "推广"]):
+            labels.append("ad_popup")
+        if any(u.get("name", "").lower() in {"close", "关闭", "x"} for u in ui_elements):
+            labels.append("has_close_button")
+        if not labels:
+            labels.append("generic_page")
+
+    return {
+        "labels": list(dict.fromkeys(labels))[:6],
+        "ocr_text": ocr_text[:600],
+    }
+
+
+def compute_embedding(features: Dict, ui_elements: List[Dict], ocr_results: List[Dict], scene: Dict) -> np.ndarray:
+    hist = features.get("histogram_bins", [0] * 8)
+    hist = np.asarray(hist, dtype=np.float32)
+    hist = hist / max(1.0, np.sum(hist))
+
+    ui_count = float(len(ui_elements))
+    button_count = float(sum(1 for e in ui_elements if "button" in e.get("type", "")))
+    text_count = float(len(ocr_results))
+    scene_hash = float(sum(ord(ch) for lb in scene.get("labels", []) for ch in lb) % 997)
+
+    vector = np.concatenate(
+        [
+            np.asarray([features.get("brightness", 0.0), features.get("texture", 0.0)], dtype=np.float32) / 255.0,
+            np.asarray([ui_count, button_count, text_count, scene_hash / 997.0], dtype=np.float32) / 20.0,
+            hist,
+        ]
+    )
+    norm = float(np.linalg.norm(vector))
+    if norm > 1e-9:
+        vector = vector / norm
+    return vector.astype(np.float32)
+
+
+def list_recent_experiences(limit: int = 240) -> List[Dict]:
     files = sorted(EXPERIENCE_DIR.glob("exp_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
     records: List[Dict] = []
     for p in files[:limit]:
@@ -375,154 +505,102 @@ def list_recent_experiences(limit: int = 120) -> List[Dict]:
     return records
 
 
-def choose_action(
-    features: Dict,
-    recent_records: List[Dict],
-    clickable_points: List[Tuple[float, float]],
-    ocr_results: List[Dict],
-) -> Dict:
-    """离线“模型”：结合视觉特征 + OCR 文本 + 经验池做策略决策。"""
-
-    def action_name(record: Dict) -> str:
-        raw_action = record.get("action")
-        if isinstance(raw_action, dict):
-            value = raw_action.get("action")
-            return value if isinstance(value, str) else ""
-        return raw_action if isinstance(raw_action, str) else ""
-
-    recent_actions = [action_name(r) for r in recent_records if isinstance(r, dict)]
-    action_counts = Counter(a for a in recent_actions if a)
-
-    brightness = features["brightness"]
-    texture = features["texture"]
-
-    ocr_text_joined = " ".join(item.get("text", "") for item in ocr_results).lower()
-    if any(keyword in ocr_text_joined for keyword in ["captcha", "验证码", "cloudflare", "验证您是人类"]):
-        return {"action": "hotkey", "keys": ["f5"], "reason": "OCR 检测到验证页面，尝试刷新并等待人工干预"}
-
-    if any(keyword in ocr_text_joined for keyword in ["登录", "sign in", "log in"]) and random.random() < 0.45:
-        return {"action": "scroll", "amount": -200, "reason": "OCR 识别到登录文本，先微调滚动定位输入框"}
-
-    recent_rewards: Dict[str, float] = {"click": 0.0, "scroll": 0.0, "type": 0.0}
-    reward_counts: Dict[str, int] = {"click": 0, "scroll": 0, "type": 0}
-    for idx in range(min(len(recent_records) - 1, 40)):
-        cur = recent_records[idx]
-        nxt = recent_records[idx + 1]
-        if not isinstance(cur, dict) or not isinstance(nxt, dict):
-            continue
-        name = action_name(cur)
-        if name not in recent_rewards:
+def retrieve_similar_experiences(current_embedding: np.ndarray, records: List[Dict], top_k: int = 12) -> List[Dict]:
+    scored = []
+    for rec in records:
+        emb = rec.get("embedding")
+        if not isinstance(emb, list) or not emb:
             continue
         try:
-            cur_f = cur.get("features", {})
-            nxt_f = nxt.get("features", {})
-            delta_b = abs(float(cur_f.get("brightness", 0.0)) - float(nxt_f.get("brightness", 0.0)))
-            delta_t = abs(float(cur_f.get("texture", 0.0)) - float(nxt_f.get("texture", 0.0)))
-            reward = delta_b * 0.4 + delta_t * 1.6
-            recent_rewards[name] += reward
-            reward_counts[name] += 1
+            v = np.asarray(emb, dtype=np.float32)
+            denom = float(np.linalg.norm(v) * np.linalg.norm(current_embedding))
+            if denom <= 1e-9:
+                continue
+            score = float(np.dot(v, current_embedding) / denom)
+            scored.append((score, rec))
         except Exception:
-            logging.warning("奖励估计失败，跳过一条经验：%s", cur.get("time", "unknown"))
+            continue
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [r for _, r in scored[:top_k]]
 
-    mean_reward = {
-        name: (recent_rewards[name] / reward_counts[name]) if reward_counts[name] else 0.0
-        for name in recent_rewards
-    }
 
-    last_three = recent_actions[:3]
-    repeated_scroll = len(last_three) == 3 and all(a == "scroll" for a in last_three)
-    repeated_click = len(last_three) == 3 and all(a == "click" for a in last_three)
+def choose_action(
+    features: Dict,
+    similar_records: List[Dict],
+    ui_elements: List[Dict],
+    ocr_results: List[Dict],
+    scene: Dict,
+) -> Dict:
+    labels = set(scene.get("labels", []))
+    ocr_text = scene.get("ocr_text", "")
 
-    if repeated_scroll:
-        return {"action": "hotkey", "keys": ["ctrl", "f"], "text": "帮助", "press_enter": True, "reason": "连续滚动后改用页面搜索定位重点"}
-    if repeated_click:
-        return {"action": "hotkey", "keys": ["pgdn"], "reason": "连续点击无效，改用翻页探索"}
+    if "ad_popup" in labels and ui_elements:
+        close_candidates = [e for e in ui_elements if e.get("name", "").lower() in {"close", "关闭", "x"}]
+        if close_candidates:
+            c = random.choice(close_candidates)
+            return {
+                "action": "click",
+                "x_ratio": c["x_ratio"],
+                "y_ratio": c["y_ratio"],
+                "reason": "检测到广告弹窗，优先关闭",
+            }
 
-    if brightness < 60:
-        return {"action": "scroll", "amount": -360, "reason": "页面偏暗，向下探索更多内容"}
+    if "login_form" in labels:
+        input_box = next((e for e in ui_elements if "editcontrol" in e.get("type", "")), None)
+        if input_box:
+            return {
+                "action": "click",
+                "x_ratio": input_box["x_ratio"],
+                "y_ratio": input_box["y_ratio"],
+                "reason": "检测到登录场景，先聚焦输入框",
+            }
 
-    if clickable_points and random.random() < 0.72:
-        recent_clicks = [
-            (float(r.get("action", {}).get("x_ratio", 0)), float(r.get("action", {}).get("y_ratio", 0)))
-            for r in recent_records[:10]
-            if isinstance(r, dict)
-            and isinstance(r.get("action"), dict)
-            and r.get("action", {}).get("action") == "click"
-        ]
+    action_votes: Dict[str, float] = {"click": 0.0, "scroll": 0.0, "type": 0.0}
+    for rec in similar_records:
+        raw = rec.get("action", {})
+        name = raw.get("action") if isinstance(raw, dict) else raw
+        reward = float(rec.get("reward", 0.0))
+        if isinstance(name, str) and name in action_votes:
+            action_votes[name] += max(-0.2, min(1.5, reward + 0.4))
 
-        distance_threshold = 0.08
-        fresh_clickable = [
-            (x_ratio, y_ratio)
-            for x_ratio, y_ratio in clickable_points
-            if all(
-                ((x_ratio - click_x) ** 2 + (y_ratio - click_y) ** 2) ** 0.5 >= distance_threshold
-                for click_x, click_y in recent_clicks
-            )
-        ]
+    if similar_records and max(action_votes.values()) > 0.5:
+        best = max(action_votes, key=action_votes.get)
+        if best == "click" and ui_elements:
+            target = random.choice(ui_elements)
+            return {
+                "action": "click",
+                "x_ratio": target["x_ratio"],
+                "y_ratio": target["y_ratio"],
+                "reason": "RAG 命中相似场景，复用高分点击动作",
+            }
+        if best == "scroll":
+            return {"action": "scroll", "amount": -320, "reason": "RAG 命中相似场景，复用滚动动作"}
 
-        candidate_points = fresh_clickable if fresh_clickable else clickable_points
-        x_ratio, y_ratio = random.choice(candidate_points)
-        reason = "CV 检测到新交互区域，优先探索未点击位置" if fresh_clickable else "CV 检测到疑似控件中心，执行精准点击"
+    if "captcha" in ocr_text or "验证码" in ocr_text:
+        return {"action": "hotkey", "keys": ["f5"], "reason": "检测到验证页面，刷新并等待"}
+
+    if ui_elements and random.random() < 0.75:
+        target = random.choice(ui_elements)
         return {
             "action": "click",
-            "x_ratio": x_ratio,
-            "y_ratio": y_ratio,
-            "reason": reason,
+            "x_ratio": target["x_ratio"],
+            "y_ratio": target["y_ratio"],
+            "reason": "UIA 检测到可交互元素，优先点击",
         }
 
-    if texture > 28 and action_counts.get("click", 0) <= action_counts.get("scroll", 0):
-        return {
-            "action": "click",
-            "x_ratio": round(random.uniform(0.2, 0.8), 3),
-            "y_ratio": round(random.uniform(0.15, 0.75), 3),
-            "reason": "页面信息密度较高，优先点击潜在交互元素",
-        }
-
-    if texture < 15 and random.random() < 0.25:
-        terms = ["最新消息", "教程", "AI", "帮助", "示例"]
-        return {
-            "action": "hotkey",
-            "keys": ["ctrl", "l"],
-            "text": random.choice(terms),
-            "press_enter": True,
-            "reason": "页面较空，先定位地址栏再输入",
-        }
-
-    if mean_reward["type"] > max(mean_reward["click"], mean_reward["scroll"]) and random.random() < 0.22:
-        terms = ["帮助", "设置", "功能", "说明", "AI"]
-        return {
-            "action": "hotkey",
-            "keys": ["ctrl", "f"],
-            "text": random.choice(terms),
-            "press_enter": True,
-            "reason": f"历史经验显示输入收益较高({mean_reward['type']:.1f})，优先页面搜索",
-        }
-
-    if mean_reward["scroll"] >= mean_reward["click"] and random.random() < 0.55:
-        if random.random() < 0.45:
-            key = random.choice(["pgdn", "space", "pgup"])
-            return {"action": "hotkey", "keys": [key], "reason": "使用浏览器快捷键进行高效滚动探索"}
-        return {"action": "scroll", "amount": -random.randint(250, 520), "reason": "常规探索"}
-
-    if random.random() < 0.12:
-        terms = ["AI 教程", "Firefox 技巧", "自动化 示例"]
-        return {
-            "action": "search_new_tab",
-            "text": random.choice(terms),
-            "reason": "主动新建标签搜索，扩展经验",
-        }
+    if features.get("brightness", 120) < 70:
+        return {"action": "scroll", "amount": -280, "reason": "页面偏暗且信息少，尝试滚动"}
 
     return {
         "action": "click",
-        "x_ratio": round(random.uniform(0.15, 0.85), 3),
-        "y_ratio": round(random.uniform(0.18, 0.82), 3),
-        "reason": "默认交互探索",
+        "x_ratio": round(random.uniform(0.2, 0.8), 3),
+        "y_ratio": round(random.uniform(0.2, 0.8), 3),
+        "reason": "默认探索",
     }
 
 
 def sanitize_text_for_keyboard(text: str) -> str:
-    clean = re.sub(r"escape|esc", "", text, flags=re.IGNORECASE)
-    return clean
+    return re.sub(r"escape|esc", "", text, flags=re.IGNORECASE)
 
 
 def clamp_mouse_to_browser(rect: BrowserRect, x_ratio: float, y_ratio: float) -> Tuple[int, int]:
@@ -542,10 +620,9 @@ def clamp_mouse_to_browser(rect: BrowserRect, x_ratio: float, y_ratio: float) ->
 
 
 def human_like_move_to(start_x: int, start_y: int, end_x: int, end_y: int, jitter_px: float = 1.6) -> None:
-    """使用贝塞尔曲线 + 非线性缓动模拟人类鼠标轨迹。"""
-    distance = ((end_x - start_x) ** 2 + (end_y - start_y) ** 2) ** 0.5
-    duration = random.uniform(0.3, 0.7)
-    steps = max(12, int(distance / 22))
+    distance = math.hypot(end_x - start_x, end_y - start_y)
+    duration = random.uniform(0.25, 0.6)
+    steps = max(10, int(distance / 24))
 
     c1x = start_x + (end_x - start_x) * random.uniform(0.2, 0.4) + random.uniform(-40, 40)
     c1y = start_y + (end_y - start_y) * random.uniform(0.2, 0.4) + random.uniform(-30, 30)
@@ -556,12 +633,12 @@ def human_like_move_to(start_x: int, start_y: int, end_x: int, end_y: int, jitte
         t_raw = i / steps
         t = pytweening.easeInOutQuad(t_raw)
         omt = 1 - t
-        x = omt ** 3 * start_x + 3 * omt ** 2 * t * c1x + 3 * omt * t ** 2 * c2x + t ** 3 * end_x
-        y = omt ** 3 * start_y + 3 * omt ** 2 * t * c1y + 3 * omt * t ** 2 * c2y + t ** 3 * end_y
+        x = omt**3 * start_x + 3 * omt**2 * t * c1x + 3 * omt * t**2 * c2x + t**3 * end_x
+        y = omt**3 * start_y + 3 * omt**2 * t * c1y + 3 * omt * t**2 * c2y + t**3 * end_y
         if i < steps:
             x += random.uniform(-jitter_px, jitter_px)
             y += random.uniform(-jitter_px, jitter_px)
-        pyautogui.moveTo(int(x), int(y), duration=max(0.002, duration / steps), tween=pytweening.easeInOutQuad)
+        pyautogui.moveTo(int(x), int(y), duration=max(0.0015, duration / steps), tween=pytweening.easeInOutQuad)
 
 
 def execute_action(action: Dict, rect: BrowserRect) -> None:
@@ -577,7 +654,7 @@ def execute_action(action: Dict, rect: BrowserRect) -> None:
             center_x, center_y = clamp_mouse_to_browser(rect, 0.5, 0.5)
             cur_x, cur_y = pyautogui.position()
             human_like_move_to(cur_x, cur_y, center_x, center_y, jitter_px=1.2)
-            pyautogui.scroll(int(action.get("amount", -320)))
+            pyautogui.scroll(int(action.get("amount", -300)))
 
         elif name == "type":
             text = sanitize_text_for_keyboard(str(action.get("text", "")))
@@ -606,20 +683,38 @@ def execute_action(action: Dict, rect: BrowserRect) -> None:
 
         elif name == "search_new_tab":
             pyautogui.hotkey("ctrl", "t")
-            sleep_interruptible(0.08)
+            sleep_interruptible(0.06)
             text = sanitize_text_for_keyboard(str(action.get("text", "")))
             if text:
                 pyautogui.write(text, interval=0.03)
             pyautogui.press("enter")
 
         else:
-            time.sleep(0.5)
+            time.sleep(0.2)
 
     except Exception:
         logging.error("执行动作失败：%s\n%s", action, traceback.format_exc())
 
 
-def save_experience(image, action: Dict, features: Dict, rect: BrowserRect) -> None:
+def estimate_reward(next_features: Dict, previous_features: Dict, action: Dict) -> float:
+    reward = 0.0
+    reward += min(0.6, abs(next_features.get("brightness", 0) - previous_features.get("brightness", 0)) / 255.0)
+    reward += min(0.6, abs(next_features.get("texture", 0) - previous_features.get("texture", 0)) / 80.0)
+    if action.get("action") == "click":
+        reward += 0.15
+    return round(float(reward - 0.15), 4)
+
+
+def save_experience(
+    image,
+    action: Dict,
+    features: Dict,
+    rect: BrowserRect,
+    embedding: np.ndarray,
+    scene: Dict,
+    ui_elements: List[Dict],
+    reward: float,
+) -> None:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     img_file = EXPERIENCE_DIR / f"exp_{ts}.jpg"
     json_file = EXPERIENCE_DIR / f"exp_{ts}.json"
@@ -630,10 +725,14 @@ def save_experience(image, action: Dict, features: Dict, rect: BrowserRect) -> N
         "browser_rect": rect.__dict__,
         "action": action,
         "features": features,
+        "scene": scene,
+        "ui_elements": ui_elements[:80],
+        "embedding": embedding.astype(float).tolist(),
+        "reward": reward,
     }
 
     try:
-        image.save(img_file, format="JPEG", quality=78)
+        image.save(img_file, format="JPEG", quality=76)
         json_file.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
         add_file_to_pool_index(img_file)
         add_file_to_pool_index(json_file)
@@ -648,7 +747,6 @@ def esc_pressed() -> bool:
 
 
 def on_esc_press() -> None:
-    """用户按 ESC 后立刻终止程序。"""
     if STOP_EVENT.is_set():
         return
     STOP_EVENT.set()
@@ -677,8 +775,6 @@ def sleep_interruptible(seconds: float) -> None:
 
 
 def async_trim_experience_pool() -> None:
-    """后台清理经验池，避免主循环阻塞。"""
-
     def worker() -> None:
         if not TRIM_LOCK.acquire(blocking=False):
             logging.info("经验池清理任务正在进行，跳过本轮触发。")
@@ -693,46 +789,77 @@ def async_trim_experience_pool() -> None:
 
 
 def main() -> None:
-    logging.info("=" * 60)
-    logging.info("浏览器 AI 启动（单文件离线版 + OCR + 人类轨迹）")
+    logging.info("=" * 64)
+    logging.info("浏览器 AI 启动（单文件版：VLM + UIA + RAG + FPS优化）")
     logging.info("按 ESC 终止程序")
-    logging.info("=" * 60)
+    logging.info("=" * 64)
 
     ensure_init_files()
     init_experience_pool_index()
     init_ocr()
+    init_vlm()
     setup_esc_kill_switch()
     browser = launch_or_get_firefox_window()
 
     loop_count = 0
+    prev_features = {"brightness": 0.0, "texture": 0.0}
+    cached_ocr: List[Dict] = []
+
     while True:
         if esc_pressed():
             logging.info("检测到 ESC，程序终止。")
             break
 
         try:
+            loop_start = time.perf_counter()
             browser = launch_or_get_firefox_window()
             rect = window_to_rect(browser)
             screenshot, features = grab_browser_snapshot(rect)
-            clickable_points = find_clickable_elements(screenshot)
-            ocr_results = run_ocr_text_detection(screenshot)
+            local_region, _ = get_local_region(screenshot, rect)
+
+            if loop_count % OCR_INTERVAL == 0:
+                full_scan = screenshot.resize((max(320, screenshot.width // 2), max(220, screenshot.height // 2)))
+                ocr_global = run_ocr_text_detection(full_scan)
+                ocr_local = run_ocr_text_detection(local_region)
+                cached_ocr = ocr_global + ocr_local
+            ocr_results = cached_ocr
+
+            ui_elements = get_clickable_elements_by_uia(rect)
+            scene = summarize_scene_with_vlm(local_region, ocr_results, ui_elements)
             features["ocr_text_count"] = len(ocr_results)
+            features["ui_count"] = len(ui_elements)
+            features["scene_labels"] = scene.get("labels", [])
 
-            experiences = list_recent_experiences(limit=160)
-            action = choose_action(features, experiences, clickable_points, ocr_results)
+            embedding = compute_embedding(features, ui_elements, ocr_results, scene)
+            experiences = list_recent_experiences(limit=240)
+            similar_records = retrieve_similar_experiences(embedding, experiences, top_k=10)
+            action = choose_action(features, similar_records, ui_elements, ocr_results, scene)
 
-            logging.info("第 %s 轮决策：%s", loop_count, action)
+            logging.info(
+                "第 %s 轮: scene=%s, ui=%s, ocr=%s, action=%s",
+                loop_count,
+                scene.get("labels"),
+                len(ui_elements),
+                len(ocr_results),
+                action,
+            )
+
             execute_action(action, rect)
-            save_experience(screenshot, action, features, rect)
+            reward = estimate_reward(features, prev_features, action)
+            save_experience(screenshot, action, features, rect, embedding, scene, ui_elements, reward)
 
+            prev_features = features
             loop_count += 1
-            if loop_count % 100 == 0:
+            if loop_count % 90 == 0:
                 async_trim_experience_pool()
-            sleep_interruptible(0.3)
+
+            loop_spent = time.perf_counter() - loop_start
+            target_sleep = max(0.05, 0.22 - min(0.12, loop_spent / 6.0))
+            sleep_interruptible(target_sleep)
 
         except Exception:
             logging.error("主循环异常：\n%s", traceback.format_exc())
-            sleep_interruptible(0.4)
+            sleep_interruptible(0.35)
 
     logging.info("程序已安全退出。")
 
