@@ -15,6 +15,16 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 # =========================
+# Win11 高分屏坐标修复（必须在 pyautogui 导入前）
+# =========================
+try:
+    import ctypes
+
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    pass
+
+# =========================
 # 全局告警处理（按需求预防）
 # =========================
 warnings.filterwarnings("ignore", category=FutureWarning, message=r".*pynvml package is deprecated.*")
@@ -75,6 +85,8 @@ class BrowserRect:
 # 延迟导入，错误打印详细信息
 try:
     import keyboard
+    import cv2
+    import numpy as np
     import pyautogui
     import pygetwindow as gw
     from PIL import ImageGrab
@@ -205,6 +217,35 @@ def grab_browser_snapshot(rect: BrowserRect):
     }
 
 
+def find_clickable_elements(image) -> List[Tuple[float, float]]:
+    """用轻量 CV 提取潜在可点击区域中心点（返回相对坐标 ratio）。"""
+    clickable_points: List[Tuple[float, float]] = []
+    try:
+        img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(img_cv, 50, 150)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        h, w = img_cv.shape[:2]
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 120:
+                continue
+            x, y, cw, ch = cv2.boundingRect(cnt)
+            if cw < 12 or ch < 10:
+                continue
+            M = cv2.moments(cnt)
+            if M["m00"] == 0:
+                continue
+            cX = int(M["m10"] / M["m00"])
+            cY = int(M["m01"] / M["m00"])
+            if 0 <= cX < w and 0 <= cY < h:
+                clickable_points.append((round(cX / w, 4), round(cY / h, 4)))
+    except Exception:
+        logging.error("CV 提取可点击元素失败：\n%s", traceback.format_exc())
+
+    return clickable_points
+
+
 def list_recent_experiences(limit: int = 120) -> List[Dict]:
     files = sorted(EXPERIENCE_DIR.glob("exp_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
     records: List[Dict] = []
@@ -216,7 +257,7 @@ def list_recent_experiences(limit: int = 120) -> List[Dict]:
     return records
 
 
-def choose_action(features: Dict, recent_records: List[Dict]) -> Dict:
+def choose_action(features: Dict, recent_records: List[Dict], clickable_points: List[Tuple[float, float]]) -> Dict:
     """离线“模型”：结合视觉特征 + 经验池做策略决策。"""
     def action_name(record: Dict) -> str:
         raw_action = record.get("action")
@@ -264,13 +305,22 @@ def choose_action(features: Dict, recent_records: List[Dict]) -> Dict:
     repeated_click = len(last_three) == 3 and all(a == "click" for a in last_three)
 
     if repeated_scroll:
-        return {"action": "click", "x_ratio": round(random.uniform(0.35, 0.65), 3), "y_ratio": 0.18, "reason": "连续滚动后尝试激活顶部交互区"}
+        return {"action": "hotkey", "keys": ["ctrl", "f"], "text": "帮助", "press_enter": True, "reason": "连续滚动后改用页面搜索定位重点"}
     if repeated_click:
-        return {"action": "scroll", "amount": -420, "reason": "连续点击无效，切换滚动探索"}
+        return {"action": "hotkey", "keys": ["pgdn"], "reason": "连续点击无效，改用翻页探索"}
 
     # 根据页面亮度/纹理做启发式判断
     if brightness < 60:
         return {"action": "scroll", "amount": -360, "reason": "页面偏暗，向下探索更多内容"}
+
+    if clickable_points and random.random() < 0.7:
+        x_ratio, y_ratio = random.choice(clickable_points)
+        return {
+            "action": "click",
+            "x_ratio": x_ratio,
+            "y_ratio": y_ratio,
+            "reason": "CV 检测到疑似控件中心，执行精准点击",
+        }
 
     if texture > 28 and action_counts.get("click", 0) <= action_counts.get("scroll", 0):
         return {
@@ -283,20 +333,38 @@ def choose_action(features: Dict, recent_records: List[Dict]) -> Dict:
     # 低纹理页面：尝试输入搜索词（禁止 ESC）
     if texture < 15 and random.random() < 0.25:
         terms = ["最新消息", "教程", "AI", "帮助", "示例"]
-        return {"action": "type", "text": random.choice(terms), "press_enter": True, "reason": "页面较空，尝试输入关键词"}
+        return {
+            "action": "hotkey",
+            "keys": ["ctrl", "l"],
+            "text": random.choice(terms),
+            "press_enter": True,
+            "reason": "页面较空，先定位地址栏再输入，避免虚空打字",
+        }
 
     # 带奖励偏好的动作选择：更倾向历史上“视觉变化”更明显的动作
     if mean_reward["type"] > max(mean_reward["click"], mean_reward["scroll"]) and random.random() < 0.22:
         terms = ["帮助", "设置", "功能", "说明", "AI"]
         return {
-            "action": "type",
+            "action": "hotkey",
+            "keys": ["ctrl", "f"],
             "text": random.choice(terms),
             "press_enter": True,
-            "reason": f"历史经验显示输入行为收益较高({mean_reward['type']:.1f})",
+            "reason": f"历史经验显示输入行为收益较高({mean_reward['type']:.1f})，优先页面搜索",
         }
 
     if mean_reward["scroll"] >= mean_reward["click"] and random.random() < 0.55:
+        if random.random() < 0.45:
+            key = random.choice(["pgdn", "space", "pgup"])
+            return {"action": "hotkey", "keys": [key], "reason": "使用浏览器快捷键进行高效滚动探索"}
         return {"action": "scroll", "amount": -random.randint(250, 520), "reason": "常规探索"}
+
+    if random.random() < 0.12:
+        terms = ["AI 教程", "Firefox 技巧", "自动化 示例"]
+        return {
+            "action": "search_new_tab",
+            "text": random.choice(terms),
+            "reason": "主动新建标签搜索，扩展经验",
+        }
 
     return {
         "action": "click",
@@ -341,6 +409,28 @@ def execute_action(action: Dict, rect: BrowserRect) -> None:
             if bool(action.get("press_enter", False)):
                 pyautogui.press("enter")
 
+        elif name == "hotkey":
+            keys = action.get("keys", [])
+            if isinstance(keys, list) and keys:
+                if len(keys) == 1:
+                    pyautogui.press(str(keys[0]))
+                else:
+                    pyautogui.hotkey(*[str(k) for k in keys])
+
+            text = sanitize_text_for_keyboard(str(action.get("text", "")))
+            if text:
+                pyautogui.write(text, interval=0.03)
+            if bool(action.get("press_enter", False)):
+                pyautogui.press("enter")
+
+        elif name == "search_new_tab":
+            pyautogui.hotkey("ctrl", "t")
+            sleep_interruptible(0.08)
+            text = sanitize_text_for_keyboard(str(action.get("text", "")))
+            if text:
+                pyautogui.write(text, interval=0.03)
+            pyautogui.press("enter")
+
         else:
             time.sleep(0.5)
 
@@ -366,8 +456,6 @@ def save_experience(image, action: Dict, features: Dict, rect: BrowserRect) -> N
         json_file.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         logging.error("保存经验失败：\n%s", traceback.format_exc())
-
-    trim_experience_pool()
 
 
 def esc_pressed() -> bool:
@@ -423,15 +511,19 @@ def main() -> None:
             browser = launch_or_get_firefox_window()
             rect = window_to_rect(browser)
             screenshot, features = grab_browser_snapshot(rect)
+            clickable_points = find_clickable_elements(screenshot)
 
             experiences = list_recent_experiences(limit=160)
-            action = choose_action(features, experiences)
+            action = choose_action(features, experiences, clickable_points)
 
             logging.info("第 %s 轮决策：%s", loop_count, action)
             execute_action(action, rect)
             save_experience(screenshot, action, features, rect)
 
             loop_count += 1
+
+            if loop_count % 100 == 0:
+                trim_experience_pool()
             sleep_interruptible(0.3)
 
         except Exception:
