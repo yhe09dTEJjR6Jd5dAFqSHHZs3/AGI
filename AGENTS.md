@@ -1,5 +1,3 @@
-操作系统：Windows 11
-
 代码：无注释、无要求中未提及的硬编码；
 
 雷电模拟器默认路径（可修改）：D:\LDPlayer9\dnplayer.exe
