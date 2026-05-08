@@ -1,1085 +1,1709 @@
+import copy
+import ctypes
 import json
-import logging
 import math
-import os
 import random
-import re
-import sqlite3
-import sys
+import subprocess
 import threading
 import time
-import traceback
-import warnings
-import subprocess
-from dataclasses import dataclass
+import uuid
+from collections import defaultdict, deque
+from dataclasses import dataclass, fields
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 
-# =========================
-# Win11 高分屏坐标修复（必须在 pyautogui 导入前）
-# =========================
+IMPORT_ERRORS = {}
 try:
-    import ctypes
-
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
-except Exception:
-    pass
-
-# =========================
-# 全局告警处理（按需求预防）
-# =========================
-warnings.filterwarnings("default")
-
-# =========================
-# 日志：禁止静默失败
-# =========================
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-
-
-def global_exception_handler(exc_type, exc_value, exc_traceback):
-    if issubclass(exc_type, KeyboardInterrupt):
-        logging.info("收到 KeyboardInterrupt，程序退出。")
-        return
-    logging.error("发生未捕获异常：")
-    logging.error("".join(traceback.format_exception(exc_type, exc_value, exc_traceback)))
-
-
-sys.excepthook = global_exception_handler
-
-
-# =========================
-# 运行参数与路径
-# =========================
-DESKTOP = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop"
-AAA_DIR = DESKTOP / "AAA"
-MODEL_FILE = AAA_DIR / "AI模型.json"
-EXPERIENCE_DIR = AAA_DIR / "经验池"
-FIREFOX_PATH = Path(r"E:\FirefoxPortable\FirefoxPortable.exe")
-MAX_EXPERIENCE_BYTES = 20 * 1024 * 1024 * 1024
-
-LOCAL_REGION_SIZE = 512
-RECONCILE_INTERVAL_SECONDS = 300
-
-
-@dataclass
-class BrowserRect:
-    left: int
-    top: int
-    width: int
-    height: int
-
-    @property
-    def right(self) -> int:
-        return self.left + self.width
-
-    @property
-    def bottom(self) -> int:
-        return self.top + self.height
-
-
-# 延迟导入，错误打印详细信息
+    import mss
+except Exception as exc:
+    mss = None
+    IMPORT_ERRORS["mss"] = exc
 try:
-    import easyocr
-    import keyboard
-    import numpy as np
-    import pyautogui
-    import pygetwindow as gw
-    import pytweening
+    from PIL import Image
+except Exception as exc:
+    Image = None
+    IMPORT_ERRORS["PIL"] = exc
+try:
+    import psutil
+except Exception as exc:
+    psutil = None
+    IMPORT_ERRORS["psutil"] = exc
+try:
+    import win32api
+    import win32con
+    import win32gui
+    import win32process
+except Exception as exc:
+    win32api = None
+    win32con = None
+    win32gui = None
+    win32process = None
+    IMPORT_ERRORS["pywin32"] = exc
+try:
+    from pynput import mouse as pynput_mouse
+except Exception as exc:
+    pynput_mouse = None
+    IMPORT_ERRORS["pynput.mouse"] = exc
+try:
+    from pynput import keyboard as pynput_keyboard
+except Exception as exc:
+    pynput_keyboard = None
+    IMPORT_ERRORS["pynput.keyboard"] = exc
 
-    def setup_comtypes_cache() -> None:
+DEFAULT_LDPLAYER_PATH = r"D:\LDPlayer9\dnplayer.exe"
+DEFAULT_DATA_PATH = r"C:\Users\Administrator\Desktop\AAA"
+DEFAULT_TRAINING_SECONDS = 900
+DEFAULT_SLEEP_SECONDS = 1800
+DEFAULT_STILL_SECONDS = 10
+REQUIRED_MODULES = ("mss", "PIL", "psutil", "pywin32", "pynput.mouse")
+MODE_NAMES = {"idle": "空闲", "starting": "准备中", "learning": "学习模式", "training": "训练模式", "sleep": "睡眠模式"}
+
+
+@dataclass(frozen=True)
+class Settings:
+    hash_size: int = 16
+    nearest_top_k: int = 96
+    nearest_candidate_limit: int = 4096
+    hash_prefix_bits: int = 12
+    mouse_still_tick: float = 0.03
+    training_tick: float = 0.05
+    sleep_tick: float = 0.1
+    key_debounce_seconds: float = 0.35
+    window_attach_seconds: float = 45.0
+    window_poll_seconds: float = 0.5
+    min_action_delay_seconds: float = 0.03
+    random_action_min: float = 0.08
+    random_action_max: float = 0.92
+    explore_min_rate: float = 0.04
+    explore_max_rate: float = 0.55
+    action_jitter: float = 0.018
+    softmax_temperature: float = 16.0
+    human_profile_min_samples: int = 24
+    human_profile_max_samples: int = 5000
+    human_profile_keep_samples: int = 4000
+    window_title_keywords: tuple = ("ldplayer", "雷电", "leidian")
+    ui_width: int = 940
+    ui_height: int = 660
+    ui_min_width: int = 880
+    ui_min_height: int = 620
+    ui_padding: int = 18
+    ui_section_padding: int = 12
+    ui_metric_columns: int = 5
+    click_direct_threshold: float = 0.006
+    drag_direct_threshold: float = 0.006
+    drag_min_points: int = 4
+    drag_bend_penalty_threshold: float = 3.2
+    click_long_duration: float = 0.9
+    reward_total_min: float = -100.0
+    reward_total_max: float = 200.0
+    score_default: float = 65.0
+    scroll_score_default: float = 72.0
+    fallback_score_base: float = 62.0
+    global_action_probability: float = 0.55
+    random_click_duration_min: float = 0.07
+    random_click_duration_max: float = 0.22
+    action_duration_min: float = 0.05
+    action_duration_max: float = 1.8
+    generated_click_hold_max: float = 0.25
+    generated_sleep_tick: float = 0.015
+    generated_wait_tick: float = 0.02
+    motion_steps_per_second: float = 60.0
+    motion_curve_offset_min: float = 0.04
+    motion_curve_offset_max: float = 0.16
+    motion_first_control_min: float = 0.25
+    motion_first_control_max: float = 0.45
+    motion_second_control_min: float = 0.55
+    motion_second_control_max: float = 0.75
+
+
+@dataclass(frozen=True)
+class Config:
+    ldplayer_path: Path
+    data_path: Path
+    training_seconds: int
+    sleep_seconds: int
+    still_seconds: float
+    settings: Settings
+
+
+@dataclass(frozen=True)
+class HashValue:
+    value: int
+    bits: int
+    hex: str
+
+
+@dataclass(frozen=True)
+class ScreenSnapshot:
+    path: Path
+    relative_path: str
+    hash_value: HashValue
+    captured_at: str
+    perf_time: float
+    elapsed: float
+    rect: tuple
+
+
+def enable_dpi_awareness():
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
         try:
-            import shutil
-
-            gen_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "LocalBrowserAI" / "comtypes_gen"
-            if gen_dir.exists():
-                shutil.rmtree(gen_dir, ignore_errors=True)
-            gen_dir.mkdir(parents=True, exist_ok=True)
-            os.environ["COMTYPES_CACHE"] = str(gen_dir)
+            ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
-            logging.warning("设置 comtypes 缓存目录失败：\n%s", traceback.format_exc())
-
-    setup_comtypes_cache()
-    import uiautomation as automation
-    from PIL import ImageGrab
-except Exception:
-    logging.error("依赖导入失败，详细错误如下：")
-    logging.error(traceback.format_exc())
-    raise
-
-pyautogui.FAILSAFE = False
+            pass
 
 
-def refresh_screen_size() -> None:
-    global SCREEN_WIDTH, SCREEN_HEIGHT
+def now_text():
+    return datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
+def safe_int(value, default):
     try:
-        size = pyautogui.size()
-        SCREEN_WIDTH, SCREEN_HEIGHT = int(size.width), int(size.height)
+        return int(float(value))
     except Exception:
-        SCREEN_WIDTH, SCREEN_HEIGHT = 2560, 1600
-        logging.error("动态获取分辨率失败，回退为默认 2560x1600：\n%s", traceback.format_exc())
+        return default
 
 
-def ensure_package(module_name: str, pip_name: Optional[str] = None) -> bool:
+def safe_float(value, default):
     try:
-        __import__(module_name)
-        return True
+        return float(value)
     except Exception:
-        target = pip_name or module_name
-        logging.warning("依赖 %s 缺失，尝试自动安装：%s", module_name, target)
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", target])
-            __import__(module_name)
-            logging.info("依赖安装成功：%s", target)
-            return True
-        except Exception:
-            logging.error("自动安装依赖失败（%s）：\n%s", target, traceback.format_exc())
-            return False
-
-STOP_EVENT = threading.Event()
-TRIM_LOCK = threading.Lock()
-POOL_DB_LOCK = threading.Lock()
-
-OCR_READER = None
-POOL_DB_FILE = EXPERIENCE_DIR / "experience_index.sqlite3"
-CURRENT_POOL_SIZE = 0
-VLM_AVAILABLE = False
-VLM_MODEL = None
-VLM_PROCESSOR = None
-LAST_RECONCILE_TS = 0.0
-LAST_ACTIONS: List[Dict] = []
-FIREFOX_WINDOW_CACHE = {"hwnd": None, "last_rect": None}
-SCREEN_WIDTH, SCREEN_HEIGHT = 0, 0
-
-
-def ensure_init_files() -> bool:
-    """初始化阶段：严格检查 AAA/AI模型/经验池，缺失时给出下载与准备指引。"""
-    try:
-        missing_targets: List[str] = []
-
-        if not AAA_DIR.exists():
-            missing_targets.append("AAA 文件夹")
-            logging.error("未找到目录：%s", AAA_DIR)
-        else:
-            logging.info("检测到 AAA 目录：%s", AAA_DIR)
-
-        if not EXPERIENCE_DIR.exists() or not EXPERIENCE_DIR.is_dir():
-            missing_targets.append("经验池")
-            logging.error("未找到经验池目录：%s", EXPERIENCE_DIR)
-            logging.error(
-                "经验池准备方法：\n"
-                "  1) 打开资源管理器进入 %s\n"
-                "  2) 新建文件夹并命名为 经验池\n"
-                "  3) 可选：下载公开网页视觉数据作为初始经验（ZIP）\n"
-                "     URL: https://huggingface.co/datasets/HuggingFaceM4/WebSight/resolve/main/sample_web_experience.zip\n"
-                "  4) 下载后解压到 %s（建议保留 exp_*.jpg / exp_*.json 命名）",
-                AAA_DIR,
-                EXPERIENCE_DIR,
-            )
-        else:
-            logging.info("检测到经验池目录：%s", EXPERIENCE_DIR)
-
-        model_dir_exists = any((AAA_DIR / name).is_dir() for name in ["moondream2", "phi3_vision"])
-        if not MODEL_FILE.exists() and not model_dir_exists:
-            missing_targets.append("AI模型")
-            logging.error("未找到 AI 模型文件（%s）或模型目录（moondream2/phi3_vision）。", MODEL_FILE)
-            logging.error(
-                "AI 模型下载方法（推荐 moondream2）：\n"
-                "  1) 访问模型页: https://huggingface.co/vikhyatk/moondream2\n"
-                "  2) 安装 Git LFS（如未安装）: https://git-lfs.com/\n"
-                "  3) 在 PowerShell 执行：\n"
-                "     cd %s\n"
-                "     git lfs install\n"
-                "     git clone https://huggingface.co/vikhyatk/moondream2\n"
-                "  4) 确认目录存在：%s\\moondream2\n"
-                "备选模型（显存更高需求）：https://huggingface.co/microsoft/Phi-3-vision-128k-instruct",
-                AAA_DIR,
-                AAA_DIR,
-            )
-        else:
-            if MODEL_FILE.exists():
-                logging.info("检测到 AI 模型配置文件：%s", MODEL_FILE)
-            if model_dir_exists:
-                logging.info("检测到本地视觉模型目录（moondream2 或 phi3_vision）。")
-
-        if missing_targets:
-            logging.error("初始化检查未通过，缺失项：%s", "、".join(missing_targets))
-            return False
-
-        if not MODEL_FILE.exists():
-            base_model = {
-                "name": "LocalBrowserAI",
-                "version": "3.4-vlm-uia-rag",
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-                "policy": {
-                    "auto_model_download_if_missing": True,
-                    "allow_keyboard_keys_except_esc": True,
-                    "only_mouse_inside_browser": True,
-                },
-                "knowledge": {
-                    "goals": ["理解页面", "优先高价值交互", "记忆历史操作", "避免重复无效动作"],
-                    "safe_actions": ["click", "scroll", "type", "wait", "hotkey", "search_new_tab"],
-                },
-            }
-            MODEL_FILE.write_text(json.dumps(base_model, ensure_ascii=False, indent=2), encoding="utf-8")
-            logging.info("已补齐 AI 模型配置文件：%s", MODEL_FILE)
-
-        return True
-    except Exception:
-        logging.error("初始化阶段失败，详细错误：\n%s", traceback.format_exc())
-        raise
-
-
-def init_ocr() -> None:
-    global OCR_READER
-    try:
-        OCR_READER = easyocr.Reader(["ch_sim", "en"], gpu=True, verbose=False)
-        logging.info("OCR 初始化完成（EasyOCR，中文+英文，GPU加速已开启）。")
-    except Exception:
-        logging.error("OCR 初始化失败，详细错误：\n%s", traceback.format_exc())
-        raise
-
-
-def init_vlm() -> None:
-    """VLM 初始化：本地优先，缺失自动下载，失败时降级规则语义。"""
-    global VLM_AVAILABLE, VLM_MODEL, VLM_PROCESSOR
-    model_map = {
-        "moondream2": "vikhyatk/moondream2",
-        "phi3_vision": "microsoft/Phi-3-vision-128k-instruct",
-    }
-    model_dir_name = next((k for k in ["moondream2", "phi3_vision"] if (AAA_DIR / k).is_dir()), "moondream2")
-    model_root = AAA_DIR / model_dir_name
-
-    if not model_root.exists():
-        if not ensure_package("huggingface_hub"):
-            logging.warning("缺少 huggingface_hub，无法自动下载模型，使用规则语义回退。")
-            return
-        try:
-            from huggingface_hub import snapshot_download
-
-            logging.warning("未检测到本地模型目录 %s，尝试自动下载 %s ...", model_root, model_map[model_dir_name])
-            snapshot_download(
-                repo_id=model_map[model_dir_name],
-                local_dir=str(model_root),
-                resume_download=True,
-                local_dir_use_symlinks=False,
-            )
-            logging.info("模型下载完成：%s", model_root)
-        except Exception:
-            logging.error("自动下载模型失败，降级到规则语义：\n%s", traceback.format_exc())
-            return
-
-    if not ensure_package("transformers"):
-        logging.warning("缺少 transformers，无法加载 VLM，使用规则语义回退。")
-        return
-
-    try:
-        from transformers import AutoModelForCausalLM, AutoProcessor
-
-        VLM_PROCESSOR = AutoProcessor.from_pretrained(str(model_root), trust_remote_code=True, local_files_only=True)
-        VLM_MODEL = AutoModelForCausalLM.from_pretrained(
-            str(model_root), trust_remote_code=True, local_files_only=True, device_map="auto"
-        )
-        VLM_AVAILABLE = True
-        logging.info("VLM 初始化完成：%s", model_root)
-    except Exception:
-        logging.error("VLM 初始化失败，降级到规则语义：\n%s", traceback.format_exc())
-
-
-def init_experience_pool_index() -> None:
-    """初始化经验池索引，避免每次全量扫描经验池目录。"""
-    global CURRENT_POOL_SIZE
-    try:
-        with sqlite3.connect(POOL_DB_FILE) as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS files (
-                    path TEXT PRIMARY KEY,
-                    size INTEGER NOT NULL,
-                    created_ts REAL NOT NULL
-                )
-                """
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_files_created_ts ON files(created_ts)")
-
-            row = conn.execute("SELECT COUNT(1), COALESCE(SUM(size), 0) FROM files").fetchone()
-            indexed_count = int(row[0]) if row else 0
-            indexed_size = int(row[1]) if row else 0
-
-            if indexed_count == 0:
-                logging.info("首次构建经验池索引，扫描历史文件中...")
-                records = []
-                for p in EXPERIENCE_DIR.iterdir():
-                    if not p.is_file():
-                        continue
-                    if not p.name.startswith("exp_"):
-                        continue
-                    if p.suffix.lower() not in {".jpg", ".json"}:
-                        continue
-                    stat = p.stat()
-                    records.append((str(p), int(stat.st_size), float(stat.st_mtime)))
-
-                if records:
-                    conn.executemany(
-                        "INSERT OR REPLACE INTO files(path, size, created_ts) VALUES (?, ?, ?)",
-                        records,
-                    )
-                    conn.commit()
-                    indexed_size = sum(size for _, size, _ in records)
-                logging.info("经验池索引已构建，共 %s 条。", len(records))
-
-            CURRENT_POOL_SIZE = indexed_size
-            logging.info("经验池当前大小：%.2fGB", CURRENT_POOL_SIZE / (1024**3))
-    except Exception:
-        logging.error("经验池索引初始化失败：\n%s", traceback.format_exc())
-        raise
-
-
-
-
-def reconcile_experience_pool_index() -> None:
-    """周期性校验经验池索引与磁盘，避免 DB 漂移。"""
-    global CURRENT_POOL_SIZE, LAST_RECONCILE_TS
-    try:
-        disk_records = {}
-        for p in EXPERIENCE_DIR.iterdir():
-            if p.is_file() and p.name.startswith("exp_") and p.suffix.lower() in {".jpg", ".json"}:
-                stat = p.stat()
-                disk_records[str(p)] = (int(stat.st_size), float(stat.st_mtime))
-
-        with POOL_DB_LOCK:
-            with sqlite3.connect(POOL_DB_FILE) as conn:
-                db_rows = conn.execute("SELECT path, size, created_ts FROM files").fetchall()
-                db_map = {row[0]: (int(row[1]), float(row[2])) for row in db_rows}
-
-                for path, (size, cts) in disk_records.items():
-                    if path not in db_map or db_map[path][0] != size:
-                        conn.execute(
-                            "INSERT OR REPLACE INTO files(path, size, created_ts) VALUES (?, ?, ?)",
-                            (path, size, cts),
-                        )
-                for path in set(db_map.keys()) - set(disk_records.keys()):
-                    conn.execute("DELETE FROM files WHERE path = ?", (path,))
-                conn.commit()
-
-        CURRENT_POOL_SIZE = sum(v[0] for v in disk_records.values())
-        LAST_RECONCILE_TS = time.time()
-        logging.info("经验池索引已对齐磁盘：%d 文件，%.2fGB", len(disk_records), CURRENT_POOL_SIZE / (1024**3))
-    except Exception:
-        logging.error("经验池索引对齐失败：\n%s", traceback.format_exc())
-
-
-def add_file_to_pool_index(file_path: Path) -> None:
-    global CURRENT_POOL_SIZE
-    try:
-        stat = file_path.stat()
-        size = int(stat.st_size)
-        created_ts = float(stat.st_mtime)
-        with POOL_DB_LOCK:
-            with sqlite3.connect(POOL_DB_FILE) as conn:
-                old = conn.execute("SELECT size FROM files WHERE path = ?", (str(file_path),)).fetchone()
-                if old:
-                    CURRENT_POOL_SIZE -= int(old[0])
-                conn.execute(
-                    "INSERT OR REPLACE INTO files(path, size, created_ts) VALUES (?, ?, ?)",
-                    (str(file_path), size, created_ts),
-                )
-                conn.commit()
-            CURRENT_POOL_SIZE += size
-    except Exception:
-        logging.error("经验池索引写入失败：%s\n%s", file_path, traceback.format_exc())
-
-
-def trim_experience_pool() -> None:
-    """经验池超过 20GB 时，删除最旧数据直到 <20GB（基于索引队列）。"""
-    global CURRENT_POOL_SIZE
-    try:
-        if CURRENT_POOL_SIZE <= MAX_EXPERIENCE_BYTES:
-            return
-
-        logging.warning("经验池大小 %.2fGB > 20GB，开始删除最旧数据...", CURRENT_POOL_SIZE / (1024**3))
-        with POOL_DB_LOCK:
-            with sqlite3.connect(POOL_DB_FILE) as conn:
-                while CURRENT_POOL_SIZE > MAX_EXPERIENCE_BYTES:
-                    row = conn.execute("SELECT path, size FROM files ORDER BY created_ts ASC LIMIT 1").fetchone()
-                    if not row:
-                        break
-
-                    file_path = Path(row[0])
-                    file_size = int(row[1])
-                    try:
-                        if file_path.exists():
-                            file_path.unlink()
-                    except Exception:
-                        logging.error("删除旧经验文件失败：%s\n%s", file_path, traceback.format_exc())
-
-                    conn.execute("DELETE FROM files WHERE path = ?", (str(file_path),))
-                    conn.commit()
-                    CURRENT_POOL_SIZE -= file_size
-                    logging.info("已删除旧经验：%s (%.2fMB)", file_path.name, file_size / (1024**2))
-
-        logging.info("经验池清理完成，当前大小：%.2fGB", CURRENT_POOL_SIZE / (1024**3))
-    except Exception:
-        logging.error("经验池清理失败：\n%s", traceback.format_exc())
-
-
-def launch_or_get_firefox_window(force_activate: bool = False):
-    """获取 Firefox 窗口，不存在则尝试启动便携版；优先复用缓存 hwnd。"""
-    try:
-        cached_hwnd = FIREFOX_WINDOW_CACHE.get("hwnd")
-        if cached_hwnd:
-            for w in gw.getAllWindows():
-                if getattr(w, "_hWnd", None) == cached_hwnd:
-                    if w.isMinimized:
-                        w.restore()
-                    if force_activate:
-                        w.activate()
-                    return w
-
-        wins = gw.getWindowsWithTitle("Mozilla Firefox")
-        if not wins:
-            if FIREFOX_PATH.exists():
-                os.startfile(str(FIREFOX_PATH))
-                logging.info("已尝试启动 Firefox Portable：%s", FIREFOX_PATH)
-                time.sleep(4)
-                wins = gw.getWindowsWithTitle("Mozilla Firefox")
-            else:
-                raise FileNotFoundError(f"Firefox 路径不存在：{FIREFOX_PATH}")
-
-        if not wins:
-            raise RuntimeError("未找到 Firefox 窗口，请确认浏览器已打开且标题含 Mozilla Firefox")
-
-        win = wins[0]
-        if win.isMinimized:
-            win.restore()
-        if force_activate:
-            win.activate()
-            time.sleep(0.2)
-        FIREFOX_WINDOW_CACHE["hwnd"] = getattr(win, "_hWnd", None)
-        return win
-    except Exception:
-        logging.error("浏览器获取失败：\n%s", traceback.format_exc())
-        raise
-
-
-def window_to_rect(win) -> BrowserRect:
-    rect = BrowserRect(left=win.left, top=win.top, width=win.width, height=win.height)
-    if rect.width <= 10 or rect.height <= 10:
-        raise ValueError(f"浏览器窗口尺寸异常：{rect}")
-    return rect
-
-
-def get_safe_rect(rect: BrowserRect) -> Tuple[int, int, int, int]:
-    left = max(0, rect.left)
-    top = max(0, rect.top)
-    right = min(SCREEN_WIDTH, rect.right)
-    bottom = min(SCREEN_HEIGHT, rect.bottom)
-    return left, top, right, bottom
-
-
-def grab_browser_snapshot(rect: BrowserRect):
-    safe_box = get_safe_rect(rect)
-    if safe_box[2] <= safe_box[0] or safe_box[3] <= safe_box[1]:
-        raise ValueError("浏览器完全在屏幕外或不可见，无法截图。")
-
-    image = ImageGrab.grab(safe_box)
-    sample = image.resize((96, 60)).convert("L")
-    pixels = np.asarray(sample, dtype=np.float32).flatten()
-    avg = float(np.mean(pixels))
-    texture = float(np.mean(np.abs(np.diff(pixels)))) if len(pixels) > 2 else 0.0
-    hist_vals, _ = np.histogram(pixels, bins=8, range=(0, 256))
-    return image, {
-        "brightness": avg,
-        "texture": texture,
-        "histogram_bins": hist_vals.astype(int).tolist(),
-    }
-
-
-def get_local_region(image, rect: BrowserRect):
-    left, top, right, bottom = get_safe_rect(rect)
-    abs_mouse_x, abs_mouse_y = pyautogui.position()
-    local_left = max(left, abs_mouse_x - LOCAL_REGION_SIZE // 2)
-    local_top = max(top, abs_mouse_y - LOCAL_REGION_SIZE // 2)
-    local_right = min(right, local_left + LOCAL_REGION_SIZE)
-    local_bottom = min(bottom, local_top + LOCAL_REGION_SIZE)
-    if local_right <= local_left or local_bottom <= local_top:
-        return image, (left, top)
-
-    rel_box = (local_left - left, local_top - top, local_right - left, local_bottom - top)
-    local_image = image.crop(rel_box)
-    return local_image, (local_left, local_top)
-
-
-def _normalize_rect(rect: BrowserRect, x: int, y: int) -> Tuple[float, float]:
-    safe_left, safe_top, safe_right, safe_bottom = get_safe_rect(rect)
-    w = max(1, safe_right - safe_left)
-    h = max(1, safe_bottom - safe_top)
-    return ((x - safe_left) / w, (y - safe_top) / h)
-
-
-def get_clickable_elements_by_uia(rect: BrowserRect, hwnd: Optional[int]) -> List[Dict]:
-    """使用窗口句柄抓取 UIA 根节点，感知阶段不移动鼠标。"""
-    items: List[Dict] = []
-    try:
-        if not hwnd:
-            return items
-        focus_control = automation.ControlFromHandle(hwnd)
-        if focus_control is None:
-            return items
-
-        seen = set()
-        queue = [focus_control]
-        max_nodes = 220
-        while queue and len(seen) < max_nodes:
-            ctrl = queue.pop(0)
-            key = f"{ctrl.ControlTypeName}:{ctrl.Name}:{id(ctrl)}"
-            if key in seen:
-                continue
-            seen.add(key)
-
-            try:
-                br = ctrl.BoundingRectangle
-                if not br:
-                    continue
-                l, t, r, b = int(br.left), int(br.top), int(br.right), int(br.bottom)
-                if r <= l or b <= t:
-                    continue
-                if l < rect.left or t < rect.top or r > rect.right or b > rect.bottom:
-                    continue
-                ctype = (ctrl.ControlTypeName or "").lower()
-                if ctype in {"buttoncontrol", "hyperlinkcontrol", "editcontrol", "menuitemcontrol", "tabitemcontrol"}:
-                    cx, cy = (l + r) // 2, (t + b) // 2
-                    x_ratio, y_ratio = _normalize_rect(rect, cx, cy)
-                    items.append({
-                        "name": (ctrl.Name or "").strip(),
-                        "type": ctype,
-                        "x_ratio": round(x_ratio, 4),
-                        "y_ratio": round(y_ratio, 4),
-                        "rect": [l, t, r, b],
-                    })
-
-                children = ctrl.GetChildren()
-                if children:
-                    queue.extend(children[:50])
-            except Exception:
-                logging.error("UIA 子节点解析失败：\n%s", traceback.format_exc())
-
-        return items
-    except Exception:
-        logging.error("UIA 提取可交互元素失败：\n%s", traceback.format_exc())
-        return []
-
-
-def run_ocr_text_detection(image) -> List[Dict]:
-    if OCR_READER is None:
-        return []
-    try:
-        results = OCR_READER.readtext(np.array(image))
-        parsed: List[Dict] = []
-        for box, text, confidence in results:
-            if not text:
-                continue
-            parsed.append({"text": str(text), "confidence": float(confidence), "box": box})
-        return parsed
-    except Exception:
-        logging.error("OCR 识别失败：\n%s", traceback.format_exc())
-        return []
-
-
-def summarize_scene_with_vlm(image, ocr_results: List[Dict], ui_elements: List[Dict]) -> Dict:
-    """VLM理解场景：例如识别登录框、广告关闭按钮等。"""
-    ocr_text = " ".join(x.get("text", "") for x in ocr_results).lower()
-    labels = []
-
-    if VLM_AVAILABLE and VLM_MODEL is not None and VLM_PROCESSOR is not None:
-        try:
-            prompt = (
-                "请识别当前浏览器页面的主要场景，并给出简短标签，"
-                "例如 login_form / ad_popup / article / search_result。只返回逗号分隔标签。"
-            )
-            inputs = VLM_PROCESSOR(text=prompt, images=image, return_tensors="pt")
-            outputs = VLM_MODEL.generate(**inputs, max_new_tokens=24)
-            text = VLM_PROCESSOR.batch_decode(outputs, skip_special_tokens=True)[0].lower()
-            labels = [x.strip() for x in re.split(r"[,;\n]", text) if x.strip()]
-        except Exception:
-            logging.error("VLM 推理失败，回退到规则语义：\n%s", traceback.format_exc())
-
-    if not labels:
-        if any(k in ocr_text for k in ["登录", "sign in", "log in", "password", "账号", "邮箱"]):
-            labels.append("login_form")
-        if any(k in ocr_text for k in ["advertisement", "sponsored", "广告", "推广"]):
-            labels.append("ad_popup")
-        if any(u.get("name", "").lower() in {"close", "关闭", "x"} for u in ui_elements):
-            labels.append("has_close_button")
-        if not labels:
-            labels.append("generic_page")
-
-    return {
-        "labels": list(dict.fromkeys(labels))[:6],
-        "ocr_text": ocr_text[:600],
-    }
-
-
-def compute_embedding(features: Dict, ui_elements: List[Dict], ocr_results: List[Dict], scene: Dict) -> np.ndarray:
-    hist = features.get("histogram_bins", [0] * 8)
-    hist = np.asarray(hist, dtype=np.float32)
-    hist = hist / max(1.0, np.sum(hist))
-
-    ui_count = float(len(ui_elements))
-    button_count = float(sum(1 for e in ui_elements if "button" in e.get("type", "")))
-    text_count = float(len(ocr_results))
-    scene_hash = float(sum(ord(ch) for lb in scene.get("labels", []) for ch in lb) % 997)
-
-    vector = np.concatenate(
-        [
-            np.asarray([features.get("brightness", 0.0), features.get("texture", 0.0)], dtype=np.float32) / 255.0,
-            np.asarray([ui_count, button_count, text_count, scene_hash / 997.0], dtype=np.float32) / 20.0,
-            hist,
-        ]
+        return default
+
+
+def clamp(value, minimum, maximum):
+    value = safe_float(value, minimum)
+    minimum = safe_float(minimum, value)
+    maximum = safe_float(maximum, value)
+    if minimum > maximum:
+        minimum, maximum = maximum, minimum
+    return max(minimum, min(maximum, value))
+
+
+def normalize_settings(settings):
+    random_min = clamp(settings.random_action_min, 0.0, 1.0)
+    random_max = clamp(settings.random_action_max, 0.0, 1.0)
+    if random_min > random_max:
+        random_min, random_max = random_max, random_min
+    max_samples = max(10, safe_int(settings.human_profile_max_samples, 5000))
+    keep_samples = clamp(settings.human_profile_keep_samples, 10, max_samples)
+    return Settings(
+        hash_size=max(4, safe_int(settings.hash_size, 16)),
+        nearest_top_k=max(1, safe_int(settings.nearest_top_k, 96)),
+        nearest_candidate_limit=max(1, safe_int(settings.nearest_candidate_limit, 4096)),
+        hash_prefix_bits=max(1, safe_int(settings.hash_prefix_bits, 12)),
+        mouse_still_tick=clamp(settings.mouse_still_tick, 0.01, 1.0),
+        training_tick=clamp(settings.training_tick, 0.01, 5.0),
+        sleep_tick=clamp(settings.sleep_tick, 0.05, 5.0),
+        key_debounce_seconds=clamp(settings.key_debounce_seconds, 0.05, 5.0),
+        window_attach_seconds=clamp(settings.window_attach_seconds, 1.0, 600.0),
+        window_poll_seconds=clamp(settings.window_poll_seconds, 0.05, 10.0),
+        min_action_delay_seconds=clamp(settings.min_action_delay_seconds, 0.0, 5.0),
+        random_action_min=random_min,
+        random_action_max=random_max,
+        explore_min_rate=clamp(settings.explore_min_rate, 0.0, 1.0),
+        explore_max_rate=clamp(settings.explore_max_rate, 0.0, 1.0),
+        action_jitter=clamp(settings.action_jitter, 0.0, 0.5),
+        softmax_temperature=max(0.1, safe_float(settings.softmax_temperature, 16.0)),
+        human_profile_min_samples=max(1, safe_int(settings.human_profile_min_samples, 24)),
+        human_profile_max_samples=max_samples,
+        human_profile_keep_samples=int(keep_samples),
+        window_title_keywords=tuple(settings.window_title_keywords) or ("ldplayer", "雷电", "leidian"),
+        ui_width=max(1, safe_int(settings.ui_width, 940)),
+        ui_height=max(1, safe_int(settings.ui_height, 660)),
+        ui_min_width=max(1, safe_int(settings.ui_min_width, 880)),
+        ui_min_height=max(1, safe_int(settings.ui_min_height, 620)),
+        ui_padding=max(0, safe_int(settings.ui_padding, 18)),
+        ui_section_padding=max(0, safe_int(settings.ui_section_padding, 12)),
+        ui_metric_columns=max(5, safe_int(settings.ui_metric_columns, 5)),
+        click_direct_threshold=clamp(settings.click_direct_threshold, 0.0, 1.0),
+        drag_direct_threshold=clamp(settings.drag_direct_threshold, 0.0, 1.0),
+        drag_min_points=max(1, safe_int(settings.drag_min_points, 4)),
+        drag_bend_penalty_threshold=clamp(settings.drag_bend_penalty_threshold, 1.0, 20.0),
+        click_long_duration=clamp(settings.click_long_duration, 0.0, 60.0),
+        reward_total_min=clamp(settings.reward_total_min, -10000.0, 10000.0),
+        reward_total_max=clamp(settings.reward_total_max, -10000.0, 10000.0),
+        score_default=clamp(settings.score_default, 0.0, 100.0),
+        scroll_score_default=clamp(settings.scroll_score_default, 0.0, 100.0),
+        fallback_score_base=clamp(settings.fallback_score_base, 0.0, 100.0),
+        global_action_probability=clamp(settings.global_action_probability, 0.0, 1.0),
+        random_click_duration_min=clamp(settings.random_click_duration_min, 0.0, 60.0),
+        random_click_duration_max=clamp(settings.random_click_duration_max, 0.0, 60.0),
+        action_duration_min=clamp(settings.action_duration_min, 0.0, 60.0),
+        action_duration_max=clamp(settings.action_duration_max, 0.0, 60.0),
+        generated_click_hold_max=clamp(settings.generated_click_hold_max, 0.0, 60.0),
+        generated_sleep_tick=clamp(settings.generated_sleep_tick, 0.001, 1.0),
+        generated_wait_tick=clamp(settings.generated_wait_tick, 0.001, 1.0),
+        motion_steps_per_second=clamp(settings.motion_steps_per_second, 1.0, 1000.0),
+        motion_curve_offset_min=clamp(settings.motion_curve_offset_min, 0.0, 1.0),
+        motion_curve_offset_max=clamp(settings.motion_curve_offset_max, 0.0, 1.0),
+        motion_first_control_min=clamp(settings.motion_first_control_min, 0.0, 1.0),
+        motion_first_control_max=clamp(settings.motion_first_control_max, 0.0, 1.0),
+        motion_second_control_min=clamp(settings.motion_second_control_min, 0.0, 1.0),
+        motion_second_control_max=clamp(settings.motion_second_control_max, 0.0, 1.0)
     )
-    norm = float(np.linalg.norm(vector))
-    if norm > 1e-9:
-        vector = vector / norm
-    return vector.astype(np.float32)
 
 
-def list_recent_experiences(limit: int = 240) -> List[Dict]:
-    files = sorted(EXPERIENCE_DIR.glob("exp_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    records: List[Dict] = []
-    for p in files[:limit]:
+def settings_from_dict(data):
+    if not isinstance(data, dict):
+        return Settings()
+    defaults = Settings()
+    values = {}
+    for item in fields(Settings):
+        if item.name not in data:
+            continue
+        raw = data[item.name]
+        default = getattr(defaults, item.name)
         try:
-            records.append(json.loads(p.read_text(encoding="utf-8")))
+            if isinstance(default, bool):
+                values[item.name] = bool(raw)
+            elif isinstance(default, int) and not isinstance(default, bool):
+                values[item.name] = int(float(raw))
+            elif isinstance(default, float):
+                values[item.name] = float(raw)
+            elif isinstance(default, tuple):
+                if isinstance(raw, str):
+                    values[item.name] = tuple(part.strip() for part in raw.split(",") if part.strip())
+                elif isinstance(raw, (list, tuple)):
+                    values[item.name] = tuple(str(part).strip() for part in raw if str(part).strip())
+            else:
+                values[item.name] = raw
         except Exception:
-            logging.warning("读取经验文件失败：%s", p)
-    return records
-
-
-def retrieve_similar_experiences(current_embedding: np.ndarray, records: List[Dict], top_k: int = 12) -> List[Dict]:
-    scored = []
-    for rec in records:
-        emb = rec.get("embedding")
-        if not isinstance(emb, list) or not emb:
-            continue
-        try:
-            v = np.asarray(emb, dtype=np.float32)
-            denom = float(np.linalg.norm(v) * np.linalg.norm(current_embedding))
-            if denom <= 1e-9:
-                continue
-            score = float(np.dot(v, current_embedding) / denom)
-            scored.append((score, rec))
-        except Exception:
-            continue
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [r for _, r in scored[:top_k]]
-
-
-def page_changed(prev_hist: Optional[List[int]], curr_hist: List[int], threshold: float = 0.08) -> bool:
-    if not prev_hist:
-        return True
-    a = np.asarray(prev_hist, dtype=np.float32)
-    b = np.asarray(curr_hist, dtype=np.float32)
-    a = a / max(1.0, float(a.sum()))
-    b = b / max(1.0, float(b.sum()))
-    return float(np.mean(np.abs(a - b))) > threshold
-
-
-def pick_ocr_click_target(ocr_results: List[Dict], rect: BrowserRect) -> Optional[Dict]:
-    keywords = ["确定", "下一步", "同意", "搜索", "关闭", "登录", "继续", "开始"]
-    best = None
-    best_score = -1.0
-    for it in ocr_results:
-        txt = str(it.get("text", ""))
-        conf = float(it.get("confidence", it.get("conf", 0.0)))
-        box = it.get("box", [])
-        if len(box) < 4:
-            continue
-        xs = [pt[0] for pt in box]
-        ys = [pt[1] for pt in box]
-        cx, cy = int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
-        x_ratio, y_ratio = _normalize_rect(rect, cx, cy)
-        hit = any(k in txt for k in keywords)
-        score = conf + (0.35 if hit else 0.0)
-        if score > best_score and 0.02 < x_ratio < 0.98 and 0.02 < y_ratio < 0.98:
-            best_score = score
-            best = {"x_ratio": x_ratio, "y_ratio": y_ratio, "text": txt, "conf": conf, "keyword_hit": hit}
-    return best
-
-
-def penalize_repeated_action(action: Dict) -> Dict:
-    if action.get("action") != "click":
-        return action
-    x, y = float(action.get("x_ratio", 0.5)), float(action.get("y_ratio", 0.5))
-    now = time.time()
-    repeat = 0
-    for rec in LAST_ACTIONS[-8:]:
-        if rec.get("action") == "click" and now - float(rec.get("ts", 0.0)) < 8.0:
-            if abs(float(rec.get("x_ratio", 0)) - x) < 0.05 and abs(float(rec.get("y_ratio", 0)) - y) < 0.05:
-                repeat += 1
-    if repeat >= 2:
-        action["x_ratio"] = max(0.08, min(0.92, x + random.uniform(-0.15, 0.15)))
-        action["y_ratio"] = max(0.08, min(0.92, y + random.uniform(-0.15, 0.15)))
-        action["reason"] = f"{action.get('reason','')}（避免重复点击抖动）"
-    return action
-
-
-def choose_action(
-    features: Dict,
-    similar_records: List[Dict],
-    ui_elements: List[Dict],
-    ocr_results: List[Dict],
-    scene: Dict,
-    rect: BrowserRect,
-) -> Dict:
-    labels = set(scene.get("labels", []))
-    ocr_text = scene.get("ocr_text", "")
-
-    if "ad_popup" in labels and ui_elements:
-        close_candidates = [e for e in ui_elements if e.get("name", "").lower() in {"close", "关闭", "x"}]
-        if close_candidates:
-            c = random.choice(close_candidates)
-            return {"action": "click", "x_ratio": c["x_ratio"], "y_ratio": c["y_ratio"], "reason": "检测到广告弹窗"}
-
-    if "login_form" in labels:
-        input_box = next((e for e in ui_elements if "editcontrol" in e.get("type", "")), None)
-        if input_box:
-            return {"action": "click", "x_ratio": input_box["x_ratio"], "y_ratio": input_box["y_ratio"], "reason": "登录框聚焦"}
-
-    action_votes: Dict[str, float] = {"click": 0.0, "scroll": 0.0, "type": 0.0}
-    for rec in similar_records:
-        raw = rec.get("action", {})
-        name = raw.get("action") if isinstance(raw, dict) else raw
-        reward = float(rec.get("reward", 0.0))
-        if isinstance(name, str) and name in action_votes:
-            action_votes[name] += max(-0.2, min(1.5, reward + 0.4))
-
-    if similar_records and max(action_votes.values()) > 0.5:
-        best = max(action_votes, key=action_votes.get)
-        if best == "click" and ui_elements:
-            t = random.choice(ui_elements)
-            return {"action": "click", "x_ratio": t["x_ratio"], "y_ratio": t["y_ratio"], "reason": "RAG 复用动作"}
-        if best == "scroll":
-            return {"action": "scroll", "amount": -320, "reason": "RAG 建议滚动"}
-
-    if "captcha" in ocr_text or "验证码" in ocr_text:
-        return {"action": "hotkey", "keys": ["f5"], "reason": "验证码页面刷新"}
-
-    if ui_elements and random.random() < 0.82:
-        target = random.choice(ui_elements)
-        return {"action": "click", "x_ratio": target["x_ratio"], "y_ratio": target["y_ratio"], "reason": "UIA 元素点击"}
-
-    ocr_target = pick_ocr_click_target(ocr_results, rect)
-    if ocr_target:
-        return {
-            "action": "click",
-            "x_ratio": round(float(ocr_target["x_ratio"]), 4),
-            "y_ratio": round(float(ocr_target["y_ratio"]), 4),
-            "reason": f"OCR 兜底点击:{ocr_target['text'][:12]}",
-        }
-
-    if features.get("brightness", 120) < 70:
-        return {"action": "scroll", "amount": -280, "reason": "页面偏暗尝试滚动"}
-
-    return {"action": "click", "x_ratio": round(random.uniform(0.2, 0.8), 3), "y_ratio": round(random.uniform(0.2, 0.8), 3), "reason": "默认探索"}
-
-
-def sanitize_text_for_keyboard(text: str) -> str:
-    return re.sub(r"escape|esc", "", text, flags=re.IGNORECASE)
-
-
-def clamp_mouse_to_browser(rect: BrowserRect, x_ratio: float, y_ratio: float) -> Tuple[int, int]:
-    left, top, right, bottom = get_safe_rect(rect)
-    if right <= left or bottom <= top:
-        raise ValueError("浏览器可见区域为空，无法执行鼠标操作。")
-
-    visible_width = right - left
-    visible_height = bottom - top
-
-    x = left + int(visible_width * max(0.0, min(1.0, x_ratio)))
-    y = top + int(visible_height * max(0.0, min(1.0, y_ratio)))
-
-    x = max(left + 2, min(x, right - 2))
-    y = max(top + 2, min(y, bottom - 2))
-    return x, y
-
-
-def human_like_move_to(start_x: int, start_y: int, end_x: int, end_y: int, jitter_px: float = 1.6) -> None:
-    distance = math.hypot(end_x - start_x, end_y - start_y)
-    duration = random.uniform(0.25, 0.6)
-    steps = max(10, int(distance / 24))
-
-    c1x = start_x + (end_x - start_x) * random.uniform(0.2, 0.4) + random.uniform(-40, 40)
-    c1y = start_y + (end_y - start_y) * random.uniform(0.2, 0.4) + random.uniform(-30, 30)
-    c2x = start_x + (end_x - start_x) * random.uniform(0.6, 0.85) + random.uniform(-40, 40)
-    c2y = start_y + (end_y - start_y) * random.uniform(0.6, 0.85) + random.uniform(-30, 30)
-
-    for i in range(1, steps + 1):
-        t_raw = i / steps
-        t = pytweening.easeInOutQuad(t_raw)
-        omt = 1 - t
-        x = omt**3 * start_x + 3 * omt**2 * t * c1x + 3 * omt * t**2 * c2x + t**3 * end_x
-        y = omt**3 * start_y + 3 * omt**2 * t * c1y + 3 * omt * t**2 * c2y + t**3 * end_y
-        if i < steps:
-            x += random.uniform(-jitter_px, jitter_px)
-            y += random.uniform(-jitter_px, jitter_px)
-        pyautogui.moveTo(int(x), int(y), duration=max(0.0015, duration / steps), tween=pytweening.easeInOutQuad)
-
-
-def execute_action(action: Dict, rect: BrowserRect) -> None:
-    name = action.get("action", "wait")
+            pass
     try:
-        if name == "click":
-            x, y = clamp_mouse_to_browser(rect, float(action.get("x_ratio", 0.5)), float(action.get("y_ratio", 0.5)))
-            cur_x, cur_y = pyautogui.position()
-            human_like_move_to(cur_x, cur_y, x, y)
-            pyautogui.click()
-
-        elif name == "scroll":
-            center_x, center_y = clamp_mouse_to_browser(rect, 0.5, 0.5)
-            cur_x, cur_y = pyautogui.position()
-            human_like_move_to(cur_x, cur_y, center_x, center_y, jitter_px=1.2)
-            pyautogui.scroll(int(action.get("amount", -300)))
-
-        elif name == "type":
-            text = sanitize_text_for_keyboard(str(action.get("text", "")))
-            if text:
-                pyautogui.write(text, interval=0.03)
-            if bool(action.get("press_enter", False)):
-                pyautogui.press("enter")
-
-        elif name == "hotkey":
-            keys = action.get("keys", [])
-            if isinstance(keys, list) and keys:
-                safe_keys = [str(k).lower() for k in keys if str(k).lower() not in ["esc", "escape"]]
-                if safe_keys:
-                    if len(safe_keys) == 1:
-                        pyautogui.press(safe_keys[0])
-                    else:
-                        pyautogui.hotkey(*safe_keys)
-                else:
-                    logging.warning("hotkey 动作包含被禁止按键 ESC，已拦截：%s", keys)
-
-            text = sanitize_text_for_keyboard(str(action.get("text", "")))
-            if text:
-                pyautogui.write(text, interval=0.03)
-            if bool(action.get("press_enter", False)):
-                pyautogui.press("enter")
-
-        elif name == "search_new_tab":
-            pyautogui.hotkey("ctrl", "t")
-            sleep_interruptible(0.06)
-            text = sanitize_text_for_keyboard(str(action.get("text", "")))
-            if text:
-                pyautogui.write(text, interval=0.03)
-            pyautogui.press("enter")
-
-        else:
-            time.sleep(0.2)
-
+        return normalize_settings(Settings(**values))
     except Exception:
-        logging.error("执行动作失败：%s\n%s", action, traceback.format_exc())
+        return Settings()
 
 
-def estimate_reward(next_features: Dict, previous_features: Dict, action: Dict, changed: bool) -> float:
-    reward = 0.0
-    reward += min(0.6, abs(next_features.get("brightness", 0) - previous_features.get("brightness", 0)) / 255.0)
-    reward += min(0.6, abs(next_features.get("texture", 0) - previous_features.get("texture", 0)) / 80.0)
-    if action.get("action") == "click":
-        reward += 0.15
-    if not changed:
-        reward -= 0.28
-    return round(float(reward - 0.15), 4)
+def rect_size(rect):
+    left, top, right, bottom = rect
+    return max(1, int(right - left)), max(1, int(bottom - top))
 
 
-def save_experience(
-    image,
-    action: Dict,
-    features: Dict,
-    rect: BrowserRect,
-    embedding: np.ndarray,
-    scene: Dict,
-    ui_elements: List[Dict],
-    reward: float,
-) -> None:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    img_file = EXPERIENCE_DIR / f"exp_{ts}.jpg"
-    json_file = EXPERIENCE_DIR / f"exp_{ts}.json"
+def point_inside(rect, x, y):
+    left, top, right, bottom = rect
+    return left <= x < right and top <= y < bottom
 
-    record = {
-        "time": ts,
-        "screen": {"width": SCREEN_WIDTH, "height": SCREEN_HEIGHT},
-        "browser_rect": rect.__dict__,
-        "action": action,
-        "features": features,
-        "scene": scene,
-        "ui_elements": ui_elements[:80],
-        "embedding": embedding.astype(float).tolist(),
-        "reward": reward,
+
+def rel_from_abs(rect, x, y):
+    left, top, right, bottom = rect
+    width, height = rect_size(rect)
+    return [
+        round(clamp((float(x) - left) / width, 0.0, 1.0), 6),
+        round(clamp((float(y) - top) / height, 0.0, 1.0), 6)
+    ]
+
+
+def abs_from_rel(rect, point):
+    left, top, right, bottom = rect
+    width, height = rect_size(rect)
+    x = left + clamp(point[0], 0.0, 1.0) * max(0, width - 1)
+    y = top + clamp(point[1], 0.0, 1.0) * max(0, height - 1)
+    return int(round(x)), int(round(y))
+
+
+def distance(a, b):
+    return math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+
+
+def path_length(points):
+    return sum(distance(points[index - 1], points[index]) for index in range(1, len(points)))
+
+
+def normalize_rel_point(point, fallback=None):
+    source = point if isinstance(point, (list, tuple)) and len(point) >= 2 else fallback
+    if not isinstance(source, (list, tuple)) or len(source) < 2:
+        source = [0.5, 0.5]
+    return [round(clamp(safe_float(source[0], 0.5), 0.0, 1.0), 6), round(clamp(safe_float(source[1], 0.5), 0.0, 1.0), 6)]
+
+
+def normalize_path(rect, path, start_abs):
+    result = []
+    base_t = None
+    for item in path or []:
+        if isinstance(item, dict):
+            t = safe_float(item.get("t", 0.0), 0.0)
+            if base_t is None:
+                base_t = t
+            point = rel_from_abs(rect, item.get("x", start_abs[0]), item.get("y", start_abs[1]))
+            point.append(round(max(0.0, t - base_t), 6))
+            result.append(point)
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            point = rel_from_abs(rect, item[0], item[1])
+            point.append(0.0)
+            result.append(point)
+    return result
+
+
+def normalize_mouse_action(action, rect):
+    if not action:
+        return None
+    if "start_rel" in action and "end_rel" in action:
+        result = copy.deepcopy(action)
+        result["type"] = result.get("type", "click")
+        result["button"] = result.get("button", "Button.left")
+        result["source"] = result.get("source", "user")
+        result["duration"] = round(max(0.0, safe_float(result.get("duration", 0.0), 0.0)), 6)
+        result["start_rel"] = normalize_rel_point(result.get("start_rel"), [0.5, 0.5])
+        result["end_rel"] = normalize_rel_point(result.get("end_rel"), result["start_rel"])
+        result["path_rel"] = [[round(clamp(safe_float(p[0], 0.0), 0.0, 1.0), 6), round(clamp(safe_float(p[1], 0.0), 0.0, 1.0), 6), round(max(0.0, safe_float(p[2], 0.0)), 6) if len(p) >= 3 else 0.0] for p in result.get("path_rel", []) if isinstance(p, (list, tuple)) and len(p) >= 2]
+        if result.get("scroll"):
+            result["scroll"] = [safe_int(result["scroll"][0], 0), safe_int(result["scroll"][1], 0)]
+        return result
+    start_abs = action.get("start_abs") or [action.get("x0", 0), action.get("y0", 0)]
+    end_abs = action.get("end_abs") or [action.get("x1", start_abs[0]), action.get("y1", start_abs[1])]
+    result = {
+        "type": action.get("type", "click"),
+        "button": action.get("button", "Button.left"),
+        "source": action.get("source", "user"),
+        "started_at": action.get("started_at"),
+        "ended_at": action.get("ended_at"),
+        "started_perf": action.get("started_perf"),
+        "ended_perf": action.get("ended_perf"),
+        "duration": round(max(0.0, safe_float(action.get("duration", 0.0), 0.0)), 6),
+        "start_rel": rel_from_abs(rect, start_abs[0], start_abs[1]),
+        "end_rel": rel_from_abs(rect, end_abs[0], end_abs[1]),
+        "path_rel": normalize_path(rect, action.get("path", []), start_abs)
+    }
+    if action.get("scroll"):
+        result["scroll"] = [safe_int(action["scroll"][0], 0), safe_int(action["scroll"][1], 0)]
+    return result
+
+
+def parse_hash_value(record):
+    if not record:
+        return None
+    bits = safe_int(record.get("screen_hash_bits", record.get("hash_bits", 0)), 0)
+    value = record.get("screen_hash_int", record.get("hash_int"))
+    if value is not None and bits > 0:
+        try:
+            value = int(value)
+            width = max(1, math.ceil(bits / 4))
+            return HashValue(value, bits, f"{value:0{width}x}"[-width:])
+        except Exception:
+            pass
+    text = record.get("screen_hash_hex") or record.get("screen_hash") or record.get("hash")
+    if not text:
+        return None
+    try:
+        text = str(text).strip()
+        if set(text) <= {"0", "1"}:
+            bits = len(text)
+            value = int(text, 2)
+        else:
+            value = int(text, 16)
+            bits = bits if bits > 0 else len(text) * 4
+        width = max(1, math.ceil(bits / 4))
+        return HashValue(value, bits, f"{value:0{width}x}"[-width:])
+    except Exception:
+        return None
+
+
+def hash_similarity(hash_a, hash_b):
+    if not hash_a or not hash_b:
+        return 0.0
+    bits = min(hash_a.bits, hash_b.bits)
+    if bits <= 0:
+        return 0.0
+    a_value = hash_a.value >> max(0, hash_a.bits - bits)
+    b_value = hash_b.value >> max(0, hash_b.bits - bits)
+    return clamp(1.0 - (a_value ^ b_value).bit_count() / bits, 0.0, 1.0)
+
+
+def reward_parts(novelty, human_score, settings):
+    screen_reward = round(clamp(novelty, 0.0, 100.0), 2)
+    action_reward = round((clamp(human_score, 0.0, 100.0) - 50.0) * 2.0, 2)
+    total = round(clamp(screen_reward + action_reward, settings.reward_total_min, settings.reward_total_max), 2)
+    return screen_reward, action_reward, total
+
+
+def weighted_choice(weighted_items):
+    clean = [(max(0.0, safe_float(weight, 0.0)), item) for weight, item in weighted_items]
+    total = sum(weight for weight, _ in clean)
+    if total <= 0.0:
+        return random.choice(clean)[1] if clean else None
+    target = random.uniform(0.0, total)
+    running = 0.0
+    for weight, item in clean:
+        running += weight
+        if running >= target:
+            return item
+    return clean[-1][1]
+
+
+def percentile_score(value, samples, default):
+    ordered = sorted(float(item) for item in samples if math.isfinite(float(item)))
+    if len(ordered) < 2:
+        return default
+    n = len(ordered)
+    median = ordered[n // 2] if n % 2 else (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0
+    deviations = sorted(abs(item - median) for item in ordered)
+    mad = deviations[n // 2] if n % 2 else (deviations[n // 2 - 1] + deviations[n // 2]) / 2.0
+    scale = max(mad * 1.4826, (ordered[-1] - ordered[0]) / max(12.0, n), 1e-6)
+    return round(clamp(100.0 - abs(float(value) - median) / scale * 18.0, 35.0, 100.0), 2)
+
+
+def action_features(action):
+    if not action:
+        return {}
+    start = action.get("start_rel") or [0.0, 0.0]
+    end = action.get("end_rel") or start
+    points = [[safe_float(item[0], 0.0), safe_float(item[1], 0.0)] for item in action.get("path_rel", []) if isinstance(item, (list, tuple)) and len(item) >= 2]
+    if not points:
+        points = [normalize_rel_point(start), normalize_rel_point(end, start)]
+    direct = distance(points[0], points[-1])
+    total = path_length(points)
+    scroll = action.get("scroll") or [0, 0]
+    return {
+        "duration": max(0.0, safe_float(action.get("duration", 0.0), 0.0)),
+        "direct": direct,
+        "total": total,
+        "bend": clamp(total / direct if direct > 1e-6 else 1.0, 1.0, 5.0),
+        "points": len(points),
+        "scroll_abs": abs(safe_int(scroll[0], 0)) + abs(safe_int(scroll[1], 0))
     }
 
-    try:
-        image.save(img_file, format="JPEG", quality=76)
-        json_file.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-        add_file_to_pool_index(img_file)
-        add_file_to_pool_index(json_file)
-        if CURRENT_POOL_SIZE > MAX_EXPERIENCE_BYTES:
-            async_trim_experience_pool()
-    except Exception:
-        logging.error("保存经验失败：\n%s", traceback.format_exc())
 
+class HumanProfile:
+    def __init__(self, settings):
+        self.settings = settings
+        self.lock = threading.RLock()
+        self.stats = defaultdict(lambda: defaultdict(list))
 
-def esc_pressed() -> bool:
-    return STOP_EVENT.is_set()
-
-
-def on_esc_press() -> None:
-    if STOP_EVENT.is_set():
-        return
-    STOP_EVENT.set()
-    logging.error("检测到 ESC，准备立即终止（优先安全退出，1秒后兜底硬退出）。")
-
-    def force_exit() -> None:
-        time.sleep(1.0)
-        if STOP_EVENT.is_set():
-            logging.error("主线程未在1秒内结束，执行兜底硬退出。")
-            sys.stdout.flush()
-            sys.stderr.flush()
-            os._exit(0)
-
-    threading.Thread(target=force_exit, daemon=True, name="esc-force-exit").start()
-
-
-def setup_esc_kill_switch() -> None:
-    try:
-        keyboard.add_hotkey("esc", on_esc_press, suppress=False, trigger_on_release=False)
-        logging.info("ESC 终止热键已启用（即时生效）。")
-    except Exception:
-        logging.error("ESC 热键注册失败：\n%s", traceback.format_exc())
-        raise
-
-
-def sleep_interruptible(seconds: float) -> None:
-    end = time.time() + max(0.0, seconds)
-    while not STOP_EVENT.is_set():
-        remain = end - time.time()
-        if remain <= 0:
+    def observe(self, action):
+        if not action:
             return
-        time.sleep(min(0.03, remain))
+        action_type = str(action.get("type", "click"))
+        with self.lock:
+            for name, value in action_features(action).items():
+                if math.isfinite(float(value)):
+                    bucket = self.stats[action_type][name]
+                    bucket.append(float(value))
+                    if len(bucket) > self.settings.human_profile_max_samples:
+                        self.stats[action_type][name] = bucket[-self.settings.human_profile_keep_samples:]
+
+    def enough(self, action_type):
+        with self.lock:
+            return len(self.stats[action_type].get("duration", [])) >= self.settings.human_profile_min_samples
+
+    def score(self, action):
+        if not action:
+            return 0.0
+        action_type = str(action.get("type", "click"))
+        features = action_features(action)
+        if action_type == "scroll":
+            return self.score_scroll(features)
+        if self.enough(action_type):
+            with self.lock:
+                stats = copy.deepcopy(self.stats[action_type])
+            scores = [
+                percentile_score(features.get("duration", 0.0), stats.get("duration", []), self.settings.score_default),
+                percentile_score(features.get("direct", 0.0), stats.get("direct", []), self.settings.score_default),
+                percentile_score(features.get("bend", 1.0), stats.get("bend", []), self.settings.score_default),
+                percentile_score(features.get("points", 2.0), stats.get("points", []), self.settings.score_default)
+            ]
+            weights = [0.34, 0.26, 0.24, 0.16]
+            return round(clamp(sum(score * weight for score, weight in zip(scores, weights)), 0.0, 100.0), 2)
+        return self.fallback_score(action_type, features)
+
+    def score_scroll(self, features):
+        with self.lock:
+            samples = list(self.stats["scroll"].get("scroll_abs", []))
+        if len(samples) >= max(6, self.settings.human_profile_min_samples // 3):
+            return percentile_score(features.get("scroll_abs", 0.0), samples, self.settings.scroll_score_default)
+        amount = features.get("scroll_abs", 0.0)
+        if amount <= 0.0:
+            return 55.0
+        return 78.0 if amount <= 8.0 else 68.0
+
+    def fallback_score(self, action_type, features):
+        duration = features.get("duration", 0.0)
+        direct = features.get("direct", 0.0)
+        bend = features.get("bend", 1.0)
+        points = features.get("points", 0.0)
+        score = self.settings.fallback_score_base
+        score += clamp(math.log1p(duration * 10.0) * 10.0, 0.0, 18.0) if duration > 0.0 else -8.0
+        if action_type == "click":
+            score += 8.0 if direct <= self.settings.click_direct_threshold else -4.0
+            if duration > self.settings.click_long_duration:
+                score -= 8.0
+        elif action_type == "drag":
+            score += 10.0 if direct > self.settings.drag_direct_threshold else -8.0
+            if points >= self.settings.drag_min_points:
+                score += 8.0
+            if bend > self.settings.drag_bend_penalty_threshold:
+                score -= 5.0
+        else:
+            score += 4.0
+        return round(clamp(score, 0.0, 100.0), 2)
 
 
-def async_trim_experience_pool() -> None:
-    def worker() -> None:
-        if not TRIM_LOCK.acquire(blocking=False):
-            logging.info("经验池清理任务正在进行，跳过本轮触发。")
-            return
+class DataStore:
+    def __init__(self, root):
+        self.root = Path(root)
+        self.screen_dir = self.root / "screens"
+        self.experience_file = self.root / "experience.jsonl"
+        self.state_file = self.root / "state.json"
+        self.settings_file = self.root / "settings.json"
+        self.lock = threading.RLock()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.screen_dir.mkdir(parents=True, exist_ok=True)
+        self.state = self.load_state()
+
+    def load_state(self):
+        if not self.state_file.exists():
+            return {"life_experience": 0.0}
         try:
-            trim_experience_pool()
-        finally:
-            TRIM_LOCK.release()
-
-    thread = threading.Thread(target=worker, daemon=True, name="exp-trim-worker")
-    thread.start()
-
-
-def main() -> None:
-    logging.info("=" * 64)
-    logging.info("浏览器 AI 启动（单文件版：VLM + UIA + RAG + 自愈索引）")
-    logging.info("按 ESC 终止程序")
-    logging.info("=" * 64)
-
-    refresh_screen_size()
-    ensure_package("nvidia_smi", "nvidia-ml-py")
-    if not ensure_init_files():
-        logging.error("请按上方步骤补齐初始化文件后重新启动程序。")
-        return
-    init_experience_pool_index()
-    reconcile_experience_pool_index()
-    init_ocr()
-    init_vlm()
-    setup_esc_kill_switch()
-    browser = launch_or_get_firefox_window(force_activate=True)
-
-    loop_count = 0
-    prev_features = {"brightness": 0.0, "texture": 0.0, "histogram_bins": [0] * 8}
-    cached_ocr: List[Dict] = []
-
-    while True:
-        if esc_pressed():
-            logging.info("检测到 ESC，程序终止。")
-            break
-
-        try:
-            loop_start = time.perf_counter()
-            refresh_screen_size()
-            browser = launch_or_get_firefox_window(force_activate=False)
-            rect = window_to_rect(browser)
-            screenshot, features = grab_browser_snapshot(rect)
-            local_region, _ = get_local_region(screenshot, rect)
-
-            changed = page_changed(prev_features.get("histogram_bins"), features.get("histogram_bins", []), threshold=0.06)
-            if changed or not cached_ocr:
-                full_scan = screenshot.resize((max(320, screenshot.width // 2), max(220, screenshot.height // 2)))
-                ocr_global = run_ocr_text_detection(full_scan)
-                ocr_local = run_ocr_text_detection(local_region)
-                cached_ocr = ocr_global + ocr_local
-            ocr_results = cached_ocr
-
-            hwnd = getattr(browser, "_hWnd", None)
-            ui_elements = get_clickable_elements_by_uia(rect, hwnd)
-            scene = summarize_scene_with_vlm(local_region, ocr_results, ui_elements)
-            features["ocr_text_count"] = len(ocr_results)
-            features["ui_count"] = len(ui_elements)
-            features["scene_labels"] = scene.get("labels", [])
-
-            embedding = compute_embedding(features, ui_elements, ocr_results, scene)
-            experiences = list_recent_experiences(limit=240)
-            similar_records = retrieve_similar_experiences(embedding, experiences, top_k=10)
-            action = choose_action(features, similar_records, ui_elements, ocr_results, scene, rect)
-            action = penalize_repeated_action(action)
-
-            logging.info(
-                "第 %s 轮: scene=%s, ui=%s, ocr=%s, changed=%s, action=%s",
-                loop_count,
-                scene.get("labels"),
-                len(ui_elements),
-                len(ocr_results),
-                changed,
-                action,
-            )
-
-            execute_action(action, rect)
-            LAST_ACTIONS.append({
-                "ts": time.time(),
-                "action": action.get("action"),
-                "x_ratio": action.get("x_ratio", 0.0),
-                "y_ratio": action.get("y_ratio", 0.0),
-            })
-            if len(LAST_ACTIONS) > 64:
-                del LAST_ACTIONS[:-64]
-
-            reward = estimate_reward(features, prev_features, action, changed)
-            save_experience(screenshot, action, features, rect, embedding, scene, ui_elements, reward)
-
-            prev_features = features
-            loop_count += 1
-            if loop_count % 90 == 0:
-                async_trim_experience_pool()
-            if time.time() - LAST_RECONCILE_TS > RECONCILE_INTERVAL_SECONDS:
-                reconcile_experience_pool_index()
-
-            loop_spent = time.perf_counter() - loop_start
-            target_sleep = max(0.05, 0.22 - min(0.12, loop_spent / 6.0))
-            sleep_interruptible(target_sleep)
-
+            with self.state_file.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+            return {"life_experience": safe_float(data.get("life_experience", 0.0), 0.0)}
         except Exception:
-            logging.error("主循环异常：\n%s", traceback.format_exc())
-            sleep_interruptible(0.35)
+            return {"life_experience": 0.0}
 
-    logging.info("程序已安全退出。")
+    def load_settings(self):
+        if not self.settings_file.exists():
+            return Settings()
+        try:
+            with self.settings_file.open("r", encoding="utf-8") as file:
+                return settings_from_dict(json.load(file))
+        except Exception:
+            return Settings()
 
+    def save_state(self):
+        with self.lock:
+            temporary = self.state_file.with_suffix(".tmp")
+            with temporary.open("w", encoding="utf-8") as file:
+                json.dump(self.state, file, ensure_ascii=False, indent=2)
+            temporary.replace(self.state_file)
+
+    def add_life_experience(self, value):
+        with self.lock:
+            current = safe_float(self.state.get("life_experience", 0.0), 0.0)
+            self.state["life_experience"] = round(max(0.0, current + safe_float(value, 0.0)), 2)
+            self.save_state()
+            return self.state["life_experience"]
+
+    def new_screen_path(self, mode):
+        folder = self.screen_dir / datetime.now().strftime("%Y%m%d") / mode
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder / f"{datetime.now().strftime('%H%M%S_%f')}_{uuid.uuid4().hex}.png"
+
+    def relative_path(self, path):
+        try:
+            return str(Path(path).resolve().relative_to(self.root.resolve()))
+        except Exception:
+            return str(path)
+
+    def append_experience(self, record):
+        with self.lock:
+            with self.experience_file.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def load_experience(self):
+        records = []
+        if not self.experience_file.exists():
+            return records
+        with self.experience_file.open("r", encoding="utf-8") as file:
+            for line in file:
+                try:
+                    records.append(json.loads(line.strip()))
+                except Exception:
+                    pass
+        return records
+
+
+class WindowManager:
+    def __init__(self, executable_path, settings):
+        self.executable_path = Path(executable_path)
+        self.settings = settings
+        self.process = None
+        self.hwnd = None
+        self.lock = threading.RLock()
+
+    def launch_or_attach(self):
+        if self.find_window():
+            return True
+        if self.executable_path.exists():
+            try:
+                self.process = subprocess.Popen([str(self.executable_path)], cwd=str(self.executable_path.parent))
+            except Exception:
+                self.process = None
+            deadline = time.time() + self.settings.window_attach_seconds
+            while time.time() < deadline:
+                if self.find_window():
+                    return True
+                time.sleep(self.settings.window_poll_seconds)
+        return self.find_window()
+
+    def executable_pids(self):
+        pids = set()
+        target = self.executable_path.name.lower()
+        for proc in psutil.process_iter(["pid", "name", "exe"]):
+            try:
+                name = (proc.info.get("name") or "").lower()
+                exe_name = Path(proc.info.get("exe") or "").name.lower()
+                if name == target or exe_name == target:
+                    pids.add(proc.info["pid"])
+            except Exception:
+                pass
+        if self.process:
+            try:
+                root = psutil.Process(self.process.pid)
+                pids.add(root.pid)
+                for child in root.children(recursive=True):
+                    pids.add(child.pid)
+            except Exception:
+                pass
+        return pids
+
+    def find_window(self):
+        pids = self.executable_pids()
+        candidates = []
+        def handler(hwnd, _):
+            try:
+                if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
+                    return
+                title = win32gui.GetWindowText(hwnd).strip()
+                if not title:
+                    return
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                rect = win32gui.GetWindowRect(hwnd)
+                client = self.client_rect_for(hwnd)
+                cwidth, cheight = rect_size(client) if client else (0, 0)
+                width, height = rect_size(rect)
+                title_lower = title.lower()
+                matched_title = any(str(word).lower() in title_lower for word in self.settings.window_title_keywords)
+                if (pids and pid in pids) or matched_title:
+                    candidates.append((cwidth * cheight, width * height, hwnd))
+            except Exception:
+                pass
+        try:
+            win32gui.EnumWindows(handler, None)
+        except Exception:
+            return False
+        if not candidates:
+            return False
+        candidates.sort(reverse=True)
+        with self.lock:
+            self.hwnd = candidates[0][2]
+        return True
+
+    def client_rect_for(self, hwnd):
+        try:
+            left, top, right, bottom = win32gui.GetClientRect(hwnd)
+            x1, y1 = win32gui.ClientToScreen(hwnd, (left, top))
+            x2, y2 = win32gui.ClientToScreen(hwnd, (right, bottom))
+            return (int(x1), int(y1), int(x2), int(y2)) if x2 > x1 and y2 > y1 else None
+        except Exception:
+            return None
+
+    def client_rect(self):
+        with self.lock:
+            hwnd = self.hwnd
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            if not self.find_window():
+                return None
+            with self.lock:
+                hwnd = self.hwnd
+        rect = self.client_rect_for(hwnd)
+        if not rect:
+            return None
+        width, height = rect_size(rect)
+        return rect if width > 1 and height > 1 else None
+
+    def foreground(self):
+        with self.lock:
+            hwnd = self.hwnd
+        if not hwnd:
+            return
+        try:
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+
+    def topmost(self):
+        with self.lock:
+            hwnd = self.hwnd
+        if not hwnd:
+            return
+        try:
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0, win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW)
+        except Exception:
+            pass
+        self.foreground()
+
+    def not_topmost(self):
+        with self.lock:
+            hwnd = self.hwnd
+        if not hwnd:
+            return
+        try:
+            win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0, win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+        except Exception:
+            pass
+
+
+class ScreenAnalyzer:
+    def __init__(self, hash_size):
+        self.hash_size = int(hash_size)
+        self.sct = None
+        self.resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+
+    def __enter__(self):
+        self.sct = mss.mss()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def capture(self, rect, path):
+        left, top, right, bottom = rect
+        width, height = rect_size(rect)
+        shot = self.sct.grab({"left": int(left), "top": int(top), "width": width, "height": height})
+        image = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        image.save(path)
+        return image
+
+    def fingerprint(self, image):
+        small = image.convert("L").resize((self.hash_size, self.hash_size), self.resample)
+        pixels = list(small.getdata())
+        average = sum(pixels) / max(1, len(pixels))
+        value = 0
+        for pixel in pixels:
+            value = (value << 1) | (1 if pixel >= average else 0)
+        bits = self.hash_size * self.hash_size
+        width = max(1, math.ceil(bits / 4))
+        return HashValue(value=value, bits=bits, hex=f"{value:0{width}x}")
+
+    def close(self):
+        if self.sct:
+            try:
+                self.sct.close()
+            except Exception:
+                pass
+            self.sct = None
+
+
+class ExperiencePool:
+    def __init__(self, settings, records=None):
+        self.settings = settings
+        self.records = []
+        self.hashes = []
+        self.index = defaultdict(list)
+        self.profile = HumanProfile(settings)
+        self.lock = threading.RLock()
+        for record in records or []:
+            self.add(record)
+
+    def _prefix(self, hash_value):
+        bits = min(max(1, self.settings.hash_prefix_bits), hash_value.bits)
+        return hash_value.value >> max(0, hash_value.bits - bits)
+
+    def add(self, record):
+        with self.lock:
+            index = len(self.records)
+            self.records.append(record)
+            hash_value = parse_hash_value(record)
+            self.hashes.append(hash_value)
+            if hash_value:
+                self.index[self._prefix(hash_value)].append(index)
+            if record.get("mouse_action"):
+                self.profile.observe(record["mouse_action"])
+
+    def count(self):
+        with self.lock:
+            return len(self.records)
+
+    def action_records(self):
+        with self.lock:
+            return [record for record in self.records if record.get("mouse_action")]
+
+    def candidate_indices(self, hash_value):
+        with self.lock:
+            if len(self.records) <= self.settings.nearest_candidate_limit:
+                return [index for index, item in enumerate(self.hashes) if item]
+            query_prefix = self._prefix(hash_value)
+            result = []
+            for prefix in sorted(self.index.keys(), key=lambda item: (item ^ query_prefix).bit_count()):
+                result.extend(self.index.get(prefix, []))
+                if len(result) >= self.settings.nearest_candidate_limit:
+                    break
+            if result:
+                return result[:self.settings.nearest_candidate_limit]
+            valid = [index for index, item in enumerate(self.hashes) if item]
+            return random.sample(valid, self.settings.nearest_candidate_limit) if len(valid) > self.settings.nearest_candidate_limit else valid
+
+    def nearest(self, hash_value):
+        if not hash_value:
+            return []
+        with self.lock:
+            scored = []
+            for index in self.candidate_indices(hash_value):
+                other = self.hashes[index]
+                if other:
+                    scored.append({"similarity": hash_similarity(hash_value, other), "record": self.records[index]})
+        scored.sort(key=lambda item: item["similarity"], reverse=True)
+        return scored[:max(1, self.settings.nearest_top_k)]
+
+    def novelty(self, hash_value):
+        batch = self.nearest(hash_value)
+        if not batch:
+            return 100.0, []
+        return round(clamp((1.0 - batch[0]["similarity"]) * 100.0, 0.0, 100.0), 2), batch
+
+    def best_global_action(self):
+        weighted = []
+        for record in self.action_records():
+            action = record.get("mouse_action")
+            reward = safe_float(record.get("reward", 0.0), 0.0)
+            human_score = clamp(record.get("human_score", 50.0), 0.0, 100.0)
+            if action:
+                weighted.append((max(0.05, 1.0 + reward / 100.0) * max(0.25, human_score / 100.0), action))
+        chosen = weighted_choice(weighted)
+        return copy.deepcopy(chosen) if chosen else None
+
+    def human_score(self, action):
+        return self.profile.score(action)
+
+
+class ActionBrain:
+    def __init__(self, pool, settings):
+        self.pool = pool
+        self.settings = settings
+        self.last_action = None
+        self.last_decision = None
+
+    def exploration_rate(self, novelty, life):
+        action_count = len(self.pool.action_records())
+        count_factor = 1.0 / math.sqrt(max(1.0, action_count))
+        novelty_factor = clamp(novelty / 100.0, 0.0, 1.0)
+        life_factor = 1.0 / math.sqrt(max(1.0, 1.0 + life / 200.0))
+        rate = (0.12 + 0.28 * count_factor + 0.18 * novelty_factor) * life_factor
+        return round(clamp(rate, self.settings.explore_min_rate, self.settings.explore_max_rate), 4)
+
+    def score_candidate(self, item):
+        record = item["record"]
+        similarity = clamp(item.get("similarity", 0.0), 0.0, 1.0)
+        reward = max(-80.0, safe_float(record.get("reward", 0.0), 0.0))
+        human_score = clamp(record.get("human_score", 50.0), 0.0, 100.0)
+        novelty = clamp(record.get("novelty", 50.0), 0.0, 100.0)
+        source_bonus = 4.0 if record.get("mode") == "learning" else 0.0
+        return similarity * 100.0 + reward * 0.55 + human_score * 0.25 + novelty * 0.08 + source_bonus
+
+    def mutate_point(self, point, scale):
+        return [
+            round(clamp(safe_float(point[0], 0.5) + random.uniform(-scale, scale), self.settings.random_action_min, self.settings.random_action_max), 6),
+            round(clamp(safe_float(point[1], 0.5) + random.uniform(-scale, scale), self.settings.random_action_min, self.settings.random_action_max), 6)
+        ]
+
+    def mutate_action(self, action, strength):
+        if not action:
+            return None
+        result = normalize_mouse_action(action, (0, 0, 1, 1))
+        result["source"] = "ai"
+        scale = clamp(self.settings.action_jitter * strength, 0.002, 0.055)
+        result["start_rel"] = self.mutate_point(result.get("start_rel", [0.5, 0.5]), scale)
+        result["end_rel"] = self.mutate_point(result.get("end_rel", result["start_rel"]), scale)
+        if result.get("type") == "click":
+            result["end_rel"] = list(result["start_rel"])
+        if result.get("type") == "drag" and distance(result["start_rel"], result["end_rel"]) < 0.01:
+            result["end_rel"] = self.mutate_point(result["start_rel"], scale * 4.0)
+        duration = safe_float(result.get("duration", 0.12), 0.12)
+        result["duration"] = round(clamp(duration * random.uniform(0.85, 1.2), self.settings.action_duration_min, self.settings.action_duration_max), 6)
+        result["path_rel"] = []
+        return result
+
+    def fallback_action(self):
+        learned = self.pool.best_global_action()
+        if learned and random.random() < self.settings.global_action_probability:
+            return self.mutate_action(learned, 1.8), "global_experience"
+        point = [round(random.uniform(self.settings.random_action_min, self.settings.random_action_max), 6), round(random.uniform(self.settings.random_action_min, self.settings.random_action_max), 6)]
+        action = {"type": "click", "button": "Button.left", "source": "ai", "duration": round(random.uniform(self.settings.random_click_duration_min, self.settings.random_click_duration_max), 6), "start_rel": point, "end_rel": point, "path_rel": []}
+        return action, "explore_random"
+
+    def choose(self, hash_value, novelty, batch, life):
+        rate = self.exploration_rate(novelty, life)
+        usable = []
+        for item in batch:
+            action = item["record"].get("mouse_action")
+            if not action or safe_float(item["record"].get("reward", 0.0), 0.0) < -60.0:
+                continue
+            score = self.score_candidate(item)
+            usable.append((math.exp(clamp(score, -100.0, 240.0) / self.settings.softmax_temperature), {"item": item, "score": score, "action": action}))
+        if random.random() < rate or not usable:
+            action, reason = self.fallback_action()
+            decision = {"reason": reason, "exploration_rate": rate, "candidate_count": len(usable), "confidence": 0.0, "nearest_similarity": round(batch[0]["similarity"], 4) if batch else 0.0}
+        else:
+            chosen = weighted_choice(usable)
+            item = chosen["item"]
+            confidence = clamp(item.get("similarity", 0.0) * 0.65 + clamp(chosen.get("score", 0.0), 0.0, 200.0) / 200.0 * 0.35, 0.0, 1.0)
+            action = self.mutate_action(chosen["action"], 1.0 - confidence + rate)
+            decision = {"reason": "nearest_rewarded_experience", "exploration_rate": rate, "candidate_count": len(usable), "confidence": round(confidence, 4), "nearest_similarity": round(batch[0]["similarity"], 4) if batch else 0.0, "chosen_similarity": round(item.get("similarity", 0.0), 4), "chosen_reward": round(safe_float(item["record"].get("reward", 0.0), 0.0), 2), "chosen_record_id": item["record"].get("id")}
+        self.last_action = copy.deepcopy(action)
+        self.last_decision = decision
+        return action, decision
+
+
+class MouseRecorder:
+    def __init__(self, get_mode, get_rect, on_activity):
+        self.get_mode = get_mode
+        self.get_rect = get_rect
+        self.on_activity = on_activity
+        self.lock = threading.RLock()
+        self.actions = deque()
+        self.start_markers = deque()
+        self.current = None
+        self.listener = None
+        self.wake = threading.Event()
+
+    def start(self):
+        if self.listener or not pynput_mouse:
+            return
+        self.listener = pynput_mouse.Listener(on_move=self.on_move, on_click=self.on_click, on_scroll=self.on_scroll)
+        self.listener.start()
+
+    def stop(self):
+        if not self.listener:
+            return
+        try:
+            self.listener.stop()
+        except Exception:
+            pass
+        self.listener = None
+
+    def clear(self):
+        with self.lock:
+            self.actions.clear()
+            self.start_markers.clear()
+            self.current = None
+            self.wake.clear()
+
+    def active(self):
+        return self.get_mode() == "learning"
+
+    def capture_event(self, kind, x, y, extra=None, allow_current=False):
+        if not self.active():
+            return None
+        rect = self.get_rect()
+        if not rect:
+            return None
+        inside = point_inside(rect, x, y)
+        if not inside and not allow_current:
+            return None
+        self.on_activity()
+        event = {"type": kind, "t": time.perf_counter(), "x": int(x), "y": int(y), "inside": bool(inside)}
+        if extra:
+            event.update(extra)
+        return event
+
+    def push_start_marker(self, action_id, event, action_type):
+        self.start_markers.append({"action_id": action_id, "action_type": action_type, "perf_time": event["t"], "created_at": now_text(), "x": event["x"], "y": event["y"]})
+        self.wake.set()
+
+    def on_move(self, x, y):
+        with self.lock:
+            has_current = bool(self.current)
+        event = self.capture_event("move", x, y, allow_current=has_current)
+        if not event:
+            return
+        with self.lock:
+            if self.current:
+                self.current["path"].append(event)
+
+    def on_scroll(self, x, y, dx, dy):
+        event = self.capture_event("scroll", x, y, {"dx": int(dx), "dy": int(dy)})
+        if not event:
+            return
+        action_id = uuid.uuid4().hex
+        action = {"action_id": action_id, "type": "scroll", "button": "scroll", "source": "user", "started_at": now_text(), "ended_at": now_text(), "started_perf": event["t"], "ended_perf": event["t"], "duration": 0.0, "start_abs": [int(x), int(y)], "end_abs": [int(x), int(y)], "path": [event], "scroll": [int(dx), int(dy)]}
+        with self.lock:
+            self.push_start_marker(action_id, event, "scroll")
+            self.actions.append(action)
+            self.wake.set()
+
+    def on_click(self, x, y, button, pressed):
+        with self.lock:
+            has_current = bool(self.current)
+        event = self.capture_event("press" if pressed else "release", x, y, {"button": str(button)}, allow_current=(not pressed and has_current))
+        if not event:
+            return
+        with self.lock:
+            if pressed:
+                action_id = uuid.uuid4().hex
+                self.current = {"action_id": action_id, "type": "click", "button": str(button), "source": "user", "started_at": now_text(), "started_perf": event["t"], "t0": event["t"], "start_abs": [int(x), int(y)], "path": [event]}
+                self.push_start_marker(action_id, event, "click")
+            elif self.current:
+                self.current["path"].append(event)
+                start_abs = self.current["start_abs"]
+                end_abs = [int(x), int(y)]
+                self.current.update({"end_abs": end_abs, "ended_at": now_text(), "ended_perf": event["t"], "duration": round(max(0.0, event["t"] - self.current.get("t0", event["t"])), 6)})
+                if int(start_abs[0]) != int(end_abs[0]) or int(start_abs[1]) != int(end_abs[1]):
+                    self.current["type"] = "drag"
+                self.actions.append(self.current)
+                self.current = None
+                self.wake.set()
+
+    def pop_start_markers(self):
+        with self.lock:
+            items = list(self.start_markers)
+            self.start_markers.clear()
+            return items
+
+    def pop_actions(self):
+        with self.lock:
+            items = list(self.actions)
+            self.actions.clear()
+            if not self.start_markers:
+                self.wake.clear()
+            return items
+
+    def wait(self, timeout):
+        self.wake.wait(timeout)
+
+
+class HumanMouseExecutor:
+    def __init__(self, window_manager, settings):
+        self.window_manager = window_manager
+        self.settings = settings
+        self.controller = pynput_mouse.Controller()
+
+    def button_from_text(self, value):
+        text = str(value).lower()
+        if "right" in text:
+            return pynput_mouse.Button.right
+        if "middle" in text:
+            return pynput_mouse.Button.middle
+        return pynput_mouse.Button.left
+
+    def smooth_points(self, start, end, duration):
+        sx, sy = start
+        ex, ey = end
+        direct = math.hypot(ex - sx, ey - sy)
+        steps = max(2, int(math.sqrt(max(1.0, direct)) + max(0.0, duration) * self.settings.motion_steps_per_second))
+        angle = random.uniform(0.0, math.tau)
+        offset = direct * random.uniform(self.settings.motion_curve_offset_min, self.settings.motion_curve_offset_max)
+        c1 = (sx + (ex - sx) * random.uniform(self.settings.motion_first_control_min, self.settings.motion_first_control_max) + math.cos(angle) * offset, sy + (ey - sy) * random.uniform(self.settings.motion_first_control_min, self.settings.motion_first_control_max) + math.sin(angle) * offset)
+        c2 = (sx + (ex - sx) * random.uniform(self.settings.motion_second_control_min, self.settings.motion_second_control_max) - math.cos(angle) * offset, sy + (ey - sy) * random.uniform(self.settings.motion_second_control_min, self.settings.motion_second_control_max) - math.sin(angle) * offset)
+        points = []
+        for index in range(steps + 1):
+            t = index / steps
+            u = 1.0 - t
+            x = u ** 3 * sx + 3.0 * u ** 2 * t * c1[0] + 3.0 * u * t ** 2 * c2[0] + t ** 3 * ex
+            y = u ** 3 * sy + 3.0 * u ** 2 * t * c1[1] + 3.0 * u * t ** 2 * c2[1] + t ** 3 * ey
+            points.append((int(round(x)), int(round(y))))
+        return points
+
+    def stoppable_sleep(self, seconds, stop_event, should_stop):
+        deadline = time.perf_counter() + max(0.0, seconds)
+        while time.perf_counter() < deadline:
+            if stop_event.is_set() or should_stop():
+                stop_event.set()
+                break
+            time.sleep(min(self.settings.generated_sleep_tick, max(0.0, deadline - time.perf_counter())))
+
+    def move_smooth(self, start, end, duration, stop_event, should_stop):
+        points = self.smooth_points(start, end, duration)
+        actual = []
+        delay = duration / max(1, len(points) - 1) if duration > 0.0 else 0.0
+        base_t = time.perf_counter()
+        for point in points:
+            if stop_event.is_set() or should_stop():
+                stop_event.set()
+                break
+            self.controller.position = point
+            actual.append({"x": int(point[0]), "y": int(point[1]), "t": time.perf_counter() - base_t})
+            if delay > 0.0:
+                self.stoppable_sleep(delay, stop_event, should_stop)
+        return actual
+
+    def execute(self, action, rect, stop_event, should_stop):
+        if not action:
+            return None
+        self.window_manager.topmost()
+        action = normalize_mouse_action(action, rect)
+        action_type = action.get("type", "click")
+        button = self.button_from_text(action.get("button", "Button.left"))
+        start_rel = action.get("start_rel") or action.get("end_rel") or [0.5, 0.5]
+        end_rel = action.get("end_rel") or start_rel
+        start_abs = abs_from_rel(rect, start_rel)
+        end_abs = abs_from_rel(rect, end_rel)
+        current = self.controller.position
+        distance_to_start = math.hypot(start_abs[0] - current[0], start_abs[1] - current[1])
+        main_distance = math.hypot(end_abs[0] - start_abs[0], end_abs[1] - start_abs[1])
+        duration = safe_float(action.get("duration", 0.0), 0.0)
+        if duration <= 0.0:
+            width, height = rect_size(rect)
+            duration = clamp((distance_to_start + main_distance) / max(width, height), self.settings.action_duration_min, 1.2)
+        duration = clamp(duration, self.settings.action_duration_min, self.settings.action_duration_max)
+        approach_ratio = distance_to_start / max(1.0, distance_to_start + main_distance)
+        approach_duration = clamp(duration * approach_ratio, 0.02, duration * 0.85)
+        main_duration = clamp(duration - approach_duration, 0.03, duration)
+        actual_path = self.move_smooth(current, start_abs, approach_duration, stop_event, should_stop)
+        if stop_event.is_set():
+            return None
+        started_at = now_text()
+        action_t = time.perf_counter()
+        pressed = False
+        try:
+            if action_type == "drag":
+                self.controller.press(button)
+                pressed = True
+                actual_path.extend(self.move_smooth(start_abs, end_abs, main_duration, stop_event, should_stop))
+            elif action_type == "scroll":
+                scroll = action.get("scroll") or [0, 0]
+                self.controller.scroll(int(scroll[0]), int(scroll[1]))
+                actual_path.append({"x": int(start_abs[0]), "y": int(start_abs[1]), "t": time.perf_counter() - action_t})
+            else:
+                self.controller.press(button)
+                pressed = True
+                self.stoppable_sleep(clamp(main_duration, 0.03, self.settings.generated_click_hold_max), stop_event, should_stop)
+                actual_path.append({"x": int(end_abs[0]), "y": int(end_abs[1]), "t": time.perf_counter() - action_t})
+        finally:
+            if pressed:
+                try:
+                    self.controller.release(button)
+                except Exception:
+                    pass
+        if stop_event.is_set():
+            return None
+        actual = {"type": action_type if action_type in ["click", "drag", "scroll"] else "click", "button": str(button), "source": "ai", "started_at": started_at, "ended_at": now_text(), "started_perf": action_t, "ended_perf": time.perf_counter(), "duration": round(max(0.0, time.perf_counter() - action_t), 6), "start_abs": [int(start_abs[0]), int(start_abs[1])], "end_abs": [int(end_abs[0]), int(end_abs[1])], "path": actual_path}
+        if action_type == "scroll":
+            actual["scroll"] = action.get("scroll") or [0, 0]
+        normalized = normalize_mouse_action(actual, rect)
+        if action_type == "scroll":
+            normalized["scroll"] = actual["scroll"]
+        return normalized
+
+
+class EscapeMonitor:
+    def __init__(self, callback, debounce_seconds):
+        self.callback = callback
+        self.debounce_seconds = debounce_seconds
+        self.listener = None
+        self.last_key_time = 0.0
+        self.lock = threading.RLock()
+
+    def start(self):
+        if pynput_keyboard and not self.listener:
+            try:
+                self.listener = pynput_keyboard.Listener(on_press=self.on_key_press)
+                self.listener.start()
+            except Exception:
+                self.listener = None
+
+    def stop(self):
+        if self.listener:
+            try:
+                self.listener.stop()
+            except Exception:
+                pass
+            self.listener = None
+
+    def trigger(self):
+        current = time.perf_counter()
+        with self.lock:
+            if current - self.last_key_time < self.debounce_seconds:
+                return False
+            self.last_key_time = current
+        self.callback()
+        return True
+
+    def on_key_press(self, key):
+        try:
+            if key == pynput_keyboard.Key.esc:
+                self.trigger()
+        except Exception:
+            pass
+
+    def poll_pressed(self):
+        if not win32api:
+            return False
+        try:
+            if win32api.GetAsyncKeyState(0x1B) & 0x8000:
+                return self.trigger()
+        except Exception:
+            return False
+        return False
+
+
+class ControlPanel(tk.Tk):
+    def __init__(self):
+        enable_dpi_awareness()
+        super().__init__()
+        self.settings = Settings()
+        self.title("雷电模拟器学习训练控制面板")
+        self.geometry(f"{self.settings.ui_width}x{self.settings.ui_height}")
+        self.minsize(self.settings.ui_min_width, self.settings.ui_min_height)
+        self.state_lock = threading.RLock()
+        self.mode = "idle"
+        self.run_token = 0
+        self.stop_event = threading.Event()
+        self.mode_thread = None
+        self.window_manager = None
+        self.store = None
+        self.experience_pool = ExperiencePool(self.settings)
+        self.brain = ActionBrain(self.experience_pool, self.settings)
+        self.mouse_recorder = None
+        self.executor = None
+        self.last_learning_activity = time.perf_counter()
+        self.activity_lock = threading.RLock()
+        self.escape_monitor = EscapeMonitor(self.stop_current_mode, self.settings.key_debounce_seconds)
+        self.ldplayer_var = tk.StringVar(value=DEFAULT_LDPLAYER_PATH)
+        self.data_var = tk.StringVar(value=DEFAULT_DATA_PATH)
+        self.training_seconds_var = tk.StringVar(value=str(DEFAULT_TRAINING_SECONDS))
+        self.sleep_seconds_var = tk.StringVar(value=str(DEFAULT_SLEEP_SECONDS))
+        self.still_seconds_var = tk.StringVar(value=str(DEFAULT_STILL_SECONDS))
+        self.mode_var = tk.StringVar(value=MODE_NAMES["idle"])
+        self.status_var = tk.StringVar(value="等待开始")
+        self.life_var = tk.StringVar(value="0")
+        self.reward_var = tk.StringVar(value="0")
+        self.screen_reward_var = tk.StringVar(value="0")
+        self.action_reward_var = tk.StringVar(value="0")
+        self.novelty_var = tk.StringVar(value="0%")
+        self.human_var = tk.StringVar(value="0%")
+        self.ai_var = tk.StringVar(value="未决策")
+        self.pool_var = tk.StringVar(value="0")
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_text_var = tk.StringVar(value="0%")
+        self.build_ui()
+        self.bind("<Escape>", lambda event: self.stop_current_mode())
+        if self.required_import_error():
+            self.after(200, self.show_import_error)
+        else:
+            self.mouse_recorder = MouseRecorder(self.current_mode, self.current_rect, self.mark_learning_activity)
+            self.mouse_recorder.start()
+        self.escape_monitor.start()
+        if not pynput_keyboard:
+            self.status_var.set("全局键盘监听不可用，已启用 Windows ESC 轮询兜底")
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+    def build_ui(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 17, "bold"))
+        style.configure("CardTitle.TLabel", font=("Microsoft YaHei UI", 10))
+        style.configure("Value.TLabel", font=("Microsoft YaHei UI", 14, "bold"))
+        style.configure("Hint.TLabel", foreground="#555555")
+        root = ttk.Frame(self, padding=self.settings.ui_padding)
+        root.pack(fill="both", expand=True)
+        ttk.Label(root, text="雷电模拟器学习训练控制面板", style="Title.TLabel").pack(anchor="w")
+        path_frame = ttk.LabelFrame(root, text="路径与时间", padding=self.settings.ui_section_padding)
+        path_frame.pack(fill="x", pady=(16, 10))
+        path_frame.columnconfigure(1, weight=1)
+        ttk.Label(path_frame, text="雷电模拟器").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=6)
+        ttk.Entry(path_frame, textvariable=self.ldplayer_var).grid(row=0, column=1, sticky="ew", pady=6)
+        ttk.Button(path_frame, text="修改", command=self.choose_ldplayer).grid(row=0, column=2, padx=(8, 0), pady=6)
+        ttk.Label(path_frame, text="数据存储").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=6)
+        ttk.Entry(path_frame, textvariable=self.data_var).grid(row=1, column=1, sticky="ew", pady=6)
+        ttk.Button(path_frame, text="修改", command=self.choose_data).grid(row=1, column=2, padx=(8, 0), pady=6)
+        time_frame = ttk.Frame(path_frame)
+        time_frame.grid(row=2, column=1, columnspan=2, sticky="w", pady=6)
+        ttk.Label(path_frame, text="时间设置").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=6)
+        for label, variable in (("训练/秒", self.training_seconds_var), ("睡眠/秒", self.sleep_seconds_var), ("静止/秒", self.still_seconds_var)):
+            ttk.Label(time_frame, text=label).pack(side="left")
+            ttk.Entry(time_frame, textvariable=variable, width=10).pack(side="left", padx=(6, 16))
+        button_frame = ttk.Frame(root)
+        button_frame.pack(fill="x", pady=(4, 12))
+        ttk.Button(button_frame, text="学习模式", command=self.learning_mode).pack(side="left", padx=(0, 8))
+        ttk.Button(button_frame, text="训练模式", command=self.training_mode).pack(side="left", padx=8)
+        ttk.Button(button_frame, text="睡眠模式", command=self.sleep_mode).pack(side="left", padx=8)
+        ttk.Button(button_frame, text="终止当前模式", command=self.stop_current_mode).pack(side="left", padx=8)
+        ttk.Button(button_frame, text="退出", command=self.close).pack(side="right")
+        status_frame = ttk.LabelFrame(root, text="状态", padding=self.settings.ui_section_padding)
+        status_frame.pack(fill="both", expand=True)
+        for column in range(self.settings.ui_metric_columns):
+            status_frame.columnconfigure(column, weight=1)
+        metrics = [(0, 0, "当前模式", self.mode_var), (0, 1, "人生阅历", self.life_var), (0, 2, "经验条数", self.pool_var), (0, 3, "新颖度", self.novelty_var), (0, 4, "真人评分", self.human_var), (2, 0, "画面奖励", self.screen_reward_var), (2, 1, "鼠标奖惩", self.action_reward_var), (2, 2, "本次奖励", self.reward_var), (2, 3, "AI决策", self.ai_var)]
+        for row, column, title, variable in metrics:
+            self.add_metric(status_frame, row, column, title, variable)
+        ttk.Label(status_frame, text="快捷键", style="CardTitle.TLabel").grid(row=4, column=0, sticky="w", pady=(18, 6), padx=(0, 12))
+        hint = "ESC 终止当前学习、训练或睡眠。学习模式下鼠标静止超时会自动结束；鼠标移出客户区不会终止模式，客户区外的新动作会被忽略。截图与坐标均使用雷电客户区。"
+        ttk.Label(status_frame, text=hint, wraplength=max(360, self.settings.ui_width - 100), style="Hint.TLabel").grid(row=5, column=0, columnspan=self.settings.ui_metric_columns, sticky="w", pady=6)
+        progress_frame = ttk.LabelFrame(root, text="进度", padding=self.settings.ui_section_padding)
+        progress_frame.pack(fill="x", pady=(12, 0))
+        progress_frame.columnconfigure(0, weight=1)
+        ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100).grid(row=0, column=0, sticky="ew")
+        ttk.Label(progress_frame, textvariable=self.progress_text_var, width=8, anchor="e").grid(row=0, column=1, sticky="e", padx=(10, 0))
+        ttk.Label(root, textvariable=self.status_var).pack(anchor="w", pady=(10, 0))
+
+    def add_metric(self, parent, row, column, title, variable):
+        ttk.Label(parent, text=title, style="CardTitle.TLabel").grid(row=row, column=column, sticky="w", pady=(8, 4), padx=(0, 12))
+        ttk.Label(parent, textvariable=variable, style="Value.TLabel").grid(row=row + 1, column=column, sticky="w", pady=(0, 8), padx=(0, 12))
+
+    def ui(self, func):
+        try:
+            self.after(0, func)
+        except Exception:
+            pass
+
+    def required_import_error(self):
+        return {name: IMPORT_ERRORS[name] for name in REQUIRED_MODULES if name in IMPORT_ERRORS}
+
+    def show_import_error(self):
+        missing = self.required_import_error()
+        lines = [f"{name}: {error}" for name, error in missing.items()]
+        messagebox.showerror("缺少依赖", "请先安装依赖：pip install mss pillow pynput psutil pywin32\n\n当前错误：\n" + "\n".join(lines))
+        self.status_var.set("依赖缺失")
+
+    def choose_ldplayer(self):
+        path = filedialog.askopenfilename(title="选择 dnplayer.exe", filetypes=[("Executable", "*.exe"), ("All", "*.*")])
+        if path:
+            self.ldplayer_var.set(path)
+
+    def choose_data(self):
+        path = filedialog.askdirectory(title="选择数据存储目录")
+        if path:
+            self.data_var.set(path)
+
+    def read_config(self):
+        training_seconds = max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS))
+        sleep_seconds = max(1, safe_int(self.sleep_seconds_var.get(), DEFAULT_SLEEP_SECONDS))
+        still_seconds = max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS))
+        self.training_seconds_var.set(str(training_seconds))
+        self.sleep_seconds_var.set(str(sleep_seconds))
+        self.still_seconds_var.set(str(still_seconds))
+        data_path = Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)
+        settings = normalize_settings(DataStore(data_path).load_settings())
+        self.settings = settings
+        self.escape_monitor.debounce_seconds = settings.key_debounce_seconds
+        self.ui(lambda: self.minsize(settings.ui_min_width, settings.ui_min_height))
+        return Config(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH), data_path, training_seconds, sleep_seconds, still_seconds, settings)
+
+    def current_mode(self):
+        with self.state_lock:
+            return self.mode
+
+    def set_mode_ui(self, mode):
+        self.ui(lambda m=mode: self.mode_var.set(MODE_NAMES.get(m, m)))
+
+    def is_run_active(self, token, mode=None):
+        with self.state_lock:
+            return token == self.run_token and (mode is None or self.mode == mode)
+
+    def begin_run(self, mode):
+        with self.state_lock:
+            if self.mode != "idle":
+                return None, None
+            self.run_token += 1
+            token = self.run_token
+            self.stop_event = threading.Event()
+            self.mode = mode
+            stop_event = self.stop_event
+        self.set_mode_ui(mode)
+        return token, stop_event
+
+    def activate_run(self, token, mode):
+        with self.state_lock:
+            if token != self.run_token:
+                return False
+            self.mode = mode
+        self.set_mode_ui(mode)
+        return True
+
+    def finish_run(self, token, status, progress=0.0, release=True):
+        with self.state_lock:
+            if token != self.run_token:
+                return False
+            self.mode = "idle"
+        self.set_mode_ui("idle")
+        self.update_progress(progress)
+        self.ui(lambda s=status: self.status_var.set(s))
+        if release:
+            self.release_window_and_panel()
+        return True
+
+    def current_rect(self):
+        return self.window_manager.client_rect() if self.window_manager else None
+
+    def mark_learning_activity(self):
+        with self.activity_lock:
+            self.last_learning_activity = time.perf_counter()
+
+    def learning_idle_seconds(self):
+        with self.activity_lock:
+            return max(0.0, time.perf_counter() - self.last_learning_activity)
+
+    def should_stop_by_escape(self):
+        return self.escape_monitor.poll_pressed()
+
+    def release_window_and_panel(self):
+        if self.window_manager:
+            self.window_manager.not_topmost()
+        self.restore_panel()
+
+    def ensure_runtime(self, config):
+        reload_pool = False
+        if not self.store or self.store.root != config.data_path:
+            self.store = DataStore(config.data_path)
+            reload_pool = True
+        if reload_pool or self.experience_pool.settings != config.settings:
+            self.experience_pool = ExperiencePool(config.settings, self.store.load_experience())
+            self.brain = ActionBrain(self.experience_pool, config.settings)
+            self.ui(lambda: self.life_var.set(str(self.store.state.get("life_experience", 0.0))))
+            self.ui(lambda: self.pool_var.set(str(self.experience_pool.count())))
+        if not self.window_manager or self.window_manager.executable_path != config.ldplayer_path or self.window_manager.settings != config.settings:
+            self.window_manager = WindowManager(config.ldplayer_path, config.settings)
+        if not self.executor or self.executor.window_manager is not self.window_manager or self.executor.settings != config.settings:
+            self.executor = HumanMouseExecutor(self.window_manager, config.settings)
+        return self.window_manager.launch_or_attach()
+
+    def learning_mode(self):
+        self.request_active_mode("learning")
+
+    def training_mode(self):
+        self.request_active_mode("training")
+
+    def request_active_mode(self, target_mode):
+        if self.required_import_error():
+            self.show_import_error()
+            return
+        token, stop_event = self.begin_run("starting")
+        if not token:
+            self.status_var.set("请先终止当前模式，或等待当前模式结束")
+            return
+        config = self.read_config()
+        self.update_progress(100.0)
+        self.status_var.set("正在启动或连接雷电模拟器")
+        self.mode_thread = threading.Thread(target=self.mode_job, args=(token, target_mode, config, stop_event), daemon=True)
+        self.mode_thread.start()
+
+    def mode_job(self, token, mode, config, stop_event):
+        try:
+            if not self.ensure_runtime(config):
+                if self.is_run_active(token):
+                    self.ui(lambda: messagebox.showerror("未找到窗口", "没有找到雷电模拟器窗口，请确认路径正确或手动启动雷电模拟器。"))
+                    self.finish_run(token, "未找到雷电模拟器", 0.0)
+                return
+            if stop_event.is_set() or not self.is_run_active(token):
+                self.finish_run(token, "当前模式已终止", 0.0)
+                return
+            self.window_manager.topmost()
+            self.ui(self.iconify)
+            if not self.activate_run(token, mode):
+                return
+            if mode == "learning":
+                if self.mouse_recorder:
+                    self.mouse_recorder.clear()
+                self.mark_learning_activity()
+                self.ui(lambda: self.status_var.set("学习模式：记录客户区画面与用户鼠标，移出客户区不会终止"))
+                self.learning_loop(token, stop_event, config)
+            elif mode == "training":
+                self.ui(lambda: self.status_var.set("训练模式：根据实时画面执行 AI 鼠标并记录"))
+                self.training_loop(token, stop_event, config)
+        except Exception as exc:
+            message = str(exc)
+            self.ui(lambda m=message: messagebox.showerror("运行失败", m))
+            self.finish_run(token, "运行失败", 0.0)
+
+    def stop_current_mode(self):
+        with self.state_lock:
+            mode = self.mode
+            if mode not in ["starting", "learning", "training", "sleep"]:
+                self.status_var.set("当前没有正在运行的模式")
+                return
+            self.stop_event.set()
+            self.run_token += 1
+            self.mode = "idle"
+        self.set_mode_ui("idle")
+        self.update_progress(0.0 if mode == "sleep" else self.progress_var.get())
+        self.status_var.set("当前模式已终止")
+        self.release_window_and_panel()
+
+    def sleep_mode(self):
+        token, stop_event = self.begin_run("sleep")
+        if not token:
+            self.status_var.set("请先终止当前模式，或等待当前模式结束")
+            return
+        config = self.read_config()
+        self.status_var.set("睡眠模式运行中")
+        self.update_progress(0.0)
+        self.mode_thread = threading.Thread(target=self.sleep_loop, args=(token, config, stop_event), daemon=True)
+        self.mode_thread.start()
+
+    def sleep_loop(self, token, config, stop_event):
+        start = time.perf_counter()
+        while not stop_event.is_set() and self.is_run_active(token, "sleep"):
+            if self.should_stop_by_escape():
+                stop_event.set()
+                break
+            elapsed = time.perf_counter() - start
+            percent = clamp(elapsed / config.sleep_seconds * 100.0, 0.0, 100.0)
+            self.update_progress(percent)
+            if percent >= 100.0:
+                break
+            time.sleep(config.settings.sleep_tick)
+        if self.is_run_active(token, "sleep") and not stop_event.is_set():
+            self.finish_run(token, "睡眠模式完成", 100.0, release=False)
+        elif self.is_run_active(token, "sleep"):
+            self.finish_run(token, "睡眠模式已终止", 0.0, release=False)
+
+    def restore_panel(self):
+        def apply():
+            try:
+                self.deiconify()
+                self.lift()
+            except Exception:
+                pass
+        self.ui(apply)
+
+    def update_progress(self, percent):
+        percent = round(clamp(percent, 0.0, 100.0), 1)
+        def apply():
+            self.progress_var.set(percent)
+            self.progress_text_var.set(f"{percent:.1f}%")
+        self.ui(apply)
+
+    def update_metrics(self, novelty, human_score, screen_reward, action_reward, reward, life, decision=None):
+        def apply():
+            self.novelty_var.set(f"{round(float(novelty), 2)}%")
+            self.human_var.set(f"{round(float(human_score), 2)}%")
+            self.screen_reward_var.set(str(round(float(screen_reward), 2)))
+            self.action_reward_var.set(str(round(float(action_reward), 2)))
+            self.reward_var.set(str(round(float(reward), 2)))
+            self.life_var.set(str(round(float(life), 2)))
+            self.pool_var.set(str(self.experience_pool.count()))
+            if decision:
+                confidence = round(safe_float(decision.get("confidence", 0.0), 0.0) * 100.0, 1)
+                self.ai_var.set(f"{decision.get('reason', 'AI')} {confidence}%")
+        self.ui(apply)
+
+    def capture_snapshot(self, analyzer, mode, session_id, session_start, rect=None):
+        if not self.store:
+            return None
+        rect = rect or self.current_rect()
+        if not rect:
+            return None
+        path = self.store.new_screen_path(mode)
+        perf_time = time.perf_counter()
+        image = analyzer.capture(rect, path)
+        hash_value = analyzer.fingerprint(image)
+        return ScreenSnapshot(path=path, relative_path=self.store.relative_path(path), hash_value=hash_value, captured_at=now_text(), perf_time=perf_time, elapsed=round(perf_time - session_start, 3), rect=tuple(rect))
+
+    def write_record(self, mode, session_id, snapshot, action, event_name, decision=None, action_anchor_perf=None):
+        if not self.store or not snapshot:
+            return None
+        novelty, batch = self.experience_pool.novelty(snapshot.hash_value)
+        normalized = normalize_mouse_action(action, snapshot.rect) if action else None
+        human_score = self.experience_pool.human_score(normalized) if normalized else 0.0
+        screen_reward, action_reward, reward = reward_parts(novelty, human_score, self.settings) if normalized else (0.0, 0.0, 0.0)
+        life = self.store.add_life_experience(reward) if normalized else self.store.state.get("life_experience", 0.0)
+        started_perf = safe_float(normalized.get("started_perf"), None) if normalized else None
+        offset_source = started_perf if started_perf is not None else action_anchor_perf
+        offset_ms = round((float(offset_source) - snapshot.perf_time) * 1000.0, 3) if offset_source is not None else None
+        record = {"id": uuid.uuid4().hex, "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "novelty": novelty, "human_score": human_score, "screen_reward": screen_reward, "action_reward": action_reward, "reward": reward, "life_experience": life, "client_rect": list(snapshot.rect)}
+        if decision:
+            record["ai_decision"] = decision
+        self.store.append_experience(record)
+        self.experience_pool.add(record)
+        self.update_metrics(novelty, human_score, screen_reward, action_reward, reward, life, decision)
+        return record
+
+    def learning_loop(self, token, stop_event, config):
+        session_id = uuid.uuid4().hex
+        start = time.perf_counter()
+        pending_snapshots = {}
+        self.mark_learning_activity()
+        with ScreenAnalyzer(config.settings.hash_size) as analyzer:
+            self.write_record("learning", session_id, self.capture_snapshot(analyzer, "learning", session_id, start), None, "mode_start")
+            while not stop_event.is_set() and self.is_run_active(token, "learning"):
+                if self.should_stop_by_escape():
+                    stop_event.set()
+                    break
+                idle_seconds = self.learning_idle_seconds()
+                self.update_progress(clamp((config.still_seconds - idle_seconds) / config.still_seconds * 100.0, 0.0, 100.0))
+                if idle_seconds >= config.still_seconds:
+                    stop_event.set()
+                    self.ui(lambda: self.status_var.set("学习模式结束：鼠标静止超时"))
+                    break
+                if self.mouse_recorder:
+                    markers = self.mouse_recorder.pop_start_markers()
+                    for marker in markers:
+                        marker_snapshot = self.capture_snapshot(analyzer, "learning", session_id, start)
+                        if marker_snapshot:
+                            pending_snapshots[marker["action_id"]] = marker_snapshot
+                    actions = self.mouse_recorder.pop_actions()
+                    for action in actions:
+                        action_snapshot = pending_snapshots.pop(action.get("action_id"), None) or self.capture_snapshot(analyzer, "learning", session_id, start)
+                        self.write_record("learning", session_id, action_snapshot, action, "user_mouse", action_anchor_perf=action.get("started_perf") or action.get("t0"))
+                    if not markers and not actions:
+                        self.mouse_recorder.wait(config.settings.mouse_still_tick)
+                else:
+                    time.sleep(config.settings.mouse_still_tick)
+            self.write_record("learning", session_id, self.capture_snapshot(analyzer, "learning", session_id, start), None, "mode_end")
+        if self.is_run_active(token, "learning"):
+            self.finish_run(token, "学习模式结束", 0.0)
+        else:
+            self.release_window_and_panel()
+
+    def training_loop(self, token, stop_event, config):
+        session_id = uuid.uuid4().hex
+        start = time.perf_counter()
+        with ScreenAnalyzer(config.settings.hash_size) as analyzer:
+            self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start), None, "mode_start")
+            while not stop_event.is_set() and self.is_run_active(token, "training"):
+                if self.should_stop_by_escape():
+                    stop_event.set()
+                    break
+                elapsed = time.perf_counter() - start
+                if elapsed >= config.training_seconds:
+                    break
+                self.update_progress(clamp((config.training_seconds - elapsed) / config.training_seconds * 100.0, 0.0, 100.0))
+                rect = self.current_rect()
+                if not rect:
+                    time.sleep(config.settings.training_tick)
+                    continue
+                snapshot = self.capture_snapshot(analyzer, "training", session_id, start, rect=rect)
+                if not snapshot:
+                    time.sleep(config.settings.training_tick)
+                    continue
+                novelty, batch = self.experience_pool.novelty(snapshot.hash_value)
+                life = safe_float(self.store.state.get("life_experience", 0.0), 0.0) if self.store else 0.0
+                action, decision = self.brain.choose(snapshot.hash_value, novelty, batch, life)
+                if action.get("end_rel") is None:
+                    action["end_rel"] = action.get("start_rel", [0.5, 0.5])
+                actual = self.executor.execute(action, rect, stop_event, self.should_stop_by_escape)
+                if not actual:
+                    break
+                record = self.write_record("training", session_id, snapshot, actual, "ai_mouse", decision=decision, action_anchor_perf=actual.get("started_perf"))
+                delay = safe_float(record["mouse_action"].get("duration", 0.0), 0.0) if record and record.get("mouse_action") else 0.0
+                deadline = time.perf_counter() + max(config.settings.min_action_delay_seconds, delay)
+                while time.perf_counter() < deadline and not stop_event.is_set():
+                    if self.should_stop_by_escape():
+                        stop_event.set()
+                        break
+                    time.sleep(min(config.settings.generated_wait_tick, deadline - time.perf_counter()))
+            self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start), None, "mode_end")
+        if self.is_run_active(token, "training") and not stop_event.is_set():
+            self.finish_run(token, "训练模式结束", 0.0)
+        elif self.is_run_active(token, "training"):
+            self.finish_run(token, "训练模式已终止", self.progress_var.get())
+        else:
+            self.release_window_and_panel()
+
+    def close(self):
+        with self.state_lock:
+            self.stop_event.set()
+            self.run_token += 1
+            self.mode = "idle"
+        if self.mouse_recorder:
+            self.mouse_recorder.stop()
+        self.escape_monitor.stop()
+        if self.window_manager:
+            self.window_manager.not_topmost()
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
-    main()
+    app = ControlPanel()
+    app.mainloop()
