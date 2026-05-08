@@ -436,7 +436,15 @@ def weighted_choice(weighted_items):
 
 
 def percentile_score(value, samples, default):
-    ordered = sorted(float(item) for item in samples if math.isfinite(float(item)))
+    normalized = []
+    for item in samples:
+        try:
+            number = float(item)
+        except Exception:
+            continue
+        if math.isfinite(number):
+            normalized.append(number)
+    ordered = sorted(normalized)
     if len(ordered) < 2:
         return default
     n = len(ordered)
@@ -499,7 +507,7 @@ class HumanProfile:
             return self.score_scroll(features)
         if self.enough(action_type):
             with self.lock:
-                stats = copy.deepcopy(self.stats[action_type])
+                stats = {name: tuple(values) for name, values in self.stats[action_type].items()}
             scores = [
                 percentile_score(features.get("duration", 0.0), stats.get("duration", []), self.settings.score_default),
                 percentile_score(features.get("direct", 0.0), stats.get("direct", []), self.settings.score_default),
