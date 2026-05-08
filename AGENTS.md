@@ -1,32 +1,35 @@
-仅用一个Python脚本，实现一个“活在浏览器里的AI”，越聪明越好。
-
-出现错误时，在控制台输出详细信息，避免静默失败。
-
-初始化阶段：检查电脑桌面上的AAA文件夹内是否存在文件：经验池、AI模型（若缺失，告诉用户网址和详细的下载方法）。
-工作阶段：AI可以操控鼠标（在浏览器窗口范围内）和键盘（除了ESC）。
-
-用户按下ESC后，立刻终止程序。
-
 操作系统：Windows 11
-显示器分辨率：2560×1600
-CPU：12th Gen Intel(R) Core(TM) i7-12650H
-基准速度：2.30 GHz
-插槽：1
-内核：10
-逻辑处理器：16
-内存：15.8GB
-GPU：NVIDIA GeForce RTX 3050 Ti
-显存：4GB
-浏览器：Mozilla Firefox, Portable Edition
-默认文件路径：E:\FirefoxPortable\FirefoxPortable.exe
 
-当经验池大小＞20GB时，丢弃最旧数据，直到经验池大小＜20GB。
+代码：无注释、无要求中未提及的硬编码；
 
-需要预防的报错：
+雷电模拟器默认路径（可修改）：D:\LDPlayer9\dnplayer.exe
 
-FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead.
+数据存储默认路径（可修改）：C:\Users\Administrator\Desktop\AAA
 
-FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+在学习模式/训练模式期间，记录：时间、画面、鼠标；
 
-UserWarning: torch.utils.checkpoint: the use_reentrant parameter should be passed explicitly. In version 2.5 we will raise an exception if use_reentrant is not passed. use_reentrant=False is recommended, but if you need to preserve the current default behavior, you can pass use_reentrant=True.
+学习模式期间，记录时间、画面、用户在雷电模拟器上的鼠标操作；
 
+训练模式期间，根据实时画面，AI在雷电模拟器上进行鼠标操作，同时记录时间、画面、AI在雷电模拟器上的鼠标操作；
+
+进入学习模式：在空闲期间，用户按控制面板上的“学习模式”按钮，最小化控制面板，雷电模拟器窗口保持置顶；
+
+进入训练模式：在空闲期间，用户按控制面板上的“训练模式”按钮，最小化控制面板，雷电模拟器窗口保持置顶；
+
+终止学习模式：在学习模式期间，用户按ESC键/鼠标长时间保持静止（默认10秒，可修改），雷电模拟器窗口不再保持置顶；
+
+终止训练模式：在训练模式期间，用户按ESC键/时间到（默认900秒，可修改），雷电模拟器窗口不再保持置顶；
+
+简洁、美观、灵活的控制面板：无论用户怎么缩放，永远呈现完整内容；
+
+睡眠模式：在空闲期间，用户按控制面板上的“睡眠模式”按钮；
+
+进度条：在睡眠模式期间，实时显示进度（0%→100%）；在学习/训练模式期间，实时显示进度（100%→0%）；
+
+奖励：增加“人生阅历”；
+
+对于一个画面，在经验池中挑选一批与之最接近的历史画面，然后进行判断：越新颖（0%→100%），奖励越高（0%→100%）；完全相同，没有奖励；
+
+对于鼠标操作：越像真人（50%→100%），奖励越高；越不像真人（50%→0%），惩罚越高；
+
+终止睡眠模式：睡眠结束后自动终止/用户按ESC键/时间到（默认1800秒，可修改）；
