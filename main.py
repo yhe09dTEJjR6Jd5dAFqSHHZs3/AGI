@@ -91,6 +91,7 @@ class Settings:
     ui_padding: int = 18
     ui_section_padding: int = 12
     ui_metric_columns: int = 5
+    ui_metric_min_column_width: int = 180
     click_direct_threshold: float = 0.006
     drag_direct_threshold: float = 0.006
     drag_min_points: int = 4
@@ -218,7 +219,8 @@ def normalize_settings(settings):
         ui_min_height=max(1, safe_int(settings.ui_min_height, 620)),
         ui_padding=max(0, safe_int(settings.ui_padding, 18)),
         ui_section_padding=max(0, safe_int(settings.ui_section_padding, 12)),
-        ui_metric_columns=max(5, safe_int(settings.ui_metric_columns, 5)),
+        ui_metric_columns=max(1, safe_int(settings.ui_metric_columns, 5)),
+        ui_metric_min_column_width=max(120, safe_int(settings.ui_metric_min_column_width, 180)),
         click_direct_threshold=clamp(settings.click_direct_threshold, 0.0, 1.0),
         drag_direct_threshold=clamp(settings.drag_direct_threshold, 0.0, 1.0),
         drag_min_points=max(1, safe_int(settings.drag_min_points, 4)),
@@ -1279,7 +1281,11 @@ class ControlPanel(tk.Tk):
         self.pool_var = tk.StringVar(value="0")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_text_var = tk.StringVar(value="0%")
+        self.metric_items = []
+        self.hint_label = None
+        self.metrics_frame = None
         self.build_ui()
+        self.bind("<Configure>", self.on_window_resize)
         self.bind("<Escape>", lambda event: self.stop_current_mode())
         if self.required_import_error():
             self.after(200, self.show_import_error)
@@ -1303,8 +1309,17 @@ class ControlPanel(tk.Tk):
         style.configure("Hint.TLabel", foreground="#555555")
         root = ttk.Frame(self, padding=self.settings.ui_padding)
         root.pack(fill="both", expand=True)
-        ttk.Label(root, text="雷电模拟器学习训练控制面板", style="Title.TLabel").pack(anchor="w")
-        path_frame = ttk.LabelFrame(root, text="路径与时间", padding=self.settings.ui_section_padding)
+        canvas = tk.Canvas(root, borderwidth=0, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(root, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        container = ttk.Frame(canvas)
+        canvas_window = canvas.create_window((0, 0), window=container, anchor="nw")
+        container.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(canvas_window, width=event.width))
+        ttk.Label(container, text="雷电模拟器学习训练控制面板", style="Title.TLabel").pack(anchor="w")
+        path_frame = ttk.LabelFrame(container, text="路径与时间", padding=self.settings.ui_section_padding)
         path_frame.pack(fill="x", pady=(16, 10))
         path_frame.columnconfigure(1, weight=1)
         ttk.Label(path_frame, text="雷电模拟器").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=6)
@@ -1319,33 +1334,60 @@ class ControlPanel(tk.Tk):
         for label, variable in (("训练/秒", self.training_seconds_var), ("睡眠/秒", self.sleep_seconds_var), ("静止/秒", self.still_seconds_var)):
             ttk.Label(time_frame, text=label).pack(side="left")
             ttk.Entry(time_frame, textvariable=variable, width=10).pack(side="left", padx=(6, 16))
-        button_frame = ttk.Frame(root)
+        button_frame = ttk.Frame(container)
         button_frame.pack(fill="x", pady=(4, 12))
         ttk.Button(button_frame, text="学习模式", command=self.learning_mode).pack(side="left", padx=(0, 8))
         ttk.Button(button_frame, text="训练模式", command=self.training_mode).pack(side="left", padx=8)
         ttk.Button(button_frame, text="睡眠模式", command=self.sleep_mode).pack(side="left", padx=8)
         ttk.Button(button_frame, text="终止当前模式", command=self.stop_current_mode).pack(side="left", padx=8)
         ttk.Button(button_frame, text="退出", command=self.close).pack(side="right")
-        status_frame = ttk.LabelFrame(root, text="状态", padding=self.settings.ui_section_padding)
+        status_frame = ttk.LabelFrame(container, text="状态", padding=self.settings.ui_section_padding)
         status_frame.pack(fill="both", expand=True)
-        for column in range(self.settings.ui_metric_columns):
-            status_frame.columnconfigure(column, weight=1)
-        metrics = [(0, 0, "当前模式", self.mode_var), (0, 1, "人生阅历", self.life_var), (0, 2, "经验条数", self.pool_var), (0, 3, "新颖度", self.novelty_var), (0, 4, "真人评分", self.human_var), (2, 0, "画面奖励", self.screen_reward_var), (2, 1, "鼠标奖惩", self.action_reward_var), (2, 2, "本次奖励", self.reward_var), (2, 3, "AI决策", self.ai_var)]
-        for row, column, title, variable in metrics:
-            self.add_metric(status_frame, row, column, title, variable)
-        ttk.Label(status_frame, text="快捷键", style="CardTitle.TLabel").grid(row=4, column=0, sticky="w", pady=(18, 6), padx=(0, 12))
+        self.metrics_frame = ttk.Frame(status_frame)
+        self.metrics_frame.grid(row=0, column=0, sticky="nsew")
+        status_frame.columnconfigure(0, weight=1)
+        metrics = [("当前模式", self.mode_var), ("人生阅历", self.life_var), ("经验条数", self.pool_var), ("新颖度", self.novelty_var), ("真人评分", self.human_var), ("画面奖励", self.screen_reward_var), ("鼠标奖惩", self.action_reward_var), ("本次奖励", self.reward_var), ("AI决策", self.ai_var)]
+        for title, variable in metrics:
+            self.metric_items.append(self.create_metric(self.metrics_frame, title, variable))
+        self.reflow_metrics()
+        ttk.Label(status_frame, text="快捷键", style="CardTitle.TLabel").grid(row=1, column=0, sticky="w", pady=(18, 6), padx=(0, 12))
         hint = "ESC 终止当前学习、训练或睡眠。学习模式下鼠标静止超时会自动结束；鼠标移出客户区不会终止模式，客户区外的新动作会被忽略。截图与坐标均使用雷电客户区。"
-        ttk.Label(status_frame, text=hint, wraplength=max(360, self.settings.ui_width - 100), style="Hint.TLabel").grid(row=5, column=0, columnspan=self.settings.ui_metric_columns, sticky="w", pady=6)
-        progress_frame = ttk.LabelFrame(root, text="进度", padding=self.settings.ui_section_padding)
+        self.hint_label = ttk.Label(status_frame, text=hint, wraplength=max(320, self.settings.ui_width - 120), style="Hint.TLabel")
+        self.hint_label.grid(row=2, column=0, sticky="ew", pady=6)
+        progress_frame = ttk.LabelFrame(container, text="进度", padding=self.settings.ui_section_padding)
         progress_frame.pack(fill="x", pady=(12, 0))
         progress_frame.columnconfigure(0, weight=1)
         ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100).grid(row=0, column=0, sticky="ew")
         ttk.Label(progress_frame, textvariable=self.progress_text_var, width=8, anchor="e").grid(row=0, column=1, sticky="e", padx=(10, 0))
-        ttk.Label(root, textvariable=self.status_var).pack(anchor="w", pady=(10, 0))
+        ttk.Label(container, textvariable=self.status_var).pack(anchor="w", pady=(10, 0))
 
-    def add_metric(self, parent, row, column, title, variable):
-        ttk.Label(parent, text=title, style="CardTitle.TLabel").grid(row=row, column=column, sticky="w", pady=(8, 4), padx=(0, 12))
-        ttk.Label(parent, textvariable=variable, style="Value.TLabel").grid(row=row + 1, column=column, sticky="w", pady=(0, 8), padx=(0, 12))
+    def create_metric(self, parent, title, variable):
+        frame = ttk.Frame(parent)
+        ttk.Label(frame, text=title, style="CardTitle.TLabel").pack(anchor="w", pady=(8, 4))
+        ttk.Label(frame, textvariable=variable, style="Value.TLabel").pack(anchor="w", pady=(0, 8))
+        return frame
+
+    def reflow_metrics(self):
+        if not self.metrics_frame:
+            return
+        width = max(1, self.metrics_frame.winfo_width() or self.winfo_width())
+        min_width = max(120, self.settings.ui_metric_min_column_width)
+        preferred = max(1, self.settings.ui_metric_columns)
+        columns = max(1, min(preferred, width // min_width if width >= min_width else 1))
+        for column in range(preferred):
+            self.metrics_frame.columnconfigure(column, weight=0)
+        for column in range(columns):
+            self.metrics_frame.columnconfigure(column, weight=1)
+        for index, item in enumerate(self.metric_items):
+            row = index // columns
+            column = index % columns
+            item.grid(row=row, column=column, sticky="ew", padx=(0, 12))
+
+    def on_window_resize(self, _event):
+        if self.hint_label:
+            width = max(320, self.winfo_width() - self.settings.ui_padding * 4)
+            self.hint_label.configure(wraplength=width)
+        self.reflow_metrics()
 
     def ui(self, func):
         try:
@@ -1601,13 +1643,14 @@ class ControlPanel(tk.Tk):
             return None
         novelty, batch = self.experience_pool.novelty(snapshot.hash_value)
         normalized = normalize_mouse_action(action, snapshot.rect) if action else None
+        mouse_source = normalized.get("source") if normalized else None
         human_score = self.experience_pool.human_score(normalized) if normalized else 0.0
         screen_reward, action_reward, reward = reward_parts(novelty, human_score, self.settings) if normalized else (0.0, 0.0, 0.0)
         life = self.store.add_life_experience(reward) if normalized else self.store.state.get("life_experience", 0.0)
         started_perf = safe_float(normalized.get("started_perf"), None) if normalized else None
         offset_source = started_perf if started_perf is not None else action_anchor_perf
         offset_ms = round((float(offset_source) - snapshot.perf_time) * 1000.0, 3) if offset_source is not None else None
-        record = {"id": uuid.uuid4().hex, "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "novelty": novelty, "human_score": human_score, "screen_reward": screen_reward, "action_reward": action_reward, "reward": reward, "life_experience": life, "client_rect": list(snapshot.rect)}
+        record = {"id": uuid.uuid4().hex, "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "novelty": novelty, "human_score": human_score, "screen_reward": screen_reward, "action_reward": action_reward, "reward": reward, "life_experience": life, "client_rect": list(snapshot.rect)}
         if decision:
             record["ai_decision"] = decision
         self.store.append_experience(record)
