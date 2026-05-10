@@ -1,6 +1,7 @@
 import copy
 import ctypes
 import json
+import heapq
 import math
 import random
 import subprocess
@@ -559,6 +560,7 @@ class DataStore:
         self.experience_file = self.root / "experience.jsonl"
         self.state_file = self.root / "state.json"
         self.settings_file = self.root / "settings.json"
+        self.error_file = self.root / "errors.jsonl"
         self.lock = threading.RLock()
         self.root.mkdir(parents=True, exist_ok=True)
         self.screen_dir.mkdir(parents=True, exist_ok=True)
@@ -624,6 +626,19 @@ class DataStore:
                 except Exception:
                     pass
         return records
+
+    def log_error(self, where, error, context=None):
+        payload = {
+            "time": now_text(),
+            "where": str(where),
+            "error_type": type(error).__name__,
+            "error": str(error)
+        }
+        if context:
+            payload["context"] = context
+        with self.lock:
+            with self.error_file.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 class WindowManager:
@@ -806,6 +821,7 @@ class ExperiencePool:
         self.records = []
         self.hashes = []
         self.index = defaultdict(list)
+        self.sorted_prefixes = []
         self.profile = HumanProfile(settings)
         self.lock = threading.RLock()
         for record in records or []:
@@ -822,7 +838,11 @@ class ExperiencePool:
             hash_value = parse_hash_value(record)
             self.hashes.append(hash_value)
             if hash_value:
-                self.index[self._prefix(hash_value)].append(index)
+                prefix = self._prefix(hash_value)
+                bucket = self.index[prefix]
+                if not bucket:
+                    self.sorted_prefixes.append(prefix)
+                bucket.append(index)
             if record.get("mouse_action"):
                 self.profile.observe(record["mouse_action"])
 
@@ -840,8 +860,9 @@ class ExperiencePool:
                 return [index for index, item in enumerate(self.hashes) if item]
             query_prefix = self._prefix(hash_value)
             result = []
-            for prefix in sorted(self.index.keys(), key=lambda item: (item ^ query_prefix).bit_count()):
-                result.extend(self.index.get(prefix, []))
+            nearby = sorted(self.sorted_prefixes, key=lambda item: (item ^ query_prefix).bit_count())
+            for prefix in nearby:
+                result.extend(self.index[prefix])
                 if len(result) >= self.settings.nearest_candidate_limit:
                     break
             if result:
@@ -853,13 +874,18 @@ class ExperiencePool:
         if not hash_value:
             return []
         with self.lock:
+            top_k = max(1, self.settings.nearest_top_k)
             scored = []
             for index in self.candidate_indices(hash_value):
                 other = self.hashes[index]
                 if other:
-                    scored.append({"similarity": hash_similarity(hash_value, other), "record": self.records[index]})
-        scored.sort(key=lambda item: item["similarity"], reverse=True)
-        return scored[:max(1, self.settings.nearest_top_k)]
+                    similarity = hash_similarity(hash_value, other)
+                    item = {"similarity": similarity, "record": self.records[index]}
+                    if len(scored) < top_k:
+                        heapq.heappush(scored, (similarity, item))
+                    elif similarity > scored[0][0]:
+                        heapq.heapreplace(scored, (similarity, item))
+        return [item for _, item in sorted(scored, key=lambda pair: pair[0], reverse=True)]
 
     def novelty(self, hash_value):
         batch = self.nearest(hash_value)
@@ -1143,6 +1169,8 @@ class HumanMouseExecutor:
         end_rel = action.get("end_rel") or start_rel
         start_abs = abs_from_rel(rect, start_rel)
         end_abs = abs_from_rel(rect, end_rel)
+        if not point_inside(rect, start_abs[0], start_abs[1]) or not point_inside(rect, end_abs[0], end_abs[1]):
+            return {"execution_error": "point_outside_client", "rect": list(rect), "start_abs": [int(start_abs[0]), int(start_abs[1])], "end_abs": [int(end_abs[0]), int(end_abs[1])]}
         current = self.controller.position
         distance_to_start = math.hypot(start_abs[0] - current[0], start_abs[1] - current[1])
         main_distance = math.hypot(end_abs[0] - start_abs[0], end_abs[1] - start_abs[1])
@@ -1174,6 +1202,8 @@ class HumanMouseExecutor:
                 pressed = True
                 self.stoppable_sleep(clamp(main_duration, 0.03, self.settings.generated_click_hold_max), stop_event, should_stop)
                 actual_path.append({"x": int(end_abs[0]), "y": int(end_abs[1]), "t": time.perf_counter() - action_t})
+        except Exception as exc:
+            return {"execution_error": str(exc), "error_type": type(exc).__name__, "action_type": action_type, "start_abs": [int(start_abs[0]), int(start_abs[1])], "end_abs": [int(end_abs[0]), int(end_abs[1])]}
         finally:
             if pressed:
                 try:
@@ -1281,6 +1311,7 @@ class ControlPanel(tk.Tk):
         self.pool_var = tk.StringVar(value="0")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_text_var = tk.StringVar(value="0%")
+        self.progress_label_var = tk.StringVar(value="进度")
         self.metric_items = []
         self.hint_label = None
         self.metrics_frame = None
@@ -1354,7 +1385,7 @@ class ControlPanel(tk.Tk):
         hint = "ESC 终止当前学习、训练或睡眠。学习模式下鼠标静止超时会自动结束；鼠标移出客户区不会终止模式，客户区外的新动作会被忽略。截图与坐标均使用雷电客户区。"
         self.hint_label = ttk.Label(status_frame, text=hint, wraplength=max(320, self.settings.ui_width - 120), style="Hint.TLabel")
         self.hint_label.grid(row=2, column=0, sticky="ew", pady=6)
-        progress_frame = ttk.LabelFrame(container, text="进度", padding=self.settings.ui_section_padding)
+        progress_frame = ttk.LabelFrame(container, textvariable=self.progress_label_var, padding=self.settings.ui_section_padding)
         progress_frame.pack(fill="x", pady=(12, 0))
         progress_frame.columnconfigure(0, weight=1)
         ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100).grid(row=0, column=0, sticky="ew")
@@ -1394,6 +1425,13 @@ class ControlPanel(tk.Tk):
             self.after(0, func)
         except Exception:
             pass
+
+    def log_exception(self, where, error, context=None):
+        if self.store:
+            try:
+                self.store.log_error(where, error, context)
+            except Exception:
+                pass
 
     def required_import_error(self):
         return {name: IMPORT_ERRORS[name] for name in REQUIRED_MODULES if name in IMPORT_ERRORS}
@@ -1581,6 +1619,7 @@ class ControlPanel(tk.Tk):
 
     def sleep_loop(self, token, config, stop_event):
         start = time.perf_counter()
+        self.ui(lambda: self.progress_label_var.set("模式进度"))
         while not stop_event.is_set() and self.is_run_active(token, "sleep"):
             if self.should_stop_by_escape():
                 stop_event.set()
@@ -1670,6 +1709,7 @@ class ControlPanel(tk.Tk):
                     stop_event.set()
                     break
                 idle_seconds = self.learning_idle_seconds()
+                self.ui(lambda: self.progress_label_var.set("静止倒计时"))
                 self.update_progress(clamp((config.still_seconds - idle_seconds) / config.still_seconds * 100.0, 0.0, 100.0))
                 if idle_seconds >= config.still_seconds:
                     stop_event.set()
@@ -1708,6 +1748,7 @@ class ControlPanel(tk.Tk):
                 if elapsed >= config.training_seconds:
                     break
                 self.update_progress(clamp((config.training_seconds - elapsed) / config.training_seconds * 100.0, 0.0, 100.0))
+                self.ui(lambda: self.progress_label_var.set("模式进度"))
                 rect = self.current_rect()
                 if not rect:
                     time.sleep(config.settings.training_tick)
@@ -1723,7 +1764,11 @@ class ControlPanel(tk.Tk):
                     action["end_rel"] = action.get("start_rel", [0.5, 0.5])
                 actual = self.executor.execute(action, rect, stop_event, self.should_stop_by_escape)
                 if not actual:
-                    break
+                    self.log_exception("training.execute", RuntimeError("empty_action_result"))
+                    continue
+                if actual.get("execution_error"):
+                    self.log_exception("training.execute", RuntimeError(actual.get("execution_error")), {"detail": actual, "decision": decision})
+                    continue
                 record = self.write_record("training", session_id, snapshot, actual, "ai_mouse", decision=decision, action_anchor_perf=actual.get("started_perf"))
                 delay = safe_float(record["mouse_action"].get("duration", 0.0), 0.0) if record and record.get("mouse_action") else 0.0
                 deadline = time.perf_counter() + max(config.settings.min_action_delay_seconds, delay)
