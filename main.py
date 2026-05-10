@@ -64,12 +64,12 @@ MODE_NAMES = {"idle": "空闲", "starting": "准备中", "learning": "学习模�
 
 @dataclass(frozen=True)
 class Settings:
-    hash_size: int = 16
-    nearest_top_k: int = 96
-    nearest_candidate_limit: int = 4096
-    hash_prefix_bits: int = 12
-    mouse_still_tick: float = 0.03
-    training_tick: float = 0.05
+    hash_size: int = 12
+    nearest_top_k: int = 32
+    nearest_candidate_limit: int = 2048
+    hash_prefix_bits: int = 8
+    mouse_still_tick: float = 0.05
+    training_tick: float = 0.08
     sleep_tick: float = 0.1
     key_debounce_seconds: float = 0.35
     window_attach_seconds: float = 45.0
@@ -93,13 +93,13 @@ class Settings:
     ui_section_padding: int = 12
     ui_metric_columns: int = 5
     ui_metric_min_column_width: int = 180
-    click_direct_threshold: float = 0.006
-    drag_direct_threshold: float = 0.006
+    click_direct_threshold: float = 0.01
+    drag_direct_threshold: float = 0.01
     drag_min_points: int = 4
     drag_bend_penalty_threshold: float = 3.2
     click_long_duration: float = 0.9
-    reward_total_min: float = -100.0
-    reward_total_max: float = 200.0
+    reward_total_min: float = -10000.0
+    reward_total_max: float = 10000.0
     experience_load_limit: int = 30000
     score_default: float = 65.0
     scroll_score_default: float = 72.0
@@ -119,9 +119,53 @@ class Settings:
     motion_first_control_max: float = 0.45
     motion_second_control_min: float = 0.55
     motion_second_control_max: float = 0.75
-    learning_screen_fps: float = 3.0
+    learning_screen_fps: float = 2.0
     learning_screen_similarity_threshold: float = 0.985
-    training_fail_stop_count: int = 8
+    training_fail_stop_count: int = 6
+
+
+class AdaptivePolicy:
+    def __init__(self):
+        self.capture_latency_ms = deque(maxlen=120)
+        self.execution_latency_ms = deque(maxlen=120)
+        self.learning_similarity = deque(maxlen=80)
+        self.window_change_flags = deque(maxlen=120)
+        self.outcome_flags = deque(maxlen=120)
+
+    def observe_capture(self, latency_ms, similarity=None, window_rect_changed=False):
+        self.capture_latency_ms.append(max(0.0, safe_float(latency_ms, 0.0)))
+        if similarity is not None:
+            self.learning_similarity.append(clamp(similarity, 0.0, 1.0))
+        self.window_change_flags.append(1.0 if window_rect_changed else 0.0)
+
+    def observe_execution(self, latency_ms=None, success=True):
+        if latency_ms is not None:
+            self.execution_latency_ms.append(max(0.0, safe_float(latency_ms, 0.0)))
+        self.outcome_flags.append(1.0 if success else 0.0)
+
+    def _avg(self, values, fallback):
+        return sum(values) / len(values) if values else fallback
+
+    def build(self, base_settings, rect, pool_count, life):
+        width, height = rect_size(rect) if rect else (1280, 720)
+        pixel_factor = math.sqrt(max(1.0, width * height) / (1280.0 * 720.0))
+        capture_ms = self._avg(self.capture_latency_ms, 24.0)
+        execution_ms = self._avg(self.execution_latency_ms, 140.0)
+        window_instability = self._avg(self.window_change_flags, 0.0)
+        recent_success = self._avg(self.outcome_flags, 1.0)
+        similarity = self._avg(self.learning_similarity, 0.97)
+        hash_size = int(clamp(round(8 + pixel_factor * 4 + math.log2(max(2, pool_count + 2)) * 0.6), 8, 24))
+        nearest_top_k = int(clamp(round(12 + math.sqrt(max(1, pool_count)) * 1.5), 8, 256))
+        nearest_candidate_limit = int(clamp(round(nearest_top_k * (12.0 + 8.0 * (1.0 - window_instability))), nearest_top_k * 4, 20000))
+        training_tick = round(clamp((capture_ms + execution_ms) / 1000.0 * (0.45 + 0.4 * window_instability), 0.02, 1.2), 4)
+        learning_screen_fps = round(clamp(1.0 / max(0.04, capture_ms / 1000.0) * (1.0 - similarity * 0.65), 0.5, 12.0), 3)
+        explore_max = clamp(0.35 + (1.0 - recent_success) * 0.45 + clamp(similarity, 0.0, 1.0) * 0.1, 0.2, 0.95)
+        explore_min = clamp(explore_max * 0.12, 0.01, 0.2)
+        fail_stop = int(clamp(round((1.0 - recent_success) * 16 + window_instability * 10 + 2), 2, 24))
+        jitter = clamp(0.01 + 0.03 * (1.0 - recent_success), 0.005, 0.08)
+        base_values = {item.name: getattr(base_settings, item.name) for item in fields(Settings)}
+        base_values.update({"hash_size": hash_size, "nearest_top_k": nearest_top_k, "nearest_candidate_limit": nearest_candidate_limit, "training_tick": training_tick, "learning_screen_fps": learning_screen_fps, "explore_min_rate": explore_min, "explore_max_rate": explore_max, "training_fail_stop_count": fail_stop, "action_jitter": jitter, "hash_prefix_bits": int(clamp(round(hash_size * 0.66), 4, 20)), "reward_total_min": -10000.0 - life, "reward_total_max": 10000.0 + life})
+        return normalize_settings(Settings(**base_values))
 
 
 @dataclass(frozen=True)
@@ -427,9 +471,9 @@ def hash_similarity(hash_a, hash_b):
 
 def reward_parts(novelty, human_score, settings):
     screen_reward = round(clamp(novelty, 0.0, 100.0), 2)
-    action_reward = round((clamp(human_score, 0.0, 100.0) - 50.0) * 2.0, 2)
-    total = round(clamp(screen_reward + action_reward, settings.reward_total_min, settings.reward_total_max), 2)
-    return screen_reward, action_reward, total
+    human_delta = round((clamp(human_score, 0.0, 100.0) - 50.0) * 2.0, 2)
+    total = round(clamp(screen_reward + human_delta, settings.reward_total_min, settings.reward_total_max), 2)
+    return screen_reward, human_delta, total
 
 
 def weighted_choice(weighted_items):
@@ -1319,6 +1363,8 @@ class ControlPanel(tk.Tk):
         enable_dpi_awareness()
         super().__init__()
         self.settings = Settings()
+        self.adaptive_policy = AdaptivePolicy()
+        self.progress_value = 0.0
         self.title("雷电模拟器学习训练控制面板")
         self.geometry(f"{self.settings.ui_width}x{self.settings.ui_height}")
         self.minsize(self.settings.ui_min_width, self.settings.ui_min_height)
@@ -1504,7 +1550,7 @@ class ControlPanel(tk.Tk):
         self.sleep_seconds_var.set(str(sleep_seconds))
         self.still_seconds_var.set(str(still_seconds))
         data_path = Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)
-        settings = normalize_settings(DataStore(data_path).load_settings())
+        settings = normalize_settings(Settings())
         self.settings = settings
         self.escape_monitor.debounce_seconds = settings.key_debounce_seconds
         self.ui(lambda: self.minsize(settings.ui_min_width, settings.ui_min_height))
@@ -1644,7 +1690,7 @@ class ControlPanel(tk.Tk):
                 return
             self.stop_event.set()
             self.run_token += 1
-            progress_now = self.progress_var.get()
+            progress_now = self.progress_value
             self.mode = "idle"
         self.set_mode_ui("idle")
         self.update_progress(0.0 if mode == "sleep" else progress_now)
@@ -1691,6 +1737,7 @@ class ControlPanel(tk.Tk):
 
     def update_progress(self, percent):
         percent = round(clamp(percent, 0.0, 100.0), 1)
+        self.progress_value = percent
         def apply():
             self.progress_var.set(percent)
             self.progress_text_var.set(f"{percent:.1f}%")
@@ -1722,31 +1769,33 @@ class ControlPanel(tk.Tk):
         hash_value = analyzer.fingerprint(image)
         return ScreenSnapshot(path=path, relative_path=self.store.relative_path(path), hash_value=hash_value, captured_at=now_text(), perf_time=perf_time, elapsed=round(perf_time - session_start, 3), rect=tuple(rect))
 
-    def write_record(self, mode, session_id, snapshot, action, event_name, decision=None, action_anchor_perf=None, after_snapshot=None):
+    def write_record(self, mode, session_id, snapshot, action, event_name, decision=None, action_anchor_perf=None, after_snapshot=None, planned_action=None, failed_action=False, window_rect_changed=False, capture_latency_ms=None, execution_latency_ms=None):
         if not self.store or not snapshot:
             return None
         before_novelty, batch = self.experience_pool.novelty(snapshot.hash_value)
         normalized = normalize_mouse_action(action, snapshot.rect) if action else None
-        mouse_source = normalized.get("source") if normalized else None
+        mouse_source = normalized.get("source") if normalized else "idle"
         human_score = self.experience_pool.human_score(normalized) if normalized else 0.0
         after_novelty = self.experience_pool.novelty(after_snapshot.hash_value)[0] if after_snapshot else before_novelty
         transition_reward = round(after_novelty - before_novelty, 2) if normalized else 0.0
-        screen_reward, action_reward, reward = reward_parts(after_novelty, human_score, self.settings) if normalized else (0.0, 0.0, 0.0)
-        reward = round(clamp(reward + transition_reward, self.settings.reward_total_min, self.settings.reward_total_max), 2) if normalized else 0.0
+        novelty_reward, human_delta, reward = reward_parts(after_novelty, human_score, self.settings) if normalized else (0.0, 0.0, 0.0)
+        human_action_reward = max(0.0, human_delta)
+        human_action_penalty = max(0.0, -human_delta)
+        reward = round(reward + transition_reward, 2) if normalized else 0.0
         life = self.store.add_life_experience(reward) if normalized else self.store.state.get("life_experience", 0.0)
         started_perf = safe_float(normalized.get("started_perf"), None) if normalized else None
         offset_source = started_perf if started_perf is not None else action_anchor_perf
         offset_ms = round((float(offset_source) - snapshot.perf_time) * 1000.0, 3) if offset_source is not None else None
-        record = {"id": uuid.uuid4().hex, "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "novelty": after_novelty, "before_screen": snapshot.relative_path if normalized else None, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "human_score": human_score, "total_reward": reward, "screen_reward": screen_reward, "action_reward": action_reward, "reward": reward, "life_experience": life, "client_rect": list(snapshot.rect)}
+        record = {"id": uuid.uuid4().hex, "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": normalized, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "novelty": after_novelty, "before_screen": snapshot.relative_path if normalized else None, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "life_experience_delta": max(0.0, reward), "penalty_delta": max(0.0, -reward), "life_experience": life, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "capture_latency_ms": capture_latency_ms, "execution_latency_ms": execution_latency_ms}
         if decision:
             record["ai_decision"] = decision
         self.store.append_experience(record)
         self.experience_pool.add(record)
-        self.update_metrics(after_novelty, human_score, screen_reward, action_reward, reward, life, decision)
+        self.update_metrics(after_novelty, human_score, novelty_reward, human_delta, reward, life, decision)
         return record
 
     def maybe_learning_screen_tick(self, analyzer, session_id, start, now_perf, config):
-        interval = 1.0 / max(0.5, config.settings.learning_screen_fps)
+        interval = 1.0 / max(0.5, self.settings.learning_screen_fps)
         if now_perf - self.last_learning_tick_perf < interval:
             return
         snapshot = self.capture_snapshot(analyzer, "learning", session_id, start)
@@ -1754,7 +1803,8 @@ class ControlPanel(tk.Tk):
             return
         if self.last_learning_tick_hash:
             similarity = hash_similarity(snapshot.hash_value, self.last_learning_tick_hash)
-            if similarity >= config.settings.learning_screen_similarity_threshold:
+            self.adaptive_policy.observe_capture(0.0, similarity=similarity, window_rect_changed=False)
+            if similarity >= self.settings.learning_screen_similarity_threshold:
                 self.last_learning_tick_perf = now_perf
                 return
         self.last_learning_tick_perf = now_perf
@@ -1793,7 +1843,7 @@ class ControlPanel(tk.Tk):
                     for action in actions:
                         action_snapshot = pending_snapshots.pop(action.get("action_id"), None) or self.capture_snapshot(analyzer, "learning", session_id, start)
                         after_snapshot = self.capture_snapshot(analyzer, "learning", session_id, start)
-                        self.write_record("learning", session_id, action_snapshot, action, "user_mouse", action_anchor_perf=action.get("started_perf") or action.get("t0"), after_snapshot=after_snapshot)
+                        self.write_record("learning", session_id, action_snapshot, action, "user_mouse", action_anchor_perf=action.get("started_perf") or action.get("t0"), after_snapshot=after_snapshot, planned_action=action)
                     if not markers and not actions:
                         self.mouse_recorder.wait(config.settings.mouse_still_tick)
                 else:
@@ -1820,12 +1870,15 @@ class ControlPanel(tk.Tk):
                 self.update_progress(clamp((config.training_seconds - elapsed) / config.training_seconds * 100.0, 0.0, 100.0))
                 self.ui(lambda: self.progress_label_var.set("模式进度"))
                 rect = self.current_rect()
+                pool_count = self.experience_pool.count() if self.experience_pool else 0
+                life_value = safe_float(self.store.state.get("life_experience", 0.0), 0.0) if self.store else 0.0
+                self.settings = self.adaptive_policy.build(self.settings, rect, pool_count, life_value)
                 if not rect:
-                    time.sleep(config.settings.training_tick)
+                    time.sleep(self.settings.training_tick)
                     continue
                 snapshot = self.capture_snapshot(analyzer, "training", session_id, start, rect=rect)
                 if not snapshot:
-                    time.sleep(config.settings.training_tick)
+                    time.sleep(self.settings.training_tick)
                     continue
                 novelty, batch = self.experience_pool.novelty(snapshot.hash_value)
                 life = safe_float(self.store.state.get("life_experience", 0.0), 0.0) if self.store else 0.0
@@ -1835,7 +1888,8 @@ class ControlPanel(tk.Tk):
                 latest_rect = self.current_rect()
                 if not latest_rect or latest_rect != rect:
                     consecutive_failures += 1
-                    if consecutive_failures >= config.settings.training_fail_stop_count:
+                    self.adaptive_policy.observe_execution(success=False)
+                    if consecutive_failures >= self.settings.training_fail_stop_count:
                         stop_event.set()
                         self.ui(lambda: self.status_var.set("训练模式结束：连续窗口校验失败"))
                     continue
@@ -1843,30 +1897,33 @@ class ControlPanel(tk.Tk):
                 if not actual:
                     self.log_exception("training.execute", RuntimeError("empty_action_result"))
                     consecutive_failures += 1
-                    if consecutive_failures >= config.settings.training_fail_stop_count:
+                    self.adaptive_policy.observe_execution(success=False)
+                    if consecutive_failures >= self.settings.training_fail_stop_count:
                         stop_event.set()
                     continue
                 if actual.get("execution_error"):
                     self.log_exception("training.execute", RuntimeError(actual.get("execution_error")), {"detail": actual, "decision": decision})
                     consecutive_failures += 1
-                    if consecutive_failures >= config.settings.training_fail_stop_count:
+                    self.adaptive_policy.observe_execution(success=False)
+                    if consecutive_failures >= self.settings.training_fail_stop_count:
                         stop_event.set()
                     continue
                 consecutive_failures = 0
+                self.adaptive_policy.observe_execution(latency_ms=(safe_float(actual.get("duration", 0.0), 0.0) * 1000.0), success=True)
                 after_snapshot = self.capture_snapshot(analyzer, "training", session_id, start, rect=rect)
-                record = self.write_record("training", session_id, snapshot, actual, "ai_mouse", decision=decision, action_anchor_perf=actual.get("started_perf"), after_snapshot=after_snapshot)
+                record = self.write_record("training", session_id, snapshot, actual, "ai_mouse", decision=decision, action_anchor_perf=actual.get("started_perf"), after_snapshot=after_snapshot, planned_action=action, execution_latency_ms=round(safe_float(actual.get("duration", 0.0), 0.0) * 1000.0, 3))
                 delay = safe_float(record["mouse_action"].get("duration", 0.0), 0.0) if record and record.get("mouse_action") else 0.0
-                deadline = time.perf_counter() + max(config.settings.min_action_delay_seconds, delay)
+                deadline = time.perf_counter() + max(self.settings.min_action_delay_seconds, delay)
                 while time.perf_counter() < deadline and not stop_event.is_set():
                     if self.should_stop_by_escape():
                         stop_event.set()
                         break
-                    time.sleep(min(config.settings.generated_wait_tick, deadline - time.perf_counter()))
+                    time.sleep(min(self.settings.generated_wait_tick, deadline - time.perf_counter()))
             self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start), None, "mode_end")
         if self.is_run_active(token, "training") and not stop_event.is_set():
             self.finish_run(token, "训练模式结束", 0.0)
         elif self.is_run_active(token, "training"):
-            self.finish_run(token, "训练模式已终止", self.progress_var.get())
+            self.finish_run(token, "训练模式已终止", self.progress_value)
         else:
             self.release_window_and_panel()
 
