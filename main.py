@@ -87,8 +87,8 @@ class Settings:
     window_title_keywords: tuple = ("ldplayer", "雷电", "leidian")
     ui_width: int = 940
     ui_height: int = 660
-    ui_min_width: int = 880
-    ui_min_height: int = 620
+    ui_min_width: int = 640
+    ui_min_height: int = 480
     ui_padding: int = 18
     ui_section_padding: int = 12
     ui_metric_columns: int = 5
@@ -119,6 +119,9 @@ class Settings:
     motion_first_control_max: float = 0.45
     motion_second_control_min: float = 0.55
     motion_second_control_max: float = 0.75
+    learning_screen_fps: float = 3.0
+    learning_screen_similarity_threshold: float = 0.985
+    training_fail_stop_count: int = 8
 
 
 @dataclass(frozen=True)
@@ -248,7 +251,10 @@ def normalize_settings(settings):
         motion_first_control_min=clamp(settings.motion_first_control_min, 0.0, 1.0),
         motion_first_control_max=clamp(settings.motion_first_control_max, 0.0, 1.0),
         motion_second_control_min=clamp(settings.motion_second_control_min, 0.0, 1.0),
-        motion_second_control_max=clamp(settings.motion_second_control_max, 0.0, 1.0)
+        motion_second_control_max=clamp(settings.motion_second_control_max, 0.0, 1.0),
+        learning_screen_fps=clamp(getattr(settings, "learning_screen_fps", 3.0), 1.0, 5.0),
+        learning_screen_similarity_threshold=clamp(getattr(settings, "learning_screen_similarity_threshold", 0.985), 0.9, 1.0),
+        training_fail_stop_count=max(1, safe_int(getattr(settings, "training_fail_stop_count", 8), 8))
     )
 
 
@@ -570,13 +576,13 @@ class DataStore:
 
     def load_state(self):
         if not self.state_file.exists():
-            return {"life_experience": 0.0}
+            return {"life_experience": 0.0, "penalty": 0.0}
         try:
             with self.state_file.open("r", encoding="utf-8") as file:
                 data = json.load(file)
-            return {"life_experience": safe_float(data.get("life_experience", 0.0), 0.0)}
+            return {"life_experience": safe_float(data.get("life_experience", 0.0), 0.0), "penalty": safe_float(data.get("penalty", 0.0), 0.0)}
         except Exception:
-            return {"life_experience": 0.0}
+            return {"life_experience": 0.0, "penalty": 0.0}
 
     def load_settings(self):
         if not self.settings_file.exists():
@@ -596,8 +602,14 @@ class DataStore:
 
     def add_life_experience(self, value):
         with self.lock:
+            delta = safe_float(value, 0.0)
             current = safe_float(self.state.get("life_experience", 0.0), 0.0)
-            self.state["life_experience"] = round(max(0.0, current + safe_float(value, 0.0)), 2)
+            penalty = safe_float(self.state.get("penalty", 0.0), 0.0)
+            if delta >= 0.0:
+                self.state["life_experience"] = round(current + delta, 2)
+            else:
+                self.state["life_experience"] = round(current, 2)
+                self.state["penalty"] = round(penalty + abs(delta), 2)
             self.save_state()
             return self.state["life_experience"]
 
@@ -907,7 +919,21 @@ class ExperiencePool:
         batch = self.nearest(hash_value)
         if not batch:
             return 100.0, []
-        return round(clamp((1.0 - batch[0]["similarity"]) * 100.0, 0.0, 100.0), 2), batch
+        top = batch[:max(1, min(32, len(batch)))]
+        sims = [clamp(item.get("similarity", 0.0), 0.0, 1.0) for item in top]
+        if any(sim >= 0.9999 for sim in sims):
+            return 0.0, batch
+        weight_total = 0.0
+        score_total = 0.0
+        for index, sim in enumerate(sims):
+            weight = 1.0 / (1.0 + index)
+            score_total += sim * weight
+            weight_total += weight
+        avg_sim = score_total / weight_total if weight_total > 0.0 else sims[0]
+        peak_sim = sims[0]
+        density = sum(1 for sim in sims if sim >= 0.95) / len(sims)
+        fused = clamp(peak_sim * 0.45 + avg_sim * 0.4 + density * 0.15, 0.0, 1.0)
+        return round(clamp((1.0 - fused) * 100.0, 0.0, 100.0), 2), batch
 
     def best_global_action(self):
         weighted = []
@@ -1327,6 +1353,8 @@ class ControlPanel(tk.Tk):
         self.pool_var = tk.StringVar(value="0")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_text_var = tk.StringVar(value="0%")
+        self.last_learning_tick_perf = 0.0
+        self.last_learning_tick_hash = None
         self.progress_label_var = tk.StringVar(value="进度")
         self.metric_items = []
         self.hint_label = None
@@ -1717,17 +1745,37 @@ class ControlPanel(tk.Tk):
         self.update_metrics(after_novelty, human_score, screen_reward, action_reward, reward, life, decision)
         return record
 
+    def maybe_learning_screen_tick(self, analyzer, session_id, start, now_perf, config):
+        interval = 1.0 / max(0.5, config.settings.learning_screen_fps)
+        if now_perf - self.last_learning_tick_perf < interval:
+            return
+        snapshot = self.capture_snapshot(analyzer, "learning", session_id, start)
+        if not snapshot:
+            return
+        if self.last_learning_tick_hash:
+            similarity = hash_similarity(snapshot.hash_value, self.last_learning_tick_hash)
+            if similarity >= config.settings.learning_screen_similarity_threshold:
+                self.last_learning_tick_perf = now_perf
+                return
+        self.last_learning_tick_perf = now_perf
+        self.last_learning_tick_hash = snapshot.hash_value
+        self.write_record("learning", session_id, snapshot, None, "screen_tick")
+
     def learning_loop(self, token, stop_event, config):
         session_id = uuid.uuid4().hex
         start = time.perf_counter()
         pending_snapshots = {}
         self.mark_learning_activity()
+        self.last_learning_tick_perf = time.perf_counter()
+        self.last_learning_tick_hash = None
         with ScreenAnalyzer(config.settings.hash_size) as analyzer:
             self.write_record("learning", session_id, self.capture_snapshot(analyzer, "learning", session_id, start), None, "mode_start")
             while not stop_event.is_set() and self.is_run_active(token, "learning"):
                 if self.should_stop_by_escape():
                     stop_event.set()
                     break
+                now_perf = time.perf_counter()
+                self.maybe_learning_screen_tick(analyzer, session_id, start, now_perf, config)
                 idle_seconds = self.learning_idle_seconds()
                 self.ui(lambda: self.progress_label_var.set("静止倒计时"))
                 self.update_progress(clamp((config.still_seconds - idle_seconds) / config.still_seconds * 100.0, 0.0, 100.0))
@@ -1759,6 +1807,7 @@ class ControlPanel(tk.Tk):
     def training_loop(self, token, stop_event, config):
         session_id = uuid.uuid4().hex
         start = time.perf_counter()
+        consecutive_failures = 0
         with ScreenAnalyzer(config.settings.hash_size) as analyzer:
             self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start), None, "mode_start")
             while not stop_event.is_set() and self.is_run_active(token, "training"):
@@ -1783,13 +1832,27 @@ class ControlPanel(tk.Tk):
                 action, decision = self.brain.choose(snapshot.hash_value, novelty, batch, life)
                 if action.get("end_rel") is None:
                     action["end_rel"] = action.get("start_rel", [0.5, 0.5])
+                latest_rect = self.current_rect()
+                if not latest_rect or latest_rect != rect:
+                    consecutive_failures += 1
+                    if consecutive_failures >= config.settings.training_fail_stop_count:
+                        stop_event.set()
+                        self.ui(lambda: self.status_var.set("训练模式结束：连续窗口校验失败"))
+                    continue
                 actual = self.executor.execute(action, rect, stop_event, self.should_stop_by_escape)
                 if not actual:
                     self.log_exception("training.execute", RuntimeError("empty_action_result"))
+                    consecutive_failures += 1
+                    if consecutive_failures >= config.settings.training_fail_stop_count:
+                        stop_event.set()
                     continue
                 if actual.get("execution_error"):
                     self.log_exception("training.execute", RuntimeError(actual.get("execution_error")), {"detail": actual, "decision": decision})
+                    consecutive_failures += 1
+                    if consecutive_failures >= config.settings.training_fail_stop_count:
+                        stop_event.set()
                     continue
+                consecutive_failures = 0
                 after_snapshot = self.capture_snapshot(analyzer, "training", session_id, start, rect=rect)
                 record = self.write_record("training", session_id, snapshot, actual, "ai_mouse", decision=decision, action_anchor_perf=actual.get("started_perf"), after_snapshot=after_snapshot)
                 delay = safe_float(record["mouse_action"].get("duration", 0.0), 0.0) if record and record.get("mouse_action") else 0.0
