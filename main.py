@@ -100,6 +100,7 @@ class Settings:
     click_long_duration: float = 0.9
     reward_total_min: float = -100.0
     reward_total_max: float = 200.0
+    experience_load_limit: int = 30000
     score_default: float = 65.0
     scroll_score_default: float = 72.0
     fallback_score_base: float = 62.0
@@ -229,6 +230,7 @@ def normalize_settings(settings):
         click_long_duration=clamp(settings.click_long_duration, 0.0, 60.0),
         reward_total_min=clamp(settings.reward_total_min, -10000.0, 10000.0),
         reward_total_max=clamp(settings.reward_total_max, -10000.0, 10000.0),
+        experience_load_limit=max(1000, safe_int(getattr(settings, "experience_load_limit", 30000), 30000)),
         score_default=clamp(settings.score_default, 0.0, 100.0),
         scroll_score_default=clamp(settings.scroll_score_default, 0.0, 100.0),
         fallback_score_base=clamp(settings.fallback_score_base, 0.0, 100.0),
@@ -615,16 +617,30 @@ class DataStore:
             with self.experience_file.open("a", encoding="utf-8") as file:
                 file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    def load_experience(self):
+    def load_experience(self, limit=None):
         records = []
         if not self.experience_file.exists():
             return records
+        tail = deque(maxlen=max(1, safe_int(limit, 0))) if limit else None
         with self.experience_file.open("r", encoding="utf-8") as file:
             for line in file:
-                try:
-                    records.append(json.loads(line.strip()))
-                except Exception:
-                    pass
+                text = line.strip()
+                if not text:
+                    continue
+                if tail is not None:
+                    tail.append(text)
+                else:
+                    try:
+                        records.append(json.loads(text))
+                    except Exception:
+                        pass
+        if tail is None:
+            return records
+        for text in tail:
+            try:
+                records.append(json.loads(text))
+            except Exception:
+                pass
         return records
 
     def log_error(self, where, error, context=None):
@@ -843,7 +859,7 @@ class ExperiencePool:
                 if not bucket:
                     self.sorted_prefixes.append(prefix)
                 bucket.append(index)
-            if record.get("mouse_action"):
+            if record.get("mouse_action") and record.get("mode") == "learning" and record.get("mouse_source") == "user":
                 self.profile.observe(record["mouse_action"])
 
     def count(self):
@@ -1534,7 +1550,7 @@ class ControlPanel(tk.Tk):
             self.store = DataStore(config.data_path)
             reload_pool = True
         if reload_pool or self.experience_pool.settings != config.settings:
-            self.experience_pool = ExperiencePool(config.settings, self.store.load_experience())
+            self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit))
             self.brain = ActionBrain(self.experience_pool, config.settings)
             self.ui(lambda: self.life_var.set(str(self.store.state.get("life_experience", 0.0))))
             self.ui(lambda: self.pool_var.set(str(self.experience_pool.count())))
@@ -1596,15 +1612,16 @@ class ControlPanel(tk.Tk):
         with self.state_lock:
             mode = self.mode
             if mode not in ["starting", "learning", "training", "sleep"]:
-                self.status_var.set("当前没有正在运行的模式")
+                self.ui(lambda: self.status_var.set("当前没有正在运行的模式"))
                 return
             self.stop_event.set()
             self.run_token += 1
+            progress_now = self.progress_var.get()
             self.mode = "idle"
         self.set_mode_ui("idle")
-        self.update_progress(0.0 if mode == "sleep" else self.progress_var.get())
-        self.status_var.set("当前模式已终止")
-        self.release_window_and_panel()
+        self.update_progress(0.0 if mode == "sleep" else progress_now)
+        self.ui(lambda: self.status_var.set("当前模式已终止"))
+        self.ui(self.release_window_and_panel)
 
     def sleep_mode(self):
         token, stop_event = self.begin_run("sleep")
@@ -1677,24 +1694,27 @@ class ControlPanel(tk.Tk):
         hash_value = analyzer.fingerprint(image)
         return ScreenSnapshot(path=path, relative_path=self.store.relative_path(path), hash_value=hash_value, captured_at=now_text(), perf_time=perf_time, elapsed=round(perf_time - session_start, 3), rect=tuple(rect))
 
-    def write_record(self, mode, session_id, snapshot, action, event_name, decision=None, action_anchor_perf=None):
+    def write_record(self, mode, session_id, snapshot, action, event_name, decision=None, action_anchor_perf=None, after_snapshot=None):
         if not self.store or not snapshot:
             return None
-        novelty, batch = self.experience_pool.novelty(snapshot.hash_value)
+        before_novelty, batch = self.experience_pool.novelty(snapshot.hash_value)
         normalized = normalize_mouse_action(action, snapshot.rect) if action else None
         mouse_source = normalized.get("source") if normalized else None
         human_score = self.experience_pool.human_score(normalized) if normalized else 0.0
-        screen_reward, action_reward, reward = reward_parts(novelty, human_score, self.settings) if normalized else (0.0, 0.0, 0.0)
+        after_novelty = self.experience_pool.novelty(after_snapshot.hash_value)[0] if after_snapshot else before_novelty
+        transition_reward = round(after_novelty - before_novelty, 2) if normalized else 0.0
+        screen_reward, action_reward, reward = reward_parts(after_novelty, human_score, self.settings) if normalized else (0.0, 0.0, 0.0)
+        reward = round(clamp(reward + transition_reward, self.settings.reward_total_min, self.settings.reward_total_max), 2) if normalized else 0.0
         life = self.store.add_life_experience(reward) if normalized else self.store.state.get("life_experience", 0.0)
         started_perf = safe_float(normalized.get("started_perf"), None) if normalized else None
         offset_source = started_perf if started_perf is not None else action_anchor_perf
         offset_ms = round((float(offset_source) - snapshot.perf_time) * 1000.0, 3) if offset_source is not None else None
-        record = {"id": uuid.uuid4().hex, "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "novelty": novelty, "human_score": human_score, "screen_reward": screen_reward, "action_reward": action_reward, "reward": reward, "life_experience": life, "client_rect": list(snapshot.rect)}
+        record = {"id": uuid.uuid4().hex, "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "novelty": after_novelty, "before_screen": snapshot.relative_path if normalized else None, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "human_score": human_score, "total_reward": reward, "screen_reward": screen_reward, "action_reward": action_reward, "reward": reward, "life_experience": life, "client_rect": list(snapshot.rect)}
         if decision:
             record["ai_decision"] = decision
         self.store.append_experience(record)
         self.experience_pool.add(record)
-        self.update_metrics(novelty, human_score, screen_reward, action_reward, reward, life, decision)
+        self.update_metrics(after_novelty, human_score, screen_reward, action_reward, reward, life, decision)
         return record
 
     def learning_loop(self, token, stop_event, config):
@@ -1724,7 +1744,8 @@ class ControlPanel(tk.Tk):
                     actions = self.mouse_recorder.pop_actions()
                     for action in actions:
                         action_snapshot = pending_snapshots.pop(action.get("action_id"), None) or self.capture_snapshot(analyzer, "learning", session_id, start)
-                        self.write_record("learning", session_id, action_snapshot, action, "user_mouse", action_anchor_perf=action.get("started_perf") or action.get("t0"))
+                        after_snapshot = self.capture_snapshot(analyzer, "learning", session_id, start)
+                        self.write_record("learning", session_id, action_snapshot, action, "user_mouse", action_anchor_perf=action.get("started_perf") or action.get("t0"), after_snapshot=after_snapshot)
                     if not markers and not actions:
                         self.mouse_recorder.wait(config.settings.mouse_still_tick)
                 else:
@@ -1769,7 +1790,8 @@ class ControlPanel(tk.Tk):
                 if actual.get("execution_error"):
                     self.log_exception("training.execute", RuntimeError(actual.get("execution_error")), {"detail": actual, "decision": decision})
                     continue
-                record = self.write_record("training", session_id, snapshot, actual, "ai_mouse", decision=decision, action_anchor_perf=actual.get("started_perf"))
+                after_snapshot = self.capture_snapshot(analyzer, "training", session_id, start, rect=rect)
+                record = self.write_record("training", session_id, snapshot, actual, "ai_mouse", decision=decision, action_anchor_perf=actual.get("started_perf"), after_snapshot=after_snapshot)
                 delay = safe_float(record["mouse_action"].get("duration", 0.0), 0.0) if record and record.get("mouse_action") else 0.0
                 deadline = time.perf_counter() + max(config.settings.min_action_delay_seconds, delay)
                 while time.perf_counter() < deadline and not stop_event.is_set():
