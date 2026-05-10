@@ -4,11 +4,11 @@
 
 除了在要求中确定的数值，其他所有数值都需要依据各种现实条件创生，不能提前确定。在创生后，它们需要随着现实条件的变化而变化。
 
-禁止用户修改要求中未提及的数值。
+除非要求允许，否则禁止用户修改数值。
 
-雷电模拟器默认路径（可修改）：D:\LDPlayer9\dnplayer.exe
+雷电模拟器默认路径（允许用户修改）：D:\LDPlayer9\dnplayer.exe
 
-数据存储默认路径（可修改）：C:\Users\Administrator\Desktop\AAA
+数据存储默认路径（允许用户修改）：C:\Users\Administrator\Desktop\AAA
 
 在学习模式/训练模式期间，记录：时间、画面、鼠标；
 
