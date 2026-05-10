@@ -64,64 +64,64 @@ MODE_NAMES = {"idle": "空闲", "starting": "准备中", "learning": "学习模�
 
 @dataclass(frozen=True)
 class Settings:
-    hash_size: int = 12
-    nearest_top_k: int = 32
-    nearest_candidate_limit: int = 2048
-    hash_prefix_bits: int = 8
-    mouse_still_tick: float = 0.05
-    training_tick: float = 0.08
-    sleep_tick: float = 0.1
-    key_debounce_seconds: float = 0.35
-    window_attach_seconds: float = 45.0
-    window_poll_seconds: float = 0.5
-    min_action_delay_seconds: float = 0.03
-    random_action_min: float = 0.08
-    random_action_max: float = 0.92
-    explore_min_rate: float = 0.04
-    explore_max_rate: float = 0.55
-    action_jitter: float = 0.018
-    softmax_temperature: float = 16.0
-    human_profile_min_samples: int = 24
-    human_profile_max_samples: int = 5000
-    human_profile_keep_samples: int = 4000
+    hash_size: int = 0
+    nearest_top_k: int = 0
+    nearest_candidate_limit: int = 0
+    hash_prefix_bits: int = 0
+    mouse_still_tick: float = 0.0
+    training_tick: float = 0.0
+    sleep_tick: float = 0.0
+    key_debounce_seconds: float = 0.0
+    window_attach_seconds: float = 0.0
+    window_poll_seconds: float = 0.0
+    min_action_delay_seconds: float = 0.0
+    random_action_min: float = 0.0
+    random_action_max: float = 0.0
+    explore_min_rate: float = 0.0
+    explore_max_rate: float = 0.0
+    action_jitter: float = 0.0
+    softmax_temperature: float = 0.0
+    human_profile_min_samples: int = 0
+    human_profile_max_samples: int = 0
+    human_profile_keep_samples: int = 0
     window_title_keywords: tuple = ("ldplayer", "雷电", "leidian")
-    ui_width: int = 940
-    ui_height: int = 660
-    ui_min_width: int = 640
-    ui_min_height: int = 480
-    ui_padding: int = 18
-    ui_section_padding: int = 12
-    ui_metric_columns: int = 5
-    ui_metric_min_column_width: int = 180
-    click_direct_threshold: float = 0.01
-    drag_direct_threshold: float = 0.01
-    drag_min_points: int = 4
-    drag_bend_penalty_threshold: float = 3.2
-    click_long_duration: float = 0.9
-    reward_total_min: float = -10000.0
-    reward_total_max: float = 10000.0
-    experience_load_limit: int = 30000
-    score_default: float = 65.0
-    scroll_score_default: float = 72.0
-    fallback_score_base: float = 62.0
-    global_action_probability: float = 0.55
-    random_click_duration_min: float = 0.07
-    random_click_duration_max: float = 0.22
-    action_duration_min: float = 0.05
-    action_duration_max: float = 1.8
-    generated_click_hold_max: float = 0.25
-    generated_sleep_tick: float = 0.015
-    generated_wait_tick: float = 0.02
-    motion_steps_per_second: float = 60.0
-    motion_curve_offset_min: float = 0.04
-    motion_curve_offset_max: float = 0.16
-    motion_first_control_min: float = 0.25
-    motion_first_control_max: float = 0.45
-    motion_second_control_min: float = 0.55
-    motion_second_control_max: float = 0.75
-    learning_screen_fps: float = 2.0
-    learning_screen_similarity_threshold: float = 0.985
-    training_fail_stop_count: int = 6
+    ui_width: int = 0
+    ui_height: int = 0
+    ui_min_width: int = 0
+    ui_min_height: int = 0
+    ui_padding: int = 0
+    ui_section_padding: int = 0
+    ui_metric_columns: int = 0
+    ui_metric_min_column_width: int = 0
+    click_direct_threshold: float = 0.0
+    drag_direct_threshold: float = 0.0
+    drag_min_points: int = 0
+    drag_bend_penalty_threshold: float = 0.0
+    click_long_duration: float = 0.0
+    reward_total_min: float = 0.0
+    reward_total_max: float = 0.0
+    experience_load_limit: int = 0
+    score_default: float = 50.0
+    scroll_score_default: float = 50.0
+    fallback_score_base: float = 50.0
+    global_action_probability: float = 0.0
+    random_click_duration_min: float = 0.0
+    random_click_duration_max: float = 0.0
+    action_duration_min: float = 0.0
+    action_duration_max: float = 0.0
+    generated_click_hold_max: float = 0.0
+    generated_sleep_tick: float = 0.0
+    generated_wait_tick: float = 0.0
+    motion_steps_per_second: float = 0.0
+    motion_curve_offset_min: float = 0.0
+    motion_curve_offset_max: float = 0.0
+    motion_first_control_min: float = 0.0
+    motion_first_control_max: float = 0.0
+    motion_second_control_min: float = 0.0
+    motion_second_control_max: float = 0.0
+    learning_screen_fps: float = 0.0
+    learning_screen_similarity_threshold: float = 0.0
+    training_fail_stop_count: int = 0
 
 
 class AdaptivePolicy:
@@ -300,6 +300,51 @@ def normalize_settings(settings):
         learning_screen_similarity_threshold=clamp(getattr(settings, "learning_screen_similarity_threshold", 0.985), 0.9, 1.0),
         training_fail_stop_count=max(1, safe_int(getattr(settings, "training_fail_stop_count", 8), 8))
     )
+
+
+def create_runtime_settings(base_settings=None, rect=None, pool_count=0, capture_ms=24.0, cpu_load=0.0):
+    source = base_settings or Settings()
+    width, height = rect_size(rect) if rect else (safe_int(getattr(win32api, "GetSystemMetrics", lambda _: 1920)(0), 1920), safe_int(getattr(win32api, "GetSystemMetrics", lambda _: 1080)(1), 1080))
+    pixel_factor = math.sqrt(max(1.0, width * height) / (1280.0 * 720.0))
+    record_factor = math.log2(max(2, pool_count + 2))
+    capture_factor = clamp(capture_ms / 24.0, 0.4, 3.0)
+    cpu_factor = clamp(1.0 + cpu_load / 200.0, 0.8, 1.8)
+    values = {item.name: getattr(source, item.name) for item in fields(Settings)}
+    values.update({
+        "hash_size": int(clamp(round(8 + pixel_factor * 4 + record_factor * 0.8), 8, 24)),
+        "nearest_top_k": int(clamp(round(10 + record_factor * 10), 8, 256)),
+        "nearest_candidate_limit": int(clamp(round((14 + record_factor * 7) * 64), 256, 20000)),
+        "hash_prefix_bits": int(clamp(round(6 + record_factor), 4, 20)),
+        "mouse_still_tick": round(clamp(0.02 * capture_factor, 0.01, 0.2), 4),
+        "training_tick": round(clamp(0.03 * capture_factor * cpu_factor, 0.01, 0.9), 4),
+        "sleep_tick": round(clamp(0.08 * cpu_factor, 0.05, 1.0), 4),
+        "key_debounce_seconds": round(clamp(0.2 * cpu_factor, 0.05, 1.0), 3),
+        "window_attach_seconds": round(clamp(20.0 + cpu_load * 0.6, 5.0, 120.0), 2),
+        "window_poll_seconds": round(clamp(0.2 * cpu_factor, 0.05, 1.0), 3),
+        "explore_max_rate": clamp(0.5 + 0.2 / max(1.0, record_factor), 0.2, 0.95),
+        "explore_min_rate": clamp(0.03 + 0.1 / max(2.0, record_factor + 1.0), 0.01, 0.2),
+        "action_jitter": clamp(0.009 + 0.01 / max(1.0, record_factor), 0.005, 0.08),
+        "softmax_temperature": clamp(12.0 + record_factor * 2.0, 6.0, 30.0),
+        "human_profile_min_samples": int(clamp(round(12 + record_factor * 8), 12, 120)),
+        "human_profile_max_samples": int(clamp(round(2400 + record_factor * 900), 1500, 10000)),
+        "human_profile_keep_samples": int(clamp(round(1800 + record_factor * 800), 1200, 9000)),
+        "ui_width": int(clamp(round(width * 0.65), 700, 1600)),
+        "ui_height": int(clamp(round(height * 0.72), 520, 1200)),
+        "ui_min_width": int(clamp(round(width * 0.42), 520, 1100)),
+        "ui_min_height": int(clamp(round(height * 0.45), 420, 900)),
+        "ui_padding": int(clamp(round(min(width, height) * 0.012), 8, 28)),
+        "ui_section_padding": int(clamp(round(min(width, height) * 0.008), 6, 22)),
+        "ui_metric_columns": int(clamp(round(width / 340.0), 2, 6)),
+        "ui_metric_min_column_width": int(clamp(round(width / 4.8), 150, 320)),
+        "reward_total_min": -10000.0,
+        "reward_total_max": 10000.0,
+        "experience_load_limit": int(clamp(round(12000 + record_factor * 8000), 8000, 90000)),
+        "global_action_probability": clamp(0.45 + 0.15 / max(1.0, record_factor), 0.2, 0.75),
+        "learning_screen_fps": clamp(1.0 / max(0.05, capture_ms / 1000.0), 0.5, 12.0),
+        "learning_screen_similarity_threshold": clamp(0.96 + min(0.03, record_factor * 0.002), 0.9, 0.999),
+        "training_fail_stop_count": int(clamp(round(4 + cpu_factor * 3 + record_factor), 3, 24))
+    })
+    return normalize_settings(Settings(**values))
 
 
 def settings_from_dict(data):
@@ -560,6 +605,8 @@ class HumanProfile:
         features = action_features(action)
         if action_type == "scroll":
             return self.score_scroll(features)
+        if not self.enough(action_type):
+            return 50.0
         if self.enough(action_type):
             with self.lock:
                 stats = {name: tuple(values) for name, values in self.stats[action_type].items()}
@@ -571,17 +618,14 @@ class HumanProfile:
             ]
             weights = [0.34, 0.26, 0.24, 0.16]
             return round(clamp(sum(score * weight for score, weight in zip(scores, weights)), 0.0, 100.0), 2)
-        return self.fallback_score(action_type, features)
+        return 50.0
 
     def score_scroll(self, features):
         with self.lock:
             samples = list(self.stats["scroll"].get("scroll_abs", []))
         if len(samples) >= max(6, self.settings.human_profile_min_samples // 3):
             return percentile_score(features.get("scroll_abs", 0.0), samples, self.settings.scroll_score_default)
-        amount = features.get("scroll_abs", 0.0)
-        if amount <= 0.0:
-            return 55.0
-        return 78.0 if amount <= 8.0 else 68.0
+        return 50.0
 
     def fallback_score(self, action_type, features):
         duration = features.get("duration", 0.0)
@@ -1045,9 +1089,7 @@ class ActionBrain:
         learned = self.pool.best_global_action()
         if learned and random.random() < self.settings.global_action_probability:
             return self.mutate_action(learned, 1.8), "global_experience"
-        point = [round(random.uniform(self.settings.random_action_min, self.settings.random_action_max), 6), round(random.uniform(self.settings.random_action_min, self.settings.random_action_max), 6)]
-        action = {"type": "click", "button": "Button.left", "source": "ai", "duration": round(random.uniform(self.settings.random_click_duration_min, self.settings.random_click_duration_max), 6), "start_rel": point, "end_rel": point, "path_rel": []}
-        return action, "explore_random"
+        return None, "observe_only"
 
     def choose(self, hash_value, novelty, batch, life):
         rate = self.exploration_rate(novelty, life)
@@ -1067,7 +1109,7 @@ class ActionBrain:
             confidence = clamp(item.get("similarity", 0.0) * 0.65 + clamp(chosen.get("score", 0.0), 0.0, 200.0) / 200.0 * 0.35, 0.0, 1.0)
             action = self.mutate_action(chosen["action"], 1.0 - confidence + rate)
             decision = {"reason": "nearest_rewarded_experience", "exploration_rate": rate, "candidate_count": len(usable), "confidence": round(confidence, 4), "nearest_similarity": round(batch[0]["similarity"], 4) if batch else 0.0, "chosen_similarity": round(item.get("similarity", 0.0), 4), "chosen_reward": round(safe_float(item["record"].get("reward", 0.0), 0.0), 2), "chosen_record_id": item["record"].get("id")}
-        self.last_action = copy.deepcopy(action)
+        self.last_action = copy.deepcopy(action) if action else None
         self.last_decision = decision
         return action, decision
 
@@ -1550,11 +1592,26 @@ class ControlPanel(tk.Tk):
         self.sleep_seconds_var.set(str(sleep_seconds))
         self.still_seconds_var.set(str(still_seconds))
         data_path = Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)
-        settings = normalize_settings(Settings())
+        cpu_load = safe_float(psutil.cpu_percent(interval=0.05), 0.0) if psutil else 0.0
+        settings = create_runtime_settings(self.settings, self.current_rect(), self.experience_pool.count() if self.experience_pool else 0, 24.0, cpu_load)
         self.settings = settings
         self.escape_monitor.debounce_seconds = settings.key_debounce_seconds
         self.ui(lambda: self.minsize(settings.ui_min_width, settings.ui_min_height))
         return Config(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH), data_path, training_seconds, sleep_seconds, still_seconds, settings)
+
+    def apply_runtime_settings(self, settings):
+        self.settings = settings
+        if self.experience_pool:
+            self.experience_pool.settings = settings
+            self.experience_pool.profile.settings = settings
+        if self.brain:
+            self.brain.settings = settings
+        if self.window_manager:
+            self.window_manager.settings = settings
+        if self.executor:
+            self.executor.settings = settings
+        if self.escape_monitor:
+            self.escape_monitor.debounce_seconds = settings.key_debounce_seconds
 
     def current_mode(self):
         with self.state_lock:
@@ -1775,18 +1832,20 @@ class ControlPanel(tk.Tk):
         before_novelty, batch = self.experience_pool.novelty(snapshot.hash_value)
         normalized = normalize_mouse_action(action, snapshot.rect) if action else None
         mouse_source = normalized.get("source") if normalized else "idle"
-        human_score = self.experience_pool.human_score(normalized) if normalized else 0.0
+        human_score = self.experience_pool.human_score(normalized) if normalized else 50.0
         after_novelty = self.experience_pool.novelty(after_snapshot.hash_value)[0] if after_snapshot else before_novelty
-        transition_reward = round(after_novelty - before_novelty, 2) if normalized else 0.0
-        novelty_reward, human_delta, reward = reward_parts(after_novelty, human_score, self.settings) if normalized else (0.0, 0.0, 0.0)
+        transition_reward = round(after_novelty - before_novelty, 2)
+        novelty_reward = round(after_novelty, 2)
+        human_delta = round(human_score - 50.0, 2) if normalized else 0.0
+        reward = round(novelty_reward + human_delta + (transition_reward if normalized else 0.0), 2)
         human_action_reward = max(0.0, human_delta)
         human_action_penalty = max(0.0, -human_delta)
-        reward = round(reward + transition_reward, 2) if normalized else 0.0
-        life = self.store.add_life_experience(reward) if normalized else self.store.state.get("life_experience", 0.0)
+        life = self.store.add_life_experience(reward)
         started_perf = safe_float(normalized.get("started_perf"), None) if normalized else None
         offset_source = started_perf if started_perf is not None else action_anchor_perf
         offset_ms = round((float(offset_source) - snapshot.perf_time) * 1000.0, 3) if offset_source is not None else None
-        record = {"id": uuid.uuid4().hex, "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": normalized, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "novelty": after_novelty, "before_screen": snapshot.relative_path if normalized else None, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "life_experience_delta": max(0.0, reward), "penalty_delta": max(0.0, -reward), "life_experience": life, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "capture_latency_ms": capture_latency_ms, "execution_latency_ms": execution_latency_ms}
+        sims = [round(item["similarity"], 4) for item in batch]
+        record = {"record_schema_version": 2, "id": uuid.uuid4().hex, "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": normalized, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": after_novelty, "before_screen": snapshot.relative_path if normalized else None, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "life_experience_delta": max(0.0, reward), "penalty_delta": max(0.0, -reward), "life_experience": life, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "capture_latency_ms": capture_latency_ms, "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_tick": self.settings.training_tick, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
         if decision:
             record["ai_decision"] = decision
         self.store.append_experience(record)
@@ -1873,6 +1932,7 @@ class ControlPanel(tk.Tk):
                 pool_count = self.experience_pool.count() if self.experience_pool else 0
                 life_value = safe_float(self.store.state.get("life_experience", 0.0), 0.0) if self.store else 0.0
                 self.settings = self.adaptive_policy.build(self.settings, rect, pool_count, life_value)
+                self.apply_runtime_settings(self.settings)
                 if not rect:
                     time.sleep(self.settings.training_tick)
                     continue
@@ -1883,6 +1943,10 @@ class ControlPanel(tk.Tk):
                 novelty, batch = self.experience_pool.novelty(snapshot.hash_value)
                 life = safe_float(self.store.state.get("life_experience", 0.0), 0.0) if self.store else 0.0
                 action, decision = self.brain.choose(snapshot.hash_value, novelty, batch, life)
+                if not action:
+                    self.write_record("training", session_id, snapshot, None, "screen_tick", decision=decision)
+                    time.sleep(self.settings.training_tick)
+                    continue
                 if action.get("end_rel") is None:
                     action["end_rel"] = action.get("start_rel", [0.5, 0.5])
                 latest_rect = self.current_rect()
