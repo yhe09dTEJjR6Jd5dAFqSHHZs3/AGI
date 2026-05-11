@@ -347,38 +347,6 @@ def create_runtime_settings(base_settings=None, rect=None, pool_count=0, capture
     return normalize_settings(Settings(**values))
 
 
-def settings_from_dict(data):
-    if not isinstance(data, dict):
-        return Settings()
-    defaults = Settings()
-    values = {}
-    for item in fields(Settings):
-        if item.name not in data:
-            continue
-        raw = data[item.name]
-        default = getattr(defaults, item.name)
-        try:
-            if isinstance(default, bool):
-                values[item.name] = bool(raw)
-            elif isinstance(default, int) and not isinstance(default, bool):
-                values[item.name] = int(float(raw))
-            elif isinstance(default, float):
-                values[item.name] = float(raw)
-            elif isinstance(default, tuple):
-                if isinstance(raw, str):
-                    values[item.name] = tuple(part.strip() for part in raw.split(",") if part.strip())
-                elif isinstance(raw, (list, tuple)):
-                    values[item.name] = tuple(str(part).strip() for part in raw if str(part).strip())
-            else:
-                values[item.name] = raw
-        except Exception:
-            pass
-    try:
-        return normalize_settings(Settings(**values))
-    except Exception:
-        return Settings()
-
-
 def rect_size(rect):
     left, top, right, bottom = rect
     return max(1, int(right - left)), max(1, int(bottom - top))
@@ -627,28 +595,6 @@ class HumanProfile:
             return percentile_score(features.get("scroll_abs", 0.0), samples, self.settings.scroll_score_default)
         return 50.0
 
-    def fallback_score(self, action_type, features):
-        duration = features.get("duration", 0.0)
-        direct = features.get("direct", 0.0)
-        bend = features.get("bend", 1.0)
-        points = features.get("points", 0.0)
-        score = self.settings.fallback_score_base
-        score += clamp(math.log1p(duration * 10.0) * 10.0, 0.0, 18.0) if duration > 0.0 else -8.0
-        if action_type == "click":
-            score += 8.0 if direct <= self.settings.click_direct_threshold else -4.0
-            if duration > self.settings.click_long_duration:
-                score -= 8.0
-        elif action_type == "drag":
-            score += 10.0 if direct > self.settings.drag_direct_threshold else -8.0
-            if points >= self.settings.drag_min_points:
-                score += 8.0
-            if bend > self.settings.drag_bend_penalty_threshold:
-                score -= 5.0
-        else:
-            score += 4.0
-        return round(clamp(score, 0.0, 100.0), 2)
-
-
 class DataStore:
     def __init__(self, root):
         self.root = Path(root)
@@ -671,15 +617,6 @@ class DataStore:
             return {"life_experience": safe_float(data.get("life_experience", 0.0), 0.0), "penalty": safe_float(data.get("penalty", 0.0), 0.0)}
         except Exception:
             return {"life_experience": 0.0, "penalty": 0.0}
-
-    def load_settings(self):
-        if not self.settings_file.exists():
-            return Settings()
-        try:
-            with self.settings_file.open("r", encoding="utf-8") as file:
-                return settings_from_dict(json.load(file))
-        except Exception:
-            return Settings()
 
     def save_state(self):
         with self.lock:
@@ -998,10 +935,10 @@ class ExperiencePool:
                     similarity = hash_similarity(hash_value, other)
                     item = {"similarity": similarity, "record": self.records[index]}
                     if len(scored) < top_k:
-                        heapq.heappush(scored, (similarity, item))
+                        heapq.heappush(scored, (similarity, index, item))
                     elif similarity > scored[0][0]:
-                        heapq.heapreplace(scored, (similarity, item))
-        return [item for _, item in sorted(scored, key=lambda pair: pair[0], reverse=True)]
+                        heapq.heapreplace(scored, (similarity, index, item))
+        return [item for _, _, item in sorted(scored, key=lambda pair: (pair[0], pair[1]), reverse=True)]
 
     def novelty(self, hash_value):
         batch = self.nearest(hash_value)
@@ -1328,7 +1265,10 @@ class HumanMouseExecutor:
             else:
                 self.controller.press(button)
                 pressed = True
-                self.stoppable_sleep(clamp(main_duration, 0.03, self.settings.generated_click_hold_max), stop_event, should_stop)
+                hold_floor = min(self.settings.random_click_duration_min, self.settings.random_click_duration_max)
+                hold_ceiling = max(self.settings.random_click_duration_min, self.settings.random_click_duration_max)
+                hold_duration = clamp(main_duration, hold_floor, hold_ceiling if hold_ceiling > 0.0 else self.settings.generated_click_hold_max)
+                self.stoppable_sleep(clamp(hold_duration, 0.0, self.settings.generated_click_hold_max), stop_event, should_stop)
                 actual_path.append({"x": int(end_abs[0]), "y": int(end_abs[1]), "t": time.perf_counter() - action_t})
         except Exception as exc:
             return {"execution_error": str(exc), "error_type": type(exc).__name__, "action_type": action_type, "start_abs": [int(start_abs[0]), int(start_abs[1])], "end_abs": [int(end_abs[0]), int(end_abs[1])]}
@@ -1466,9 +1406,15 @@ class ControlPanel(tk.Tk):
             style.theme_use("clam")
         except Exception:
             pass
-        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 17, "bold"))
-        style.configure("CardTitle.TLabel", font=("Microsoft YaHei UI", 10))
-        style.configure("Value.TLabel", font=("Microsoft YaHei UI", 14, "bold"))
+        scale = max(0.8, min(2.2, float(self.winfo_fpixels("1i")) / 96.0))
+        pane_h = max(1, self.winfo_height() or self.settings.ui_height)
+        font_scale = max(0.8, min(2.1, (pane_h / max(1, self.settings.ui_min_height)) ** 0.5 * scale))
+        title_size = max(11, int(round(14 * font_scale)))
+        value_size = max(10, int(round(12 * font_scale)))
+        card_size = max(8, int(round(9 * font_scale)))
+        style.configure("Title.TLabel", font=("Microsoft YaHei UI", title_size, "bold"))
+        style.configure("CardTitle.TLabel", font=("Microsoft YaHei UI", card_size))
+        style.configure("Value.TLabel", font=("Microsoft YaHei UI", value_size, "bold"))
         style.configure("Hint.TLabel", foreground="#555555")
         root = ttk.Frame(self, padding=self.settings.ui_padding)
         root.pack(fill="both", expand=True)
@@ -1486,10 +1432,10 @@ class ControlPanel(tk.Tk):
         path_frame.pack(fill="x", pady=(16, 10))
         path_frame.columnconfigure(1, weight=1)
         ttk.Label(path_frame, text="雷电模拟器").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Entry(path_frame, textvariable=self.ldplayer_var).grid(row=0, column=1, sticky="ew", pady=6)
+        ttk.Entry(path_frame, textvariable=self.ldplayer_var, justify="right").grid(row=0, column=1, sticky="ew", pady=6)
         ttk.Button(path_frame, text="修改", command=self.choose_ldplayer).grid(row=0, column=2, padx=(8, 0), pady=6)
         ttk.Label(path_frame, text="数据存储").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Entry(path_frame, textvariable=self.data_var).grid(row=1, column=1, sticky="ew", pady=6)
+        ttk.Entry(path_frame, textvariable=self.data_var, justify="right").grid(row=1, column=1, sticky="ew", pady=6)
         ttk.Button(path_frame, text="修改", command=self.choose_data).grid(row=1, column=2, padx=(8, 0), pady=6)
         time_frame = ttk.Frame(path_frame)
         time_frame.grid(row=2, column=1, columnspan=2, sticky="w", pady=6)
@@ -1499,11 +1445,15 @@ class ControlPanel(tk.Tk):
             ttk.Entry(time_frame, textvariable=variable, width=10).pack(side="left", padx=(6, 16))
         button_frame = ttk.Frame(container)
         button_frame.pack(fill="x", pady=(4, 12))
-        ttk.Button(button_frame, text="学习模式", command=self.learning_mode).pack(side="left", padx=(0, 8))
-        ttk.Button(button_frame, text="训练模式", command=self.training_mode).pack(side="left", padx=8)
-        ttk.Button(button_frame, text="睡眠模式", command=self.sleep_mode).pack(side="left", padx=8)
-        ttk.Button(button_frame, text="终止当前模式", command=self.stop_current_mode).pack(side="left", padx=8)
-        ttk.Button(button_frame, text="退出", command=self.close).pack(side="right")
+        self.button_frame = button_frame
+        self.control_buttons = [
+            ttk.Button(button_frame, text="学习模式", command=self.learning_mode),
+            ttk.Button(button_frame, text="训练模式", command=self.training_mode),
+            ttk.Button(button_frame, text="睡眠模式", command=self.sleep_mode),
+            ttk.Button(button_frame, text="终止当前模式", command=self.stop_current_mode),
+            ttk.Button(button_frame, text="退出", command=self.close)
+        ]
+        self.reflow_buttons()
         status_frame = ttk.LabelFrame(container, text="状态", padding=self.settings.ui_section_padding)
         status_frame.pack(fill="both", expand=True)
         self.metrics_frame = ttk.Frame(status_frame)
@@ -1535,9 +1485,8 @@ class ControlPanel(tk.Tk):
             return
         width = max(1, self.metrics_frame.winfo_width() or self.winfo_width())
         min_width = max(120, self.settings.ui_metric_min_column_width)
-        preferred = max(1, self.settings.ui_metric_columns)
-        columns = max(1, min(preferred, width // min_width if width >= min_width else 1))
-        for column in range(preferred):
+        columns = max(1, width // min_width if width >= min_width else 1)
+        for column in range(max(1, len(self.metric_items))):
             self.metrics_frame.columnconfigure(column, weight=0)
         for column in range(columns):
             self.metrics_frame.columnconfigure(column, weight=1)
@@ -1545,12 +1494,26 @@ class ControlPanel(tk.Tk):
             row = index // columns
             column = index % columns
             item.grid(row=row, column=column, sticky="ew", padx=(0, 12))
+    def reflow_buttons(self):
+        if not getattr(self, "button_frame", None):
+            return
+        width = max(1, self.button_frame.winfo_width() or self.winfo_width())
+        min_width = max(120, int(max(120, self.settings.ui_metric_min_column_width * 0.7)))
+        columns = max(1, width // min_width if width >= min_width else 1)
+        for index, button in enumerate(self.control_buttons):
+            row = index // columns
+            column = index % columns
+            sticky = "ew" if button.cget("text") != "退出" else "e"
+            button.grid(row=row, column=column, padx=6, pady=4, sticky=sticky)
+        for column in range(columns):
+            self.button_frame.columnconfigure(column, weight=1)
 
     def on_window_resize(self, _event):
         if self.hint_label:
             width = max(320, self.winfo_width() - self.settings.ui_padding * 4)
             self.hint_label.configure(wraplength=width)
         self.reflow_metrics()
+        self.reflow_buttons()
 
     def ui(self, func):
         try:
