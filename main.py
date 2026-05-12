@@ -146,13 +146,16 @@ class AdaptivePolicy:
     def _avg(self, values, fallback):
         return sum(values) / len(values) if values else fallback
 
-    def build(self, base_settings, rect, pool_count, life):
+    def build(self, base_settings, rect, pool_count, life, hardware=None):
         capture_ms = self._avg(self.capture_latency_ms, 24.0)
         execution_ms = self._avg(self.execution_latency_ms, 140.0)
         window_instability = self._avg(self.window_change_flags, 0.0)
         recent_success = self._avg(self.outcome_flags, 1.0)
         similarity = self._avg(self.learning_similarity, 0.97)
-        return derive_runtime_settings(base_settings=base_settings, rect=rect, pool_count=pool_count, capture_ms=capture_ms, cpu_load=0.0, execution_ms=execution_ms, window_instability=window_instability, recent_success=recent_success, life=life, learning_similarity=similarity)
+        cpu_load = 0.0
+        if hardware:
+            cpu_load = safe_float(hardware.get("cpu_load", 0.0), 0.0)
+        return derive_runtime_settings(base_settings=base_settings, rect=rect, pool_count=pool_count, capture_ms=capture_ms, cpu_load=cpu_load, execution_ms=execution_ms, window_instability=window_instability, recent_success=recent_success, life=life, learning_similarity=similarity, hardware=hardware)
 
 
 @dataclass(frozen=True)
@@ -289,7 +292,27 @@ def normalize_settings(settings):
     )
 
 
-def derive_runtime_settings(base_settings=None, rect=None, pool_count=0, capture_ms=None, cpu_load=0.0, execution_ms=None, window_instability=0.0, recent_success=1.0, life=0.0, learning_similarity=0.97):
+def read_hardware_state():
+    cpu_count = safe_int(psutil.cpu_count(logical=True), 0) if psutil else 0
+    cpu_load = safe_float(psutil.cpu_percent(interval=0.05), 0.0) if psutil else 0.0
+    memory_total = safe_float(getattr(psutil.virtual_memory(), "total", 0.0), 0.0) if psutil else 0.0
+    memory_available = safe_float(getattr(psutil.virtual_memory(), "available", 0.0), 0.0) if psutil else 0.0
+    memory_free_ratio = clamp(memory_available / memory_total if memory_total > 0 else 0.0, 0.0, 1.0)
+    gpu_count = 0
+    gpu_memory_total = 0.0
+    try:
+        output = subprocess.check_output(["wmic", "path", "win32_VideoController", "get", "AdapterRAM"], stderr=subprocess.DEVNULL, text=True, timeout=2.0)
+        for line in output.splitlines():
+            number = safe_int(line.strip(), 0)
+            if number > 0:
+                gpu_count += 1
+                gpu_memory_total += float(number)
+    except Exception:
+        pass
+    return {"cpu_count": max(1, cpu_count), "cpu_load": clamp(cpu_load, 0.0, 100.0), "memory_free_ratio": memory_free_ratio, "gpu_count": gpu_count, "gpu_memory_total": max(0.0, gpu_memory_total)}
+
+
+def derive_runtime_settings(base_settings=None, rect=None, pool_count=0, capture_ms=None, cpu_load=0.0, execution_ms=None, window_instability=0.0, recent_success=1.0, life=0.0, learning_similarity=0.97, hardware=None):
     source = base_settings or Settings()
     width, height = rect_size(rect) if rect else (safe_int(getattr(win32api, "GetSystemMetrics", lambda _: 1920)(0), 1920), safe_int(getattr(win32api, "GetSystemMetrics", lambda _: 1080)(1), 1080))
     pixel_factor = math.sqrt(max(1.0, width * height) / (1280.0 * 720.0))
@@ -299,8 +322,15 @@ def derive_runtime_settings(base_settings=None, rect=None, pool_count=0, capture
     instability = clamp(window_instability, 0.0, 1.0)
     success = clamp(recent_success, 0.0, 1.0)
     similarity = clamp(learning_similarity, 0.0, 1.0)
+    hardware = hardware or {}
+    memory_free_ratio = clamp(safe_float(hardware.get("memory_free_ratio", 0.5), 0.5), 0.0, 1.0)
+    cpu_count = max(1, safe_int(hardware.get("cpu_count", 1), 1))
+    gpu_count = max(0, safe_int(hardware.get("gpu_count", 0), 0))
+    gpu_memory_total = max(0.0, safe_float(hardware.get("gpu_memory_total", 0.0), 0.0))
+    gpu_factor = clamp(1.0 + gpu_count * 0.08 + gpu_memory_total / (8.0 * 1024 * 1024 * 1024), 1.0, 2.2)
+    core_factor = clamp(math.log2(cpu_count + 1.0) / math.log2(9.0), 0.45, 1.2)
     capture_factor = clamp(capture_ms / 24.0, 0.4, 3.0)
-    cpu_factor = clamp(1.0 + cpu_load / 200.0, 0.8, 1.8)
+    cpu_factor = clamp((1.0 + cpu_load / 200.0) * (1.12 - memory_free_ratio * 0.22) / max(0.5, core_factor), 0.65, 2.4)
     timing_factor = clamp((capture_ms + execution_ms * 0.5) / 80.0, 0.5, 2.5)
     values = {item.name: getattr(source, item.name) for item in fields(Settings)}
     values.update({
@@ -309,11 +339,11 @@ def derive_runtime_settings(base_settings=None, rect=None, pool_count=0, capture
         "nearest_candidate_limit": int(clamp(round((14 + record_factor * 7 + instability * 8) * 64), 256, 20000)),
         "hash_prefix_bits": int(clamp(round(6 + record_factor), 4, 20)),
         "mouse_still_tick": round(clamp(0.02 * capture_factor, 0.01, 0.2), 4),
-        "training_tick": round(clamp(0.03 * capture_factor * cpu_factor * timing_factor * (0.85 + instability * 0.45), 0.01, 0.9), 4),
-        "sleep_tick": round(clamp(0.08 * cpu_factor, 0.05, 1.0), 4),
+        "training_tick": round(clamp(0.03 * capture_factor * cpu_factor * timing_factor * (0.85 + instability * 0.45) / gpu_factor, 0.01, 0.9), 4),
+        "sleep_tick": round(clamp(0.08 * cpu_factor / core_factor, 0.05, 1.0), 4),
         "key_debounce_seconds": round(clamp(0.2 * cpu_factor, 0.05, 1.0), 3),
         "window_attach_seconds": round(clamp(20.0 + cpu_load * 0.6, 5.0, 120.0), 2),
-        "window_poll_seconds": round(clamp(0.2 * cpu_factor, 0.05, 1.0), 3),
+        "window_poll_seconds": round(clamp(0.2 * cpu_factor / gpu_factor, 0.05, 1.0), 3),
         "explore_max_rate": clamp(0.35 + (1.0 - success) * 0.45 + similarity * 0.1, 0.2, 0.95),
         "explore_min_rate": clamp((0.35 + (1.0 - success) * 0.45 + similarity * 0.1) * 0.12, 0.01, 0.2),
         "action_jitter": clamp(0.008 + (1.0 - success) * 0.03 + instability * 0.012, 0.005, 0.08),
@@ -333,7 +363,7 @@ def derive_runtime_settings(base_settings=None, rect=None, pool_count=0, capture
         "reward_total_max": 10000.0 + max(0.0, safe_float(life, 0.0)),
         "experience_load_limit": int(clamp(round(12000 + record_factor * 8000), 8000, 90000)),
         "global_action_probability": clamp(0.45 + 0.15 / max(1.0, record_factor), 0.2, 0.75),
-        "learning_screen_fps": clamp(1.0 / max(0.05, capture_ms / 1000.0), 0.5, 12.0),
+        "learning_screen_fps": clamp(1.0 / max(0.05, capture_ms / 1000.0) * clamp(core_factor * gpu_factor, 0.8, 2.4), 0.5, 20.0),
         "learning_screen_similarity_threshold": clamp(0.95 + min(0.04, record_factor * 0.0025 + similarity * 0.01), 0.9, 0.999),
         "training_fail_stop_count": int(clamp(round((1.0 - success) * 16 + instability * 10 + 2), 2, 24))
     })
@@ -341,7 +371,7 @@ def derive_runtime_settings(base_settings=None, rect=None, pool_count=0, capture
 
 
 def create_runtime_settings(base_settings=None, rect=None, pool_count=0, capture_ms=24.0, cpu_load=0.0):
-    return derive_runtime_settings(base_settings=base_settings, rect=rect, pool_count=pool_count, capture_ms=capture_ms, cpu_load=cpu_load)
+    return derive_runtime_settings(base_settings=base_settings, rect=rect, pool_count=pool_count, capture_ms=capture_ms, cpu_load=cpu_load, hardware=read_hardware_state())
 
 
 def rect_size(rect):
@@ -1343,8 +1373,8 @@ class ControlPanel(tk.Tk):
         super().__init__()
         self.adaptive_policy = AdaptivePolicy()
         initial_capture_ms = self.measure_capture_latency()
-        initial_cpu_load = safe_float(psutil.cpu_percent(interval=0.05), 0.0) if psutil else 0.0
-        self.settings = derive_runtime_settings(rect=self.screen_rect(), pool_count=0, capture_ms=initial_capture_ms, cpu_load=initial_cpu_load)
+        self.hardware_state = read_hardware_state()
+        self.settings = derive_runtime_settings(rect=self.screen_rect(), pool_count=0, capture_ms=initial_capture_ms, cpu_load=safe_float(self.hardware_state.get("cpu_load", 0.0), 0.0), hardware=self.hardware_state)
         self.adaptive_policy.observe_capture(initial_capture_ms)
         self.progress_value = 0.0
         self.title("雷电模拟器学习训练控制面板")
@@ -1575,11 +1605,12 @@ class ControlPanel(tk.Tk):
         self.sleep_seconds_var.set(str(sleep_seconds))
         self.still_seconds_var.set(str(still_seconds))
         data_path = Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)
-        cpu_load = safe_float(psutil.cpu_percent(interval=0.05), 0.0) if psutil else 0.0
+        self.hardware_state = read_hardware_state()
+        cpu_load = safe_float(self.hardware_state.get("cpu_load", 0.0), 0.0)
         capture_ms = self.adaptive_policy._avg(self.adaptive_policy.capture_latency_ms, 0.0)
         if capture_ms <= 0.0:
             capture_ms = self.measure_capture_latency()
-        settings = derive_runtime_settings(base_settings=self.settings, rect=self.current_rect() or self.screen_rect(), pool_count=self.experience_pool.count() if self.experience_pool else 0, capture_ms=capture_ms, cpu_load=cpu_load, execution_ms=self.adaptive_policy._avg(self.adaptive_policy.execution_latency_ms, 0.0), window_instability=self.adaptive_policy._avg(self.adaptive_policy.window_change_flags, 0.0), recent_success=self.adaptive_policy._avg(self.adaptive_policy.outcome_flags, 1.0), life=self.store.life if self.store else 0.0, learning_similarity=self.adaptive_policy._avg(self.adaptive_policy.learning_similarity, 0.97))
+        settings = derive_runtime_settings(base_settings=self.settings, rect=self.current_rect() or self.screen_rect(), pool_count=self.experience_pool.count() if self.experience_pool else 0, capture_ms=capture_ms, cpu_load=cpu_load, execution_ms=self.adaptive_policy._avg(self.adaptive_policy.execution_latency_ms, 0.0), window_instability=self.adaptive_policy._avg(self.adaptive_policy.window_change_flags, 0.0), recent_success=self.adaptive_policy._avg(self.adaptive_policy.outcome_flags, 1.0), life=self.store.life if self.store else 0.0, learning_similarity=self.adaptive_policy._avg(self.adaptive_policy.learning_similarity, 0.97), hardware=self.hardware_state)
         self.settings = settings
         self.escape_monitor.debounce_seconds = settings.key_debounce_seconds
         self.ui(lambda: self.minsize(settings.ui_min_width, settings.ui_min_height))
@@ -1917,7 +1948,8 @@ class ControlPanel(tk.Tk):
                 rect = self.current_rect()
                 pool_count = self.experience_pool.count() if self.experience_pool else 0
                 life_value = safe_float(self.store.state.get("life_experience", 0.0), 0.0) if self.store else 0.0
-                self.settings = self.adaptive_policy.build(self.settings, rect, pool_count, life_value)
+                self.hardware_state = read_hardware_state()
+                self.settings = self.adaptive_policy.build(self.settings, rect, pool_count, life_value, hardware=self.hardware_state)
                 self.apply_runtime_settings(self.settings)
                 if not rect:
                     time.sleep(self.settings.training_tick)
