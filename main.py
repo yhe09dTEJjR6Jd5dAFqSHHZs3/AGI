@@ -147,25 +147,12 @@ class AdaptivePolicy:
         return sum(values) / len(values) if values else fallback
 
     def build(self, base_settings, rect, pool_count, life):
-        width, height = rect_size(rect) if rect else (1280, 720)
-        pixel_factor = math.sqrt(max(1.0, width * height) / (1280.0 * 720.0))
         capture_ms = self._avg(self.capture_latency_ms, 24.0)
         execution_ms = self._avg(self.execution_latency_ms, 140.0)
         window_instability = self._avg(self.window_change_flags, 0.0)
         recent_success = self._avg(self.outcome_flags, 1.0)
         similarity = self._avg(self.learning_similarity, 0.97)
-        hash_size = int(clamp(round(8 + pixel_factor * 4 + math.log2(max(2, pool_count + 2)) * 0.6), 8, 24))
-        nearest_top_k = int(clamp(round(12 + math.sqrt(max(1, pool_count)) * 1.5), 8, 256))
-        nearest_candidate_limit = int(clamp(round(nearest_top_k * (12.0 + 8.0 * (1.0 - window_instability))), nearest_top_k * 4, 20000))
-        training_tick = round(clamp((capture_ms + execution_ms) / 1000.0 * (0.45 + 0.4 * window_instability), 0.02, 1.2), 4)
-        learning_screen_fps = round(clamp(1.0 / max(0.04, capture_ms / 1000.0) * (1.0 - similarity * 0.65), 0.5, 12.0), 3)
-        explore_max = clamp(0.35 + (1.0 - recent_success) * 0.45 + clamp(similarity, 0.0, 1.0) * 0.1, 0.2, 0.95)
-        explore_min = clamp(explore_max * 0.12, 0.01, 0.2)
-        fail_stop = int(clamp(round((1.0 - recent_success) * 16 + window_instability * 10 + 2), 2, 24))
-        jitter = clamp(0.01 + 0.03 * (1.0 - recent_success), 0.005, 0.08)
-        base_values = {item.name: getattr(base_settings, item.name) for item in fields(Settings)}
-        base_values.update({"hash_size": hash_size, "nearest_top_k": nearest_top_k, "nearest_candidate_limit": nearest_candidate_limit, "training_tick": training_tick, "learning_screen_fps": learning_screen_fps, "explore_min_rate": explore_min, "explore_max_rate": explore_max, "training_fail_stop_count": fail_stop, "action_jitter": jitter, "hash_prefix_bits": int(clamp(round(hash_size * 0.66), 4, 20)), "reward_total_min": -10000.0 - life, "reward_total_max": 10000.0 + life})
-        return normalize_settings(Settings(**base_values))
+        return derive_runtime_settings(base_settings=base_settings, rect=rect, pool_count=pool_count, capture_ms=capture_ms, cpu_load=0.0, execution_ms=execution_ms, window_instability=window_instability, recent_success=recent_success, life=life, learning_similarity=similarity)
 
 
 @dataclass(frozen=True)
@@ -302,28 +289,34 @@ def normalize_settings(settings):
     )
 
 
-def create_runtime_settings(base_settings=None, rect=None, pool_count=0, capture_ms=24.0, cpu_load=0.0):
+def derive_runtime_settings(base_settings=None, rect=None, pool_count=0, capture_ms=None, cpu_load=0.0, execution_ms=None, window_instability=0.0, recent_success=1.0, life=0.0, learning_similarity=0.97):
     source = base_settings or Settings()
     width, height = rect_size(rect) if rect else (safe_int(getattr(win32api, "GetSystemMetrics", lambda _: 1920)(0), 1920), safe_int(getattr(win32api, "GetSystemMetrics", lambda _: 1080)(1), 1080))
     pixel_factor = math.sqrt(max(1.0, width * height) / (1280.0 * 720.0))
     record_factor = math.log2(max(2, pool_count + 2))
+    capture_ms = max(1.0, safe_float(capture_ms, 24.0))
+    execution_ms = max(1.0, safe_float(execution_ms, max(60.0, capture_ms * 4.2)))
+    instability = clamp(window_instability, 0.0, 1.0)
+    success = clamp(recent_success, 0.0, 1.0)
+    similarity = clamp(learning_similarity, 0.0, 1.0)
     capture_factor = clamp(capture_ms / 24.0, 0.4, 3.0)
     cpu_factor = clamp(1.0 + cpu_load / 200.0, 0.8, 1.8)
+    timing_factor = clamp((capture_ms + execution_ms * 0.5) / 80.0, 0.5, 2.5)
     values = {item.name: getattr(source, item.name) for item in fields(Settings)}
     values.update({
         "hash_size": int(clamp(round(8 + pixel_factor * 4 + record_factor * 0.8), 8, 24)),
         "nearest_top_k": int(clamp(round(10 + record_factor * 10), 8, 256)),
-        "nearest_candidate_limit": int(clamp(round((14 + record_factor * 7) * 64), 256, 20000)),
+        "nearest_candidate_limit": int(clamp(round((14 + record_factor * 7 + instability * 8) * 64), 256, 20000)),
         "hash_prefix_bits": int(clamp(round(6 + record_factor), 4, 20)),
         "mouse_still_tick": round(clamp(0.02 * capture_factor, 0.01, 0.2), 4),
-        "training_tick": round(clamp(0.03 * capture_factor * cpu_factor, 0.01, 0.9), 4),
+        "training_tick": round(clamp(0.03 * capture_factor * cpu_factor * timing_factor * (0.85 + instability * 0.45), 0.01, 0.9), 4),
         "sleep_tick": round(clamp(0.08 * cpu_factor, 0.05, 1.0), 4),
         "key_debounce_seconds": round(clamp(0.2 * cpu_factor, 0.05, 1.0), 3),
         "window_attach_seconds": round(clamp(20.0 + cpu_load * 0.6, 5.0, 120.0), 2),
         "window_poll_seconds": round(clamp(0.2 * cpu_factor, 0.05, 1.0), 3),
-        "explore_max_rate": clamp(0.5 + 0.2 / max(1.0, record_factor), 0.2, 0.95),
-        "explore_min_rate": clamp(0.03 + 0.1 / max(2.0, record_factor + 1.0), 0.01, 0.2),
-        "action_jitter": clamp(0.009 + 0.01 / max(1.0, record_factor), 0.005, 0.08),
+        "explore_max_rate": clamp(0.35 + (1.0 - success) * 0.45 + similarity * 0.1, 0.2, 0.95),
+        "explore_min_rate": clamp((0.35 + (1.0 - success) * 0.45 + similarity * 0.1) * 0.12, 0.01, 0.2),
+        "action_jitter": clamp(0.008 + (1.0 - success) * 0.03 + instability * 0.012, 0.005, 0.08),
         "softmax_temperature": clamp(12.0 + record_factor * 2.0, 6.0, 30.0),
         "human_profile_min_samples": int(clamp(round(12 + record_factor * 8), 12, 120)),
         "human_profile_max_samples": int(clamp(round(2400 + record_factor * 900), 1500, 10000)),
@@ -336,15 +329,19 @@ def create_runtime_settings(base_settings=None, rect=None, pool_count=0, capture
         "ui_section_padding": int(clamp(round(min(width, height) * 0.008), 6, 22)),
         "ui_metric_columns": int(clamp(round(width / 340.0), 2, 6)),
         "ui_metric_min_column_width": int(clamp(round(width / 4.8), 150, 320)),
-        "reward_total_min": -10000.0,
-        "reward_total_max": 10000.0,
+        "reward_total_min": -10000.0 - max(0.0, safe_float(life, 0.0)),
+        "reward_total_max": 10000.0 + max(0.0, safe_float(life, 0.0)),
         "experience_load_limit": int(clamp(round(12000 + record_factor * 8000), 8000, 90000)),
         "global_action_probability": clamp(0.45 + 0.15 / max(1.0, record_factor), 0.2, 0.75),
         "learning_screen_fps": clamp(1.0 / max(0.05, capture_ms / 1000.0), 0.5, 12.0),
-        "learning_screen_similarity_threshold": clamp(0.96 + min(0.03, record_factor * 0.002), 0.9, 0.999),
-        "training_fail_stop_count": int(clamp(round(4 + cpu_factor * 3 + record_factor), 3, 24))
+        "learning_screen_similarity_threshold": clamp(0.95 + min(0.04, record_factor * 0.0025 + similarity * 0.01), 0.9, 0.999),
+        "training_fail_stop_count": int(clamp(round((1.0 - success) * 16 + instability * 10 + 2), 2, 24))
     })
     return normalize_settings(Settings(**values))
+
+
+def create_runtime_settings(base_settings=None, rect=None, pool_count=0, capture_ms=24.0, cpu_load=0.0):
+    return derive_runtime_settings(base_settings=base_settings, rect=rect, pool_count=pool_count, capture_ms=capture_ms, cpu_load=cpu_load)
 
 
 def rect_size(rect):
@@ -1344,8 +1341,11 @@ class ControlPanel(tk.Tk):
     def __init__(self):
         enable_dpi_awareness()
         super().__init__()
-        self.settings = Settings()
         self.adaptive_policy = AdaptivePolicy()
+        initial_capture_ms = self.measure_capture_latency()
+        initial_cpu_load = safe_float(psutil.cpu_percent(interval=0.05), 0.0) if psutil else 0.0
+        self.settings = derive_runtime_settings(rect=self.screen_rect(), pool_count=0, capture_ms=initial_capture_ms, cpu_load=initial_cpu_load)
+        self.adaptive_policy.observe_capture(initial_capture_ms)
         self.progress_value = 0.0
         self.title("雷电模拟器学习训练控制面板")
         self.geometry(f"{self.settings.ui_width}x{self.settings.ui_height}")
@@ -1547,6 +1547,26 @@ class ControlPanel(tk.Tk):
         if path:
             self.data_var.set(path)
 
+    def screen_rect(self):
+        width = safe_int(getattr(win32api, "GetSystemMetrics", lambda _: self.winfo_screenwidth())(0), self.winfo_screenwidth())
+        height = safe_int(getattr(win32api, "GetSystemMetrics", lambda _: self.winfo_screenheight())(1), self.winfo_screenheight())
+        return 0, 0, max(1, width), max(1, height)
+
+    def measure_capture_latency(self, rounds=2):
+        if not mss:
+            return 24.0
+        monitor = {"left": 0, "top": 0, "width": max(160, safe_int(self.winfo_screenwidth(), 1920) // 6), "height": max(120, safe_int(self.winfo_screenheight(), 1080) // 6)}
+        cost = []
+        try:
+            with mss.mss() as sct:
+                for _ in range(max(1, safe_int(rounds, 2))):
+                    t0 = time.perf_counter()
+                    sct.grab(monitor)
+                    cost.append((time.perf_counter() - t0) * 1000.0)
+        except Exception:
+            return 24.0
+        return max(1.0, sum(cost) / len(cost)) if cost else 24.0
+
     def read_config(self):
         training_seconds = max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS))
         sleep_seconds = max(1, safe_int(self.sleep_seconds_var.get(), DEFAULT_SLEEP_SECONDS))
@@ -1556,7 +1576,10 @@ class ControlPanel(tk.Tk):
         self.still_seconds_var.set(str(still_seconds))
         data_path = Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)
         cpu_load = safe_float(psutil.cpu_percent(interval=0.05), 0.0) if psutil else 0.0
-        settings = create_runtime_settings(self.settings, self.current_rect(), self.experience_pool.count() if self.experience_pool else 0, 24.0, cpu_load)
+        capture_ms = self.adaptive_policy._avg(self.adaptive_policy.capture_latency_ms, 0.0)
+        if capture_ms <= 0.0:
+            capture_ms = self.measure_capture_latency()
+        settings = derive_runtime_settings(base_settings=self.settings, rect=self.current_rect() or self.screen_rect(), pool_count=self.experience_pool.count() if self.experience_pool else 0, capture_ms=capture_ms, cpu_load=cpu_load, execution_ms=self.adaptive_policy._avg(self.adaptive_policy.execution_latency_ms, 0.0), window_instability=self.adaptive_policy._avg(self.adaptive_policy.window_change_flags, 0.0), recent_success=self.adaptive_policy._avg(self.adaptive_policy.outcome_flags, 1.0), life=self.store.life if self.store else 0.0, learning_similarity=self.adaptive_policy._avg(self.adaptive_policy.learning_similarity, 0.97))
         self.settings = settings
         self.escape_monitor.debounce_seconds = settings.key_debounce_seconds
         self.ui(lambda: self.minsize(settings.ui_min_width, settings.ui_min_height))
