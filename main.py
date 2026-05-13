@@ -635,6 +635,10 @@ class DataStore:
         self.screen_dir.mkdir(parents=True, exist_ok=True)
         self.state = self.load_state()
 
+    @property
+    def life(self):
+        return safe_float(self.state.get("life_experience", 0.0), 0.0)
+
     def load_state(self):
         if not self.state_file.exists():
             return {"life_experience": 0.0, "penalty": 0.0}
@@ -1413,6 +1417,8 @@ class ControlPanel(tk.Tk):
         self.progress_text_var = tk.StringVar(value="0%")
         self.last_learning_tick_perf = 0.0
         self.last_learning_tick_hash = None
+        self.hardware_last_full_refresh_perf = 0.0
+        self.hardware_last_light_refresh_perf = 0.0
         self.progress_label_var = tk.StringVar(value="进度")
         self.metric_items = []
         self.hint_label = None
@@ -1457,6 +1463,7 @@ class ControlPanel(tk.Tk):
         canvas_window = canvas.create_window((0, 0), window=container, anchor="nw")
         container.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda event: canvas.itemconfigure(canvas_window, width=event.width))
+        canvas.bind_all("<MouseWheel>", lambda event: canvas.yview_scroll(int(-event.delta / 120), "units"))
         ttk.Label(container, text="雷电模拟器学习训练控制面板", style="Title.TLabel").pack(anchor="w")
         path_frame = ttk.LabelFrame(container, text="路径与时间", padding=self.settings.ui_section_padding)
         path_frame.pack(fill="x", pady=(16, 10))
@@ -1606,11 +1613,14 @@ class ControlPanel(tk.Tk):
         self.still_seconds_var.set(str(still_seconds))
         data_path = Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)
         self.hardware_state = read_hardware_state()
+        self.hardware_last_full_refresh_perf = time.perf_counter()
+        self.hardware_last_light_refresh_perf = self.hardware_last_full_refresh_perf
         cpu_load = safe_float(self.hardware_state.get("cpu_load", 0.0), 0.0)
         capture_ms = self.adaptive_policy._avg(self.adaptive_policy.capture_latency_ms, 0.0)
         if capture_ms <= 0.0:
             capture_ms = self.measure_capture_latency()
-        settings = derive_runtime_settings(base_settings=self.settings, rect=self.current_rect() or self.screen_rect(), pool_count=self.experience_pool.count() if self.experience_pool else 0, capture_ms=capture_ms, cpu_load=cpu_load, execution_ms=self.adaptive_policy._avg(self.adaptive_policy.execution_latency_ms, 0.0), window_instability=self.adaptive_policy._avg(self.adaptive_policy.window_change_flags, 0.0), recent_success=self.adaptive_policy._avg(self.adaptive_policy.outcome_flags, 1.0), life=self.store.life if self.store else 0.0, learning_similarity=self.adaptive_policy._avg(self.adaptive_policy.learning_similarity, 0.97), hardware=self.hardware_state)
+        life_value = self.store.life if self.store else 0.0
+        settings = derive_runtime_settings(base_settings=self.settings, rect=self.current_rect() or self.screen_rect(), pool_count=self.experience_pool.count() if self.experience_pool else 0, capture_ms=capture_ms, cpu_load=cpu_load, execution_ms=self.adaptive_policy._avg(self.adaptive_policy.execution_latency_ms, 0.0), window_instability=self.adaptive_policy._avg(self.adaptive_policy.window_change_flags, 0.0), recent_success=self.adaptive_policy._avg(self.adaptive_policy.outcome_flags, 1.0), life=life_value, learning_similarity=self.adaptive_policy._avg(self.adaptive_policy.learning_similarity, 0.97), hardware=self.hardware_state)
         self.settings = settings
         self.escape_monitor.debounce_seconds = settings.key_debounce_seconds
         self.ui(lambda: self.minsize(settings.ui_min_width, settings.ui_min_height))
@@ -1852,9 +1862,8 @@ class ControlPanel(tk.Tk):
         human_score = self.experience_pool.human_score(normalized) if normalized else 50.0
         after_novelty = self.experience_pool.novelty(after_snapshot.hash_value)[0] if after_snapshot else before_novelty
         transition_reward = round(after_novelty - before_novelty, 2)
-        novelty_reward = round(after_novelty, 2)
-        human_delta = round(human_score - 50.0, 2) if normalized else 0.0
-        reward = round(novelty_reward + human_delta + (transition_reward if normalized else 0.0), 2)
+        novelty_reward, human_delta, base_reward = reward_parts(after_novelty, human_score if normalized else 50.0, self.settings)
+        reward = round(base_reward + (transition_reward if normalized else 0.0), 2)
         human_action_reward = max(0.0, human_delta)
         human_action_penalty = max(0.0, -human_delta)
         life = self.store.add_life_experience(reward)
@@ -1947,8 +1956,8 @@ class ControlPanel(tk.Tk):
                 self.ui(lambda: self.progress_label_var.set("模式进度"))
                 rect = self.current_rect()
                 pool_count = self.experience_pool.count() if self.experience_pool else 0
-                life_value = safe_float(self.store.state.get("life_experience", 0.0), 0.0) if self.store else 0.0
-                self.hardware_state = read_hardware_state()
+                life_value = self.store.life if self.store else 0.0
+                self.hardware_state = self.refresh_hardware_state()
                 self.settings = self.adaptive_policy.build(self.settings, rect, pool_count, life_value, hardware=self.hardware_state)
                 self.apply_runtime_settings(self.settings)
                 if not rect:
@@ -1959,7 +1968,7 @@ class ControlPanel(tk.Tk):
                     time.sleep(self.settings.training_tick)
                     continue
                 novelty, batch = self.experience_pool.novelty(snapshot.hash_value)
-                life = safe_float(self.store.state.get("life_experience", 0.0), 0.0) if self.store else 0.0
+                life = self.store.life if self.store else 0.0
                 action, decision = self.brain.choose(snapshot.hash_value, novelty, batch, life)
                 if not action:
                     self.write_record("training", session_id, snapshot, None, "screen_tick", decision=decision)
@@ -2019,10 +2028,37 @@ class ControlPanel(tk.Tk):
         self.escape_monitor.stop()
         if self.window_manager:
             self.window_manager.not_topmost()
+        mode_thread = self.mode_thread
+        if mode_thread and mode_thread.is_alive():
+            mode_thread.join(timeout=1.2)
         try:
             self.destroy()
         except Exception:
             pass
+
+    def refresh_hardware_state(self):
+        now_perf = time.perf_counter()
+        if not self.hardware_state:
+            self.hardware_state = read_hardware_state()
+            self.hardware_last_full_refresh_perf = now_perf
+            self.hardware_last_light_refresh_perf = now_perf
+            return self.hardware_state
+        if now_perf - self.hardware_last_light_refresh_perf >= 1.0:
+            cpu_load = safe_float(psutil.cpu_percent(interval=0.0), self.hardware_state.get("cpu_load", 0.0)) if psutil else self.hardware_state.get("cpu_load", 0.0)
+            memory = psutil.virtual_memory() if psutil else None
+            memory_total = safe_float(getattr(memory, "total", 0.0), 0.0)
+            memory_available = safe_float(getattr(memory, "available", 0.0), 0.0)
+            memory_free_ratio = clamp(memory_available / memory_total if memory_total > 0 else self.hardware_state.get("memory_free_ratio", 0.0), 0.0, 1.0)
+            self.hardware_state["cpu_load"] = clamp(cpu_load, 0.0, 100.0)
+            self.hardware_state["memory_free_ratio"] = memory_free_ratio
+            self.hardware_last_light_refresh_perf = now_perf
+        if now_perf - self.hardware_last_full_refresh_perf >= 30.0:
+            full = read_hardware_state()
+            full["cpu_load"] = self.hardware_state.get("cpu_load", full.get("cpu_load", 0.0))
+            full["memory_free_ratio"] = self.hardware_state.get("memory_free_ratio", full.get("memory_free_ratio", 0.0))
+            self.hardware_state = full
+            self.hardware_last_full_refresh_perf = now_perf
+        return self.hardware_state
 
 if __name__ == "__main__":
     app = ControlPanel()
