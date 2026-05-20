@@ -634,6 +634,8 @@ class DataStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.screen_dir.mkdir(parents=True, exist_ok=True)
         self.state = self.load_state()
+        self.pending_state_writes = 0
+        self.last_state_save_perf = time.perf_counter()
 
     @property
     def life(self):
@@ -666,8 +668,17 @@ class DataStore:
             else:
                 self.state["life_experience"] = round(current, 2)
                 self.state["penalty"] = round(penalty + abs(delta), 2)
-            self.save_state()
             return self.state["life_experience"]
+
+    def flush_state(self, force=False, min_interval=1.5, max_pending=36):
+        with self.lock:
+            self.pending_state_writes += 1
+            now_perf = time.perf_counter()
+            due = force or self.pending_state_writes >= max(1, safe_int(max_pending, 36)) or (now_perf - self.last_state_save_perf) >= max(0.1, safe_float(min_interval, 1.5))
+            if due:
+                self.save_state()
+                self.pending_state_writes = 0
+                self.last_state_save_perf = now_perf
 
     def new_screen_path(self, mode):
         folder = self.screen_dir / datetime.now().strftime("%Y%m%d") / mode
@@ -871,13 +882,15 @@ class ScreenAnalyzer:
     def __exit__(self, exc_type, exc, tb):
         self.close()
 
-    def capture(self, rect, path):
+    def capture(self, rect):
         left, top, right, bottom = rect
         width, height = rect_size(rect)
         shot = self.sct.grab({"left": int(left), "top": int(top), "width": width, "height": height})
         image = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-        image.save(path)
         return image
+
+    def save_image(self, image, path):
+        image.save(path)
 
     def fingerprint(self, image):
         small = image.convert("L").resize((self.hash_size, self.hash_size), self.resample)
@@ -908,6 +921,8 @@ class ExperiencePool:
         self.sorted_prefixes = []
         self.profile = HumanProfile(settings)
         self.lock = threading.RLock()
+        self.action_cache = []
+        self.prefix_neighbor_cache = {}
         for record in records or []:
             self.add(record)
 
@@ -926,9 +941,12 @@ class ExperiencePool:
                 bucket = self.index[prefix]
                 if not bucket:
                     self.sorted_prefixes.append(prefix)
+                    self.prefix_neighbor_cache.clear()
                 bucket.append(index)
             if record.get("mouse_action") and record.get("mode") == "learning" and record.get("mouse_source") == "user":
                 self.profile.observe(record["mouse_action"])
+            if record.get("mouse_action"):
+                self.action_cache.append(record)
 
     def count(self):
         with self.lock:
@@ -936,7 +954,7 @@ class ExperiencePool:
 
     def action_records(self):
         with self.lock:
-            return [record for record in self.records if record.get("mouse_action")]
+            return list(self.action_cache)
 
     def candidate_indices(self, hash_value):
         with self.lock:
@@ -944,7 +962,10 @@ class ExperiencePool:
                 return [index for index, item in enumerate(self.hashes) if item]
             query_prefix = self._prefix(hash_value)
             result = []
-            nearby = sorted(self.sorted_prefixes, key=lambda item: (item ^ query_prefix).bit_count())
+            nearby = self.prefix_neighbor_cache.get(query_prefix)
+            if nearby is None:
+                nearby = sorted(self.sorted_prefixes, key=lambda item: (item ^ query_prefix).bit_count())
+                self.prefix_neighbor_cache[query_prefix] = nearby
             for prefix in nearby:
                 result.extend(self.index[prefix])
                 if len(result) >= self.settings.nearest_candidate_limit:
@@ -959,16 +980,17 @@ class ExperiencePool:
             return []
         with self.lock:
             top_k = max(1, self.settings.nearest_top_k)
-            scored = []
-            for index in self.candidate_indices(hash_value):
-                other = self.hashes[index]
-                if other:
-                    similarity = hash_similarity(hash_value, other)
-                    item = {"similarity": similarity, "record": self.records[index]}
-                    if len(scored) < top_k:
-                        heapq.heappush(scored, (similarity, index, item))
-                    elif similarity > scored[0][0]:
-                        heapq.heapreplace(scored, (similarity, index, item))
+            candidate_indexes = self.candidate_indices(hash_value)
+            snapshot = [(index, self.hashes[index], self.records[index]) for index in candidate_indexes]
+        scored = []
+        for index, other, record in snapshot:
+            if other:
+                similarity = hash_similarity(hash_value, other)
+                item = {"similarity": similarity, "record": record}
+                if len(scored) < top_k:
+                    heapq.heappush(scored, (similarity, index, item))
+                elif similarity > scored[0][0]:
+                    heapq.heapreplace(scored, (similarity, index, item))
         return [item for _, _, item in sorted(scored, key=lambda pair: (pair[0], pair[1]), reverse=True)]
 
     def novelty(self, hash_value):
@@ -1841,16 +1863,18 @@ class ControlPanel(tk.Tk):
                 self.ai_var.set(f"{decision.get('reason', 'AI')} {confidence}%")
         self.ui(apply)
 
-    def capture_snapshot(self, analyzer, mode, session_id, session_start, rect=None):
+    def capture_snapshot(self, analyzer, mode, session_id, session_start, rect=None, persist=True):
         if not self.store:
             return None
         rect = rect or self.current_rect()
         if not rect:
             return None
-        path = self.store.new_screen_path(mode)
         perf_time = time.perf_counter()
-        image = analyzer.capture(rect, path)
+        image = analyzer.capture(rect)
         hash_value = analyzer.fingerprint(image)
+        path = self.store.new_screen_path(mode)
+        if persist:
+            analyzer.save_image(image, path)
         return ScreenSnapshot(path=path, relative_path=self.store.relative_path(path), hash_value=hash_value, captured_at=now_text(), perf_time=perf_time, elapsed=round(perf_time - session_start, 3), rect=tuple(rect))
 
     def write_record(self, mode, session_id, snapshot, action, event_name, decision=None, action_anchor_perf=None, after_snapshot=None, planned_action=None, failed_action=False, window_rect_changed=False, capture_latency_ms=None, execution_latency_ms=None):
@@ -1875,6 +1899,7 @@ class ControlPanel(tk.Tk):
         if decision:
             record["ai_decision"] = decision
         self.store.append_experience(record)
+        self.store.flush_state()
         self.experience_pool.add(record)
         self.update_metrics(after_novelty, human_score, novelty_reward, human_delta, reward, life, decision)
         return record
@@ -1890,6 +1915,11 @@ class ControlPanel(tk.Tk):
             similarity = hash_similarity(snapshot.hash_value, self.last_learning_tick_hash)
             self.adaptive_policy.observe_capture(0.0, similarity=similarity, window_rect_changed=False)
             if similarity >= self.settings.learning_screen_similarity_threshold:
+                try:
+                    if snapshot.path.exists():
+                        snapshot.path.unlink()
+                except Exception:
+                    pass
                 self.last_learning_tick_perf = now_perf
                 return
         self.last_learning_tick_perf = now_perf
@@ -2028,6 +2058,8 @@ class ControlPanel(tk.Tk):
         self.escape_monitor.stop()
         if self.window_manager:
             self.window_manager.not_topmost()
+        if self.store:
+            self.store.flush_state(force=True)
         mode_thread = self.mode_thread
         if mode_thread and mode_thread.is_alive():
             mode_thread.join(timeout=1.2)
