@@ -5,6 +5,8 @@ import heapq
 import math
 import random
 import subprocess
+import sys
+import os
 import threading
 import time
 import uuid
@@ -14,6 +16,23 @@ from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+
+DEPENDENCY_INSTALL_MAP = {"mss": "mss", "PIL": "pillow", "psutil": "psutil", "pywin32": "pywin32", "pynput.mouse": "pynput", "pynput.keyboard": "pynput"}
+REQUIRED_MODULES = ("mss", "PIL", "pywin32", "pynput.mouse")
+OPTIONAL_MODULES = ("psutil", "pynput.keyboard")
+
+
+def bootstrap_dependencies():
+    required = set(REQUIRED_MODULES)
+    missing = sorted({DEPENDENCY_INSTALL_MAP[name] for name in required if name in IMPORT_ERRORS})
+    if not missing:
+        return
+    command = [sys.executable, "-m", "pip", "install", "--user", *missing]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"自动安装依赖失败: {' '.join(missing)}\n{detail}")
+    os.execv(sys.executable, [sys.executable, *sys.argv])
 
 IMPORT_ERRORS = {}
 try:
@@ -53,12 +72,13 @@ except Exception as exc:
     pynput_keyboard = None
     IMPORT_ERRORS["pynput.keyboard"] = exc
 
+bootstrap_dependencies()
+
 DEFAULT_LDPLAYER_PATH = r"D:\LDPlayer9\dnplayer.exe"
 DEFAULT_DATA_PATH = r"C:\Users\Administrator\Desktop\AAA"
 DEFAULT_TRAINING_SECONDS = 900
 DEFAULT_SLEEP_SECONDS = 1800
 DEFAULT_STILL_SECONDS = 10
-REQUIRED_MODULES = ("mss", "PIL", "psutil", "pywin32", "pynput.mouse")
 MODE_NAMES = {"idle": "空闲", "starting": "准备中", "learning": "学习模式", "training": "训练模式", "sleep": "睡眠模式"}
 
 
@@ -363,6 +383,20 @@ def derive_runtime_settings(base_settings=None, rect=None, pool_count=0, capture
         "reward_total_max": 10000.0 + max(0.0, safe_float(life, 0.0)),
         "experience_load_limit": int(clamp(round(12000 + record_factor * 8000), 8000, 90000)),
         "global_action_probability": clamp(0.45 + 0.15 / max(1.0, record_factor), 0.2, 0.75),
+        "random_action_min": clamp(0.02 + instability * 0.03, 0.0, 0.12),
+        "random_action_max": clamp(0.98 - instability * 0.03, 0.88, 1.0),
+        "action_duration_min": clamp((capture_ms + execution_ms * 0.15) / 1200.0, 0.05, 0.35),
+        "action_duration_max": clamp((capture_ms + execution_ms * 0.75) / 320.0, 0.18, 1.8),
+        "random_click_duration_min": clamp((capture_ms + execution_ms * 0.08) / 1500.0, 0.03, 0.22),
+        "random_click_duration_max": clamp((capture_ms + execution_ms * 0.35) / 700.0, 0.08, 0.7),
+        "generated_click_hold_max": clamp((capture_ms + execution_ms * 0.2) / 500.0, 0.08, 0.9),
+        "motion_steps_per_second": clamp((42.0 + width / 24.0) / max(0.6, cpu_factor), 40.0, 260.0),
+        "motion_curve_offset_min": clamp(0.04 + instability * 0.04, 0.02, 0.2),
+        "motion_curve_offset_max": clamp(0.2 + (1.0 - success) * 0.22 + instability * 0.12, 0.16, 0.65),
+        "motion_first_control_min": clamp(0.12 + instability * 0.06, 0.08, 0.3),
+        "motion_first_control_max": clamp(0.46 + (1.0 - success) * 0.12, 0.3, 0.78),
+        "motion_second_control_min": clamp(0.54 - (1.0 - success) * 0.08, 0.26, 0.7),
+        "motion_second_control_max": clamp(0.9 - instability * 0.05, 0.7, 0.95),
         "learning_screen_fps": clamp(1.0 / max(0.05, capture_ms / 1000.0) * clamp(core_factor * gpu_factor, 0.8, 2.4), 0.5, 20.0),
         "learning_screen_similarity_threshold": clamp(0.95 + min(0.04, record_factor * 0.0025 + similarity * 0.01), 0.9, 0.999),
         "training_fail_stop_count": int(clamp(round((1.0 - success) * 16 + instability * 10 + 2), 2, 24))
@@ -923,6 +957,8 @@ class ExperiencePool:
         self.lock = threading.RLock()
         self.action_cache = []
         self.prefix_neighbor_cache = {}
+        self.global_action_heap = []
+        self.nearest_cache = {}
         for record in records or []:
             self.add(record)
 
@@ -947,6 +983,12 @@ class ExperiencePool:
                 self.profile.observe(record["mouse_action"])
             if record.get("mouse_action"):
                 self.action_cache.append(record)
+                reward = safe_float(record.get("reward", 0.0), 0.0)
+                self.global_action_heap.append((-reward, index))
+                if len(self.global_action_heap) > 2048:
+                    self.global_action_heap.sort(key=lambda item: item[0])
+                    self.global_action_heap = self.global_action_heap[:2048]
+            self.nearest_cache.clear()
 
     def count(self):
         with self.lock:
@@ -980,6 +1022,10 @@ class ExperiencePool:
             return []
         with self.lock:
             top_k = max(1, self.settings.nearest_top_k)
+            cache_key = hash_value.hex
+            cached = self.nearest_cache.get(cache_key)
+            if cached is not None:
+                return [copy.deepcopy(item) for item in cached]
             candidate_indexes = self.candidate_indices(hash_value)
             snapshot = [(index, self.hashes[index], self.records[index]) for index in candidate_indexes]
         scored = []
@@ -991,7 +1037,12 @@ class ExperiencePool:
                     heapq.heappush(scored, (similarity, index, item))
                 elif similarity > scored[0][0]:
                     heapq.heapreplace(scored, (similarity, index, item))
-        return [item for _, _, item in sorted(scored, key=lambda pair: (pair[0], pair[1]), reverse=True)]
+        result = [item for _, _, item in sorted(scored, key=lambda pair: (pair[0], pair[1]), reverse=True)]
+        with self.lock:
+            if len(self.nearest_cache) > 256:
+                self.nearest_cache.pop(next(iter(self.nearest_cache)))
+            self.nearest_cache[hash_value.hex] = copy.deepcopy(result)
+        return result
 
     def novelty(self, hash_value):
         batch = self.nearest(hash_value)
@@ -1014,13 +1065,18 @@ class ExperiencePool:
         return round(clamp((1.0 - fused) * 100.0, 0.0, 100.0), 2), batch
 
     def best_global_action(self):
-        weighted = []
-        for record in self.action_records():
-            action = record.get("mouse_action")
-            reward = safe_float(record.get("reward", 0.0), 0.0)
-            human_score = clamp(record.get("human_score", 50.0), 0.0, 100.0)
-            if action:
-                weighted.append((max(0.05, 1.0 + reward / 100.0) * max(0.25, human_score / 100.0), action))
+        with self.lock:
+            ranked = sorted(self.global_action_heap[:96], key=lambda item: item[0])
+            weighted = []
+            for _, index in ranked:
+                if index < 0 or index >= len(self.records):
+                    continue
+                record = self.records[index]
+                action = record.get("mouse_action")
+                reward = safe_float(record.get("reward", 0.0), 0.0)
+                human_score = clamp(record.get("human_score", 50.0), 0.0, 100.0)
+                if action:
+                    weighted.append((max(0.05, 1.0 + reward / 100.0) * max(0.25, human_score / 100.0), action))
         chosen = weighted_choice(weighted)
         return copy.deepcopy(chosen) if chosen else None
 
@@ -1054,8 +1110,8 @@ class ActionBrain:
 
     def mutate_point(self, point, scale):
         return [
-            round(clamp(safe_float(point[0], 0.5) + random.uniform(-scale, scale), self.settings.random_action_min, self.settings.random_action_max), 6),
-            round(clamp(safe_float(point[1], 0.5) + random.uniform(-scale, scale), self.settings.random_action_min, self.settings.random_action_max), 6)
+            round(clamp(safe_float(point[0], 0.5) + random.uniform(-scale, scale), 0.0, 1.0), 6),
+            round(clamp(safe_float(point[1], 0.5) + random.uniform(-scale, scale), 0.0, 1.0), 6)
         ]
 
     def mutate_action(self, action, strength):
@@ -1403,6 +1459,8 @@ class ControlPanel(tk.Tk):
         self.settings = derive_runtime_settings(rect=self.screen_rect(), pool_count=0, capture_ms=initial_capture_ms, cpu_load=safe_float(self.hardware_state.get("cpu_load", 0.0), 0.0), hardware=self.hardware_state)
         self.adaptive_policy.observe_capture(initial_capture_ms)
         self.progress_value = 0.0
+        self.last_ui_update_perf = 0.0
+        self.last_metric_payload = None
         self.title("雷电模拟器学习训练控制面板")
         self.geometry(f"{self.settings.ui_width}x{self.settings.ui_height}")
         self.minsize(self.settings.ui_min_width, self.settings.ui_min_height)
@@ -1588,12 +1646,12 @@ class ControlPanel(tk.Tk):
                 pass
 
     def required_import_error(self):
-        return {name: IMPORT_ERRORS[name] for name in REQUIRED_MODULES if name in IMPORT_ERRORS}
+        return {name: IMPORT_ERRORS[name] for name in tuple(REQUIRED_MODULES) + tuple(OPTIONAL_MODULES) if name in IMPORT_ERRORS}
 
     def show_import_error(self):
         missing = self.required_import_error()
         lines = [f"{name}: {error}" for name, error in missing.items()]
-        messagebox.showerror("缺少依赖", "请先安装依赖：pip install mss pillow pynput psutil pywin32\n\n当前错误：\n" + "\n".join(lines))
+        messagebox.showerror("依赖异常", "依赖自动安装或加载失败。\n\n当前错误：\n" + "\n".join(lines))
         self.status_var.set("依赖缺失")
 
     def choose_ldplayer(self):
@@ -1843,13 +1901,23 @@ class ControlPanel(tk.Tk):
 
     def update_progress(self, percent):
         percent = round(clamp(percent, 0.0, 100.0), 1)
+        now_perf = time.perf_counter()
+        if abs(percent - self.progress_value) < 0.2 and now_perf - self.last_ui_update_perf < 0.08:
+            return
         self.progress_value = percent
+        self.last_ui_update_perf = now_perf
         def apply():
             self.progress_var.set(percent)
             self.progress_text_var.set(f"{percent:.1f}%")
         self.ui(apply)
 
     def update_metrics(self, novelty, human_score, screen_reward, action_reward, reward, life, decision=None):
+        payload = (round(float(novelty), 2), round(float(human_score), 2), round(float(screen_reward), 2), round(float(action_reward), 2), round(float(reward), 2), round(float(life), 2), decision.get("reason") if decision else None, round(safe_float(decision.get("confidence", 0.0), 0.0), 3) if decision else None)
+        now_perf = time.perf_counter()
+        if payload == self.last_metric_payload and now_perf - self.last_ui_update_perf < 0.08:
+            return
+        self.last_metric_payload = payload
+        self.last_ui_update_perf = now_perf
         def apply():
             self.novelty_var.set(f"{round(float(novelty), 2)}%")
             self.human_var.set(f"{round(float(human_score), 2)}%")
