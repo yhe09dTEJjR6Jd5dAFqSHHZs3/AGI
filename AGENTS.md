@@ -1,6 +1,8 @@
 代码不能有注释。
 
-操作系统：Windows 10/Windows 11；
+操作系统：Windows 11；
+
+GPU：NVIDIA GeForce RTX 3050 Ti；
 
 第一次运行main.py前，用户只需要安装各种库，不需要依赖其他文件。
 
