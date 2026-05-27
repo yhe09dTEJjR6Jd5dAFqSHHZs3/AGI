@@ -931,27 +931,27 @@ class WindowManager:
         except Exception:
             pass
 
-    def topmost(self):
+    def window_ok(self):
         with self.lock:
             hwnd = self.hwnd
-        if not hwnd:
-            return
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            return False
         try:
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-            win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0, win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW)
+            if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
+                return False
+            rect = self.client_rect_for(hwnd)
+            if not rect:
+                return False
+            left, top, right, bottom = rect
+            screen_w = max(1, safe_int(win32api.GetSystemMetrics(0), 1))
+            screen_h = max(1, safe_int(win32api.GetSystemMetrics(1), 1))
+            if left < 0 or top < 0 or right > screen_w or bottom > screen_h:
+                return False
+            center = (int((left + right) / 2), int((top + bottom) / 2))
+            hit = win32gui.WindowFromPoint(center)
+            return bool(hit == hwnd or win32gui.IsChild(hwnd, hit))
         except Exception:
-            pass
-        self.foreground()
-
-    def not_topmost(self):
-        with self.lock:
-            hwnd = self.hwnd
-        if not hwnd:
-            return
-        try:
-            win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0, win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
-        except Exception:
-            pass
+            return False
 
 
 class ScreenAnalyzer:
@@ -1865,8 +1865,6 @@ class ControlPanel(tk.Tk):
         return self.escape_monitor.poll_pressed()
 
     def release_window_and_panel(self):
-        if self.window_manager:
-            self.window_manager.not_topmost()
         self.restore_panel()
 
     def ensure_runtime(self, config):
@@ -1915,7 +1913,6 @@ class ControlPanel(tk.Tk):
             if stop_event.is_set() or not self.is_run_active(token):
                 self.finish_run(token, "当前模式已终止", 0.0)
                 return
-            self.window_manager.topmost()
             self.ui(self.iconify)
             if not self.activate_run(token, mode):
                 return
@@ -2095,6 +2092,10 @@ class ControlPanel(tk.Tk):
                     stop_event.set()
                     break
                 now_perf = time.perf_counter()
+                if not self.window_manager.window_ok():
+                    stop_event.set()
+                    self.ui(lambda: self.status_var.set("学习模式结束：雷电模拟器窗口异常"))
+                    break
                 self.maybe_learning_screen_tick(analyzer, session_id, start, now_perf, config)
                 idle_seconds = self.learning_idle_seconds()
                 self.ui(lambda: self.progress_label_var.set("静止倒计时"))
@@ -2139,6 +2140,10 @@ class ControlPanel(tk.Tk):
                     break
                 self.update_progress(clamp((config.training_seconds - elapsed) / config.training_seconds * 100.0, 0.0, 100.0))
                 self.ui(lambda: self.progress_label_var.set("模式进度"))
+                if not self.window_manager.window_ok():
+                    stop_event.set()
+                    self.ui(lambda: self.status_var.set("训练模式结束：雷电模拟器窗口异常"))
+                    break
                 rect = self.current_rect()
                 pool_count = self.experience_pool.count() if self.experience_pool else 0
                 life_value = self.store.life if self.store else 0.0
@@ -2211,8 +2216,6 @@ class ControlPanel(tk.Tk):
         if self.mouse_recorder:
             self.mouse_recorder.stop()
         self.escape_monitor.stop()
-        if self.window_manager:
-            self.window_manager.not_topmost()
         if self.store:
             self.store.flush_state(force=True)
         mode_thread = self.mode_thread
