@@ -6,9 +6,9 @@
 
 除非AGENTS.md中明确允许，否则禁止用户修改内容。
 
-雷电模拟器默认路径（允许用户修改）：D:\LDPlayer9\dnplayer.exe
+允许用户修改雷电模拟器默认路径：D:\LDPlayer9\dnplayer.exe
 
-数据存储默认路径（允许用户修改）：C:\Users\Administrator\Desktop\AAA
+允许用户修改默认存储路径：C:\Users\Administrator\Desktop\AAA
 
 在学习模式/训练模式期间，记录：时间、画面、鼠标；
 
