@@ -1639,7 +1639,8 @@ class ControlPanel(tk.Tk):
         hint = "ESC 终止当前学习、训练或睡眠。学习模式下鼠标静止超时会自动结束；鼠标移出客户区不会终止模式，客户区外的新动作会被忽略。截图与坐标均使用雷电客户区。"
         self.hint_label = ttk.Label(status_frame, text=hint, wraplength=max(320, self.settings.ui_width - 120), style="Hint.TLabel")
         self.hint_label.grid(row=2, column=0, sticky="ew", pady=6)
-        progress_frame = ttk.LabelFrame(container, textvariable=self.progress_label_var, padding=self.settings.ui_section_padding)
+        progress_frame = ttk.LabelFrame(container, text=self.progress_label_var.get(), padding=self.settings.ui_section_padding)
+        self.progress_label_var.trace_add("write", lambda *args: progress_frame.configure(text=self.progress_label_var.get()))
         progress_frame.pack(fill="x", pady=(12, 0))
         progress_frame.columnconfigure(0, weight=1)
         ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100).grid(row=0, column=0, sticky="ew")
