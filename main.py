@@ -18,8 +18,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 DEPENDENCY_INSTALL_MAP = {"mss": "mss", "PIL": "pillow", "psutil": "psutil", "pywin32": "pywin32", "pynput.mouse": "pynput", "pynput.keyboard": "pynput"}
-REQUIRED_MODULES = ("mss", "PIL", "pywin32", "pynput.mouse")
-OPTIONAL_MODULES = ("psutil", "pynput.keyboard")
+REQUIRED_MODULES = ("mss", "PIL", "pywin32", "pynput.mouse", "psutil")
+OPTIONAL_MODULES = ("pynput.keyboard",)
 
 
 def bootstrap_dependencies():
@@ -28,10 +28,14 @@ def bootstrap_dependencies():
     if not missing:
         return
     command = [sys.executable, "-m", "pip", "install", "--user", *missing]
-    result = subprocess.run(command, capture_output=True, text=True)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=240)
+    except subprocess.TimeoutExpired as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        raise RuntimeError(f"自动安装依赖超时（240秒）: {' '.join(missing)}\n请检查网络或手动执行: {' '.join(command)}\n{detail}") from exc
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"自动安装依赖失败: {' '.join(missing)}\n{detail}")
+        raise RuntimeError(f"自动安装依赖失败: {' '.join(missing)}\n请手动执行: {' '.join(command)}\n{detail}")
     os.execv(sys.executable, [sys.executable, *sys.argv])
 
 IMPORT_ERRORS = {}
@@ -214,6 +218,25 @@ def enable_dpi_awareness():
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
+
+
+def run_self_test():
+    settings = derive_runtime_settings()
+    assert clamp(12, 0, 10) == 10
+    action = normalize_mouse_action({"type": "click", "start_rel": [2, -1], "duration": 0.3}, (0, 0, 100, 100))
+    assert 0.0 <= action["start_rel"][0] <= 1.0
+    a = HashValue(value=0b1111, bits=4, hex="f")
+    b = HashValue(value=0b1101, bits=4, hex="d")
+    sim = hash_similarity(a, b)
+    assert 0.0 <= sim <= 1.0
+    pool = ExperiencePool(settings)
+    pool.add({"id": "t1", "mode": "learning", "mouse_action": {"type": "click", "start_rel": [0.5, 0.5]}, "reward": 12, "screen_hash_hex": "f", "screen_hash_bits": 4, "mouse_source": "user"})
+    novelty, batch = pool.novelty(a)
+    assert novelty >= 0.0
+    brain = ActionBrain(pool, settings)
+    _, decision = brain.choose(a, novelty, batch, 0.0)
+    assert isinstance(decision, dict)
+    print("self-test passed")
 
 
 def now_text():
@@ -729,6 +752,24 @@ class DataStore:
         with self.lock:
             with self.experience_file.open("a", encoding="utf-8") as file:
                 file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def load_settings(self):
+        if not self.settings_file.exists():
+            return {}
+        try:
+            with self.settings_file.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def save_settings(self, settings):
+        payload = settings if isinstance(settings, dict) else {}
+        with self.lock:
+            temporary = self.settings_file.with_suffix(".tmp")
+            with temporary.open("w", encoding="utf-8") as file:
+                json.dump(payload, file, ensure_ascii=False, indent=2)
+            temporary.replace(self.settings_file)
 
     def load_experience(self, limit=None):
         records = []
@@ -1503,7 +1544,9 @@ class ControlPanel(tk.Tk):
         self.metric_items = []
         self.hint_label = None
         self.metrics_frame = None
+        self.data_store_for_settings = DataStore(Path(DEFAULT_DATA_PATH))
         self.build_ui()
+        self.load_persistent_settings()
         self.bind("<Configure>", self.on_window_resize)
         self.bind("<Escape>", lambda event: self.stop_current_mode())
         if self.required_import_error():
@@ -1543,7 +1586,9 @@ class ControlPanel(tk.Tk):
         canvas_window = canvas.create_window((0, 0), window=container, anchor="nw")
         container.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda event: canvas.itemconfigure(canvas_window, width=event.width))
-        canvas.bind_all("<MouseWheel>", lambda event: canvas.yview_scroll(int(-event.delta / 120), "units"))
+        self.scroll_canvas = canvas
+        container.bind("<Enter>", self.bind_mousewheel)
+        container.bind("<Leave>", self.unbind_mousewheel)
         ttk.Label(container, text="雷电模拟器学习训练控制面板", style="Title.TLabel").pack(anchor="w")
         path_frame = ttk.LabelFrame(container, text="路径与时间", padding=self.settings.ui_section_padding)
         path_frame.pack(fill="x", pady=(16, 10))
@@ -1646,7 +1691,7 @@ class ControlPanel(tk.Tk):
                 pass
 
     def required_import_error(self):
-        return {name: IMPORT_ERRORS[name] for name in tuple(REQUIRED_MODULES) + tuple(OPTIONAL_MODULES) if name in IMPORT_ERRORS}
+        return {name: IMPORT_ERRORS[name] for name in tuple(REQUIRED_MODULES) if name in IMPORT_ERRORS}
 
     def show_import_error(self):
         missing = self.required_import_error()
@@ -1658,11 +1703,41 @@ class ControlPanel(tk.Tk):
         path = filedialog.askopenfilename(title="选择 dnplayer.exe", filetypes=[("Executable", "*.exe"), ("All", "*.*")])
         if path:
             self.ldplayer_var.set(path)
+            self.save_persistent_settings()
 
     def choose_data(self):
         path = filedialog.askdirectory(title="选择数据存储目录")
         if path:
             self.data_var.set(path)
+            self.save_persistent_settings()
+
+    def bind_mousewheel(self, _event):
+        self.bind_all("<MouseWheel>", self.on_mousewheel)
+
+    def unbind_mousewheel(self, _event):
+        self.unbind_all("<MouseWheel>")
+
+    def on_mousewheel(self, event):
+        if getattr(self, "scroll_canvas", None):
+            self.scroll_canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    def load_persistent_settings(self):
+        settings = self.data_store_for_settings.load_settings()
+        self.ldplayer_var.set(str(settings.get("ldplayer_path", self.ldplayer_var.get())))
+        self.data_var.set(str(settings.get("data_path", self.data_var.get())))
+        self.training_seconds_var.set(str(max(1, safe_int(settings.get("training_seconds", self.training_seconds_var.get()), DEFAULT_TRAINING_SECONDS))))
+        self.sleep_seconds_var.set(str(max(1, safe_int(settings.get("sleep_seconds", self.sleep_seconds_var.get()), DEFAULT_SLEEP_SECONDS))))
+        self.still_seconds_var.set(str(max(0.1, safe_float(settings.get("still_seconds", self.still_seconds_var.get()), DEFAULT_STILL_SECONDS))))
+
+    def save_persistent_settings(self):
+        payload = {
+            "ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH,
+            "data_path": self.data_var.get().strip() or DEFAULT_DATA_PATH,
+            "training_seconds": max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS)),
+            "sleep_seconds": max(1, safe_int(self.sleep_seconds_var.get(), DEFAULT_SLEEP_SECONDS)),
+            "still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS))
+        }
+        self.data_store_for_settings.save_settings(payload)
 
     def screen_rect(self):
         width = safe_int(getattr(win32api, "GetSystemMetrics", lambda _: self.winfo_screenwidth())(0), self.winfo_screenwidth())
@@ -1691,6 +1766,7 @@ class ControlPanel(tk.Tk):
         self.training_seconds_var.set(str(training_seconds))
         self.sleep_seconds_var.set(str(sleep_seconds))
         self.still_seconds_var.set(str(still_seconds))
+        self.save_persistent_settings()
         data_path = Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)
         self.hardware_state = read_hardware_state()
         self.hardware_last_full_refresh_perf = time.perf_counter()
@@ -2161,5 +2237,8 @@ class ControlPanel(tk.Tk):
         return self.hardware_state
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        run_self_test()
+        sys.exit(0)
     app = ControlPanel()
     app.mainloop()
