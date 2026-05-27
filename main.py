@@ -22,6 +22,16 @@ REQUIRED_MODULES = ("mss", "PIL", "pywin32", "pynput.mouse", "psutil")
 OPTIONAL_MODULES = ("pynput.keyboard",)
 
 
+def fail_and_exit(message):
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("启动失败", f"{message}\n\n点击确定后退出。")
+        root.destroy()
+    except Exception:
+        pass
+    sys.exit(1)
+
 def bootstrap_dependencies():
     required = set(REQUIRED_MODULES)
     missing = sorted({DEPENDENCY_INSTALL_MAP[name] for name in required if name in IMPORT_ERRORS})
@@ -32,10 +42,10 @@ def bootstrap_dependencies():
         result = subprocess.run(command, capture_output=True, text=True, timeout=240)
     except subprocess.TimeoutExpired as exc:
         detail = (exc.stderr or exc.stdout or "").strip()
-        raise RuntimeError(f"自动安装依赖超时（240秒）: {' '.join(missing)}\n请检查网络或手动执行: {' '.join(command)}\n{detail}") from exc
+        fail_and_exit(f"自动安装依赖超时（240秒）: {' '.join(missing)}\n请检查网络或手动执行: {' '.join(command)}\n{detail}")
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"自动安装依赖失败: {' '.join(missing)}\n请手动执行: {' '.join(command)}\n{detail}")
+        fail_and_exit(f"自动安装依赖失败: {' '.join(missing)}\n请手动执行: {' '.join(command)}\n{detail}")
     os.execv(sys.executable, [sys.executable, *sys.argv])
 
 IMPORT_ERRORS = {}
