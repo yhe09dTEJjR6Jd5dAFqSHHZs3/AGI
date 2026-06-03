@@ -1946,13 +1946,13 @@ class MouseRecorder:
     def capture_event(self, kind, x, y, extra=None, allow_current=False):
         if not self.active():
             return None
+        self.on_activity()
         rect = self.get_rect()
         if not rect:
             return None
         inside = point_inside(rect, x, y)
         if not inside and not allow_current:
             return None
-        self.on_activity()
         event = {"type": kind, "t": time.perf_counter(), "x": int(x), "y": int(y), "inside": bool(inside)}
         if extra:
             event.update(extra)
@@ -2591,7 +2591,7 @@ class ControlPanel(tk.Tk):
             self.metric_items.append(self.create_metric(self.metrics_frame, title, variable))
         self.reflow_metrics()
         ttk.Label(status_frame, text="快捷键", style="CardTitle.TLabel").grid(row=1, column=0, sticky="w", pady=(18, 6), padx=(0, 12))
-        hint = "ESC 终止当前学习、训练或睡眠。学习模式下鼠标静止超时会自动结束；鼠标移出客户区不会终止模式，客户区外的新动作会被忽略。截图与坐标均使用雷电客户区。"
+        hint = "学习模式期间，全局鼠标静止超时会自动结束。雷电模拟器窗口外的新动作不会记录为学习动作，但会刷新静止倒计时。ESC 终止当前学习、训练或睡眠。截图与坐标均使用雷电客户区。"
         self.hint_label = ttk.Label(status_frame, text=hint, wraplength=max(320, self.settings.ui_width - 120), style="Hint.TLabel")
         self.hint_label.grid(row=2, column=0, sticky="ew", pady=6)
         progress_frame = ttk.LabelFrame(container, text=self.progress_label_var.get(), padding=self.settings.ui_section_padding)
@@ -3096,10 +3096,23 @@ class ControlPanel(tk.Tk):
             self.status_var.set("请先终止当前模式，或等待当前模式结束")
             return
         config = self.read_config()
+        if not self.minimize_panel_for_active_mode(config):
+            self.finish_run(token, "控制面板最小化失败", 0.0)
+            return
         self.update_progress(100.0)
         self.status_var.set("正在启动或连接雷电模拟器")
         self.mode_thread = threading.Thread(target=self.mode_job, args=(token, target_mode, config, stop_event), daemon=True)
         self.mode_thread.start()
+
+    def minimize_panel_for_active_mode(self, config):
+        def apply():
+            try:
+                self.iconify()
+                self.update_idletasks()
+                return self.state() == "iconic"
+            except Exception:
+                return False
+        return bool(self.ui_sync(apply, config.settings.window_poll_seconds))
 
     def mode_job(self, token, mode, config, stop_event):
         try:
@@ -3111,8 +3124,6 @@ class ControlPanel(tk.Tk):
             if stop_event.is_set() or not self.is_run_active(token):
                 self.finish_run(token, "当前模式已终止", 0.0)
                 return
-            self.ui_sync(self.iconify, config.settings.window_attach_seconds)
-            self.ui_sync(self.update_idletasks, config.settings.window_poll_seconds)
             self.window_manager.foreground()
             time.sleep(config.settings.window_poll_seconds)
             check = self.window_manager.check_window(force=True)
