@@ -27,6 +27,26 @@ REQUIRED_MODULES = ("mss", "PIL", "pywin32", "pynput.mouse", "psutil")
 OPTIONAL_MODULES = ("pynput.keyboard",)
 
 
+@dataclass(frozen=True)
+class AgentSpec:
+    default_ldplayer_path: str
+    default_data_path: str
+    default_training_seconds: int
+    default_sleep_seconds: int
+    default_still_seconds: float
+    editable_fields: tuple
+
+
+AGENT_SPEC = AgentSpec(
+    default_ldplayer_path=r"D:\LDPlayer9\dnplayer.exe",
+    default_data_path=r"C:\Users\Administrator\Desktop\AAA",
+    default_training_seconds=900,
+    default_sleep_seconds=1800,
+    default_still_seconds=10.0,
+    editable_fields=("ldplayer_path", "data_path", "training_seconds", "sleep_seconds", "still_seconds")
+)
+
+
 def fail_and_exit(message):
     try:
         root = tk.Tk()
@@ -44,7 +64,7 @@ if sys.version_info < MIN_PYTHON_VERSION:
 
 def write_startup_install_log(command, result=None, error=None):
     try:
-        log_dir = Path(globals().get("DEFAULT_DATA_PATH", r"C:\Users\Administrator\Desktop\AAA"))
+        log_dir = Path(globals().get("DEFAULT_DATA_PATH", AGENT_SPEC.default_data_path))
         log_dir.mkdir(parents=True, exist_ok=True)
         payload = {"created_at": now_text() if "now_text" in globals() else datetime.now().astimezone().isoformat(timespec="milliseconds"), "command": command, "returncode": getattr(result, "returncode", None), "stdout": getattr(result, "stdout", "") or "", "stderr": getattr(result, "stderr", "") or "", "error": str(error) if error else None}
         with (log_dir / "startup_install.log").open("a", encoding="utf-8") as file:
@@ -72,9 +92,23 @@ def bootstrap_dependencies():
     missing = sorted({DEPENDENCY_INSTALL_MAP[name] for name in required if name in IMPORT_ERRORS})
     if not missing:
         return
+    install_key = "AGI_BOOTSTRAP_INSTALLING"
+    if os.environ.get(install_key):
+        fail_and_exit("依赖安装后仍无法导入，已停止重复安装：" + "；".join(f"{name}: {error}" for name, error in IMPORT_ERRORS.items()))
+    try:
+        pip_check = subprocess.run([sys.executable, "-m", "pip", "--version"], capture_output=True, text=True, timeout=30)
+        write_startup_install_log([sys.executable, "-m", "pip", "--version"], result=pip_check)
+        if pip_check.returncode != 0:
+            detail = (pip_check.stderr or pip_check.stdout or "").strip()
+            fail_and_exit(f"无法启动 pip，不能自动安装依赖。请检查 Python 环境。\n{detail}")
+    except Exception as exc:
+        write_startup_install_log([sys.executable, "-m", "pip", "--version"], error=exc)
+        fail_and_exit(f"无法启动 pip，不能自动安装依赖。请检查 Python 环境或网络。\n{exc}")
     command = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--user", *missing]
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=240)
+        env = dict(os.environ)
+        env[install_key] = "1"
+        result = subprocess.run(command, capture_output=True, text=True, timeout=240, env=env)
         write_startup_install_log(command, result=result)
     except subprocess.TimeoutExpired as exc:
         write_startup_install_log(command, error=exc)
@@ -88,11 +122,16 @@ def bootstrap_dependencies():
         try:
             postinstall_result = subprocess.run(postinstall, capture_output=True, text=True, timeout=120)
             write_startup_install_log(postinstall, result=postinstall_result)
+            if postinstall_result.returncode != 0:
+                detail = (postinstall_result.stderr or postinstall_result.stdout or "").strip()
+                fail_and_exit(f"pywin32 安装后配置失败。请手动执行: {' '.join(postinstall)}\n{detail}")
         except Exception as exc:
             write_startup_install_log(postinstall, error=exc)
+            fail_and_exit(f"pywin32 安装后配置失败。请手动执行: {' '.join(postinstall)}\n{exc}")
     failed = verify_installed_modules()
     if failed:
         fail_and_exit("自动安装依赖后仍无法导入：" + "；".join(failed))
+    os.environ[install_key] = "1"
     os.execv(sys.executable, [sys.executable, *sys.argv])
 
 IMPORT_ERRORS = {}
@@ -136,17 +175,22 @@ except Exception as exc:
 if "--self-test" not in sys.argv:
     bootstrap_dependencies()
 
-DEFAULT_LDPLAYER_PATH = r"D:\LDPlayer9\dnplayer.exe"
-DEFAULT_DATA_PATH = r"C:\Users\Administrator\Desktop\AAA"
-DEFAULT_TRAINING_SECONDS = 900
-DEFAULT_SLEEP_SECONDS = 1800
-DEFAULT_STILL_SECONDS = 10
+DEFAULT_LDPLAYER_PATH = AGENT_SPEC.default_ldplayer_path
+DEFAULT_DATA_PATH = AGENT_SPEC.default_data_path
+DEFAULT_TRAINING_SECONDS = AGENT_SPEC.default_training_seconds
+DEFAULT_SLEEP_SECONDS = AGENT_SPEC.default_sleep_seconds
+DEFAULT_STILL_SECONDS = AGENT_SPEC.default_still_seconds
 MODE_NAMES = {"idle": "空闲", "starting": "准备中", "learning": "学习模式", "training": "训练模式", "sleep": "睡眠模式", "migration": "数据迁移"}
 CONFIG_SCHEMA_VERSION = 1
 USER_EDITABLE_STARTUP_FIELDS = ("ldplayer_path", "data_path")
 USER_EDITABLE_RUNTIME_FIELDS = ("training_seconds", "sleep_seconds", "still_seconds")
-USER_EDITABLE_FIELDS = USER_EDITABLE_STARTUP_FIELDS + USER_EDITABLE_RUNTIME_FIELDS
+USER_EDITABLE_FIELDS = AGENT_SPEC.editable_fields
 TERMINATION_REASONS = ("window_invalid", "rect_changed", "empty_action", "executor_error", "time_limit", "esc", "still_timeout", "user_stop", "migration_error", "completed")
+HUMAN_FEATURE_NAMES = ("duration", "direct", "bend", "points", "speed_mean", "speed_variance", "acceleration_change", "pauses", "hover_before", "drag_curvature", "double_click_interval")
+
+
+def default_human_feature_weights(feature_names=HUMAN_FEATURE_NAMES):
+    return tuple(1.0 for _ in feature_names)
 
 
 @dataclass(frozen=True)
@@ -312,6 +356,19 @@ def enable_dpi_awareness():
 
 def run_self_test():
     settings = derive_runtime_settings()
+    assert len(settings.human_feature_weights) == len(HUMAN_FEATURE_NAMES)
+    assert sum(settings.human_feature_weights) > 0.0
+    for item in fields(Settings):
+        value = getattr(settings, item.name)
+        if isinstance(value, (int, float)):
+            assert math.isfinite(float(value))
+    raw_empty_weight_settings = replace(settings, human_profile_min_samples=3, human_feature_weights=())
+    profile = HumanProfile(raw_empty_weight_settings)
+    human_action = {"type": "click", "start_rel": [0.2, 0.3], "end_rel": [0.22, 0.32], "duration": 0.18, "path_rel": [[0.2, 0.3, 0.0], [0.21, 0.31, 0.08], [0.22, 0.32, 0.18]]}
+    for _ in range(raw_empty_weight_settings.human_profile_min_samples):
+        profile.observe(human_action)
+    assert profile.enough("click")
+    assert profile.score(human_action) > 0.0
     assert sys.version_info >= MIN_PYTHON_VERSION
     assert hasattr(WindowManager, "topmost")
     assert clamp(12, 0, 10) == 10
@@ -390,6 +447,17 @@ def clamp(value, minimum, maximum):
     return max(minimum, min(maximum, value))
 
 
+def normalized_human_feature_weights(weights, feature_names=HUMAN_FEATURE_NAMES):
+    normalized = [clamp(item, 0.0, 1.0) for item in (weights or ())]
+    target = len(feature_names)
+    if len(normalized) < target:
+        normalized.extend(default_human_feature_weights(feature_names[len(normalized):]))
+    normalized = normalized[:target]
+    if not normalized or sum(normalized) <= 0.0:
+        normalized = list(default_human_feature_weights(feature_names))
+    return tuple(normalized)
+
+
 def normalize_settings(settings):
     random_min = clamp(settings.random_action_min, 0.0, 1.0)
     random_max = clamp(settings.random_action_max, 0.0, 1.0)
@@ -397,7 +465,7 @@ def normalize_settings(settings):
         random_min, random_max = random_max, random_min
     max_samples = max(1, safe_int(settings.human_profile_max_samples, 1))
     keep_samples = clamp(settings.human_profile_keep_samples, 1, max_samples)
-    human_weights = tuple(clamp(item, 0.0, 1.0) for item in settings.human_feature_weights) if settings.human_feature_weights else Settings().human_feature_weights
+    human_weights = normalized_human_feature_weights(settings.human_feature_weights)
     return Settings(
         hash_size=max(1, safe_int(settings.hash_size, 1)),
         nearest_top_k=max(1, safe_int(settings.nearest_top_k, 1)),
@@ -601,6 +669,10 @@ class RuntimeNumberFactory:
         }
         return clamp(formulas.get(name, minimum), minimum, maximum)
 
+    def human_feature_weights(self, source_weights):
+        normalized = normalized_human_feature_weights(source_weights)
+        return tuple(clamp(value * (0.9 + self.success_rate * 0.2), 0.01, 1.0) for value in normalized)
+
 
 def derive_runtime_settings(base_settings=None, rect=None, pool_count=0, capture_ms=None, cpu_load=0.0, execution_ms=None, window_instability=0.0, recent_success=1.0, life=0.0, learning_similarity=0.97, hardware=None):
     source = base_settings or Settings()
@@ -669,7 +741,7 @@ def derive_runtime_settings(base_settings=None, rect=None, pool_count=0, capture
         "action_score_novelty_weight": factory.ratio("action_score_novelty_weight", 0.01, 1.0),
         "motion_score_magnitude_weight": factory.ratio("motion_score_magnitude_weight", 0.1, 0.9),
         "motion_score_continuity_weight": factory.ratio("motion_score_continuity_weight", 0.1, 0.9),
-        "human_feature_weights": tuple(clamp(value * (0.9 + factory.success_rate * 0.2), 0.01, 1.0) for value in source.human_feature_weights) if source.human_feature_weights else Settings().human_feature_weights
+        "human_feature_weights": factory.human_feature_weights(source.human_feature_weights)
     })
     return normalize_settings(Settings(**values))
 
@@ -938,8 +1010,8 @@ class HumanProfile:
         if self.enough(action_type):
             with self.lock:
                 stats = {name: tuple(values) for name, values in self.stats[action_type].items()}
-            names = ("duration", "direct", "bend", "points", "speed_mean", "speed_variance", "acceleration_change", "pauses", "hover_before", "drag_curvature", "double_click_interval")
-            weights = self.settings.human_feature_weights or Settings().human_feature_weights
+            names = HUMAN_FEATURE_NAMES
+            weights = normalized_human_feature_weights(self.settings.human_feature_weights)
             scores = [percentile_score(features.get(name, 0.0), stats.get(name, []), self.settings.score_default) for name in names]
             return round(clamp(sum(score * weight for score, weight in zip(scores, weights)) / max(0.01, sum(weights)), 0.0, 100.0), 2)
         return 50.0
@@ -964,7 +1036,7 @@ class AppConfigStore:
 
     def load_settings(self):
         if not self.settings_file.exists():
-            self.save_settings({"ldplayer_path": DEFAULT_LDPLAYER_PATH, "data_path": DEFAULT_DATA_PATH})
+            self.save_settings({"ldplayer_path": AGENT_SPEC.default_ldplayer_path, "data_path": AGENT_SPEC.default_data_path})
         try:
             with self.settings_file.open("r", encoding="utf-8") as file:
                 data = json.load(file)
@@ -976,7 +1048,7 @@ class AppConfigStore:
 
     def save_settings(self, settings):
         source = {name: settings.get(name) for name in USER_EDITABLE_STARTUP_FIELDS} if isinstance(settings, dict) else {}
-        payload = {"schema_version": CONFIG_SCHEMA_VERSION, "ldplayer_path": str(source.get("ldplayer_path") or DEFAULT_LDPLAYER_PATH), "data_path": str(source.get("data_path") or DEFAULT_DATA_PATH)}
+        payload = {"schema_version": CONFIG_SCHEMA_VERSION, "ldplayer_path": str(source.get("ldplayer_path") or AGENT_SPEC.default_ldplayer_path), "data_path": str(source.get("data_path") or AGENT_SPEC.default_data_path)}
         with self.lock:
             self.root.mkdir(parents=True, exist_ok=True)
             temporary = self.settings_file.with_suffix(".tmp")
@@ -1073,7 +1145,7 @@ class DataStore:
 
     def save_settings(self, settings):
         source = {name: settings.get(name) for name in USER_EDITABLE_RUNTIME_FIELDS} if isinstance(settings, dict) else {}
-        payload = {"schema_version": CONFIG_SCHEMA_VERSION, "training_seconds": max(1, safe_int(source.get("training_seconds", DEFAULT_TRAINING_SECONDS), DEFAULT_TRAINING_SECONDS)), "sleep_seconds": max(1, safe_int(source.get("sleep_seconds", DEFAULT_SLEEP_SECONDS), DEFAULT_SLEEP_SECONDS)), "still_seconds": max(0.1, safe_float(source.get("still_seconds", DEFAULT_STILL_SECONDS), DEFAULT_STILL_SECONDS))}
+        payload = {"schema_version": CONFIG_SCHEMA_VERSION, "training_seconds": max(1, safe_int(source.get("training_seconds", AGENT_SPEC.default_training_seconds), AGENT_SPEC.default_training_seconds)), "sleep_seconds": max(1, safe_int(source.get("sleep_seconds", AGENT_SPEC.default_sleep_seconds), AGENT_SPEC.default_sleep_seconds)), "still_seconds": max(0.1, safe_float(source.get("still_seconds", AGENT_SPEC.default_still_seconds), AGENT_SPEC.default_still_seconds))}
         with self.lock:
             temporary = self.settings_file.with_suffix(".tmp")
             with temporary.open("w", encoding="utf-8") as file:
@@ -1125,6 +1197,15 @@ class DataStore:
         with self.lock:
             with self.error_file.open("a", encoding="utf-8") as file:
                 file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+@dataclass(frozen=True)
+class WindowCheck:
+    ok: bool
+    reason: str
+    rect: tuple = ()
+    hits: int = 0
+    expected: int = 0
 
 
 class WindowManager:
@@ -1241,37 +1322,43 @@ class WindowManager:
     def topmost(self):
         self.foreground()
 
-    def window_ok(self, force=False):
+    def check_window(self, force=False):
         with self.lock:
             hwnd = self.hwnd
         if not hwnd or not win32gui.IsWindow(hwnd):
-            return False
+            return WindowCheck(False, "invalid_handle")
         try:
             rect = self.client_rect_for(hwnd)
             if not rect:
-                return False
+                return WindowCheck(False, "missing_rect")
             width, height = rect_size(rect)
             if width <= 1 or height <= 1:
-                return False
+                return WindowCheck(False, "empty_rect", rect)
             now_perf = time.perf_counter()
             cache = self.window_check_cache
             if not force and cache.get("rect") == rect and now_perf - cache.get("basic_perf", 0.0) < self.settings.window_poll_seconds:
-                return bool(cache.get("ok", False))
+                return cache.get("check", WindowCheck(bool(cache.get("ok", False)), cache.get("reason", "cached"), rect))
             cache["rect"] = rect
             cache["basic_perf"] = now_perf
             if force or now_perf - cache.get("visibility_perf", 0.0) >= clamp(self.settings.window_poll_seconds, 0.2, 0.5):
-                if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
-                    cache["ok"] = False
-                    return False
+                if not win32gui.IsWindowVisible(hwnd):
+                    result = WindowCheck(False, "invisible", rect)
+                    cache.update({"ok": result.ok, "reason": result.reason, "check": result})
+                    return result
+                if win32gui.IsIconic(hwnd):
+                    result = WindowCheck(False, "minimized", rect)
+                    cache.update({"ok": result.ok, "reason": result.reason, "check": result})
+                    return result
                 left, top, right, bottom = rect
                 screen_w = max(1, safe_int(win32api.GetSystemMetrics(0), 1))
                 screen_h = max(1, safe_int(win32api.GetSystemMetrics(1), 1))
                 if left < 0 or top < 0 or right > screen_w or bottom > screen_h:
-                    cache["ok"] = False
-                    return False
+                    result = WindowCheck(False, "out_of_screen", rect)
+                    cache.update({"ok": result.ok, "reason": result.reason, "check": result})
+                    return result
                 cache["visibility_perf"] = now_perf
             if not force and now_perf - cache.get("occlusion_perf", 0.0) < clamp(self.settings.window_poll_seconds * 2.0, 0.5, 1.0):
-                return bool(cache.get("ok", True))
+                return cache.get("check", WindowCheck(bool(cache.get("ok", True)), cache.get("reason", "cached"), rect))
             left, top, right, bottom = rect
             inset_x = max(1, min(width // 20, 12))
             inset_y = max(1, min(height // 20, 12))
@@ -1284,10 +1371,14 @@ class WindowManager:
                 if hit == hwnd or win32gui.IsChild(hwnd, hit):
                     hits += 1
             cache["occlusion_perf"] = now_perf
-            cache["ok"] = hits == len(points)
-            return bool(cache["ok"])
-        except Exception:
-            return False
+            result = WindowCheck(hits == len(points), "ok" if hits == len(points) else "occluded", rect, hits, len(points))
+            cache.update({"ok": result.ok, "reason": result.reason, "check": result})
+            return result
+        except Exception as exc:
+            return WindowCheck(False, type(exc).__name__)
+
+    def window_ok(self, force=False):
+        return self.check_window(force=force).ok
 
 class ScreenAnalyzer:
     def __init__(self, hash_size):
@@ -1348,6 +1439,7 @@ class ExperiencePool:
         self.prefix_neighbor_cache = OrderedDict()
         self.global_action_heap = []
         self.nearest_cache = OrderedDict()
+        self.index_version = 0
         for record in records or []:
             self.add(record)
 
@@ -1372,6 +1464,7 @@ class ExperiencePool:
         self.index = defaultdict(list)
         self.sorted_prefixes = []
         self.prefix_neighbor_cache = OrderedDict()
+        self.index_version += 1
         for index, hash_value in enumerate(self.hashes):
             if hash_value:
                 prefix = self._prefix(hash_value)
@@ -1391,7 +1484,7 @@ class ExperiencePool:
                 bucket = self.index[prefix]
                 if not bucket:
                     self.sorted_prefixes.append(prefix)
-                    self.prefix_neighbor_cache.clear()
+                    self.index_version += 1
                 bucket.append(index)
             if record.get("mouse_action") and record.get("mode") == "learning" and record.get("mouse_source") == "user":
                 self.profile.observe(record["mouse_action"])
@@ -1420,12 +1513,13 @@ class ExperiencePool:
                 return [index for index, item in enumerate(self.hashes) if item]
             query_prefix = self._prefix(hash_value)
             result = []
-            nearby = self.prefix_neighbor_cache.get(query_prefix)
+            cache_key = (self.index_version, query_prefix)
+            nearby = self.prefix_neighbor_cache.get(cache_key)
             if nearby is not None:
-                self.prefix_neighbor_cache.move_to_end(query_prefix)
+                self.prefix_neighbor_cache.move_to_end(cache_key)
             else:
                 nearby = sorted(self.sorted_prefixes, key=lambda item: (item ^ query_prefix).bit_count())
-                self.prefix_neighbor_cache[query_prefix] = nearby
+                self.prefix_neighbor_cache[cache_key] = nearby
                 capacity = max(1, min(self.settings.local_action_heap_limit, self.index_settings.nearest_candidate_limit // max(1, self.settings.hash_prefix_bits)))
                 while len(self.prefix_neighbor_cache) > capacity:
                     self.prefix_neighbor_cache.popitem(last=False)
@@ -1891,6 +1985,7 @@ class AsyncPersistenceQueue:
             self.poll_seconds = self.settings.persistence_poll_seconds
             self.close_seconds = self.settings.persistence_close_seconds
         self.jobs = queue.Queue(maxsize=max(1, safe_int(maxsize, self.settings.async_queue_size)))
+        self.image_dropped = 0
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
@@ -1915,6 +2010,7 @@ class AsyncPersistenceQueue:
                     store.log_error("async_persistence_queue_full", RuntimeError("image_job_dropped"), {"path": str(job.get("path"))})
                 except Exception:
                     pass
+            self.image_dropped += 1
             return False
 
     def run(self):
@@ -1943,9 +2039,37 @@ class AsyncPersistenceQueue:
     def flush(self):
         self.jobs.join()
 
+    def drop_pending_images(self):
+        dropped = 0
+        with self.jobs.mutex:
+            kept = deque()
+            while self.jobs.queue:
+                job = self.jobs.queue.popleft()
+                if isinstance(job, dict) and job.get("type") == "image":
+                    dropped += 1
+                    self.jobs.unfinished_tasks = max(0, self.jobs.unfinished_tasks - 1)
+                    store = job.get("store")
+                    if store:
+                        try:
+                            store.log_error("async_persistence_close", RuntimeError("image_dropped"), {"path": str(job.get("path"))})
+                        except Exception:
+                            pass
+                else:
+                    kept.append(job)
+            self.jobs.queue.extend(kept)
+            self.jobs.all_tasks_done.notify_all()
+        self.image_dropped += dropped
+        return dropped
+
     def close(self):
         self.stop_event.set()
-        self.flush()
+        deadline = time.perf_counter() + self.close_seconds
+        while self.jobs.unfinished_tasks and time.perf_counter() < deadline:
+            time.sleep(min(self.poll_seconds, max(0.001, deadline - time.perf_counter())))
+        if self.jobs.unfinished_tasks:
+            self.drop_pending_images()
+        while self.jobs.unfinished_tasks and time.perf_counter() < deadline + self.close_seconds:
+            time.sleep(min(self.poll_seconds, max(0.001, deadline + self.close_seconds - time.perf_counter())))
         self.thread.join(timeout=self.close_seconds)
 
 
