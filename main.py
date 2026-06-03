@@ -4,6 +4,7 @@ import json
 import heapq
 import math
 import random
+import queue
 import subprocess
 import sys
 import os
@@ -11,7 +12,7 @@ import shutil
 import threading
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, fields
 from typing import Optional
 from datetime import datetime
@@ -41,20 +42,57 @@ def fail_and_exit(message):
 if sys.version_info < MIN_PYTHON_VERSION:
     fail_and_exit(f"需要 Python {MIN_PYTHON_VERSION[0]}.{MIN_PYTHON_VERSION[1]} 或更高版本，当前版本为 {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}。")
 
+def write_startup_install_log(command, result=None, error=None):
+    try:
+        log_dir = Path(globals().get("DEFAULT_DATA_PATH", r"C:\Users\Administrator\Desktop\AAA"))
+        log_dir.mkdir(parents=True, exist_ok=True)
+        payload = {"created_at": now_text() if "now_text" in globals() else datetime.now().astimezone().isoformat(timespec="milliseconds"), "command": command, "returncode": getattr(result, "returncode", None), "stdout": getattr(result, "stdout", "") or "", "stderr": getattr(result, "stderr", "") or "", "error": str(error) if error else None}
+        with (log_dir / "startup_install.log").open("a", encoding="utf-8") as file:
+            file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def verify_installed_modules():
+    failed = []
+    for name in REQUIRED_MODULES:
+        try:
+            if name == "pywin32":
+                __import__("win32api")
+                __import__("win32gui")
+            else:
+                __import__(name)
+        except Exception as exc:
+            failed.append(f"{name}: {exc}")
+    return failed
+
+
 def bootstrap_dependencies():
     required = set(REQUIRED_MODULES)
     missing = sorted({DEPENDENCY_INSTALL_MAP[name] for name in required if name in IMPORT_ERRORS})
     if not missing:
         return
-    command = [sys.executable, "-m", "pip", "install", "--user", *missing]
+    command = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--user", *missing]
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=240)
+        write_startup_install_log(command, result=result)
     except subprocess.TimeoutExpired as exc:
+        write_startup_install_log(command, error=exc)
         detail = (exc.stderr or exc.stdout or "").strip()
         fail_and_exit(f"自动安装依赖超时（240秒）: {' '.join(missing)}\n请检查网络或手动执行: {' '.join(command)}\n{detail}")
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         fail_and_exit(f"自动安装依赖失败: {' '.join(missing)}\n请手动执行: {' '.join(command)}\n{detail}")
+    if "pywin32" in missing:
+        postinstall = [sys.executable, "-m", "pywin32_postinstall", "-install"]
+        try:
+            postinstall_result = subprocess.run(postinstall, capture_output=True, text=True, timeout=120)
+            write_startup_install_log(postinstall, result=postinstall_result)
+        except Exception as exc:
+            write_startup_install_log(postinstall, error=exc)
+    failed = verify_installed_modules()
+    if failed:
+        fail_and_exit("自动安装依赖后仍无法导入：" + "；".join(failed))
     os.execv(sys.executable, [sys.executable, *sys.argv])
 
 IMPORT_ERRORS = {}
@@ -400,77 +438,157 @@ def read_hardware_state():
     return {"cpu_count": max(1, cpu_count), "cpu_load": clamp(cpu_load, 0.0, 100.0), "memory_free_ratio": memory_free_ratio, "gpu_count": gpu_count, "gpu_memory_total": max(0.0, gpu_memory_total)}
 
 
+class RuntimeNumberFactory:
+    def __init__(self, hardware, screen, pool_count, capture_ms, execution_ms, latency, success_rate, window_instability, learning_similarity, life):
+        width, height = screen
+        self.width = max(1, safe_int(width, 1))
+        self.height = max(1, safe_int(height, 1))
+        self.pool_count = max(0, safe_int(pool_count, 0))
+        self.capture_ms = max(1.0, safe_float(capture_ms, 24.0))
+        self.execution_ms = max(1.0, safe_float(execution_ms, max(60.0, self.capture_ms * 4.2)))
+        self.latency = max(1.0, safe_float(latency, self.capture_ms))
+        self.success_rate = clamp(success_rate, 0.0, 1.0)
+        self.window_instability = clamp(window_instability, 0.0, 1.0)
+        self.learning_similarity = clamp(learning_similarity, 0.0, 1.0)
+        self.life = max(0.0, safe_float(life, 0.0))
+        hardware = hardware or {}
+        self.cpu_load = clamp(safe_float(hardware.get("cpu_load", 0.0), 0.0), 0.0, 100.0)
+        self.memory_free_ratio = clamp(safe_float(hardware.get("memory_free_ratio", 0.5), 0.5), 0.0, 1.0)
+        self.cpu_count = max(1, safe_int(hardware.get("cpu_count", 1), 1))
+        self.gpu_count = max(0, safe_int(hardware.get("gpu_count", 0), 0))
+        self.gpu_memory_total = max(0.0, safe_float(hardware.get("gpu_memory_total", 0.0), 0.0))
+        self.pixel_factor = math.sqrt(max(1.0, self.width * self.height) / (1280.0 * 720.0))
+        self.record_factor = math.log2(max(2, self.pool_count + 2))
+        self.gpu_factor = clamp(1.0 + self.gpu_count * 0.08 + self.gpu_memory_total / (8.0 * 1024 * 1024 * 1024), 1.0, 2.2)
+        self.core_factor = clamp(math.log2(self.cpu_count + 1.0) / math.log2(9.0), 0.45, 1.2)
+        self.capture_factor = clamp(self.capture_ms / 24.0, 0.4, 3.0)
+        self.cpu_factor = clamp((1.0 + self.cpu_load / 200.0) * (1.12 - self.memory_free_ratio * 0.22) / max(0.5, self.core_factor), 0.65, 2.4)
+        self.timing_factor = clamp((self.capture_ms + self.execution_ms * 0.5) / 80.0, 0.5, 2.5)
+
+    def seconds(self, name, minimum, maximum):
+        formulas = {
+            "mouse_still_tick": 0.02 * self.capture_factor,
+            "training_tick": 0.03 * self.capture_factor * self.cpu_factor * self.timing_factor * (0.85 + self.window_instability * 0.45) / self.gpu_factor,
+            "sleep_tick": 0.08 * self.cpu_factor / self.core_factor,
+            "key_debounce_seconds": 0.2 * self.cpu_factor,
+            "window_attach_seconds": 20.0 + self.cpu_load * 0.6,
+            "window_poll_seconds": 0.2 * self.cpu_factor / self.gpu_factor,
+            "action_duration_min": (self.capture_ms + self.execution_ms * 0.15) / 1200.0,
+            "action_duration_max": (self.capture_ms + self.execution_ms * 0.75) / 320.0,
+            "random_click_duration_min": (self.capture_ms + self.execution_ms * 0.08) / 1500.0,
+            "random_click_duration_max": (self.capture_ms + self.execution_ms * 0.35) / 700.0,
+            "generated_click_hold_max": (self.capture_ms + self.execution_ms * 0.2) / 500.0
+        }
+        return clamp(formulas.get(name, minimum), minimum, maximum)
+
+    def ratio(self, name, minimum, maximum):
+        explore_base = 0.35 + (1.0 - self.success_rate) * 0.45 + self.learning_similarity * 0.1
+        formulas = {
+            "explore_max_rate": explore_base,
+            "explore_min_rate": explore_base * 0.12,
+            "action_jitter": 0.008 + (1.0 - self.success_rate) * 0.03 + self.window_instability * 0.012,
+            "global_action_probability": 0.45 + 0.15 / max(1.0, self.record_factor),
+            "random_action_min": 0.02 + self.window_instability * 0.03,
+            "random_action_max": 0.98 - self.window_instability * 0.03,
+            "motion_curve_offset_min": 0.04 + self.window_instability * 0.04,
+            "motion_curve_offset_max": 0.2 + (1.0 - self.success_rate) * 0.22 + self.window_instability * 0.12,
+            "motion_first_control_min": 0.12 + self.window_instability * 0.06,
+            "motion_first_control_max": 0.46 + (1.0 - self.success_rate) * 0.12,
+            "motion_second_control_min": 0.54 - (1.0 - self.success_rate) * 0.08,
+            "motion_second_control_max": 0.9 - self.window_instability * 0.05,
+            "learning_screen_similarity_threshold": 0.95 + min(0.04, self.record_factor * 0.0025 + self.learning_similarity * 0.01)
+        }
+        return clamp(formulas.get(name, minimum), minimum, maximum)
+
+    def count(self, name, minimum, maximum):
+        formulas = {
+            "hash_size": round(8 + self.pixel_factor * 4 + self.record_factor * 0.8),
+            "nearest_top_k": round(10 + self.record_factor * 10),
+            "nearest_candidate_limit": round((14 + self.record_factor * 7 + self.window_instability * 8) * 64),
+            "hash_prefix_bits": round(6 + self.record_factor),
+            "human_profile_min_samples": round(12 + self.record_factor * 8),
+            "human_profile_max_samples": round(2400 + self.record_factor * 900),
+            "human_profile_keep_samples": round(1800 + self.record_factor * 800),
+            "ui_width": round(self.width * 0.65),
+            "ui_height": round(self.height * 0.72),
+            "ui_min_width": round(self.width * 0.42),
+            "ui_min_height": round(self.height * 0.45),
+            "ui_padding": round(min(self.width, self.height) * 0.012),
+            "ui_section_padding": round(min(self.width, self.height) * 0.008),
+            "ui_metric_columns": round(self.width / 340.0),
+            "ui_metric_min_column_width": round(self.width / 4.8),
+            "experience_load_limit": round(12000 + self.record_factor * 8000),
+            "training_fail_stop_count": round((1.0 - self.success_rate) * 16 + self.window_instability * 10 + 2)
+        }
+        return int(clamp(formulas.get(name, minimum), minimum, maximum))
+
+    def scalar(self, name, minimum, maximum):
+        formulas = {
+            "softmax_temperature": 12.0 + self.record_factor * 2.0,
+            "reward_total_min": -10000.0 - self.life,
+            "reward_total_max": 10000.0 + self.life,
+            "motion_steps_per_second": (42.0 + self.width / 24.0) / max(0.6, self.cpu_factor),
+            "learning_screen_fps": 1.0 / max(0.05, self.capture_ms / 1000.0) * clamp(self.core_factor * self.gpu_factor, 0.8, 2.4)
+        }
+        return clamp(formulas.get(name, minimum), minimum, maximum)
+
+
 def derive_runtime_settings(base_settings=None, rect=None, pool_count=0, capture_ms=None, cpu_load=0.0, execution_ms=None, window_instability=0.0, recent_success=1.0, life=0.0, learning_similarity=0.97, hardware=None):
     source = base_settings or Settings()
     width, height = rect_size(rect) if rect else (safe_int(getattr(win32api, "GetSystemMetrics", lambda _: 1920)(0), 1920), safe_int(getattr(win32api, "GetSystemMetrics", lambda _: 1080)(1), 1080))
-    pixel_factor = math.sqrt(max(1.0, width * height) / (1280.0 * 720.0))
-    record_factor = math.log2(max(2, pool_count + 2))
-    capture_ms = max(1.0, safe_float(capture_ms, 24.0))
-    execution_ms = max(1.0, safe_float(execution_ms, max(60.0, capture_ms * 4.2)))
-    instability = clamp(window_instability, 0.0, 1.0)
-    success = clamp(recent_success, 0.0, 1.0)
-    similarity = clamp(learning_similarity, 0.0, 1.0)
-    hardware = hardware or {}
-    memory_free_ratio = clamp(safe_float(hardware.get("memory_free_ratio", 0.5), 0.5), 0.0, 1.0)
-    cpu_count = max(1, safe_int(hardware.get("cpu_count", 1), 1))
-    gpu_count = max(0, safe_int(hardware.get("gpu_count", 0), 0))
-    gpu_memory_total = max(0.0, safe_float(hardware.get("gpu_memory_total", 0.0), 0.0))
-    gpu_factor = clamp(1.0 + gpu_count * 0.08 + gpu_memory_total / (8.0 * 1024 * 1024 * 1024), 1.0, 2.2)
-    core_factor = clamp(math.log2(cpu_count + 1.0) / math.log2(9.0), 0.45, 1.2)
-    capture_factor = clamp(capture_ms / 24.0, 0.4, 3.0)
-    cpu_factor = clamp((1.0 + cpu_load / 200.0) * (1.12 - memory_free_ratio * 0.22) / max(0.5, core_factor), 0.65, 2.4)
-    timing_factor = clamp((capture_ms + execution_ms * 0.5) / 80.0, 0.5, 2.5)
+    hardware = dict(hardware or {})
+    hardware["cpu_load"] = cpu_load
+    factory = RuntimeNumberFactory(hardware, (width, height), pool_count, capture_ms, execution_ms, capture_ms, recent_success, window_instability, learning_similarity, life)
     values = {item.name: getattr(source, item.name) for item in fields(Settings)}
     values.update({
-        "hash_size": int(clamp(round(8 + pixel_factor * 4 + record_factor * 0.8), 8, 24)),
-        "nearest_top_k": int(clamp(round(10 + record_factor * 10), 8, 256)),
-        "nearest_candidate_limit": int(clamp(round((14 + record_factor * 7 + instability * 8) * 64), 256, 20000)),
-        "hash_prefix_bits": int(clamp(round(6 + record_factor), 4, 20)),
-        "mouse_still_tick": round(clamp(0.02 * capture_factor, 0.01, 0.2), 4),
-        "training_tick": round(clamp(0.03 * capture_factor * cpu_factor * timing_factor * (0.85 + instability * 0.45) / gpu_factor, 0.01, 0.9), 4),
-        "sleep_tick": round(clamp(0.08 * cpu_factor / core_factor, 0.05, 1.0), 4),
-        "key_debounce_seconds": round(clamp(0.2 * cpu_factor, 0.05, 1.0), 3),
-        "window_attach_seconds": round(clamp(20.0 + cpu_load * 0.6, 5.0, 120.0), 2),
-        "window_poll_seconds": round(clamp(0.2 * cpu_factor / gpu_factor, 0.05, 1.0), 3),
-        "explore_max_rate": clamp(0.35 + (1.0 - success) * 0.45 + similarity * 0.1, 0.2, 0.95),
-        "explore_min_rate": clamp((0.35 + (1.0 - success) * 0.45 + similarity * 0.1) * 0.12, 0.01, 0.2),
-        "action_jitter": clamp(0.008 + (1.0 - success) * 0.03 + instability * 0.012, 0.005, 0.08),
-        "softmax_temperature": clamp(12.0 + record_factor * 2.0, 6.0, 30.0),
-        "human_profile_min_samples": int(clamp(round(12 + record_factor * 8), 12, 120)),
-        "human_profile_max_samples": int(clamp(round(2400 + record_factor * 900), 1500, 10000)),
-        "human_profile_keep_samples": int(clamp(round(1800 + record_factor * 800), 1200, 9000)),
-        "ui_width": int(clamp(round(width * 0.65), 700, 1600)),
-        "ui_height": int(clamp(round(height * 0.72), 520, 1200)),
-        "ui_min_width": int(clamp(round(width * 0.42), 520, 1100)),
-        "ui_min_height": int(clamp(round(height * 0.45), 420, 900)),
-        "ui_padding": int(clamp(round(min(width, height) * 0.012), 8, 28)),
-        "ui_section_padding": int(clamp(round(min(width, height) * 0.008), 6, 22)),
-        "ui_metric_columns": int(clamp(round(width / 340.0), 2, 6)),
-        "ui_metric_min_column_width": int(clamp(round(width / 4.8), 150, 320)),
-        "reward_total_min": -10000.0 - max(0.0, safe_float(life, 0.0)),
-        "reward_total_max": 10000.0 + max(0.0, safe_float(life, 0.0)),
-        "experience_load_limit": int(clamp(round(12000 + record_factor * 8000), 8000, 90000)),
-        "global_action_probability": clamp(0.45 + 0.15 / max(1.0, record_factor), 0.2, 0.75),
-        "random_action_min": clamp(0.02 + instability * 0.03, 0.0, 0.12),
-        "random_action_max": clamp(0.98 - instability * 0.03, 0.88, 1.0),
-        "action_duration_min": clamp((capture_ms + execution_ms * 0.15) / 1200.0, 0.05, 0.35),
-        "action_duration_max": clamp((capture_ms + execution_ms * 0.75) / 320.0, 0.18, 1.8),
-        "random_click_duration_min": clamp((capture_ms + execution_ms * 0.08) / 1500.0, 0.03, 0.22),
-        "random_click_duration_max": clamp((capture_ms + execution_ms * 0.35) / 700.0, 0.08, 0.7),
-        "generated_click_hold_max": clamp((capture_ms + execution_ms * 0.2) / 500.0, 0.08, 0.9),
-        "motion_steps_per_second": clamp((42.0 + width / 24.0) / max(0.6, cpu_factor), 40.0, 260.0),
-        "motion_curve_offset_min": clamp(0.04 + instability * 0.04, 0.02, 0.2),
-        "motion_curve_offset_max": clamp(0.2 + (1.0 - success) * 0.22 + instability * 0.12, 0.16, 0.65),
-        "motion_first_control_min": clamp(0.12 + instability * 0.06, 0.08, 0.3),
-        "motion_first_control_max": clamp(0.46 + (1.0 - success) * 0.12, 0.3, 0.78),
-        "motion_second_control_min": clamp(0.54 - (1.0 - success) * 0.08, 0.26, 0.7),
-        "motion_second_control_max": clamp(0.9 - instability * 0.05, 0.7, 0.95),
-        "learning_screen_fps": clamp(1.0 / max(0.05, capture_ms / 1000.0) * clamp(core_factor * gpu_factor, 0.8, 2.4), 0.5, 20.0),
-        "learning_screen_similarity_threshold": clamp(0.95 + min(0.04, record_factor * 0.0025 + similarity * 0.01), 0.9, 0.999),
-        "training_fail_stop_count": int(clamp(round((1.0 - success) * 16 + instability * 10 + 2), 2, 24))
+        "hash_size": factory.count("hash_size", 8, 24),
+        "nearest_top_k": factory.count("nearest_top_k", 8, 256),
+        "nearest_candidate_limit": factory.count("nearest_candidate_limit", 256, 20000),
+        "hash_prefix_bits": factory.count("hash_prefix_bits", 4, 20),
+        "mouse_still_tick": round(factory.seconds("mouse_still_tick", 0.01, 0.2), 4),
+        "training_tick": round(factory.seconds("training_tick", 0.01, 0.9), 4),
+        "sleep_tick": round(factory.seconds("sleep_tick", 0.05, 1.0), 4),
+        "key_debounce_seconds": round(factory.seconds("key_debounce_seconds", 0.05, 1.0), 3),
+        "window_attach_seconds": round(factory.seconds("window_attach_seconds", 5.0, 120.0), 2),
+        "window_poll_seconds": round(factory.seconds("window_poll_seconds", 0.05, 1.0), 3),
+        "explore_max_rate": factory.ratio("explore_max_rate", 0.2, 0.95),
+        "explore_min_rate": factory.ratio("explore_min_rate", 0.01, 0.2),
+        "action_jitter": factory.ratio("action_jitter", 0.005, 0.08),
+        "softmax_temperature": factory.scalar("softmax_temperature", 6.0, 30.0),
+        "human_profile_min_samples": factory.count("human_profile_min_samples", 12, 120),
+        "human_profile_max_samples": factory.count("human_profile_max_samples", 1500, 10000),
+        "human_profile_keep_samples": factory.count("human_profile_keep_samples", 1200, 9000),
+        "ui_width": factory.count("ui_width", 700, 1600),
+        "ui_height": factory.count("ui_height", 520, 1200),
+        "ui_min_width": factory.count("ui_min_width", 520, 1100),
+        "ui_min_height": factory.count("ui_min_height", 420, 900),
+        "ui_padding": factory.count("ui_padding", 8, 28),
+        "ui_section_padding": factory.count("ui_section_padding", 6, 22),
+        "ui_metric_columns": factory.count("ui_metric_columns", 2, 6),
+        "ui_metric_min_column_width": factory.count("ui_metric_min_column_width", 150, 320),
+        "reward_total_min": factory.scalar("reward_total_min", -1000000000.0, 0.0),
+        "reward_total_max": factory.scalar("reward_total_max", 0.0, 1000000000.0),
+        "experience_load_limit": factory.count("experience_load_limit", 8000, 90000),
+        "global_action_probability": factory.ratio("global_action_probability", 0.2, 0.75),
+        "random_action_min": factory.ratio("random_action_min", 0.0, 0.12),
+        "random_action_max": factory.ratio("random_action_max", 0.88, 1.0),
+        "action_duration_min": factory.seconds("action_duration_min", 0.05, 0.35),
+        "action_duration_max": factory.seconds("action_duration_max", 0.18, 1.8),
+        "random_click_duration_min": factory.seconds("random_click_duration_min", 0.03, 0.22),
+        "random_click_duration_max": factory.seconds("random_click_duration_max", 0.08, 0.7),
+        "generated_click_hold_max": factory.seconds("generated_click_hold_max", 0.08, 0.9),
+        "motion_steps_per_second": factory.scalar("motion_steps_per_second", 40.0, 260.0),
+        "motion_curve_offset_min": factory.ratio("motion_curve_offset_min", 0.02, 0.2),
+        "motion_curve_offset_max": factory.ratio("motion_curve_offset_max", 0.16, 0.65),
+        "motion_first_control_min": factory.ratio("motion_first_control_min", 0.08, 0.3),
+        "motion_first_control_max": factory.ratio("motion_first_control_max", 0.3, 0.78),
+        "motion_second_control_min": factory.ratio("motion_second_control_min", 0.26, 0.7),
+        "motion_second_control_max": factory.ratio("motion_second_control_max", 0.7, 0.95),
+        "learning_screen_fps": factory.scalar("learning_screen_fps", 0.5, 20.0),
+        "learning_screen_similarity_threshold": factory.ratio("learning_screen_similarity_threshold", 0.9, 0.999),
+        "training_fail_stop_count": factory.count("training_fail_stop_count", 2, 24)
     })
     return normalize_settings(Settings(**values))
-
 
 def create_runtime_settings(base_settings=None, rect=None, pool_count=0, capture_ms=24.0, cpu_load=0.0):
     return derive_runtime_settings(base_settings=base_settings, rect=rect, pool_count=pool_count, capture_ms=capture_ms, cpu_load=cpu_load, hardware=read_hardware_state())
@@ -660,19 +778,41 @@ def action_features(action):
         return {}
     start = action.get("start_rel") or [0.0, 0.0]
     end = action.get("end_rel") or start
-    points = [[safe_float(item[0], 0.0), safe_float(item[1], 0.0)] for item in action.get("path_rel", []) if isinstance(item, (list, tuple)) and len(item) >= 2]
+    path_items = [item for item in action.get("path_rel", []) if isinstance(item, (list, tuple)) and len(item) >= 2]
+    points = [[safe_float(item[0], 0.0), safe_float(item[1], 0.0)] for item in path_items]
+    times = [max(0.0, safe_float(item[2], 0.0)) if len(item) >= 3 else 0.0 for item in path_items]
     if not points:
         points = [normalize_rel_point(start), normalize_rel_point(end, start)]
+        times = [0.0, max(0.0, safe_float(action.get("duration", 0.0), 0.0))]
     direct = distance(points[0], points[-1])
     total = path_length(points)
+    segments = [distance(points[index - 1], points[index]) for index in range(1, len(points))]
+    deltas = [max(1e-4, times[index] - times[index - 1]) for index in range(1, len(times)) if index < len(points)]
+    speeds = [segment / delta for segment, delta in zip(segments, deltas)]
+    speed_mean = sum(speeds) / len(speeds) if speeds else 0.0
+    speed_variance = sum((item - speed_mean) ** 2 for item in speeds) / len(speeds) if speeds else 0.0
+    accelerations = [(speeds[index] - speeds[index - 1]) / max(1e-4, deltas[index]) for index in range(1, min(len(speeds), len(deltas)))]
+    acceleration_change = sum(abs(item) for item in accelerations) / len(accelerations) if accelerations else 0.0
+    pauses = sum(1 for delta, segment in zip(deltas, segments) if delta > max(0.03, safe_float(action.get("duration", 0.0), 0.0) / max(4.0, len(points))) and segment < 0.002)
+    hover_before = max(0.0, times[1] - times[0]) if len(times) > 1 and len(points) > 1 and distance(points[0], points[1]) < 0.002 else 0.0
+    curvature = clamp(total / direct if direct > 1e-6 else 1.0, 1.0, 5.0)
     scroll = action.get("scroll") or [0, 0]
+    scroll_abs = abs(safe_int(scroll[0], 0)) + abs(safe_int(scroll[1], 0))
     return {
         "duration": max(0.0, safe_float(action.get("duration", 0.0), 0.0)),
         "direct": direct,
         "total": total,
-        "bend": clamp(total / direct if direct > 1e-6 else 1.0, 1.0, 5.0),
+        "bend": curvature,
         "points": len(points),
-        "scroll_abs": abs(safe_int(scroll[0], 0)) + abs(safe_int(scroll[1], 0))
+        "scroll_abs": scroll_abs,
+        "speed_mean": speed_mean,
+        "speed_variance": speed_variance,
+        "acceleration_change": acceleration_change,
+        "pauses": pauses,
+        "hover_before": hover_before,
+        "drag_curvature": curvature if action.get("type") == "drag" else 1.0,
+        "scroll_continuity": scroll_abs / max(1.0, len(points)),
+        "double_click_interval": max(0.0, safe_float(action.get("double_click_interval", 0.0), 0.0))
     }
 
 
@@ -710,21 +850,19 @@ class HumanProfile:
         if self.enough(action_type):
             with self.lock:
                 stats = {name: tuple(values) for name, values in self.stats[action_type].items()}
-            scores = [
-                percentile_score(features.get("duration", 0.0), stats.get("duration", []), self.settings.score_default),
-                percentile_score(features.get("direct", 0.0), stats.get("direct", []), self.settings.score_default),
-                percentile_score(features.get("bend", 1.0), stats.get("bend", []), self.settings.score_default),
-                percentile_score(features.get("points", 2.0), stats.get("points", []), self.settings.score_default)
-            ]
-            weights = [0.34, 0.26, 0.24, 0.16]
-            return round(clamp(sum(score * weight for score, weight in zip(scores, weights)), 0.0, 100.0), 2)
+            names = ("duration", "direct", "bend", "points", "speed_mean", "speed_variance", "acceleration_change", "pauses", "hover_before", "drag_curvature", "double_click_interval")
+            weights = (0.22, 0.15, 0.14, 0.09, 0.1, 0.09, 0.08, 0.05, 0.04, 0.03, 0.02)
+            scores = [percentile_score(features.get(name, 0.0), stats.get(name, []), self.settings.score_default) for name in names]
+            return round(clamp(sum(score * weight for score, weight in zip(scores, weights)) / max(0.01, sum(weights)), 0.0, 100.0), 2)
         return 50.0
 
     def score_scroll(self, features):
         with self.lock:
             samples = list(self.stats["scroll"].get("scroll_abs", []))
         if len(samples) >= max(6, self.settings.human_profile_min_samples // 3):
-            return percentile_score(features.get("scroll_abs", 0.0), samples, self.settings.scroll_score_default)
+            continuity = percentile_score(features.get("scroll_continuity", 0.0), self.stats["scroll"].get("scroll_continuity", []), self.settings.scroll_score_default)
+            magnitude = percentile_score(features.get("scroll_abs", 0.0), samples, self.settings.scroll_score_default)
+            return round(clamp(magnitude * 0.72 + continuity * 0.28, 0.0, 100.0), 2)
         return 50.0
 
 class AppConfigStore:
@@ -901,6 +1039,7 @@ class WindowManager:
         self.process = None
         self.hwnd = None
         self.lock = threading.RLock()
+        self.window_check_cache = {"rect": None, "basic_perf": 0.0, "visibility_perf": 0.0, "occlusion_perf": 0.0, "ok": False}
 
     def launch_or_attach(self):
         if self.find_window():
@@ -1007,23 +1146,38 @@ class WindowManager:
     def topmost(self):
         self.foreground()
 
-    def window_ok(self):
+    def window_ok(self, force=False):
         with self.lock:
             hwnd = self.hwnd
         if not hwnd or not win32gui.IsWindow(hwnd):
             return False
         try:
-            if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
-                return False
             rect = self.client_rect_for(hwnd)
             if not rect:
                 return False
-            left, top, right, bottom = rect
-            screen_w = max(1, safe_int(win32api.GetSystemMetrics(0), 1))
-            screen_h = max(1, safe_int(win32api.GetSystemMetrics(1), 1))
-            if left < 0 or top < 0 or right > screen_w or bottom > screen_h:
-                return False
             width, height = rect_size(rect)
+            if width <= 1 or height <= 1:
+                return False
+            now_perf = time.perf_counter()
+            cache = self.window_check_cache
+            if not force and cache.get("rect") == rect and now_perf - cache.get("basic_perf", 0.0) < self.settings.window_poll_seconds:
+                return bool(cache.get("ok", False))
+            cache["rect"] = rect
+            cache["basic_perf"] = now_perf
+            if force or now_perf - cache.get("visibility_perf", 0.0) >= clamp(self.settings.window_poll_seconds, 0.2, 0.5):
+                if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
+                    cache["ok"] = False
+                    return False
+                left, top, right, bottom = rect
+                screen_w = max(1, safe_int(win32api.GetSystemMetrics(0), 1))
+                screen_h = max(1, safe_int(win32api.GetSystemMetrics(1), 1))
+                if left < 0 or top < 0 or right > screen_w or bottom > screen_h:
+                    cache["ok"] = False
+                    return False
+                cache["visibility_perf"] = now_perf
+            if not force and now_perf - cache.get("occlusion_perf", 0.0) < clamp(self.settings.window_poll_seconds * 2.0, 0.5, 1.0):
+                return bool(cache.get("ok", True))
+            left, top, right, bottom = rect
             inset_x = max(1, min(width // 20, 12))
             inset_y = max(1, min(height // 20, 12))
             mid_x = int((left + right) / 2)
@@ -1034,10 +1188,11 @@ class WindowManager:
                 hit = win32gui.WindowFromPoint(point)
                 if hit == hwnd or win32gui.IsChild(hwnd, hit):
                     hits += 1
-            return hits == len(points)
+            cache["occlusion_perf"] = now_perf
+            cache["ok"] = hits == len(points)
+            return bool(cache["ok"])
         except Exception:
             return False
-
 
 class ScreenAnalyzer:
     def __init__(self, hash_size):
@@ -1095,9 +1250,9 @@ class ExperiencePool:
         self.profile = HumanProfile(settings)
         self.lock = threading.RLock()
         self.action_cache = []
-        self.prefix_neighbor_cache = {}
+        self.prefix_neighbor_cache = OrderedDict()
         self.global_action_heap = []
-        self.nearest_cache = {}
+        self.nearest_cache = OrderedDict()
         for record in records or []:
             self.add(record)
 
@@ -1121,7 +1276,7 @@ class ExperiencePool:
     def rebuild_index_locked(self):
         self.index = defaultdict(list)
         self.sorted_prefixes = []
-        self.prefix_neighbor_cache = {}
+        self.prefix_neighbor_cache = OrderedDict()
         for index, hash_value in enumerate(self.hashes):
             if hash_value:
                 prefix = self._prefix(hash_value)
@@ -1153,8 +1308,8 @@ class ExperiencePool:
                     heapq.heappush(self.global_action_heap, item)
                 elif reward > self.global_action_heap[0][0]:
                     heapq.heapreplace(self.global_action_heap, item)
-            if len(self.nearest_cache) > 512:
-                self.nearest_cache.pop(next(iter(self.nearest_cache)))
+            if self.nearest_cache:
+                self.nearest_cache.clear()
 
     def count(self):
         with self.lock:
@@ -1171,9 +1326,14 @@ class ExperiencePool:
             query_prefix = self._prefix(hash_value)
             result = []
             nearby = self.prefix_neighbor_cache.get(query_prefix)
-            if nearby is None:
+            if nearby is not None:
+                self.prefix_neighbor_cache.move_to_end(query_prefix)
+            else:
                 nearby = sorted(self.sorted_prefixes, key=lambda item: (item ^ query_prefix).bit_count())
                 self.prefix_neighbor_cache[query_prefix] = nearby
+                capacity = max(16, min(2048, self.index_settings.nearest_candidate_limit // 8))
+                while len(self.prefix_neighbor_cache) > capacity:
+                    self.prefix_neighbor_cache.popitem(last=False)
             for prefix in nearby:
                 result.extend(self.index[prefix])
                 if len(result) >= self.index_settings.nearest_candidate_limit:
@@ -1191,9 +1351,13 @@ class ExperiencePool:
             cache_key = (hash_value.bits, hash_value.hex, self.index_settings.hash_prefix_bits, self.index_settings.nearest_candidate_limit, self.settings.nearest_top_k)
             cached = self.nearest_cache.get(cache_key)
             if cached is not None:
+                self.nearest_cache.move_to_end(cache_key)
                 return [copy.deepcopy(item) for item in cached]
             candidate_indexes = self.candidate_indices(hash_value)
-            snapshot = [(index, self.hashes[index], self.records[index]) for index in candidate_indexes]
+            if len(self.records) > self.index_settings.nearest_candidate_limit:
+                recent_limit = min(len(self.records), max(top_k, self.index_settings.nearest_candidate_limit // 4))
+                candidate_indexes = list(dict.fromkeys(candidate_indexes + list(range(len(self.records) - recent_limit, len(self.records))) + [index for _, index in heapq.nlargest(min(len(self.global_action_heap), top_k), self.global_action_heap)]))
+            snapshot = [(index, self.hashes[index], self.records[index]) for index in candidate_indexes if self.hashes[index]]
         scored = []
         for index, other, record in snapshot:
             if other:
@@ -1205,9 +1369,11 @@ class ExperiencePool:
                     heapq.heapreplace(scored, (similarity, index, item))
         result = [item for _, _, item in sorted(scored, key=lambda pair: (pair[0], pair[1]), reverse=True)]
         with self.lock:
-            if len(self.nearest_cache) > 256:
-                self.nearest_cache.pop(next(iter(self.nearest_cache)))
-            self.nearest_cache[hash_value.hex] = copy.deepcopy(result)
+            self.nearest_cache[cache_key] = copy.deepcopy(result)
+            self.nearest_cache.move_to_end(cache_key)
+            capacity = max(32, min(2048, self.index_settings.nearest_candidate_limit // 4))
+            while len(self.nearest_cache) > capacity:
+                self.nearest_cache.popitem(last=False)
         return result
 
     def novelty(self, hash_value):
@@ -1502,6 +1668,8 @@ class HumanMouseExecutor:
         if not action:
             return None
         self.window_manager.topmost()
+        if not self.window_manager.window_ok(force=True):
+            return {"execution_error": "window_not_ready"}
         action = normalize_mouse_action(action, rect)
         action_type = action.get("type", "click")
         button = self.button_from_text(action.get("button", "Button.left"))
@@ -1615,6 +1783,58 @@ class EscapeMonitor:
         return False
 
 
+class AsyncPersistenceQueue:
+    def __init__(self, maxsize):
+        self.jobs = queue.Queue(maxsize=max(16, safe_int(maxsize, 256)))
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def enqueue_image(self, analyzer, image, path):
+        self.enqueue({"type": "image", "analyzer": analyzer, "image": image.copy() if image else None, "path": path})
+
+    def enqueue_record(self, store, record):
+        self.enqueue({"type": "record", "store": store, "record": copy.deepcopy(record)})
+
+    def enqueue(self, job):
+        try:
+            self.jobs.put_nowait(job)
+        except queue.Full:
+            if job.get("type") == "record":
+                self.jobs.put(job)
+
+    def run(self):
+        while not self.stop_event.is_set() or not self.jobs.empty():
+            try:
+                job = self.jobs.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                if job.get("type") == "image" and job.get("image") is not None:
+                    job["analyzer"].save_image(job["image"], job["path"])
+                elif job.get("type") == "record":
+                    store = job["store"]
+                    store.append_experience(job["record"])
+                    store.flush_state()
+            except Exception as exc:
+                store = job.get("store")
+                if store:
+                    try:
+                        store.log_error("async_persistence", exc, {"type": job.get("type")})
+                    except Exception:
+                        pass
+            finally:
+                self.jobs.task_done()
+
+    def flush(self):
+        self.jobs.join()
+
+    def close(self):
+        self.stop_event.set()
+        self.flush()
+        self.thread.join(timeout=1.2)
+
+
 class ControlPanel(tk.Tk):
     def __init__(self):
         enable_dpi_awareness()
@@ -1625,8 +1845,11 @@ class ControlPanel(tk.Tk):
         self.settings = derive_runtime_settings(rect=self.screen_rect(), pool_count=0, capture_ms=initial_capture_ms, cpu_load=safe_float(self.hardware_state.get("cpu_load", 0.0), 0.0), hardware=self.hardware_state)
         self.adaptive_policy.observe_capture(initial_capture_ms)
         self.progress_value = 0.0
-        self.last_ui_update_perf = 0.0
+        self.last_progress_update_perf = 0.0
+        self.last_metrics_update_perf = 0.0
+        self.last_status_update_perf = 0.0
         self.last_metric_payload = None
+        self.persistence_queue = AsyncPersistenceQueue(RuntimeNumberFactory(self.hardware_state, rect_size(self.screen_rect()), 0, initial_capture_ms, initial_capture_ms, initial_capture_ms, 1.0, 0.0, 0.97, 0.0).count("experience_load_limit", 128, 4096))
         self.title("雷电模拟器学习训练控制面板")
         self.geometry(f"{self.settings.ui_width}x{self.settings.ui_height}")
         self.minsize(self.settings.ui_min_width, self.settings.ui_min_height)
@@ -1900,14 +2123,58 @@ class ControlPanel(tk.Tk):
             pass
         return copied, True
 
+    def migration_known_names(self):
+        return {"screens", "experience.jsonl", "state.json", "settings.json", "errors.jsonl"}
+
+    def migration_target_conflicts(self, target):
+        path = Path(target)
+        if not path.exists():
+            return []
+        known = self.migration_known_names()
+        return [item.name for item in path.iterdir() if item.name not in known and not item.name.startswith(".backup_")]
+
+    def migration_counts(self, root):
+        root = Path(root)
+        screens = root / "screens"
+        screen_count = 0
+        if screens.exists():
+            for _, _, filenames in os.walk(screens):
+                screen_count += len([name for name in filenames if name.lower().endswith(".png")])
+        lines = 0
+        experience = root / "experience.jsonl"
+        if experience.exists():
+            try:
+                with experience.open("r", encoding="utf-8") as file:
+                    for _ in file:
+                        lines += 1
+            except Exception:
+                pass
+        return {"screens": screen_count, "experience_lines": lines, "settings": (root / "settings.json").exists(), "state": (root / "state.json").exists()}
+
+    def verify_migration(self, source, target):
+        source_counts = self.migration_counts(source)
+        target_counts = self.migration_counts(target)
+        if target_counts["experience_lines"] < source_counts["experience_lines"]:
+            raise ValueError("迁移校验失败：experience.jsonl 行数少于源目录")
+        if target_counts["screens"] < source_counts["screens"]:
+            raise ValueError("迁移校验失败：screens 文件数少于源目录")
+        if source_counts["settings"] and not target_counts["settings"]:
+            raise ValueError("迁移校验失败：settings.json 缺失")
+        if source_counts["state"] and not target_counts["state"]:
+            raise ValueError("迁移校验失败：state.json 缺失")
+
     def migration_loop(self, token, old_path, new_path, stop_event, values):
         reason = "数据迁移完成"
         temp_root = None
+        backup_root = None
         try:
             old_root = Path(old_path).resolve()
             new_root = Path(new_path).resolve()
             if new_root == old_root or old_root in new_root.parents:
                 raise ValueError("迁移目标不能等于旧目录，也不能位于旧目录内部")
+            conflicts = self.migration_target_conflicts(new_root)
+            if conflicts:
+                raise ValueError("迁移目标包含非本程序文件：" + "，".join(conflicts[:8]))
             new_root.parent.mkdir(parents=True, exist_ok=True)
             temp_root = new_root.parent / f".{new_root.name}.migration.{uuid.uuid4().hex}"
             temp_root.mkdir(parents=True, exist_ok=False)
@@ -1924,6 +2191,8 @@ class ControlPanel(tk.Tk):
             if not stop_event.is_set() and self.is_run_active(token, "migration"):
                 DataStore(temp_root).save_settings({"training_seconds": values["training_seconds"], "sleep_seconds": values["sleep_seconds"], "still_seconds": values["still_seconds"]})
                 if new_root.exists():
+                    backup_root = new_root.parent / f".backup_{new_root.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    shutil.copytree(new_root, backup_root)
                     for item in temp_root.iterdir():
                         target = new_root / item.name
                         if target.exists():
@@ -1936,6 +2205,7 @@ class ControlPanel(tk.Tk):
                 else:
                     temp_root.replace(new_root)
                     temp_root = None
+                self.verify_migration(old_root, new_root)
                 self.ui(lambda path=str(new_root): self.data_var.set(path))
                 self.app_config_store.save_settings({"ldplayer_path": values["ldplayer_path"], "data_path": str(new_root)})
                 self.store = DataStore(new_root)
@@ -1946,6 +2216,13 @@ class ControlPanel(tk.Tk):
             elif self.is_run_active(token, "migration"):
                 self.finish_run(token, reason, self.progress_value, release=False, reason=reason)
         except Exception as exc:
+            if backup_root and Path(backup_root).exists():
+                try:
+                    if Path(new_path).exists():
+                        shutil.rmtree(new_path)
+                    shutil.copytree(backup_root, new_path)
+                except Exception:
+                    pass
             self.log_exception("migration", exc, {"old_path": str(old_path), "new_path": str(new_path)})
             self.ui(lambda e=str(exc): messagebox.showerror("迁移失败", e))
             self.finish_run(token, "数据迁移失败", self.progress_value, release=False, reason="migration_error")
@@ -2227,10 +2504,10 @@ class ControlPanel(tk.Tk):
     def update_progress(self, percent):
         percent = round(clamp(percent, 0.0, 100.0), 1)
         now_perf = time.perf_counter()
-        if abs(percent - self.progress_value) < 0.2 and now_perf - self.last_ui_update_perf < 0.08:
+        if abs(percent - self.progress_value) < 0.2 and now_perf - self.last_progress_update_perf < 0.08:
             return
         self.progress_value = percent
-        self.last_ui_update_perf = now_perf
+        self.last_progress_update_perf = now_perf
         def apply():
             self.progress_var.set(percent)
             self.progress_text_var.set(f"{percent:.1f}%")
@@ -2239,10 +2516,10 @@ class ControlPanel(tk.Tk):
     def update_metrics(self, novelty, human_score, screen_reward, action_reward, reward, life, decision=None):
         payload = (round(float(novelty), 2), round(float(human_score), 2), round(float(screen_reward), 2), round(float(action_reward), 2), round(float(reward), 2), round(float(life), 2), decision.get("reason") if decision else None, round(safe_float(decision.get("confidence", 0.0), 0.0), 3) if decision else None)
         now_perf = time.perf_counter()
-        if payload == self.last_metric_payload and now_perf - self.last_ui_update_perf < 0.08:
+        if payload == self.last_metric_payload and now_perf - self.last_metrics_update_perf < 0.08:
             return
         self.last_metric_payload = payload
-        self.last_ui_update_perf = now_perf
+        self.last_metrics_update_perf = now_perf
         def apply():
             self.novelty_var.set(f"{round(float(novelty), 2)}%")
             self.human_var.set(f"{round(float(human_score), 2)}%")
@@ -2277,7 +2554,7 @@ class ControlPanel(tk.Tk):
         snapshot, image = self.capture_snapshot_image(analyzer, mode, session_start, rect)
         if snapshot and persist:
             try:
-                analyzer.save_image(image, snapshot.path)
+                self.persistence_queue.enqueue_image(analyzer, image, snapshot.path)
             except Exception as exc:
                 self.log_exception("capture_snapshot.save", exc, {"path": str(snapshot.path)})
                 return None
@@ -2306,8 +2583,7 @@ class ControlPanel(tk.Tk):
         record = {"record_schema_version": 2, "id": uuid.uuid4().hex, "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": after_novelty, "before_screen": snapshot.relative_path if normalized else None, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "life_experience_delta": max(0.0, reward), "penalty_delta": max(0.0, -reward), "life_experience": life, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "capture_latency_ms": capture_latency_ms, "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_tick": self.settings.training_tick, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
         if decision:
             record["ai_decision"] = decision
-        self.store.append_experience(record)
-        self.store.flush_state()
+        self.persistence_queue.enqueue_record(self.store, record)
         self.experience_pool.add(record)
         self.update_metrics(after_novelty, human_score, novelty_reward, human_delta, reward, life, decision)
         return record
@@ -2326,7 +2602,7 @@ class ControlPanel(tk.Tk):
                 self.last_learning_tick_perf = now_perf
                 return
         try:
-            analyzer.save_image(image, snapshot.path)
+            self.persistence_queue.enqueue_image(analyzer, image, snapshot.path)
         except Exception as exc:
             self.log_exception("learning_screen_tick.save", exc, {"path": str(snapshot.path)})
             return
@@ -2475,6 +2751,8 @@ class ControlPanel(tk.Tk):
         if self.mouse_recorder:
             self.mouse_recorder.stop()
         self.escape_monitor.stop()
+        if self.persistence_queue:
+            self.persistence_queue.close()
         if self.store:
             self.store.flush_state(force=True)
         mode_thread = self.mode_thread
