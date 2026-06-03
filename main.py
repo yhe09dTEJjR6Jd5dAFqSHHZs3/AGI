@@ -1,3 +1,4 @@
+import concurrent.futures
 import copy
 import ctypes
 import json
@@ -197,6 +198,9 @@ RUNTIME_NUMBER_RULES = {
     "mouse_still_tick": ("capture_ms", "cpu_load"),
     "training_tick": ("capture_ms", "execution_ms", "cpu_load", "gpu_factor", "window_instability"),
     "sleep_tick": ("cpu_load", "cpu_count", "memory_free_ratio"),
+    "sleep_worker_count": ("cpu_count", "gpu_count", "memory_free_ratio", "cpu_load"),
+    "sleep_batch_size": ("pool_count", "cpu_count", "memory_free_ratio", "life_experience"),
+    "sleep_queue_depth": ("cpu_count", "gpu_count", "memory_free_ratio"),
     "key_debounce_seconds": ("cpu_load", "capture_ms"),
     "window_attach_seconds": ("cpu_load", "window_instability"),
     "window_poll_seconds": ("cpu_load", "gpu_factor", "window_instability"),
@@ -270,6 +274,9 @@ class Settings:
     mouse_still_tick: float = 0.0
     training_tick: float = 0.0
     sleep_tick: float = 0.0
+    sleep_worker_count: int = 0
+    sleep_batch_size: int = 0
+    sleep_queue_depth: int = 0
     key_debounce_seconds: float = 0.0
     window_attach_seconds: float = 0.0
     window_poll_seconds: float = 0.0
@@ -473,6 +480,9 @@ def run_self_test():
     pool.apply_settings(changed)
     assert pool.index_settings.hash_prefix_bits == changed.hash_prefix_bits
     assert pool.nearest(a)
+    sleep_result = pool.sleep_training_step(changed.sleep_batch_size)
+    assert sleep_result["trained"] >= 1
+    assert pool.records[0].get("sleep_visits", 0) >= 1
     brain = ActionBrain(pool, changed)
     _, decision = brain.choose(a, novelty, batch, 0.0)
     assert isinstance(decision, dict)
@@ -548,6 +558,9 @@ def normalize_settings(settings):
         mouse_still_tick=max(0.001, safe_float(settings.mouse_still_tick, 0.001)),
         training_tick=max(0.001, safe_float(settings.training_tick, 0.001)),
         sleep_tick=max(0.001, safe_float(settings.sleep_tick, 0.001)),
+        sleep_worker_count=max(1, safe_int(settings.sleep_worker_count, 1)),
+        sleep_batch_size=max(1, safe_int(settings.sleep_batch_size, 1)),
+        sleep_queue_depth=max(1, safe_int(settings.sleep_queue_depth, 1)),
         key_debounce_seconds=max(0.001, safe_float(settings.key_debounce_seconds, 0.001)),
         window_attach_seconds=max(0.001, safe_float(settings.window_attach_seconds, 0.001)),
         window_poll_seconds=max(0.001, safe_float(settings.window_poll_seconds, 0.001)),
@@ -677,6 +690,9 @@ class RuntimeNumberFactory:
             "mouse_still_tick": 0.02 * self.capture_factor,
             "training_tick": 0.03 * self.capture_factor * self.cpu_factor * self.timing_factor * (0.85 + self.window_instability * 0.45) / self.gpu_factor,
             "sleep_tick": 0.08 * self.cpu_factor / self.core_factor,
+            "sleep_worker_count": self.cpu_count * clamp(self.memory_free_ratio * (1.25 - self.cpu_load / 220.0), 0.35, 1.35) + self.gpu_count,
+            "sleep_batch_size": (self.record_factor + self.core_factor + self.memory_free_ratio * 3.0 + math.log2(max(2.0, self.life + 2.0)) * 0.08) * 24.0,
+            "sleep_queue_depth": (self.cpu_count + max(1, self.gpu_count) + self.memory_free_ratio * 4.0) * 1.5,
             "key_debounce_seconds": 0.2 * self.cpu_factor,
             "window_attach_seconds": 20.0 + self.cpu_load * 0.6,
             "window_poll_seconds": 0.2 * self.cpu_factor / self.gpu_factor,
@@ -770,6 +786,9 @@ def derive_runtime_settings(base_settings=None, rect=None, pool_count=0, capture
         "mouse_still_tick": round(factory.seconds("mouse_still_tick", 0.01, 0.2), 4),
         "training_tick": round(factory.seconds("training_tick", 0.01, 0.9), 4),
         "sleep_tick": round(factory.seconds("sleep_tick", 0.05, 1.0), 4),
+        "sleep_worker_count": factory.count("sleep_worker_count", 1, 64),
+        "sleep_batch_size": factory.count("sleep_batch_size", 8, 4096),
+        "sleep_queue_depth": factory.count("sleep_queue_depth", 1, 256),
         "key_debounce_seconds": round(factory.seconds("key_debounce_seconds", 0.05, 1.0), 3),
         "window_attach_seconds": round(factory.seconds("window_attach_seconds", 5.0, 120.0), 2),
         "window_poll_seconds": round(factory.seconds("window_poll_seconds", 0.05, 1.0), 3),
@@ -1721,6 +1740,91 @@ class ExperiencePool:
         chosen = weighted_choice(weighted)
         return copy.deepcopy(chosen) if chosen else None
 
+
+    def sleep_training_batch_indices(self, batch_size):
+        with self.lock:
+            action_indices = [index for index, record in enumerate(self.records) if record.get("mouse_action")]
+            if not action_indices:
+                return []
+            target = max(1, min(safe_int(batch_size, 1), len(action_indices)))
+            ranked = [index for _, index in heapq.nlargest(min(len(self.global_action_heap), target), self.global_action_heap, key=lambda item: item[0])]
+            recent = action_indices[-target:]
+            remaining = target * max(1, self.settings.ui_metric_columns) - len(ranked) - len(recent)
+            sampled = random.sample(action_indices, min(len(action_indices), max(0, remaining))) if remaining > 0 else []
+            return list(dict.fromkeys(ranked + recent + sampled))[:target]
+
+    def sleep_training_step(self, batch_size):
+        indices = self.sleep_training_batch_indices(batch_size)
+        if not indices:
+            return {"trained": 0, "best_score": 0.0, "avg_score": 0.0, "avg_confidence": 0.0}
+        with self.lock:
+            records_len = len(self.records)
+            sample_limit = max(len(indices), min(records_len, self.settings.nearest_candidate_limit))
+            sample_indexes = list(range(max(0, records_len - sample_limit), records_len))
+            if records_len > sample_limit:
+                sample_indexes.extend(random.sample(range(records_len), min(sample_limit, records_len)))
+            sample_indexes = list(dict.fromkeys(sample_indexes))
+            hash_sample = [(index, self.hashes[index]) for index in sample_indexes if self.hashes[index]]
+            snapshot = [(index, self.hashes[index], copy.deepcopy(self.records[index])) for index in indices if index < records_len and self.hashes[index]]
+        updates = []
+        for index, hash_value, record in snapshot:
+            sims = []
+            for other_index, other_hash in hash_sample:
+                if other_index != index and other_hash:
+                    sims.append(hash_similarity(hash_value, other_hash))
+            if sims:
+                sims.sort(reverse=True)
+                top = sims[:max(1, min(self.settings.nearest_top_k, len(sims)))]
+                density = sum(1 for item in top if item >= 0.95) / len(top)
+                novelty = clamp((1.0 - (top[0] * 0.5 + sum(top) / len(top) * 0.35 + density * 0.15)) * 100.0, 0.0, 100.0)
+                similarity_confidence = clamp(top[0] * 0.65 + (1.0 - density) * 0.35, 0.0, 1.0)
+            else:
+                novelty = 100.0
+                similarity_confidence = 0.0
+            action = record.get("mouse_action")
+            human_score = clamp(record.get("human_score", self.profile.score(action)), 0.0, 100.0) if action else self.settings.score_default
+            reward = safe_float(record.get("reward", 0.0), 0.0)
+            transition = safe_float(record.get("transition_reward", 0.0), 0.0)
+            source = 1.0 if record.get("mode") == "learning" and record.get("mouse_source") == "user" else 0.0
+            visits = max(0, safe_int(record.get("sleep_visits", 0), 0))
+            learned = safe_float(record.get("sleep_policy_reward", reward), reward)
+            candidate = reward + novelty * self.settings.action_score_novelty_weight + (human_score - self.settings.score_default) * self.settings.action_score_human_weight + transition * self.settings.action_score_reward_weight + source * self.settings.score_default
+            value = (learned * visits + candidate) / (visits + 1)
+            confidence = clamp((similarity_confidence + human_score / 100.0 + min(1.0, (visits + 1) / max(1.0, self.settings.nearest_top_k))) / 3.0, 0.0, 1.0)
+            updates.append((index, value, visits + 1, confidence, novelty, human_score))
+        with self.lock:
+            total_score = 0.0
+            best_score = None
+            for index, value, visits, confidence, novelty, human_score in updates:
+                if index >= len(self.records):
+                    continue
+                record = self.records[index]
+                record["sleep_policy_reward"] = round(value, 4)
+                record["sleep_visits"] = visits
+                record["sleep_confidence"] = round(confidence, 4)
+                record["sleep_novelty"] = round(novelty, 2)
+                record["sleep_human_score"] = round(human_score, 2)
+                score = value * (0.75 + confidence * 0.25)
+                total_score += score
+                best_score = score if best_score is None else max(best_score, score)
+            self.rebuild_action_heap_locked()
+        count = len(updates)
+        return {"trained": count, "best_score": round(best_score or 0.0, 4), "avg_score": round(total_score / count if count else 0.0, 4), "avg_confidence": round(sum(item[3] for item in updates) / count if count else 0.0, 4)}
+
+    def rebuild_action_heap_locked(self):
+        heap = []
+        for index, record in enumerate(self.records):
+            if not record.get("mouse_action"):
+                continue
+            reward = safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0)
+            confidence = clamp(record.get("sleep_confidence", 0.0), 0.0, 1.0)
+            item = (reward * (0.75 + confidence * 0.25), index)
+            if len(heap) < self.settings.global_action_heap_limit:
+                heapq.heappush(heap, item)
+            elif item[0] > heap[0][0]:
+                heapq.heapreplace(heap, item)
+        self.global_action_heap = heap
+
     def human_score(self, action):
         return self.profile.score(action)
 
@@ -1743,11 +1847,12 @@ class ActionBrain:
     def score_candidate(self, item):
         record = item["record"]
         similarity = clamp(item.get("similarity", 0.0), 0.0, 1.0)
-        reward = max(-80.0, safe_float(record.get("reward", 0.0), 0.0))
+        reward = max(-80.0, safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0))
         human_score = clamp(record.get("human_score", 50.0), 0.0, 100.0)
-        novelty = clamp(record.get("novelty", 50.0), 0.0, 100.0)
+        novelty = clamp(record.get("sleep_novelty", record.get("novelty", 50.0)), 0.0, 100.0)
         source_bonus = 4.0 if record.get("mode") == "learning" else 0.0
-        return similarity * 100.0 * self.settings.action_score_similarity_weight + reward * self.settings.action_score_reward_weight + human_score * self.settings.action_score_human_weight + novelty * self.settings.action_score_novelty_weight + source_bonus
+        sleep_confidence = clamp(record.get("sleep_confidence", 0.0), 0.0, 1.0)
+        return similarity * 100.0 * self.settings.action_score_similarity_weight + reward * self.settings.action_score_reward_weight * (1.0 + sleep_confidence * 0.35) + human_score * self.settings.action_score_human_weight + novelty * self.settings.action_score_novelty_weight + source_bonus
 
     def mutate_point(self, point, scale):
         return [
@@ -3060,17 +3165,65 @@ class ControlPanel(tk.Tk):
 
     def sleep_loop(self, token, config, stop_event):
         start = time.perf_counter()
-        self.ui(lambda: self.progress_label_var.set("模式进度"))
-        while not stop_event.is_set() and self.is_run_active(token, "sleep"):
-            if self.should_stop_by_escape():
-                stop_event.set()
-                break
-            elapsed = time.perf_counter() - start
-            percent = clamp(elapsed / config.sleep_seconds * 100.0, 0.0, 100.0)
-            self.update_progress(percent)
-            if percent >= 100.0:
-                break
-            time.sleep(config.settings.sleep_tick)
+        completed = 0
+        submitted = 0
+        done_event = threading.Event()
+        workers = max(1, config.settings.sleep_worker_count)
+        queue_depth = max(workers, config.settings.sleep_queue_depth)
+        batch_size = max(1, config.settings.sleep_batch_size)
+        self.ui(lambda: self.progress_label_var.set("睡眠训练进度"))
+        def train_once():
+            result = self.experience_pool.sleep_training_step(batch_size)
+            done_event.set()
+            return result
+        def submit_next(executor, futures):
+            nonlocal submitted
+            if stop_event.is_set() or not self.is_run_active(token, "sleep"):
+                return
+            futures.add(executor.submit(train_once))
+            submitted += 1
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = set()
+            for _ in range(queue_depth):
+                submit_next(executor, futures)
+            while not stop_event.is_set() and self.is_run_active(token, "sleep"):
+                if self.should_stop_by_escape():
+                    stop_event.set()
+                    break
+                elapsed = time.perf_counter() - start
+                percent = clamp(elapsed / config.sleep_seconds * 100.0, 0.0, 100.0)
+                self.update_progress(percent)
+                if percent >= 100.0:
+                    break
+                if not futures:
+                    submit_next(executor, futures)
+                done, futures = concurrent.futures.wait(futures, timeout=config.settings.sleep_tick, return_when=concurrent.futures.FIRST_COMPLETED)
+                if not done:
+                    done_event.wait(config.settings.sleep_tick)
+                    done_event.clear()
+                    continue
+                trained = 0
+                best_score = 0.0
+                avg_score = 0.0
+                avg_confidence = 0.0
+                for future in done:
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        self.log_exception("sleep_training", exc, {"submitted": submitted, "completed": completed})
+                        result = {"trained": 0, "best_score": 0.0, "avg_score": 0.0, "avg_confidence": 0.0}
+                    completed += 1
+                    trained += safe_int(result.get("trained", 0), 0)
+                    best_score = max(best_score, safe_float(result.get("best_score", 0.0), 0.0))
+                    avg_score += safe_float(result.get("avg_score", 0.0), 0.0)
+                    avg_confidence += safe_float(result.get("avg_confidence", 0.0), 0.0)
+                    submit_next(executor, futures)
+                divisor = max(1, len(done))
+                life = self.store.state.get("life_experience", 0.0) if self.store else 0.0
+                decision = {"reason": "sleep_prioritized_replay", "confidence": avg_confidence / divisor, "candidate_count": trained, "best_score": best_score, "completed_batches": completed, "workers": workers}
+                self.update_metrics(0.0, 50.0 + clamp(avg_confidence / divisor * 50.0, 0.0, 50.0), 0.0, avg_score / divisor, best_score, life, decision)
+            for future in futures:
+                future.cancel()
         if self.is_run_active(token, "sleep") and not stop_event.is_set():
             self.finish_run(token, "睡眠模式完成", 100.0, release=False)
         elif self.is_run_active(token, "sleep"):
