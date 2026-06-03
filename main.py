@@ -13,10 +13,13 @@ import time
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, fields
+from typing import Optional
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+
+MIN_PYTHON_VERSION = (3, 10)
 
 DEPENDENCY_INSTALL_MAP = {"mss": "mss", "PIL": "pillow", "psutil": "psutil", "pywin32": "pywin32", "pynput.mouse": "pynput", "pynput.keyboard": "pynput"}
 REQUIRED_MODULES = ("mss", "PIL", "pywin32", "pynput.mouse", "psutil")
@@ -32,6 +35,11 @@ def fail_and_exit(message):
     except Exception:
         pass
     sys.exit(1)
+
+
+
+if sys.version_info < MIN_PYTHON_VERSION:
+    fail_and_exit(f"需要 Python {MIN_PYTHON_VERSION[0]}.{MIN_PYTHON_VERSION[1]} 或更高版本，当前版本为 {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}。")
 
 def bootstrap_dependencies():
     required = set(REQUIRED_MODULES)
@@ -87,7 +95,8 @@ except Exception as exc:
     pynput_keyboard = None
     IMPORT_ERRORS["pynput.keyboard"] = exc
 
-bootstrap_dependencies()
+if "--self-test" not in sys.argv:
+    bootstrap_dependencies()
 
 DEFAULT_LDPLAYER_PATH = r"D:\LDPlayer9\dnplayer.exe"
 DEFAULT_DATA_PATH = r"C:\Users\Administrator\Desktop\AAA"
@@ -198,9 +207,9 @@ class ModeSession:
     token: int
     mode: str
     started_at: float
-    deadline: float | None
+    deadline: Optional[float]
     stop_event: threading.Event
-    termination_reason: str | None = None
+    termination_reason: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -243,6 +252,8 @@ def enable_dpi_awareness():
 
 def run_self_test():
     settings = derive_runtime_settings()
+    assert sys.version_info >= MIN_PYTHON_VERSION
+    assert hasattr(WindowManager, "topmost")
     assert clamp(12, 0, 10) == 10
     action = normalize_mouse_action({"type": "click", "start_rel": [2, -1], "duration": 0.3}, (0, 0, 100, 100))
     assert 0.0 <= action["start_rel"][0] <= 1.0
@@ -250,11 +261,24 @@ def run_self_test():
     b = HashValue(value=0b1101, bits=4, hex="d")
     sim = hash_similarity(a, b)
     assert 0.0 <= sim <= 1.0
+    low_screen = reward_parts(70.0, 100.0, settings)[2]
+    high_screen = reward_parts(71.0, 0.0, settings)[2]
+    high_human = reward_parts(70.0, 100.0, settings)[2]
+    low_human = reward_parts(70.0, 0.0, settings)[2]
+    assert high_screen > low_screen
+    assert high_human > low_human
+    assert high_human < high_screen
     pool = ExperiencePool(settings)
     pool.add({"id": "t1", "mode": "learning", "mouse_action": {"type": "click", "start_rel": [0.5, 0.5]}, "reward": 12, "screen_hash_hex": "f", "screen_hash_bits": 4, "mouse_source": "user"})
     novelty, batch = pool.novelty(a)
     assert novelty >= 0.0
-    brain = ActionBrain(pool, settings)
+    values = {item.name: getattr(settings, item.name) for item in fields(Settings)}
+    values["hash_prefix_bits"] = max(1, settings.hash_prefix_bits - 1)
+    changed = Settings(**values)
+    pool.apply_settings(changed)
+    assert pool.index_settings.hash_prefix_bits == changed.hash_prefix_bits
+    assert pool.nearest(a)
+    brain = ActionBrain(pool, changed)
     _, decision = brain.choose(a, novelty, batch, 0.0)
     assert isinstance(decision, dict)
     print("self-test passed")
@@ -590,7 +614,10 @@ def hash_similarity(hash_a, hash_b):
 def reward_parts(novelty, human_score, settings):
     screen_reward = round(clamp(novelty, 0.0, 100.0), 2)
     human_delta = round((clamp(human_score, 0.0, 100.0) - 50.0) * 2.0, 2)
-    total = round(clamp(screen_reward + human_delta, settings.reward_total_min, settings.reward_total_max), 2)
+    reward_span = max(1.0, abs(safe_float(settings.reward_total_max, 100.0) - safe_float(settings.reward_total_min, 0.0)))
+    tie_breaker = reward_span / 10000000.0
+    human_tiebreak = clamp(human_delta / 100.0, -1.0, 1.0) * tie_breaker
+    total = round(clamp(screen_reward + human_tiebreak, settings.reward_total_min, settings.reward_total_max), 4)
     return screen_reward, human_delta, total
 
 
@@ -714,7 +741,10 @@ class AppConfigStore:
         try:
             with self.settings_file.open("r", encoding="utf-8") as file:
                 data = json.load(file)
-            return data if isinstance(data, dict) else {}
+            if not isinstance(data, dict):
+                return {}
+            allowed = ("ldplayer_path", "data_path")
+            return {name: data[name] for name in allowed if name in data}
         except Exception:
             return {}
 
@@ -808,12 +838,16 @@ class DataStore:
         try:
             with self.settings_file.open("r", encoding="utf-8") as file:
                 data = json.load(file)
-            return data if isinstance(data, dict) else {}
+            if not isinstance(data, dict):
+                return {}
+            allowed = ("training_seconds", "sleep_seconds", "still_seconds")
+            return {name: data[name] for name in allowed if name in data}
         except Exception:
             return {}
 
     def save_settings(self, settings):
-        payload = settings if isinstance(settings, dict) else {}
+        source = settings if isinstance(settings, dict) else {}
+        payload = {"training_seconds": max(1, safe_int(source.get("training_seconds", DEFAULT_TRAINING_SECONDS), DEFAULT_TRAINING_SECONDS)), "sleep_seconds": max(1, safe_int(source.get("sleep_seconds", DEFAULT_SLEEP_SECONDS), DEFAULT_SLEEP_SECONDS)), "still_seconds": max(0.1, safe_float(source.get("still_seconds", DEFAULT_STILL_SECONDS), DEFAULT_STILL_SECONDS))}
         with self.lock:
             temporary = self.settings_file.with_suffix(".tmp")
             with temporary.open("w", encoding="utf-8") as file:
@@ -970,6 +1004,9 @@ class WindowManager:
         except Exception:
             pass
 
+    def topmost(self):
+        self.foreground()
+
     def window_ok(self):
         with self.lock:
             hwnd = self.hwnd
@@ -1046,8 +1083,11 @@ class ScreenAnalyzer:
 
 
 class ExperiencePool:
+    INDEX_SETTING_NAMES = ("hash_prefix_bits", "nearest_candidate_limit")
+
     def __init__(self, settings, records=None):
         self.settings = settings
+        self.index_settings = settings
         self.records = []
         self.hashes = []
         self.index = defaultdict(list)
@@ -1062,8 +1102,33 @@ class ExperiencePool:
             self.add(record)
 
     def _prefix(self, hash_value):
-        bits = min(max(1, self.settings.hash_prefix_bits), hash_value.bits)
+        bits = min(max(1, self.index_settings.hash_prefix_bits), hash_value.bits)
         return hash_value.value >> max(0, hash_value.bits - bits)
+
+    def _index_signature(self, settings):
+        return tuple(getattr(settings, name) for name in self.INDEX_SETTING_NAMES)
+
+    def apply_settings(self, settings):
+        with self.lock:
+            rebuild = self._index_signature(settings) != self._index_signature(self.index_settings)
+            self.settings = settings
+            self.profile.settings = settings
+            if rebuild:
+                self.index_settings = settings
+                self.rebuild_index_locked()
+            self.nearest_cache.clear()
+
+    def rebuild_index_locked(self):
+        self.index = defaultdict(list)
+        self.sorted_prefixes = []
+        self.prefix_neighbor_cache = {}
+        for index, hash_value in enumerate(self.hashes):
+            if hash_value:
+                prefix = self._prefix(hash_value)
+                bucket = self.index[prefix]
+                if not bucket:
+                    self.sorted_prefixes.append(prefix)
+                bucket.append(index)
 
     def add(self, record):
         with self.lock:
@@ -1101,7 +1166,7 @@ class ExperiencePool:
 
     def candidate_indices(self, hash_value):
         with self.lock:
-            if len(self.records) <= self.settings.nearest_candidate_limit:
+            if len(self.records) <= self.index_settings.nearest_candidate_limit:
                 return [index for index, item in enumerate(self.hashes) if item]
             query_prefix = self._prefix(hash_value)
             result = []
@@ -1111,19 +1176,19 @@ class ExperiencePool:
                 self.prefix_neighbor_cache[query_prefix] = nearby
             for prefix in nearby:
                 result.extend(self.index[prefix])
-                if len(result) >= self.settings.nearest_candidate_limit:
+                if len(result) >= self.index_settings.nearest_candidate_limit:
                     break
             if result:
-                return result[:self.settings.nearest_candidate_limit]
+                return result[:self.index_settings.nearest_candidate_limit]
             valid = [index for index, item in enumerate(self.hashes) if item]
-            return random.sample(valid, self.settings.nearest_candidate_limit) if len(valid) > self.settings.nearest_candidate_limit else valid
+            return random.sample(valid, self.index_settings.nearest_candidate_limit) if len(valid) > self.index_settings.nearest_candidate_limit else valid
 
     def nearest(self, hash_value):
         if not hash_value:
             return []
         with self.lock:
             top_k = max(1, self.settings.nearest_top_k)
-            cache_key = hash_value.hex
+            cache_key = (hash_value.bits, hash_value.hex, self.index_settings.hash_prefix_bits, self.index_settings.nearest_candidate_limit, self.settings.nearest_top_k)
             cached = self.nearest_cache.get(cache_key)
             if cached is not None:
                 return [copy.deepcopy(item) for item in cached]
@@ -1800,35 +1865,79 @@ class ControlPanel(tk.Tk):
         items = []
         for name in ("screens", "experience.jsonl", "state.json", "settings.json", "errors.jsonl"):
             source = root / name
-            if source.exists():
-                items.append((name, source))
+            if source.is_dir():
+                for file_root, _, filenames in os.walk(source):
+                    for filename in filenames:
+                        file_path = Path(file_root) / filename
+                        try:
+                            relative = file_path.relative_to(root)
+                            items.append((relative, file_path, max(0, file_path.stat().st_size)))
+                        except Exception:
+                            pass
+            elif source.exists():
+                try:
+                    items.append((Path(name), source, max(0, source.stat().st_size)))
+                except Exception:
+                    items.append((Path(name), source, 0))
         return items
+
+    def copy_migration_file(self, source, target, copied, total, stop_event, token):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        buffer_size = max(65536, min(1048576, safe_int(total / 200 if total else 65536, 65536)))
+        with source.open("rb") as src, target.open("wb") as dst:
+            while True:
+                if stop_event.is_set() or not self.is_run_active(token, "migration"):
+                    return copied, False
+                chunk = src.read(buffer_size)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                copied += len(chunk)
+                self.update_progress(clamp(copied / max(1, total) * 100.0, 0.0, 99.0))
+        try:
+            shutil.copystat(source, target)
+        except Exception:
+            pass
+        return copied, True
 
     def migration_loop(self, token, old_path, new_path, stop_event, values):
         reason = "数据迁移完成"
+        temp_root = None
         try:
-            old_root = Path(old_path)
-            new_root = Path(new_path)
-            new_root.mkdir(parents=True, exist_ok=True)
+            old_root = Path(old_path).resolve()
+            new_root = Path(new_path).resolve()
+            if new_root == old_root or old_root in new_root.parents:
+                raise ValueError("迁移目标不能等于旧目录，也不能位于旧目录内部")
+            new_root.parent.mkdir(parents=True, exist_ok=True)
+            temp_root = new_root.parent / f".{new_root.name}.migration.{uuid.uuid4().hex}"
+            temp_root.mkdir(parents=True, exist_ok=False)
             items = self.migration_items(old_root)
-            total = max(1, len(items))
-            if not items:
-                DataStore(new_root).save_settings({"training_seconds": values["training_seconds"], "sleep_seconds": values["sleep_seconds"], "still_seconds": values["still_seconds"]})
-            for index, (name, source) in enumerate(items):
-                if stop_event.is_set() or not self.is_run_active(token, "migration"):
+            total = max(1, sum(size for _, _, size in items))
+            copied = 0
+            for relative, source, size in items:
+                copied, ok = self.copy_migration_file(source, temp_root / relative, copied, total, stop_event, token)
+                if not ok:
                     reason = "数据迁移已终止"
                     break
-                target = new_root / name
-                if source.is_dir():
-                    shutil.copytree(source, target, dirs_exist_ok=True)
-                else:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source, target)
-                self.update_progress((index + 1) / total * 100.0)
+                if size == 0:
+                    self.update_progress(clamp(copied / total * 100.0, 0.0, 99.0))
             if not stop_event.is_set() and self.is_run_active(token, "migration"):
+                DataStore(temp_root).save_settings({"training_seconds": values["training_seconds"], "sleep_seconds": values["sleep_seconds"], "still_seconds": values["still_seconds"]})
+                if new_root.exists():
+                    for item in temp_root.iterdir():
+                        target = new_root / item.name
+                        if target.exists():
+                            if target.is_dir():
+                                shutil.rmtree(target)
+                            else:
+                                target.unlink()
+                        shutil.move(str(item), str(target))
+                    shutil.rmtree(temp_root, ignore_errors=True)
+                else:
+                    temp_root.replace(new_root)
+                    temp_root = None
                 self.ui(lambda path=str(new_root): self.data_var.set(path))
                 self.app_config_store.save_settings({"ldplayer_path": values["ldplayer_path"], "data_path": str(new_root)})
-                DataStore(new_root).save_settings({"training_seconds": values["training_seconds"], "sleep_seconds": values["sleep_seconds"], "still_seconds": values["still_seconds"]})
                 self.store = DataStore(new_root)
                 self.experience_pool = ExperiencePool(self.settings, self.store.load_experience(self.settings.experience_load_limit))
                 self.brain = ActionBrain(self.experience_pool, self.settings)
@@ -1840,6 +1949,9 @@ class ControlPanel(tk.Tk):
             self.log_exception("migration", exc, {"old_path": str(old_path), "new_path": str(new_path)})
             self.ui(lambda e=str(exc): messagebox.showerror("迁移失败", e))
             self.finish_run(token, "数据迁移失败", self.progress_value, release=False, reason="migration_error")
+        finally:
+            if temp_root:
+                shutil.rmtree(temp_root, ignore_errors=True)
 
     def bind_mousewheel(self, _event):
         self.bind_all("<MouseWheel>", self.on_mousewheel)
@@ -1913,8 +2025,7 @@ class ControlPanel(tk.Tk):
     def apply_runtime_settings(self, settings):
         self.settings = settings
         if self.experience_pool:
-            self.experience_pool.settings = settings
-            self.experience_pool.profile.settings = settings
+            self.experience_pool.apply_settings(settings)
         if self.brain:
             self.brain.settings = settings
         if self.window_manager:
@@ -2182,7 +2293,7 @@ class ControlPanel(tk.Tk):
         after_novelty = self.experience_pool.novelty(after_snapshot.hash_value)[0] if after_snapshot else before_novelty
         transition_reward = round(after_novelty - before_novelty, 2)
         novelty_reward, human_delta, base_reward = reward_parts(after_novelty, human_score if normalized else 50.0, self.settings)
-        reward = round(base_reward + (transition_reward if normalized else 0.0), 2)
+        reward = base_reward
         human_action_reward = max(0.0, human_delta)
         human_action_penalty = max(0.0, -human_delta)
         if failed_action:
