@@ -7,6 +7,7 @@ import random
 import subprocess
 import sys
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -93,7 +94,7 @@ DEFAULT_DATA_PATH = r"C:\Users\Administrator\Desktop\AAA"
 DEFAULT_TRAINING_SECONDS = 900
 DEFAULT_SLEEP_SECONDS = 1800
 DEFAULT_STILL_SECONDS = 10
-MODE_NAMES = {"idle": "空闲", "starting": "准备中", "learning": "学习模式", "training": "训练模式", "sleep": "睡眠模式"}
+MODE_NAMES = {"idle": "空闲", "starting": "准备中", "learning": "学习模式", "training": "训练模式", "sleep": "睡眠模式", "migration": "数据迁移"}
 
 
 @dataclass(frozen=True)
@@ -190,6 +191,16 @@ class AdaptivePolicy:
         if hardware:
             cpu_load = safe_float(hardware.get("cpu_load", 0.0), 0.0)
         return derive_runtime_settings(base_settings=base_settings, rect=rect, pool_count=pool_count, capture_ms=capture_ms, cpu_load=cpu_load, execution_ms=execution_ms, window_instability=window_instability, recent_success=recent_success, life=life, learning_similarity=similarity, hardware=hardware)
+
+
+@dataclass
+class ModeSession:
+    token: int
+    mode: str
+    started_at: float
+    deadline: float | None
+    stop_event: threading.Event
+    termination_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -689,6 +700,34 @@ class HumanProfile:
             return percentile_score(features.get("scroll_abs", 0.0), samples, self.settings.scroll_score_default)
         return 50.0
 
+class AppConfigStore:
+    def __init__(self):
+        base = Path(os.environ.get("APPDATA") or (Path.home() / ".config"))
+        self.root = base / "AGI"
+        self.settings_file = self.root / "startup.json"
+        self.lock = threading.RLock()
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def load_settings(self):
+        if not self.settings_file.exists():
+            self.save_settings({"ldplayer_path": DEFAULT_LDPLAYER_PATH, "data_path": DEFAULT_DATA_PATH})
+        try:
+            with self.settings_file.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def save_settings(self, settings):
+        payload = {"ldplayer_path": str(settings.get("ldplayer_path") or DEFAULT_LDPLAYER_PATH), "data_path": str(settings.get("data_path") or DEFAULT_DATA_PATH)}
+        with self.lock:
+            self.root.mkdir(parents=True, exist_ok=True)
+            temporary = self.settings_file.with_suffix(".tmp")
+            with temporary.open("w", encoding="utf-8") as file:
+                json.dump(payload, file, ensure_ascii=False, indent=2)
+            temporary.replace(self.settings_file)
+
+
 class DataStore:
     def __init__(self, root):
         self.root = Path(root)
@@ -947,9 +986,18 @@ class WindowManager:
             screen_h = max(1, safe_int(win32api.GetSystemMetrics(1), 1))
             if left < 0 or top < 0 or right > screen_w or bottom > screen_h:
                 return False
-            center = (int((left + right) / 2), int((top + bottom) / 2))
-            hit = win32gui.WindowFromPoint(center)
-            return bool(hit == hwnd or win32gui.IsChild(hwnd, hit))
+            width, height = rect_size(rect)
+            inset_x = max(1, min(width // 20, 12))
+            inset_y = max(1, min(height // 20, 12))
+            mid_x = int((left + right) / 2)
+            mid_y = int((top + bottom) / 2)
+            points = ((mid_x, mid_y), (left + inset_x, top + inset_y), (right - inset_x - 1, top + inset_y), (left + inset_x, bottom - inset_y - 1), (right - inset_x - 1, bottom - inset_y - 1), (mid_x, top + inset_y), (mid_x, bottom - inset_y - 1), (left + inset_x, mid_y), (right - inset_x - 1, mid_y))
+            hits = 0
+            for point in points:
+                hit = win32gui.WindowFromPoint(point)
+                if hit == hwnd or win32gui.IsChild(hwnd, hit):
+                    hits += 1
+            return hits == len(points)
         except Exception:
             return False
 
@@ -1035,11 +1083,13 @@ class ExperiencePool:
             if record.get("mouse_action"):
                 self.action_cache.append(record)
                 reward = safe_float(record.get("reward", 0.0), 0.0)
-                self.global_action_heap.append((-reward, index))
-                if len(self.global_action_heap) > 2048:
-                    self.global_action_heap.sort(key=lambda item: item[0])
-                    self.global_action_heap = self.global_action_heap[:2048]
-            self.nearest_cache.clear()
+                item = (reward, index)
+                if len(self.global_action_heap) < 2048:
+                    heapq.heappush(self.global_action_heap, item)
+                elif reward > self.global_action_heap[0][0]:
+                    heapq.heapreplace(self.global_action_heap, item)
+            if len(self.nearest_cache) > 512:
+                self.nearest_cache.pop(next(iter(self.nearest_cache)))
 
     def count(self):
         with self.lock:
@@ -1117,7 +1167,7 @@ class ExperiencePool:
 
     def best_global_action(self):
         with self.lock:
-            ranked = sorted(self.global_action_heap[:96], key=lambda item: item[0])
+            ranked = heapq.nlargest(96, self.global_action_heap, key=lambda item: item[0])
             weighted = []
             for _, index in ranked:
                 if index < 0 or index >= len(self.records):
@@ -1519,6 +1569,8 @@ class ControlPanel(tk.Tk):
         self.mode = "idle"
         self.run_token = 0
         self.stop_event = threading.Event()
+        self.active_session = ModeSession(0, "idle", time.perf_counter(), None, self.stop_event)
+        self.termination_reason = None
         self.mode_thread = None
         self.window_manager = None
         self.store = None
@@ -1554,7 +1606,7 @@ class ControlPanel(tk.Tk):
         self.metric_items = []
         self.hint_label = None
         self.metrics_frame = None
-        self.data_store_for_settings = DataStore(Path(DEFAULT_DATA_PATH))
+        self.app_config_store = AppConfigStore()
         self.build_ui()
         self.load_persistent_settings()
         self.bind("<Configure>", self.on_window_resize)
@@ -1691,13 +1743,20 @@ class ControlPanel(tk.Tk):
     def ui(self, func):
         try:
             self.after(0, func)
-        except Exception:
-            pass
+        except Exception as exc:
+            self.log_exception("ui.dispatch", exc)
 
     def log_exception(self, where, error, context=None):
+        logged = False
         if self.store:
             try:
                 self.store.log_error(where, error, context)
+                logged = True
+            except Exception:
+                logged = False
+        if not logged:
+            try:
+                sys.stderr.write(json.dumps({"time": now_text(), "where": str(where), "error": str(error), "context": context}, ensure_ascii=False) + "\n")
             except Exception:
                 pass
 
@@ -1718,9 +1777,69 @@ class ControlPanel(tk.Tk):
 
     def choose_data(self):
         path = filedialog.askdirectory(title="选择数据存储目录")
-        if path:
-            self.data_var.set(path)
+        if not path:
+            return
+        old_path = Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)
+        new_path = Path(path)
+        if old_path == new_path:
+            self.data_var.set(str(new_path))
             self.save_persistent_settings()
+            return
+        token, stop_event = self.begin_run("migration")
+        if not token:
+            self.status_var.set("请先终止当前模式，或等待当前模式结束")
+            return
+        self.status_var.set("正在迁移数据")
+        self.update_progress(0.0)
+        values = {"ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH, "training_seconds": max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS)), "sleep_seconds": max(1, safe_int(self.sleep_seconds_var.get(), DEFAULT_SLEEP_SECONDS)), "still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS))}
+        self.mode_thread = threading.Thread(target=self.migration_loop, args=(token, old_path, new_path, stop_event, values), daemon=True)
+        self.mode_thread.start()
+
+    def migration_items(self, old_path):
+        root = Path(old_path)
+        items = []
+        for name in ("screens", "experience.jsonl", "state.json", "settings.json", "errors.jsonl"):
+            source = root / name
+            if source.exists():
+                items.append((name, source))
+        return items
+
+    def migration_loop(self, token, old_path, new_path, stop_event, values):
+        reason = "数据迁移完成"
+        try:
+            old_root = Path(old_path)
+            new_root = Path(new_path)
+            new_root.mkdir(parents=True, exist_ok=True)
+            items = self.migration_items(old_root)
+            total = max(1, len(items))
+            if not items:
+                DataStore(new_root).save_settings({"training_seconds": values["training_seconds"], "sleep_seconds": values["sleep_seconds"], "still_seconds": values["still_seconds"]})
+            for index, (name, source) in enumerate(items):
+                if stop_event.is_set() or not self.is_run_active(token, "migration"):
+                    reason = "数据迁移已终止"
+                    break
+                target = new_root / name
+                if source.is_dir():
+                    shutil.copytree(source, target, dirs_exist_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target)
+                self.update_progress((index + 1) / total * 100.0)
+            if not stop_event.is_set() and self.is_run_active(token, "migration"):
+                self.ui(lambda path=str(new_root): self.data_var.set(path))
+                self.app_config_store.save_settings({"ldplayer_path": values["ldplayer_path"], "data_path": str(new_root)})
+                DataStore(new_root).save_settings({"training_seconds": values["training_seconds"], "sleep_seconds": values["sleep_seconds"], "still_seconds": values["still_seconds"]})
+                self.store = DataStore(new_root)
+                self.experience_pool = ExperiencePool(self.settings, self.store.load_experience(self.settings.experience_load_limit))
+                self.brain = ActionBrain(self.experience_pool, self.settings)
+                self.update_progress(100.0)
+                self.finish_run(token, reason, 100.0, release=False, reason=reason)
+            elif self.is_run_active(token, "migration"):
+                self.finish_run(token, reason, self.progress_value, release=False, reason=reason)
+        except Exception as exc:
+            self.log_exception("migration", exc, {"old_path": str(old_path), "new_path": str(new_path)})
+            self.ui(lambda e=str(exc): messagebox.showerror("迁移失败", e))
+            self.finish_run(token, "数据迁移失败", self.progress_value, release=False, reason="migration_error")
 
     def bind_mousewheel(self, _event):
         self.bind_all("<MouseWheel>", self.on_mousewheel)
@@ -1733,22 +1852,20 @@ class ControlPanel(tk.Tk):
             self.scroll_canvas.yview_scroll(int(-event.delta / 120), "units")
 
     def load_persistent_settings(self):
-        settings = self.data_store_for_settings.load_settings()
-        self.ldplayer_var.set(str(settings.get("ldplayer_path", self.ldplayer_var.get())))
-        self.data_var.set(str(settings.get("data_path", self.data_var.get())))
-        self.training_seconds_var.set(str(max(1, safe_int(settings.get("training_seconds", self.training_seconds_var.get()), DEFAULT_TRAINING_SECONDS))))
-        self.sleep_seconds_var.set(str(max(1, safe_int(settings.get("sleep_seconds", self.sleep_seconds_var.get()), DEFAULT_SLEEP_SECONDS))))
-        self.still_seconds_var.set(str(max(0.1, safe_float(settings.get("still_seconds", self.still_seconds_var.get()), DEFAULT_STILL_SECONDS))))
+        startup = self.app_config_store.load_settings()
+        self.ldplayer_var.set(str(startup.get("ldplayer_path", self.ldplayer_var.get())))
+        self.data_var.set(str(startup.get("data_path", self.data_var.get())))
+        data_settings = DataStore(Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)).load_settings()
+        if not data_settings:
+            DataStore(Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)).save_settings({"training_seconds": DEFAULT_TRAINING_SECONDS, "sleep_seconds": DEFAULT_SLEEP_SECONDS, "still_seconds": DEFAULT_STILL_SECONDS})
+        self.training_seconds_var.set(str(max(1, safe_int(data_settings.get("training_seconds", self.training_seconds_var.get()), DEFAULT_TRAINING_SECONDS))))
+        self.sleep_seconds_var.set(str(max(1, safe_int(data_settings.get("sleep_seconds", self.sleep_seconds_var.get()), DEFAULT_SLEEP_SECONDS))))
+        self.still_seconds_var.set(str(max(0.1, safe_float(data_settings.get("still_seconds", self.still_seconds_var.get()), DEFAULT_STILL_SECONDS))))
 
     def save_persistent_settings(self):
-        payload = {
-            "ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH,
-            "data_path": self.data_var.get().strip() or DEFAULT_DATA_PATH,
-            "training_seconds": max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS)),
-            "sleep_seconds": max(1, safe_int(self.sleep_seconds_var.get(), DEFAULT_SLEEP_SECONDS)),
-            "still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS))
-        }
-        self.data_store_for_settings.save_settings(payload)
+        data_path = Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)
+        self.app_config_store.save_settings({"ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH, "data_path": str(data_path)})
+        DataStore(data_path).save_settings({"training_seconds": max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS)), "sleep_seconds": max(1, safe_int(self.sleep_seconds_var.get(), DEFAULT_SLEEP_SECONDS)), "still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS))})
 
     def screen_rect(self):
         width = safe_int(getattr(win32api, "GetSystemMetrics", lambda _: self.winfo_screenwidth())(0), self.winfo_screenwidth())
@@ -1814,36 +1931,47 @@ class ControlPanel(tk.Tk):
     def set_mode_ui(self, mode):
         self.ui(lambda m=mode: self.mode_var.set(MODE_NAMES.get(m, m)))
 
+    def transition(self, expected, target, reason=None, token=None, deadline=None):
+        with self.state_lock:
+            if token is not None and token != self.run_token:
+                return None
+            if expected is not None and self.mode != expected:
+                return None
+            if target == "idle":
+                if self.active_session:
+                    self.active_session.termination_reason = reason
+                self.termination_reason = reason
+                self.mode = "idle"
+                self.active_session = ModeSession(self.run_token, "idle", time.perf_counter(), None, self.stop_event, reason)
+                session = self.active_session
+            else:
+                self.run_token += 1 if token is None else 0
+                session_token = self.run_token if token is None else token
+                stop_event = self.stop_event if token is not None else threading.Event()
+                self.stop_event = stop_event
+                self.mode = target
+                session = ModeSession(session_token, target, time.perf_counter(), deadline, stop_event, reason)
+                self.active_session = session
+        self.set_mode_ui(target)
+        return session
+
     def is_run_active(self, token, mode=None):
         with self.state_lock:
             return token == self.run_token and (mode is None or self.mode == mode)
 
-    def begin_run(self, mode):
-        with self.state_lock:
-            if self.mode != "idle":
-                return None, None
-            self.run_token += 1
-            token = self.run_token
-            self.stop_event = threading.Event()
-            self.mode = mode
-            stop_event = self.stop_event
-        self.set_mode_ui(mode)
-        return token, stop_event
+    def begin_run(self, mode, deadline=None):
+        session = self.transition("idle", mode, token=None, deadline=deadline)
+        if not session:
+            return None, None
+        return session.token, session.stop_event
 
     def activate_run(self, token, mode):
-        with self.state_lock:
-            if token != self.run_token:
-                return False
-            self.mode = mode
-        self.set_mode_ui(mode)
-        return True
+        session = self.transition(None, mode, token=token)
+        return bool(session)
 
-    def finish_run(self, token, status, progress=0.0, release=True):
-        with self.state_lock:
-            if token != self.run_token:
-                return False
-            self.mode = "idle"
-        self.set_mode_ui("idle")
+    def finish_run(self, token, status, progress=0.0, release=True, reason=None):
+        if not self.transition(None, "idle", reason=reason or status, token=token):
+            return False
         self.update_progress(progress)
         self.ui(lambda s=status: self.status_var.set(s))
         if release:
@@ -1933,13 +2061,15 @@ class ControlPanel(tk.Tk):
     def stop_current_mode(self):
         with self.state_lock:
             mode = self.mode
-            if mode not in ["starting", "learning", "training", "sleep"]:
+            if mode not in ["starting", "learning", "training", "sleep", "migration"]:
                 self.ui(lambda: self.status_var.set("当前没有正在运行的模式"))
                 return
             self.stop_event.set()
             self.run_token += 1
             progress_now = self.progress_value
             self.mode = "idle"
+            self.termination_reason = "user_stop"
+            self.active_session = ModeSession(self.run_token, "idle", time.perf_counter(), None, self.stop_event, "user_stop")
         self.set_mode_ui("idle")
         self.update_progress(0.0 if mode == "sleep" else progress_now)
         self.ui(lambda: self.status_var.set("当前模式已终止"))
@@ -2015,21 +2145,34 @@ class ControlPanel(tk.Tk):
                 self.ai_var.set(f"{decision.get('reason', 'AI')} {confidence}%")
         self.ui(apply)
 
-    def capture_snapshot(self, analyzer, mode, session_id, session_start, rect=None, persist=True):
+    def capture_snapshot_image(self, analyzer, mode, session_start, rect=None):
         if not self.store:
-            return None
+            return None, None
         rect = rect or self.current_rect()
         if not rect:
-            return None
+            return None, None
         perf_time = time.perf_counter()
-        image = analyzer.capture(rect)
-        hash_value = analyzer.fingerprint(image)
-        path = self.store.new_screen_path(mode)
-        if persist:
-            analyzer.save_image(image, path)
-        return ScreenSnapshot(path=path, relative_path=self.store.relative_path(path), hash_value=hash_value, captured_at=now_text(), perf_time=perf_time, elapsed=round(perf_time - session_start, 3), rect=tuple(rect))
+        try:
+            image = analyzer.capture(rect)
+            hash_value = analyzer.fingerprint(image)
+            path = self.store.new_screen_path(mode)
+            snapshot = ScreenSnapshot(path=path, relative_path=self.store.relative_path(path), hash_value=hash_value, captured_at=now_text(), perf_time=perf_time, elapsed=round(perf_time - session_start, 3), rect=tuple(rect))
+            return snapshot, image
+        except Exception as exc:
+            self.log_exception("capture_snapshot", exc, {"mode": mode, "rect": list(rect)})
+            return None, None
 
-    def write_record(self, mode, session_id, snapshot, action, event_name, decision=None, action_anchor_perf=None, after_snapshot=None, planned_action=None, failed_action=False, window_rect_changed=False, capture_latency_ms=None, execution_latency_ms=None):
+    def capture_snapshot(self, analyzer, mode, session_id, session_start, rect=None, persist=True):
+        snapshot, image = self.capture_snapshot_image(analyzer, mode, session_start, rect)
+        if snapshot and persist:
+            try:
+                analyzer.save_image(image, snapshot.path)
+            except Exception as exc:
+                self.log_exception("capture_snapshot.save", exc, {"path": str(snapshot.path)})
+                return None
+        return snapshot
+
+    def write_record(self, mode, session_id, snapshot, action, event_name, decision=None, action_anchor_perf=None, after_snapshot=None, planned_action=None, failed_action=False, window_rect_changed=False, capture_latency_ms=None, execution_latency_ms=None, execution_error=None):
         if not self.store or not snapshot:
             return None
         before_novelty, batch = self.experience_pool.novelty(snapshot.hash_value)
@@ -2042,12 +2185,14 @@ class ControlPanel(tk.Tk):
         reward = round(base_reward + (transition_reward if normalized else 0.0), 2)
         human_action_reward = max(0.0, human_delta)
         human_action_penalty = max(0.0, -human_delta)
+        if failed_action:
+            reward = round(-abs(max(1.0, human_action_penalty, 100.0 - human_score)), 2)
         life = self.store.add_life_experience(reward)
         started_perf = safe_float(normalized.get("started_perf"), None) if normalized else None
         offset_source = started_perf if started_perf is not None else action_anchor_perf
         offset_ms = round((float(offset_source) - snapshot.perf_time) * 1000.0, 3) if offset_source is not None else None
         sims = [round(item["similarity"], 4) for item in batch]
-        record = {"record_schema_version": 2, "id": uuid.uuid4().hex, "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": normalized, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": after_novelty, "before_screen": snapshot.relative_path if normalized else None, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "life_experience_delta": max(0.0, reward), "penalty_delta": max(0.0, -reward), "life_experience": life, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "capture_latency_ms": capture_latency_ms, "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_tick": self.settings.training_tick, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
+        record = {"record_schema_version": 2, "id": uuid.uuid4().hex, "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": after_novelty, "before_screen": snapshot.relative_path if normalized else None, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "life_experience_delta": max(0.0, reward), "penalty_delta": max(0.0, -reward), "life_experience": life, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "capture_latency_ms": capture_latency_ms, "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_tick": self.settings.training_tick, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
         if decision:
             record["ai_decision"] = decision
         self.store.append_experience(record)
@@ -2060,20 +2205,20 @@ class ControlPanel(tk.Tk):
         interval = 1.0 / max(0.5, self.settings.learning_screen_fps)
         if now_perf - self.last_learning_tick_perf < interval:
             return
-        snapshot = self.capture_snapshot(analyzer, "learning", session_id, start)
+        snapshot, image = self.capture_snapshot_image(analyzer, "learning", start)
         if not snapshot:
             return
         if self.last_learning_tick_hash:
             similarity = hash_similarity(snapshot.hash_value, self.last_learning_tick_hash)
             self.adaptive_policy.observe_capture(0.0, similarity=similarity, window_rect_changed=False)
             if similarity >= self.settings.learning_screen_similarity_threshold:
-                try:
-                    if snapshot.path.exists():
-                        snapshot.path.unlink()
-                except Exception:
-                    pass
                 self.last_learning_tick_perf = now_perf
                 return
+        try:
+            analyzer.save_image(image, snapshot.path)
+        except Exception as exc:
+            self.log_exception("learning_screen_tick.save", exc, {"path": str(snapshot.path)})
+            return
         self.last_learning_tick_perf = now_perf
         self.last_learning_tick_hash = snapshot.hash_value
         self.write_record("learning", session_id, snapshot, None, "screen_tick")
@@ -2168,6 +2313,7 @@ class ControlPanel(tk.Tk):
                     action["end_rel"] = action.get("start_rel", [0.5, 0.5])
                 latest_rect = self.current_rect()
                 if not latest_rect or latest_rect != rect:
+                    self.write_record("training", session_id, snapshot, None, "ai_mouse_failed", decision=decision, planned_action=action, failed_action=True, window_rect_changed=True, execution_error="window_rect_changed")
                     consecutive_failures += 1
                     self.adaptive_policy.observe_execution(success=False)
                     if consecutive_failures >= self.settings.training_fail_stop_count:
@@ -2177,6 +2323,7 @@ class ControlPanel(tk.Tk):
                 actual = self.executor.execute(action, rect, stop_event, self.should_stop_by_escape)
                 if not actual:
                     self.log_exception("training.execute", RuntimeError("empty_action_result"))
+                    self.write_record("training", session_id, snapshot, None, "ai_mouse_failed", decision=decision, planned_action=action, failed_action=True, execution_error="empty_action_result")
                     consecutive_failures += 1
                     self.adaptive_policy.observe_execution(success=False)
                     if consecutive_failures >= self.settings.training_fail_stop_count:
@@ -2184,6 +2331,7 @@ class ControlPanel(tk.Tk):
                     continue
                 if actual.get("execution_error"):
                     self.log_exception("training.execute", RuntimeError(actual.get("execution_error")), {"detail": actual, "decision": decision})
+                    self.write_record("training", session_id, snapshot, None, "ai_mouse_failed", decision=decision, planned_action=action, failed_action=True, execution_error=actual.get("execution_error"))
                     consecutive_failures += 1
                     self.adaptive_policy.observe_execution(success=False)
                     if consecutive_failures >= self.settings.training_fail_stop_count:
