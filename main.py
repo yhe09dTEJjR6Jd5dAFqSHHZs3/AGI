@@ -2086,7 +2086,12 @@ class EscapeMonitor:
             return False
         try:
             if win32api.GetAsyncKeyState(0x1B) & 0x8000:
-                return self.trigger()
+                current = time.perf_counter()
+                with self.lock:
+                    if current - self.last_key_time < self.debounce_seconds:
+                        return False
+                    self.last_key_time = current
+                return True
         except Exception:
             return False
         return False
@@ -2294,9 +2299,10 @@ class TrainingService:
         elapsed = time.perf_counter() - start
         if elapsed >= config.training_seconds:
             return True
-        if not panel.window_manager.window_ok():
+        check = panel.window_manager.check_window(force=True)
+        if not check.ok:
             stop_event.set()
-            panel.ui(lambda: panel.status_var.set("训练模式结束：雷电模拟器窗口异常"))
+            panel.ui(lambda r=check.reason: panel.status_var.set(f"训练模式结束：雷电模拟器窗口异常：{r}"))
             return True
         panel.update_progress(clamp((config.training_seconds - elapsed) / config.training_seconds * 100.0, 0.0, 100.0))
         panel.ui(lambda: panel.progress_label_var.set("模式进度"))
@@ -2310,18 +2316,18 @@ class TrainingService:
         if not latest_rect or latest_rect != rect:
             panel.write_record("training", session_id, snapshot, None, "ai_mouse_failed", decision=decision, planned_action=action, failed_action=True, window_rect_changed=True, execution_error="window_rect_changed")
             panel.adaptive_policy.observe_execution(success=False)
-            return False, None
+            return False, {"failure_reason": "window_rect_changed"}
         actual = panel.executor.execute(action, rect, stop_event, panel.should_stop_by_escape)
         if not actual:
             panel.log_exception("training.execute", RuntimeError("empty_action_result"))
             panel.write_record("training", session_id, snapshot, None, "ai_mouse_failed", decision=decision, planned_action=action, failed_action=True, execution_error="empty_action_result")
             panel.adaptive_policy.observe_execution(success=False)
-            return False, None
+            return False, {"failure_reason": "empty_action_result"}
         if actual.get("execution_error"):
             panel.log_exception("training.execute", RuntimeError(actual.get("execution_error")), {"detail": actual, "decision": decision})
             panel.write_record("training", session_id, snapshot, None, "ai_mouse_failed", decision=decision, planned_action=action, failed_action=True, execution_error=actual.get("execution_error"))
             panel.adaptive_policy.observe_execution(success=False)
-            return False, None
+            return False, {"failure_reason": actual.get("execution_error") or "execution_error"}
         latency_ms = safe_float(actual.get("duration", 0.0), 0.0) * 1000.0
         panel.adaptive_policy.observe_execution(latency_ms=latency_ms, success=True)
         after_snapshot = panel.capture_snapshot(analyzer, "training", session_id, start, rect=rect, priority="critical")
@@ -2537,6 +2543,33 @@ class ControlPanel(tk.Tk):
             self.after(0, func)
         except Exception as exc:
             self.log_exception("ui.dispatch", exc)
+
+    def ui_sync(self, func, timeout=None):
+        if threading.current_thread() is threading.main_thread():
+            try:
+                return func()
+            except Exception as exc:
+                self.log_exception("ui.sync", exc)
+                return None
+        done = threading.Event()
+        result = {}
+        def apply():
+            try:
+                result["value"] = func()
+            except Exception as exc:
+                result["error"] = exc
+            finally:
+                done.set()
+        try:
+            self.after(0, apply)
+        except Exception as exc:
+            self.log_exception("ui.sync.dispatch", exc)
+            return None
+        wait_seconds = timeout if timeout is not None else max(self.settings.window_poll_seconds, self.settings.key_debounce_seconds)
+        done.wait(wait_seconds)
+        if "error" in result:
+            self.log_exception("ui.sync", result["error"])
+        return result.get("value")
 
     def log_exception(self, where, error, context=None):
         logged = False
@@ -2973,7 +3006,14 @@ class ControlPanel(tk.Tk):
             if stop_event.is_set() or not self.is_run_active(token):
                 self.finish_run(token, "当前模式已终止", 0.0)
                 return
-            self.ui(self.iconify)
+            self.ui_sync(self.iconify, config.settings.window_attach_seconds)
+            self.ui_sync(self.update_idletasks, config.settings.window_poll_seconds)
+            self.window_manager.foreground()
+            time.sleep(config.settings.window_poll_seconds)
+            check = self.window_manager.check_window(force=True)
+            if not check.ok:
+                self.finish_run(token, f"雷电模拟器窗口异常：{check.reason}", 0.0, reason=f"window_{check.reason}")
+                return
             if not self.activate_run(token, mode):
                 return
             if mode == "learning":
@@ -3188,9 +3228,10 @@ class ControlPanel(tk.Tk):
                     stop_event.set()
                     break
                 now_perf = time.perf_counter()
-                if not self.window_manager.window_ok():
+                check = self.window_manager.check_window(force=True)
+                if not check.ok:
                     stop_event.set()
-                    self.ui(lambda: self.status_var.set("学习模式结束：雷电模拟器窗口异常"))
+                    self.ui(lambda r=check.reason: self.status_var.set(f"学习模式结束：雷电模拟器窗口异常：{r}"))
                     break
                 self.maybe_learning_screen_tick(analyzer, session_id, start, now_perf, config)
                 idle_seconds = self.learning_idle_seconds()
@@ -3225,6 +3266,7 @@ class ControlPanel(tk.Tk):
         session_id = uuid.uuid4().hex
         start = time.perf_counter()
         consecutive_failures = 0
+        last_training_error = None
         service = self.training_service
         with ScreenAnalyzer(config.settings.hash_size) as analyzer:
             self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start, priority="critical"), None, "mode_start")
@@ -3248,9 +3290,11 @@ class ControlPanel(tk.Tk):
                 success, record = service.execute_and_record(analyzer, session_id, start, rect, snapshot, action, decision, stop_event)
                 if not success:
                     consecutive_failures += 1
+                    last_training_error = record.get("failure_reason") if isinstance(record, dict) else None
+                    last_training_error = last_training_error or (decision.get("reason") if decision else "unknown")
                     if consecutive_failures >= self.settings.training_fail_stop_count:
                         stop_event.set()
-                        self.ui(lambda: self.status_var.set("训练模式结束：连续执行失败"))
+                        self.ui(lambda e=last_training_error: self.status_var.set(f"训练模式结束：连续执行失败：{e}"))
                     continue
                 consecutive_failures = 0
                 delay = safe_float(record["mouse_action"].get("duration", 0.0), 0.0) if record and record.get("mouse_action") else 0.0
