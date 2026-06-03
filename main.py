@@ -195,15 +195,15 @@ RUNTIME_NUMBER_RULES = {
     "nearest_top_k": ("pool_count", "cpu_count", "life_experience"),
     "nearest_candidate_limit": ("pool_count", "window_instability", "cpu_count", "gpu_count"),
     "hash_prefix_bits": ("pool_count", "screen_pixels"),
-    "mouse_still_tick": ("capture_ms", "cpu_load"),
-    "training_tick": ("capture_ms", "execution_ms", "cpu_load", "gpu_factor", "window_instability"),
-    "sleep_tick": ("cpu_load", "cpu_count", "memory_free_ratio"),
+    "mouse_activity_wait": ("capture_ms", "cpu_load"),
+    "training_event_wait": ("capture_ms", "execution_ms", "cpu_load", "gpu_factor", "window_instability"),
+    "sleep_event_wait": ("cpu_load", "cpu_count", "memory_free_ratio"),
     "sleep_worker_count": ("cpu_count", "gpu_count", "memory_free_ratio", "cpu_load"),
     "sleep_batch_size": ("pool_count", "cpu_count", "memory_free_ratio", "life_experience"),
     "sleep_queue_depth": ("cpu_count", "gpu_count", "memory_free_ratio"),
     "key_debounce_seconds": ("cpu_load", "capture_ms"),
     "window_attach_seconds": ("cpu_load", "window_instability"),
-    "window_poll_seconds": ("cpu_load", "gpu_factor", "window_instability"),
+    "window_event_wait": ("cpu_load", "gpu_factor", "window_instability"),
     "explore_max_rate": ("recent_success", "learning_similarity", "window_instability"),
     "explore_min_rate": ("recent_success", "learning_similarity", "pool_count"),
     "action_jitter": ("recent_success", "window_instability", "screen_pixels"),
@@ -237,12 +237,12 @@ RUNTIME_NUMBER_RULES = {
     "motion_first_control_max": ("window_instability", "recent_success"),
     "motion_second_control_min": ("window_instability", "recent_success"),
     "motion_second_control_max": ("window_instability", "recent_success"),
-    "learning_screen_fps": ("capture_ms", "cpu_count", "gpu_count"),
+    "learning_screen_change_capacity": ("capture_ms", "cpu_count", "gpu_count"),
     "learning_screen_similarity_threshold": ("pool_count", "learning_similarity"),
     "training_fail_stop_count": ("recent_success", "window_instability"),
-    "ui_refresh_interval": ("capture_ms", "cpu_load", "gpu_factor"),
+    "ui_event_coalesce_seconds": ("capture_ms", "cpu_load", "gpu_factor"),
     "ui_progress_delta": ("window_instability", "cpu_load"),
-    "persistence_poll_seconds": ("capture_ms", "persistence_latency", "cpu_load"),
+    "persistence_event_wait": ("capture_ms", "persistence_latency", "cpu_load"),
     "persistence_close_seconds": ("execution_ms", "capture_ms", "cpu_load"),
     "async_queue_size": ("cpu_count", "gpu_count", "pool_count"),
     "global_action_heap_limit": ("pool_count", "cpu_count"),
@@ -271,15 +271,15 @@ class Settings:
     nearest_top_k: int = 0
     nearest_candidate_limit: int = 0
     hash_prefix_bits: int = 0
-    mouse_still_tick: float = 0.0
-    training_tick: float = 0.0
-    sleep_tick: float = 0.0
+    mouse_activity_wait: float = 0.0
+    training_event_wait: float = 0.0
+    sleep_event_wait: float = 0.0
     sleep_worker_count: int = 0
     sleep_batch_size: int = 0
     sleep_queue_depth: int = 0
     key_debounce_seconds: float = 0.0
     window_attach_seconds: float = 0.0
-    window_poll_seconds: float = 0.0
+    window_event_wait: float = 0.0
     min_action_delay_seconds: float = 0.0
     random_action_min: float = 0.0
     random_action_max: float = 0.0
@@ -316,8 +316,8 @@ class Settings:
     action_duration_min: float = 0.0
     action_duration_max: float = 0.0
     generated_click_hold_max: float = 0.0
-    generated_sleep_tick: float = 0.0
-    generated_wait_tick: float = 0.0
+    generated_sleep_event_wait: float = 0.0
+    generated_action_complete_wait: float = 0.0
     motion_steps_per_second: float = 0.0
     motion_curve_offset_min: float = 0.0
     motion_curve_offset_max: float = 0.0
@@ -325,12 +325,12 @@ class Settings:
     motion_first_control_max: float = 0.0
     motion_second_control_min: float = 0.0
     motion_second_control_max: float = 0.0
-    learning_screen_fps: float = 0.0
+    learning_screen_change_capacity: float = 0.0
     learning_screen_similarity_threshold: float = 0.0
     training_fail_stop_count: int = 0
-    ui_refresh_interval: float = 0.0
+    ui_event_coalesce_seconds: float = 0.0
     ui_progress_delta: float = 0.0
-    persistence_poll_seconds: float = 0.0
+    persistence_event_wait: float = 0.0
     persistence_close_seconds: float = 0.0
     async_queue_size: int = 0
     global_action_heap_limit: int = 0
@@ -438,7 +438,7 @@ def run_self_test():
     factory = RuntimeNumberFactory(read_hardware_state(), (1280, 720), 8, 24.0, 140.0, 24.0, 1.0, 0.0, 0.97, 0.0)
     assert factory.count("training_fail_stop_count", 1, 99) >= 1
     assert "training_fail_stop_count" in factory.audit
-    assert RUNTIME_NUMBER_RULES["training_tick"]
+    assert RUNTIME_NUMBER_RULES["training_event_wait"]
     for item in fields(Settings):
         value = getattr(settings, item.name)
         if isinstance(value, (int, float)):
@@ -495,7 +495,7 @@ def run_self_test():
         loaded = store.load_experience()
         assert len(loaded) == 1 and loaded[0]["id"] == "ok"
         assert (store.root / "experience.bad.jsonl").exists()
-    tiny = replace(settings, async_queue_size=1, persistence_poll_seconds=settings.sleep_tick, persistence_close_seconds=settings.sleep_tick)
+    tiny = replace(settings, async_queue_size=1, persistence_event_wait=settings.sleep_event_wait, persistence_close_seconds=settings.sleep_event_wait)
     persistence = AsyncPersistenceQueue(tiny)
     assert persistence.enqueue({"type": "noop"}, block_when_full=False)
     dropped = persistence.enqueue({"type": "image", "analyzer": None, "image": None, "path": "x"}, block_when_full=False)
@@ -555,15 +555,15 @@ def normalize_settings(settings):
         nearest_top_k=max(1, safe_int(settings.nearest_top_k, 1)),
         nearest_candidate_limit=max(1, safe_int(settings.nearest_candidate_limit, 1)),
         hash_prefix_bits=max(1, safe_int(settings.hash_prefix_bits, 1)),
-        mouse_still_tick=max(0.001, safe_float(settings.mouse_still_tick, 0.001)),
-        training_tick=max(0.001, safe_float(settings.training_tick, 0.001)),
-        sleep_tick=max(0.001, safe_float(settings.sleep_tick, 0.001)),
+        mouse_activity_wait=max(0.001, safe_float(settings.mouse_activity_wait, 0.001)),
+        training_event_wait=max(0.001, safe_float(settings.training_event_wait, 0.001)),
+        sleep_event_wait=max(0.001, safe_float(settings.sleep_event_wait, 0.001)),
         sleep_worker_count=max(1, safe_int(settings.sleep_worker_count, 1)),
         sleep_batch_size=max(1, safe_int(settings.sleep_batch_size, 1)),
         sleep_queue_depth=max(1, safe_int(settings.sleep_queue_depth, 1)),
         key_debounce_seconds=max(0.001, safe_float(settings.key_debounce_seconds, 0.001)),
         window_attach_seconds=max(0.001, safe_float(settings.window_attach_seconds, 0.001)),
-        window_poll_seconds=max(0.001, safe_float(settings.window_poll_seconds, 0.001)),
+        window_event_wait=max(0.001, safe_float(settings.window_event_wait, 0.001)),
         min_action_delay_seconds=max(0.0, safe_float(settings.min_action_delay_seconds, 0.0)),
         random_action_min=random_min,
         random_action_max=random_max,
@@ -600,8 +600,8 @@ def normalize_settings(settings):
         action_duration_min=max(0.0, safe_float(settings.action_duration_min, 0.0)),
         action_duration_max=max(0.0, safe_float(settings.action_duration_max, 0.0)),
         generated_click_hold_max=max(0.0, safe_float(settings.generated_click_hold_max, 0.0)),
-        generated_sleep_tick=max(0.001, safe_float(settings.generated_sleep_tick, 0.001)),
-        generated_wait_tick=max(0.001, safe_float(settings.generated_wait_tick, 0.001)),
+        generated_sleep_event_wait=max(0.001, safe_float(settings.generated_sleep_event_wait, 0.001)),
+        generated_action_complete_wait=max(0.001, safe_float(settings.generated_action_complete_wait, 0.001)),
         motion_steps_per_second=max(0.001, safe_float(settings.motion_steps_per_second, 0.001)),
         motion_curve_offset_min=clamp(settings.motion_curve_offset_min, 0.0, 1.0),
         motion_curve_offset_max=clamp(settings.motion_curve_offset_max, 0.0, 1.0),
@@ -609,12 +609,12 @@ def normalize_settings(settings):
         motion_first_control_max=clamp(settings.motion_first_control_max, 0.0, 1.0),
         motion_second_control_min=clamp(settings.motion_second_control_min, 0.0, 1.0),
         motion_second_control_max=clamp(settings.motion_second_control_max, 0.0, 1.0),
-        learning_screen_fps=max(0.001, safe_float(settings.learning_screen_fps, 0.001)),
+        learning_screen_change_capacity=max(0.001, safe_float(settings.learning_screen_change_capacity, 0.001)),
         learning_screen_similarity_threshold=clamp(settings.learning_screen_similarity_threshold, 0.0, 1.0),
         training_fail_stop_count=max(1, safe_int(settings.training_fail_stop_count, 1)),
-        ui_refresh_interval=max(0.001, safe_float(settings.ui_refresh_interval, 0.001)),
+        ui_event_coalesce_seconds=max(0.001, safe_float(settings.ui_event_coalesce_seconds, 0.001)),
         ui_progress_delta=max(0.001, safe_float(settings.ui_progress_delta, 0.001)),
-        persistence_poll_seconds=max(0.001, safe_float(settings.persistence_poll_seconds, 0.001)),
+        persistence_event_wait=max(0.001, safe_float(settings.persistence_event_wait, 0.001)),
         persistence_close_seconds=max(0.001, safe_float(settings.persistence_close_seconds, 0.001)),
         async_queue_size=max(1, safe_int(settings.async_queue_size, 1)),
         global_action_heap_limit=max(1, safe_int(settings.global_action_heap_limit, 1)),
@@ -687,22 +687,22 @@ class RuntimeNumberFactory:
     def value(self, name):
         explore_base = 0.35 + (1.0 - self.success_rate) * 0.45 + self.learning_similarity * 0.1
         formulas = {
-            "mouse_still_tick": 0.02 * self.capture_factor,
-            "training_tick": 0.03 * self.capture_factor * self.cpu_factor * self.timing_factor * (0.85 + self.window_instability * 0.45) / self.gpu_factor,
-            "sleep_tick": 0.08 * self.cpu_factor / self.core_factor,
+            "mouse_activity_wait": 0.02 * self.capture_factor,
+            "training_event_wait": 0.03 * self.capture_factor * self.cpu_factor * self.timing_factor * (0.85 + self.window_instability * 0.45) / self.gpu_factor,
+            "sleep_event_wait": 0.08 * self.cpu_factor / self.core_factor,
             "sleep_worker_count": self.cpu_count * clamp(self.memory_free_ratio * (1.25 - self.cpu_load / 220.0), 0.35, 1.35) + self.gpu_count,
             "sleep_batch_size": (self.record_factor + self.core_factor + self.memory_free_ratio * 3.0 + math.log2(max(2.0, self.life + 2.0)) * 0.08) * 24.0,
             "sleep_queue_depth": (self.cpu_count + max(1, self.gpu_count) + self.memory_free_ratio * 4.0) * 1.5,
             "key_debounce_seconds": 0.2 * self.cpu_factor,
             "window_attach_seconds": 20.0 + self.cpu_load * 0.6,
-            "window_poll_seconds": 0.2 * self.cpu_factor / self.gpu_factor,
+            "window_event_wait": 0.2 * self.cpu_factor / self.gpu_factor,
             "action_duration_min": (self.capture_ms + self.execution_ms * 0.15) / 1200.0,
             "action_duration_max": (self.capture_ms + self.execution_ms * 0.75) / 320.0,
             "random_click_duration_min": (self.capture_ms + self.execution_ms * 0.08) / 1500.0,
             "random_click_duration_max": (self.capture_ms + self.execution_ms * 0.35) / 700.0,
             "generated_click_hold_max": (self.capture_ms + self.execution_ms * 0.2) / 500.0,
-            "ui_refresh_interval": (self.capture_ms / 1000.0) * self.cpu_factor / self.gpu_factor,
-            "persistence_poll_seconds": (self.capture_ms + self.latency) / 240.0 * self.cpu_factor,
+            "ui_event_coalesce_seconds": (self.capture_ms / 1000.0) * self.cpu_factor / self.gpu_factor,
+            "persistence_event_wait": (self.capture_ms + self.latency) / 240.0 * self.cpu_factor,
             "persistence_close_seconds": (self.execution_ms + self.capture_ms) / 90.0 * self.cpu_factor,
             "explore_max_rate": explore_base,
             "explore_min_rate": explore_base * 0.12,
@@ -748,7 +748,7 @@ class RuntimeNumberFactory:
             "reward_total_min": -10000.0 - self.life,
             "reward_total_max": 10000.0 + self.life,
             "motion_steps_per_second": (42.0 + self.width / 24.0) / max(0.6, self.cpu_factor),
-            "learning_screen_fps": 1.0 / max(0.05, self.capture_ms / 1000.0) * clamp(self.core_factor * self.gpu_factor, 0.8, 2.4)
+            "learning_screen_change_capacity": 1.0 / max(0.05, self.capture_ms / 1000.0) * clamp(self.core_factor * self.gpu_factor, 0.8, 2.4)
         }
         return self.remember(name, formulas[name])
 
@@ -783,15 +783,15 @@ def derive_runtime_settings(base_settings=None, rect=None, pool_count=0, capture
         "nearest_top_k": factory.count("nearest_top_k", 8, 256),
         "nearest_candidate_limit": factory.count("nearest_candidate_limit", 256, 20000),
         "hash_prefix_bits": factory.count("hash_prefix_bits", 4, 20),
-        "mouse_still_tick": round(factory.seconds("mouse_still_tick", 0.01, 0.2), 4),
-        "training_tick": round(factory.seconds("training_tick", 0.01, 0.9), 4),
-        "sleep_tick": round(factory.seconds("sleep_tick", 0.05, 1.0), 4),
+        "mouse_activity_wait": round(factory.seconds("mouse_activity_wait", 0.01, 0.2), 4),
+        "training_event_wait": round(factory.seconds("training_event_wait", 0.01, 0.9), 4),
+        "sleep_event_wait": round(factory.seconds("sleep_event_wait", 0.05, 1.0), 4),
         "sleep_worker_count": factory.count("sleep_worker_count", 1, 64),
         "sleep_batch_size": factory.count("sleep_batch_size", 8, 4096),
         "sleep_queue_depth": factory.count("sleep_queue_depth", 1, 256),
         "key_debounce_seconds": round(factory.seconds("key_debounce_seconds", 0.05, 1.0), 3),
         "window_attach_seconds": round(factory.seconds("window_attach_seconds", 5.0, 120.0), 2),
-        "window_poll_seconds": round(factory.seconds("window_poll_seconds", 0.05, 1.0), 3),
+        "window_event_wait": round(factory.seconds("window_event_wait", 0.05, 1.0), 3),
         "explore_max_rate": factory.ratio("explore_max_rate", 0.2, 0.95),
         "explore_min_rate": factory.ratio("explore_min_rate", 0.01, 0.2),
         "action_jitter": factory.ratio("action_jitter", 0.005, 0.08),
@@ -825,12 +825,12 @@ def derive_runtime_settings(base_settings=None, rect=None, pool_count=0, capture
         "motion_first_control_max": factory.ratio("motion_first_control_max", 0.3, 0.78),
         "motion_second_control_min": factory.ratio("motion_second_control_min", 0.26, 0.7),
         "motion_second_control_max": factory.ratio("motion_second_control_max", 0.7, 0.95),
-        "learning_screen_fps": factory.scalar("learning_screen_fps", 0.5, 20.0),
+        "learning_screen_change_capacity": factory.scalar("learning_screen_change_capacity", 0.5, 20.0),
         "learning_screen_similarity_threshold": factory.ratio("learning_screen_similarity_threshold", 0.9, 0.999),
         "training_fail_stop_count": factory.count("training_fail_stop_count", 2, 24),
-        "ui_refresh_interval": round(factory.seconds("ui_refresh_interval", 0.01, 0.35), 4),
+        "ui_event_coalesce_seconds": round(factory.seconds("ui_event_coalesce_seconds", 0.01, 0.35), 4),
         "ui_progress_delta": factory.ratio("ui_progress_delta", 0.02, 1.0),
-        "persistence_poll_seconds": round(factory.seconds("persistence_poll_seconds", 0.02, 1.0), 4),
+        "persistence_event_wait": round(factory.seconds("persistence_event_wait", 0.02, 1.0), 4),
         "persistence_close_seconds": round(factory.seconds("persistence_close_seconds", 0.2, 8.0), 4),
         "async_queue_size": factory.count("async_queue_size", 32, 8192),
         "global_action_heap_limit": factory.count("global_action_heap_limit", 128, 8192),
@@ -1353,7 +1353,7 @@ class WindowManager:
             while time.time() < deadline:
                 if self.find_window():
                     return True
-                time.sleep(self.settings.window_poll_seconds)
+                threading.Event().wait(self.settings.window_event_wait)
         return self.find_window()
 
     def executable_pids(self):
@@ -1460,11 +1460,11 @@ class WindowManager:
                 return WindowCheck(False, "empty_rect", rect)
             now_perf = time.perf_counter()
             cache = self.window_check_cache
-            if not force and cache.get("rect") == rect and now_perf - cache.get("basic_perf", 0.0) < self.settings.window_poll_seconds:
+            if not force and cache.get("rect") == rect and now_perf - cache.get("basic_perf", 0.0) < self.settings.window_event_wait:
                 return cache.get("check", WindowCheck(bool(cache.get("ok", False)), cache.get("reason", "cached"), rect))
             cache["rect"] = rect
             cache["basic_perf"] = now_perf
-            if force or now_perf - cache.get("visibility_perf", 0.0) >= clamp(self.settings.window_poll_seconds, 0.2, 0.5):
+            if force or now_perf - cache.get("visibility_perf", 0.0) >= clamp(self.settings.window_event_wait, 0.2, 0.5):
                 if not win32gui.IsWindowVisible(hwnd):
                     result = WindowCheck(False, "invisible", rect)
                     cache.update({"ok": result.ok, "reason": result.reason, "check": result})
@@ -1481,7 +1481,7 @@ class WindowManager:
                     cache.update({"ok": result.ok, "reason": result.reason, "check": result})
                     return result
                 cache["visibility_perf"] = now_perf
-            if not force and now_perf - cache.get("occlusion_perf", 0.0) < clamp(self.settings.window_poll_seconds * 2.0, 0.5, 1.0):
+            if not force and now_perf - cache.get("occlusion_perf", 0.0) < clamp(self.settings.window_event_wait * 2.0, 0.5, 1.0):
                 return cache.get("check", WindowCheck(bool(cache.get("ok", True)), cache.get("reason", "cached"), rect))
             left, top, right, bottom = rect
             inset_x = max(1, min(width // 20, 12))
@@ -1528,7 +1528,7 @@ class ScreenAnalyzer:
         save_kwargs = {}
         if str(path).lower().endswith(".png"):
             compression = 1 if priority == "critical" else 3
-            if settings is not None and settings.training_tick > settings.ui_refresh_interval:
+            if settings is not None and settings.training_event_wait > settings.ui_event_coalesce_seconds:
                 compression = 1
             save_kwargs = {"optimize": priority == "critical", "compress_level": int(clamp(compression, 0, 9))}
         image.save(path, **save_kwargs)
@@ -1947,6 +1947,7 @@ class MouseRecorder:
         if not self.active():
             return None
         self.on_activity()
+        self.wake.set()
         rect = self.get_rect()
         if not rect:
             return None
@@ -2020,7 +2021,7 @@ class MouseRecorder:
             return items
 
     def wait(self, timeout):
-        self.wake.wait(timeout)
+        return self.wake.wait(timeout)
 
 
 class HumanMouseExecutor:
@@ -2061,7 +2062,7 @@ class HumanMouseExecutor:
             if stop_event.is_set() or should_stop():
                 stop_event.set()
                 break
-            time.sleep(min(self.settings.generated_sleep_tick, max(0.0, deadline - time.perf_counter())))
+            stop_event.wait(min(self.settings.generated_sleep_event_wait, max(0.0, deadline - time.perf_counter())))
 
     def move_smooth(self, start, end, duration, stop_event, should_stop):
         points = self.smooth_points(start, end, duration)
@@ -2186,7 +2187,7 @@ class EscapeMonitor:
         except Exception:
             pass
 
-    def poll_pressed(self):
+    def esc_event_pending(self):
         if not win32api:
             return False
         try:
@@ -2207,12 +2208,10 @@ class AsyncPersistenceQueue:
         if isinstance(settings_or_maxsize, Settings):
             self.settings = settings_or_maxsize
             maxsize = settings_or_maxsize.async_queue_size
-            self.poll_seconds = settings_or_maxsize.persistence_poll_seconds
             self.close_seconds = settings_or_maxsize.persistence_close_seconds
         else:
             self.settings = derive_runtime_settings()
             maxsize = settings_or_maxsize
-            self.poll_seconds = self.settings.persistence_poll_seconds
             self.close_seconds = self.settings.persistence_close_seconds
         self.jobs = queue.Queue(maxsize=max(1, safe_int(maxsize, self.settings.async_queue_size)))
         self.image_dropped = 0
@@ -2228,6 +2227,8 @@ class AsyncPersistenceQueue:
         return self.enqueue({"type": "record", "store": store, "record": copy.deepcopy(record)}, block_when_full=True)
 
     def enqueue(self, job, block_when_full=False):
+        if self.stop_event.is_set():
+            return False
         try:
             self.jobs.put_nowait(job)
             return True
@@ -2245,12 +2246,11 @@ class AsyncPersistenceQueue:
             return False
 
     def run(self):
-        while not self.stop_event.is_set() or not self.jobs.empty():
+        while True:
+            job = self.jobs.get()
             try:
-                job = self.jobs.get(timeout=self.poll_seconds)
-            except queue.Empty:
-                continue
-            try:
+                if job is None:
+                    return
                 if job.get("type") == "image" and job.get("image") is not None:
                     job["analyzer"].save_image(job["image"], job["path"], priority=job.get("priority", "normal"), settings=self.settings)
                 elif job.get("type") == "record":
@@ -2258,7 +2258,7 @@ class AsyncPersistenceQueue:
                     store.append_experience(job["record"])
                     store.flush_state(min_interval=self.settings.persistence_close_seconds, max_pending=max(1, self.settings.async_queue_size // max(1, self.settings.global_action_heap_limit // self.settings.local_action_heap_limit)))
             except Exception as exc:
-                store = job.get("store")
+                store = job.get("store") if isinstance(job, dict) else None
                 if store:
                     try:
                         store.log_error("async_persistence", exc, {"type": job.get("type")})
@@ -2294,13 +2294,12 @@ class AsyncPersistenceQueue:
 
     def close(self):
         self.stop_event.set()
-        deadline = time.perf_counter() + self.close_seconds
-        while self.jobs.unfinished_tasks and time.perf_counter() < deadline:
-            time.sleep(min(self.poll_seconds, max(0.001, deadline - time.perf_counter())))
-        if self.jobs.unfinished_tasks:
+        self.drop_pending_images()
+        try:
+            self.jobs.put_nowait(None)
+        except queue.Full:
             self.drop_pending_images()
-        while self.jobs.unfinished_tasks and time.perf_counter() < deadline + self.close_seconds:
-            time.sleep(min(self.poll_seconds, max(0.001, deadline + self.close_seconds - time.perf_counter())))
+            self.jobs.put(None)
         self.thread.join(timeout=self.close_seconds)
 
 
@@ -2378,7 +2377,7 @@ class TrainingService:
     def __init__(self, panel):
         self.panel = panel
 
-    def prepare_tick(self, rect):
+    def prepare_for_event(self, rect):
         panel = self.panel
         pool_count = panel.experience_pool.count() if panel.experience_pool else 0
         life_value = panel.store.life if panel.store else 0.0
@@ -2501,8 +2500,8 @@ class ControlPanel(tk.Tk):
         self.pool_var = tk.StringVar(value="0")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_text_var = tk.StringVar(value="0%")
-        self.last_learning_tick_perf = 0.0
-        self.last_learning_tick_hash = None
+        self.last_learning_event_perf = 0.0
+        self.last_learning_event_hash = None
         self.hardware_last_full_refresh_perf = 0.0
         self.hardware_last_light_refresh_perf = 0.0
         self.progress_label_var = tk.StringVar(value="进度")
@@ -2591,7 +2590,7 @@ class ControlPanel(tk.Tk):
             self.metric_items.append(self.create_metric(self.metrics_frame, title, variable))
         self.reflow_metrics()
         ttk.Label(status_frame, text="快捷键", style="CardTitle.TLabel").grid(row=1, column=0, sticky="w", pady=(18, 6), padx=(0, 12))
-        hint = "学习模式期间，全局鼠标静止超时会自动结束。雷电模拟器窗口外的新动作不会记录为学习动作，但会刷新静止倒计时。ESC 终止当前学习、训练或睡眠。截图与坐标均使用雷电客户区。"
+        hint = "学习模式期间，全局鼠标静止超时会自动结束。雷电模拟器窗口外的新动作不会记录为学习动作，但会重置静止倒计时。ESC 终止当前学习、训练或睡眠。截图与坐标均使用雷电客户区。"
         self.hint_label = ttk.Label(status_frame, text=hint, wraplength=max(320, self.settings.ui_width - 120), style="Hint.TLabel")
         self.hint_label.grid(row=2, column=0, sticky="ew", pady=6)
         progress_frame = ttk.LabelFrame(container, text=self.progress_label_var.get(), padding=self.settings.ui_section_padding)
@@ -2670,7 +2669,7 @@ class ControlPanel(tk.Tk):
         except Exception as exc:
             self.log_exception("ui.sync.dispatch", exc)
             return None
-        wait_seconds = timeout if timeout is not None else max(self.settings.window_poll_seconds, self.settings.key_debounce_seconds)
+        wait_seconds = timeout if timeout is not None else max(self.settings.window_event_wait, self.settings.key_debounce_seconds)
         done.wait(wait_seconds)
         if "error" in result:
             self.log_exception("ui.sync", result["error"])
@@ -3060,7 +3059,7 @@ class ControlPanel(tk.Tk):
             return max(0.0, time.perf_counter() - self.last_learning_activity)
 
     def should_stop_by_escape(self):
-        return self.escape_monitor.poll_pressed()
+        return self.escape_monitor.esc_event_pending()
 
     def release_window_and_panel(self):
         self.restore_panel()
@@ -3112,7 +3111,7 @@ class ControlPanel(tk.Tk):
                 return self.state() == "iconic"
             except Exception:
                 return False
-        return bool(self.ui_sync(apply, config.settings.window_poll_seconds))
+        return bool(self.ui_sync(apply, config.settings.window_event_wait))
 
     def mode_job(self, token, mode, config, stop_event):
         try:
@@ -3125,7 +3124,7 @@ class ControlPanel(tk.Tk):
                 self.finish_run(token, "当前模式已终止", 0.0)
                 return
             self.window_manager.foreground()
-            time.sleep(config.settings.window_poll_seconds)
+            stop_event.wait(config.settings.window_event_wait)
             check = self.window_manager.check_window(force=True)
             if not check.ok:
                 self.finish_run(token, f"雷电模拟器窗口异常：{check.reason}", 0.0, reason=f"window_{check.reason}")
@@ -3178,15 +3177,12 @@ class ControlPanel(tk.Tk):
         start = time.perf_counter()
         completed = 0
         submitted = 0
-        done_event = threading.Event()
         workers = max(1, config.settings.sleep_worker_count)
         queue_depth = max(workers, config.settings.sleep_queue_depth)
         batch_size = max(1, config.settings.sleep_batch_size)
         self.ui(lambda: self.progress_label_var.set("睡眠训练进度"))
         def train_once():
-            result = self.experience_pool.sleep_training_step(batch_size)
-            done_event.set()
-            return result
+            return self.experience_pool.sleep_training_step(batch_size)
         def submit_next(executor, futures):
             nonlocal submitted
             if stop_event.is_set() or not self.is_run_active(token, "sleep"):
@@ -3208,11 +3204,10 @@ class ControlPanel(tk.Tk):
                     break
                 if not futures:
                     submit_next(executor, futures)
-                done, futures = concurrent.futures.wait(futures, timeout=config.settings.sleep_tick, return_when=concurrent.futures.FIRST_COMPLETED)
+                remaining = max(0.0, config.sleep_seconds - elapsed)
+                done, futures = concurrent.futures.wait(futures, timeout=remaining, return_when=concurrent.futures.FIRST_COMPLETED)
                 if not done:
-                    done_event.wait(config.settings.sleep_tick)
-                    done_event.clear()
-                    continue
+                    break
                 trained = 0
                 best_score = 0.0
                 avg_score = 0.0
@@ -3251,11 +3246,10 @@ class ControlPanel(tk.Tk):
 
     def update_progress(self, percent):
         percent = round(clamp(percent, 0.0, 100.0), 1)
-        now_perf = time.perf_counter()
-        if abs(percent - self.progress_value) < self.settings.ui_progress_delta and now_perf - self.last_progress_update_perf < self.settings.ui_refresh_interval:
+        if abs(percent - self.progress_value) < self.settings.ui_progress_delta:
             return
         self.progress_value = percent
-        self.last_progress_update_perf = now_perf
+        self.last_progress_update_perf = time.perf_counter()
         def apply():
             self.progress_var.set(percent)
             self.progress_text_var.set(f"{percent:.1f}%")
@@ -3263,11 +3257,10 @@ class ControlPanel(tk.Tk):
 
     def update_metrics(self, novelty, human_score, screen_reward, action_reward, reward, life, decision=None):
         payload = (round(float(novelty), 2), round(float(human_score), 2), round(float(screen_reward), 2), round(float(action_reward), 2), round(float(reward), 2), round(float(life), 2), decision.get("reason") if decision else None, round(safe_float(decision.get("confidence", 0.0), 0.0), 3) if decision else None)
-        now_perf = time.perf_counter()
-        if payload == self.last_metric_payload and now_perf - self.last_metrics_update_perf < self.settings.ui_refresh_interval:
+        if payload == self.last_metric_payload:
             return
         self.last_metric_payload = payload
-        self.last_metrics_update_perf = now_perf
+        self.last_metrics_update_perf = time.perf_counter()
         def apply():
             self.novelty_var.set(f"{round(float(novelty), 2)}%")
             self.human_var.set(f"{round(float(human_score), 2)}%")
@@ -3344,7 +3337,7 @@ class ControlPanel(tk.Tk):
         offset_source = started_perf if started_perf is not None else action_anchor_perf
         offset_ms = round((float(offset_source) - snapshot.perf_time) * 1000.0, 3) if offset_source is not None else None
         sims = [round(item["similarity"], 4) for item in batch]
-        record = {"record_schema_version": 2, "id": uuid.uuid4().hex, "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": after_novelty, "before_screen": snapshot.relative_path if normalized else None, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_sort_key": reward_info["reward_sort_key"], "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "life_experience_delta": max(0.0, reward), "penalty_delta": max(0.0, -reward), "life_experience": life, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "image_dropped": bool(getattr(snapshot, "image_dropped", False)), "screen_file_expected": not bool(getattr(snapshot, "image_dropped", False)), "capture_latency_ms": capture_latency_ms if capture_latency_ms is not None else getattr(snapshot, "capture_latency_ms", None), "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_tick": self.settings.training_tick, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
+        record = {"record_schema_version": 2, "id": uuid.uuid4().hex, "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": after_novelty, "before_screen": snapshot.relative_path if normalized else None, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_sort_key": reward_info["reward_sort_key"], "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "life_experience_delta": max(0.0, reward), "penalty_delta": max(0.0, -reward), "life_experience": life, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "image_dropped": bool(getattr(snapshot, "image_dropped", False)), "screen_file_expected": not bool(getattr(snapshot, "image_dropped", False)), "capture_latency_ms": capture_latency_ms if capture_latency_ms is not None else getattr(snapshot, "capture_latency_ms", None), "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_event_wait": self.settings.training_event_wait, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
         if decision:
             record["ai_decision"] = decision
         self.persistence_queue.enqueue_record(self.store, record)
@@ -3352,18 +3345,15 @@ class ControlPanel(tk.Tk):
         self.update_metrics(after_novelty, human_score, novelty_reward, human_delta, reward, life, decision)
         return record
 
-    def maybe_learning_screen_tick(self, analyzer, session_id, start, now_perf, config):
-        interval = 1.0 / max(0.5, self.settings.learning_screen_fps)
-        if now_perf - self.last_learning_tick_perf < interval:
-            return
+    def capture_learning_screen_change(self, analyzer, session_id, start, now_perf, config):
         snapshot, image = self.capture_snapshot_image(analyzer, "learning", start, priority="low")
         if not snapshot:
             return
-        if self.last_learning_tick_hash:
-            similarity = hash_similarity(snapshot.hash_value, self.last_learning_tick_hash)
+        if self.last_learning_event_hash:
+            similarity = hash_similarity(snapshot.hash_value, self.last_learning_event_hash)
             self.adaptive_policy.observe_capture(0.0, similarity=similarity, window_rect_changed=False)
             if similarity >= self.settings.learning_screen_similarity_threshold:
-                self.last_learning_tick_perf = now_perf
+                self.last_learning_event_perf = now_perf
                 return
         try:
             if self.persistence_paused.is_set():
@@ -3371,20 +3361,20 @@ class ControlPanel(tk.Tk):
             else:
                 self.mark_snapshot_image_result(snapshot, self.persistence_queue.enqueue_image(analyzer, image, snapshot.path, self.store, priority="low"))
         except Exception as exc:
-            self.log_exception("learning_screen_tick.save", exc, {"path": str(snapshot.path)})
+            self.log_exception("learning_screen_event.save", exc, {"path": str(snapshot.path)})
             return
         self.adaptive_policy.observe_capture(getattr(snapshot, "capture_latency_ms", 0.0))
-        self.last_learning_tick_perf = now_perf
-        self.last_learning_tick_hash = snapshot.hash_value
-        self.write_record("learning", session_id, snapshot, None, "screen_tick")
+        self.last_learning_event_perf = now_perf
+        self.last_learning_event_hash = snapshot.hash_value
+        self.write_record("learning", session_id, snapshot, None, "screen_event")
 
     def learning_loop(self, token, stop_event, config):
         session_id = uuid.uuid4().hex
         start = time.perf_counter()
         pending_snapshots = {}
         self.mark_learning_activity()
-        self.last_learning_tick_perf = time.perf_counter()
-        self.last_learning_tick_hash = None
+        self.last_learning_event_perf = time.perf_counter()
+        self.last_learning_event_hash = None
         with ScreenAnalyzer(config.settings.hash_size) as analyzer:
             self.write_record("learning", session_id, self.capture_snapshot(analyzer, "learning", session_id, start, priority="critical"), None, "mode_start")
             while not stop_event.is_set() and self.is_run_active(token, "learning"):
@@ -3397,7 +3387,6 @@ class ControlPanel(tk.Tk):
                     stop_event.set()
                     self.ui(lambda r=check.reason: self.status_var.set(f"学习模式结束：雷电模拟器窗口异常：{r}"))
                     break
-                self.maybe_learning_screen_tick(analyzer, session_id, start, now_perf, config)
                 idle_seconds = self.learning_idle_seconds()
                 self.ui(lambda: self.progress_label_var.set("静止倒计时"))
                 self.update_progress(clamp((config.still_seconds - idle_seconds) / config.still_seconds * 100.0, 0.0, 100.0))
@@ -3405,21 +3394,25 @@ class ControlPanel(tk.Tk):
                     stop_event.set()
                     self.ui(lambda: self.status_var.set("学习模式结束：鼠标静止超时"))
                     break
+                event_seen = False
                 if self.mouse_recorder:
                     markers = self.mouse_recorder.pop_start_markers()
+                    actions = self.mouse_recorder.pop_actions()
+                    event_seen = bool(markers or actions)
+                    if event_seen:
+                        self.capture_learning_screen_change(analyzer, session_id, start, now_perf, config)
                     for marker in markers:
                         marker_snapshot = self.capture_snapshot(analyzer, "learning", session_id, start, priority="critical")
                         if marker_snapshot:
                             pending_snapshots[marker["action_id"]] = marker_snapshot
-                    actions = self.mouse_recorder.pop_actions()
                     for action in actions:
                         action_snapshot = pending_snapshots.pop(action.get("action_id"), None) or self.capture_snapshot(analyzer, "learning", session_id, start, priority="critical")
                         after_snapshot = self.capture_snapshot(analyzer, "learning", session_id, start, priority="critical")
                         self.write_record("learning", session_id, action_snapshot, action, "user_mouse", action_anchor_perf=action.get("started_perf") or action.get("t0"), after_snapshot=after_snapshot, planned_action=action)
-                    if not markers and not actions:
-                        self.mouse_recorder.wait(config.settings.mouse_still_tick)
+                    if not event_seen:
+                        self.mouse_recorder.wait(max(0.0, config.still_seconds - idle_seconds))
                 else:
-                    time.sleep(config.settings.mouse_still_tick)
+                    stop_event.wait(max(0.0, config.still_seconds - idle_seconds))
             self.write_record("learning", session_id, self.capture_snapshot(analyzer, "learning", session_id, start, priority="critical"), None, "mode_end")
         if self.is_run_active(token, "learning"):
             self.finish_run(token, "学习模式结束", 0.0)
@@ -3438,18 +3431,18 @@ class ControlPanel(tk.Tk):
                 if service.should_stop(start, config, stop_event):
                     break
                 rect = self.current_rect()
-                service.prepare_tick(rect)
+                service.prepare_for_event(rect)
                 if not rect:
-                    time.sleep(self.settings.training_tick)
+                    stop_event.wait(self.settings.training_event_wait)
                     continue
                 snapshot = service.observe_screen(analyzer, session_id, start, rect)
                 if not snapshot:
-                    time.sleep(self.settings.training_tick)
+                    stop_event.wait(self.settings.training_event_wait)
                     continue
                 action, decision = service.decide_action(snapshot)
                 if not action:
-                    self.write_record("training", session_id, snapshot, None, "screen_tick", decision=decision)
-                    time.sleep(self.settings.training_tick)
+                    self.write_record("training", session_id, snapshot, None, "screen_event", decision=decision)
+                    stop_event.wait(self.settings.training_event_wait)
                     continue
                 success, record = service.execute_and_record(analyzer, session_id, start, rect, snapshot, action, decision, stop_event)
                 if not success:
@@ -3467,7 +3460,7 @@ class ControlPanel(tk.Tk):
                     if self.should_stop_by_escape():
                         stop_event.set()
                         break
-                    time.sleep(min(self.settings.generated_wait_tick, deadline - time.perf_counter()))
+                    stop_event.wait(min(self.settings.generated_action_complete_wait, deadline - time.perf_counter()))
             self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start, priority="critical"), None, "mode_end")
         if self.is_run_active(token, "training") and not stop_event.is_set():
             self.finish_run(token, "训练模式结束", 0.0)
@@ -3497,27 +3490,14 @@ class ControlPanel(tk.Tk):
             pass
 
     def refresh_hardware_state(self):
-        now_perf = time.perf_counter()
-        if not self.hardware_state:
-            self.hardware_state = read_hardware_state()
-            self.hardware_last_full_refresh_perf = now_perf
-            self.hardware_last_light_refresh_perf = now_perf
-            return self.hardware_state
-        if now_perf - self.hardware_last_light_refresh_perf >= 1.0:
-            cpu_load = safe_float(psutil.cpu_percent(interval=0.0), self.hardware_state.get("cpu_load", 0.0)) if psutil else self.hardware_state.get("cpu_load", 0.0)
-            memory = psutil.virtual_memory() if psutil else None
-            memory_total = safe_float(getattr(memory, "total", 0.0), 0.0)
-            memory_available = safe_float(getattr(memory, "available", 0.0), 0.0)
-            memory_free_ratio = clamp(memory_available / memory_total if memory_total > 0 else self.hardware_state.get("memory_free_ratio", 0.0), 0.0, 1.0)
-            self.hardware_state["cpu_load"] = clamp(cpu_load, 0.0, 100.0)
-            self.hardware_state["memory_free_ratio"] = memory_free_ratio
-            self.hardware_last_light_refresh_perf = now_perf
-        if now_perf - self.hardware_last_full_refresh_perf >= 30.0:
-            full = read_hardware_state()
-            full["cpu_load"] = self.hardware_state.get("cpu_load", full.get("cpu_load", 0.0))
-            full["memory_free_ratio"] = self.hardware_state.get("memory_free_ratio", full.get("memory_free_ratio", 0.0))
-            self.hardware_state = full
-            self.hardware_last_full_refresh_perf = now_perf
+        event_perf = time.perf_counter()
+        full = read_hardware_state()
+        if self.hardware_state:
+            full["cpu_load"] = safe_float(full.get("cpu_load", self.hardware_state.get("cpu_load", 0.0)), self.hardware_state.get("cpu_load", 0.0))
+            full["memory_free_ratio"] = safe_float(full.get("memory_free_ratio", self.hardware_state.get("memory_free_ratio", 0.0)), self.hardware_state.get("memory_free_ratio", 0.0))
+        self.hardware_state = full
+        self.hardware_last_full_refresh_perf = event_perf
+        self.hardware_last_light_refresh_perf = event_perf
         return self.hardware_state
 
 if __name__ == "__main__":
