@@ -36,6 +36,7 @@ class AgentSpec:
     default_sleep_seconds: int
     default_still_seconds: float
     default_experience_pool_gb: float
+    default_ai_model_limit: int
     editable_fields: tuple
 
 
@@ -46,7 +47,8 @@ AGENT_SPEC = AgentSpec(
     default_sleep_seconds=1800,
     default_still_seconds=10.0,
     default_experience_pool_gb=10.0,
-    editable_fields=("ldplayer_path", "data_path", "training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb")
+    default_ai_model_limit=10,
+    editable_fields=("ldplayer_path", "data_path", "training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit")
 )
 
 
@@ -205,17 +207,18 @@ DEFAULT_TRAINING_SECONDS = AGENT_SPEC.default_training_seconds
 DEFAULT_SLEEP_SECONDS = AGENT_SPEC.default_sleep_seconds
 DEFAULT_STILL_SECONDS = AGENT_SPEC.default_still_seconds
 DEFAULT_EXPERIENCE_POOL_GB = AGENT_SPEC.default_experience_pool_gb
+DEFAULT_AI_MODEL_LIMIT = AGENT_SPEC.default_ai_model_limit
 MODE_NAMES = {"idle": "空闲", "starting": "准备中", "learning": "学习模式", "training": "训练模式", "sleep": "睡眠模式", "migration": "数据迁移"}
 CONFIG_SCHEMA_VERSION = 1
 USER_EDITABLE_STARTUP_FIELDS = ("ldplayer_path", "data_path")
-USER_EDITABLE_RUNTIME_FIELDS = ("training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb")
+USER_EDITABLE_RUNTIME_FIELDS = ("training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit")
 USER_EDITABLE_FIELDS = AGENT_SPEC.editable_fields
 
 
 class AllowedUserEditPolicy:
     ALLOWED_FIELDS = frozenset(AGENT_SPEC.editable_fields)
     STARTUP_FIELDS = frozenset(("ldplayer_path", "data_path"))
-    RUNTIME_FIELDS = frozenset(("training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb"))
+    RUNTIME_FIELDS = frozenset(("training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit"))
 
     @classmethod
     def filter(cls, settings, scope=None):
@@ -243,12 +246,12 @@ ALLOWED_TRANSITIONS = {
     ("starting", "idle"): {"window_invalid", "user_stop", "runtime_error", "minimize_failed"},
     ("learning", "idle"): {"esc", "still_timeout", "window_invalid", "user_stop", "runtime_error"},
     ("training", "idle"): {"esc", "time_limit", "still_timeout", "window_invalid", "user_stop", "runtime_error", "executor_error"},
-    ("sleep", "idle"): {"completed", "esc", "time_limit", "user_stop", "runtime_error"},
+    ("sleep", "idle"): {"completed", "esc", "time_limit", "poor_optimization", "user_stop", "runtime_error"},
     ("migration", "idle"): {"completed", "migration_error", "user_stop"}
 }
 
 
-TERMINATION_REASONS = ("window_invalid", "rect_changed", "empty_action", "executor_error", "time_limit", "esc", "still_timeout", "user_stop", "migration_error", "completed")
+TERMINATION_REASONS = ("window_invalid", "rect_changed", "empty_action", "executor_error", "time_limit", "esc", "still_timeout", "user_stop", "migration_error", "completed", "poor_optimization")
 HUMAN_FEATURE_NAMES = ("duration", "direct", "bend", "points", "speed_mean", "speed_variance", "acceleration_change", "pauses", "hover_before", "drag_curvature", "double_click_interval")
 
 RUNTIME_NUMBER_RULES = {
@@ -462,6 +465,7 @@ class Config:
     sleep_seconds: int
     still_seconds: float
     experience_pool_gb: float
+    ai_model_limit: int
     settings: Settings
 
 
@@ -552,7 +556,7 @@ def run_self_test():
     details = reward_breakdown(70.0, 100.0, settings)
     assert details["reward_sort_key"][0] == details["screen_primary_reward"]
     assert "human_tie_break_reward" in details
-    assert set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb"}
+    assert set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit"}
     pool = ExperiencePool(settings)
     pool.add({"id": "t1", "mode": "learning", "mouse_action": {"type": "click", "start_rel": [0.5, 0.5]}, "reward": 12, "screen_hash_hex": "f", "screen_hash_bits": 4, "mouse_source": "user"})
     novelty, batch = pool.novelty(a)
@@ -572,13 +576,16 @@ def run_self_test():
     import tempfile
     with tempfile.TemporaryDirectory() as folder:
         store = DataStore(folder)
-        store.save_settings({"training_seconds": 1, "sleep_seconds": 2, "still_seconds": 3, "experience_pool_gb": 4, "forbidden": 5})
+        store.save_settings({"training_seconds": 1, "sleep_seconds": 2, "still_seconds": 3, "experience_pool_gb": 4, "ai_model_limit": 5, "forbidden": 6})
         saved_settings = json.loads(store.settings_file.read_text(encoding="utf-8"))
-        assert "forbidden" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0
+        assert "forbidden" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0 and saved_settings["ai_model_limit"] == 5
         store.experience_file.write_text("{bad json}\n" + json.dumps({"id": "ok"}) + "\n", encoding="utf-8")
         loaded = store.load_experience()
         assert len(loaded) == 1 and loaded[0]["id"] == "ok"
         assert (store.root / "experience.bad.jsonl").exists()
+        store.save_experience_records([{"id": "m1", "mouse_action": {"type": "click"}, "reward": 1.0, "sleep_confidence": 0.5}])
+        model_path = store.save_ai_model_snapshot(store.load_experience(), settings, 1, "completed")
+        assert model_path.exists() and len(list(store.model_dir.glob("model_*.json"))) == 1
     tiny = replace(settings, async_queue_size=1, persistence_event_wait=settings.sleep_event_wait, persistence_close_seconds=settings.sleep_event_wait)
     persistence = AsyncPersistenceQueue(tiny)
     assert persistence.enqueue({"type": "noop"}, block_when_full=False)
@@ -1273,6 +1280,7 @@ class DataStore:
     def __init__(self, root):
         self.root = Path(root)
         self.screen_dir = self.root / "screens"
+        self.model_dir = self.root / "models"
         self.experience_file = self.root / "experience.jsonl"
         self.state_file = self.root / "state.json"
         self.settings_file = self.root / "settings.json"
@@ -1280,6 +1288,7 @@ class DataStore:
         self.lock = threading.RLock()
         self.root.mkdir(parents=True, exist_ok=True)
         self.screen_dir.mkdir(parents=True, exist_ok=True)
+        self.model_dir.mkdir(parents=True, exist_ok=True)
         self.state = self.load_state()
         self.pending_state_writes = 0
         self.last_state_save_perf = time.perf_counter()
@@ -1343,6 +1352,49 @@ class DataStore:
             with self.experience_file.open("a", encoding="utf-8") as file:
                 file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    def save_experience_records(self, records):
+        with self.lock:
+            temporary = self.experience_file.with_suffix(".save.tmp")
+            with temporary.open("w", encoding="utf-8") as file:
+                for record in records or []:
+                    file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            temporary.replace(self.experience_file)
+
+    def record_reward_sort_key(self, record):
+        key = record.get("reward_sort_key") if isinstance(record, dict) else None
+        if isinstance(key, (list, tuple)) and key:
+            screen = safe_float(key[0], 0.0)
+            human = safe_float(key[1] if len(key) > 1 else 0.0, 0.0)
+            return screen, human, safe_float(record.get("reward", record.get("total_reward", 0.0)), 0.0)
+        reward = safe_float(record.get("reward", record.get("total_reward", 0.0)), 0.0) if isinstance(record, dict) else 0.0
+        return reward, safe_float(record.get("sleep_confidence", 0.0), 0.0) if isinstance(record, dict) else 0.0, reward
+
+    def save_ai_model_snapshot(self, records, settings, max_models, status):
+        with self.lock:
+            self.model_dir.mkdir(parents=True, exist_ok=True)
+            ranked = sorted([record for record in records or [] if record.get("mouse_action")], key=lambda record: (safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), safe_float(record.get("sleep_confidence", 0.0), 0.0)), reverse=True)
+            limit = max(1, min(len(ranked) or 1, safe_int(getattr(settings, "global_action_heap_limit", 1), 1)))
+            payload = {"schema_version": CONFIG_SCHEMA_VERSION, "created_at": now_text(), "status": status, "life_experience": self.life, "experience_count": len(records or []), "policy": [{"id": record.get("id"), "mode": record.get("mode"), "mouse_action": record.get("mouse_action"), "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
+            path = self.model_dir / f"model_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex}.json"
+            temporary = path.with_suffix(".tmp")
+            with temporary.open("w", encoding="utf-8") as file:
+                json.dump(payload, file, ensure_ascii=False, indent=2)
+            temporary.replace(path)
+            self.compact_ai_models(max_models)
+            return path
+
+    def compact_ai_models(self, max_models):
+        limit = max(1, safe_int(max_models, AGENT_SPEC.default_ai_model_limit))
+        models = sorted(self.model_dir.glob("model_*.json"), key=lambda path: path.stat().st_mtime if path.exists() else 0.0, reverse=True)
+        removed = 0
+        for path in models[limit:]:
+            try:
+                path.unlink()
+                removed += 1
+            except Exception:
+                pass
+        return {"changed": removed > 0, "removed": removed, "limit": limit}
+
     def load_settings(self):
         if not self.settings_file.exists():
             return {}
@@ -1357,7 +1409,7 @@ class DataStore:
 
     def save_settings(self, settings):
         source = AllowedUserEditPolicy.filter(settings, "runtime")
-        payload = {"schema_version": CONFIG_SCHEMA_VERSION, "training_seconds": max(1, safe_int(source.get("training_seconds", AGENT_SPEC.default_training_seconds), AGENT_SPEC.default_training_seconds)), "sleep_seconds": max(1, safe_int(source.get("sleep_seconds", AGENT_SPEC.default_sleep_seconds), AGENT_SPEC.default_sleep_seconds)), "still_seconds": max(0.1, safe_float(source.get("still_seconds", AGENT_SPEC.default_still_seconds), AGENT_SPEC.default_still_seconds)), "experience_pool_gb": max(0.1, safe_float(source.get("experience_pool_gb", AGENT_SPEC.default_experience_pool_gb), AGENT_SPEC.default_experience_pool_gb)), "runtime_generated_numbers": RUNTIME_NUMBER_AUDIT}
+        payload = {"schema_version": CONFIG_SCHEMA_VERSION, "training_seconds": max(1, safe_int(source.get("training_seconds", AGENT_SPEC.default_training_seconds), AGENT_SPEC.default_training_seconds)), "sleep_seconds": max(1, safe_int(source.get("sleep_seconds", AGENT_SPEC.default_sleep_seconds), AGENT_SPEC.default_sleep_seconds)), "still_seconds": max(0.1, safe_float(source.get("still_seconds", AGENT_SPEC.default_still_seconds), AGENT_SPEC.default_still_seconds)), "experience_pool_gb": max(0.1, safe_float(source.get("experience_pool_gb", AGENT_SPEC.default_experience_pool_gb), AGENT_SPEC.default_experience_pool_gb)), "ai_model_limit": max(1, safe_int(source.get("ai_model_limit", AGENT_SPEC.default_ai_model_limit), AGENT_SPEC.default_ai_model_limit)), "runtime_generated_numbers": RUNTIME_NUMBER_AUDIT}
         with self.lock:
             temporary = self.settings_file.with_suffix(".tmp")
             with temporary.open("w", encoding="utf-8") as file:
@@ -1402,7 +1454,7 @@ class DataStore:
                 tail.append(item)
                 try:
                     parsed = json.loads(text)
-                    reward = safe_float(parsed.get("reward", parsed.get("total_reward", 0.0)), 0.0)
+                    reward = self.record_reward_sort_key(parsed)
                     if len(rewarded) < reward_limit:
                         heapq.heappush(rewarded, (reward, line_number, text))
                     elif reward > rewarded[0][0]:
@@ -1451,7 +1503,7 @@ class DataStore:
                     except Exception as exc:
                         self.quarantine_bad_experience(line_number, text, exc)
                         continue
-                    reward = safe_float(record.get("reward", record.get("total_reward", 0.0)), 0.0)
+                    reward = self.record_reward_sort_key(record)
                     records.append({"reward": reward, "line": line_number, "text": text, "record": record})
         records.sort(key=lambda item: (item["reward"], item["line"]))
         removed_ids = set()
@@ -2680,6 +2732,7 @@ class ControlPanel(tk.Tk):
         self.sleep_seconds_var = tk.StringVar(value=str(DEFAULT_SLEEP_SECONDS))
         self.still_seconds_var = tk.StringVar(value=str(DEFAULT_STILL_SECONDS))
         self.experience_pool_gb_var = tk.StringVar(value=str(DEFAULT_EXPERIENCE_POOL_GB))
+        self.ai_model_limit_var = tk.StringVar(value=str(DEFAULT_AI_MODEL_LIMIT))
         self.mode_var = tk.StringVar(value=MODE_NAMES["idle"])
         self.status_var = tk.StringVar(value="等待开始")
         self.life_var = tk.StringVar(value="0")
@@ -2758,7 +2811,7 @@ class ControlPanel(tk.Tk):
         time_frame = ttk.Frame(path_frame)
         time_frame.grid(row=2, column=1, columnspan=2, sticky="w", pady=6)
         ttk.Label(path_frame, text="时间设置").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=6)
-        for label, variable in (("训练/秒", self.training_seconds_var), ("睡眠/秒", self.sleep_seconds_var), ("静止/秒", self.still_seconds_var), ("经验池/GB", self.experience_pool_gb_var)):
+        for label, variable in (("训练/秒", self.training_seconds_var), ("睡眠/秒", self.sleep_seconds_var), ("静止/秒", self.still_seconds_var), ("经验池/GB", self.experience_pool_gb_var), ("AI模型/个", self.ai_model_limit_var)):
             ttk.Label(time_frame, text=label).pack(side="left")
             ttk.Entry(time_frame, textvariable=variable, width=10).pack(side="left", padx=(6, 16))
         button_frame = ttk.Frame(container)
@@ -2934,7 +2987,7 @@ class ControlPanel(tk.Tk):
             return
         self.status_var.set("正在迁移数据")
         self.update_progress(0.0)
-        values = {"ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH, "training_seconds": max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS)), "sleep_seconds": max(1, safe_int(self.sleep_seconds_var.get(), DEFAULT_SLEEP_SECONDS)), "still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB))}
+        values = {"ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH, "training_seconds": max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS)), "sleep_seconds": max(1, safe_int(self.sleep_seconds_var.get(), DEFAULT_SLEEP_SECONDS)), "still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))}
         self.mode_thread = threading.Thread(target=self.migration_service.run, args=(token, old_path, new_path, stop_event, values), daemon=True)
         self.mode_thread.start()
 
@@ -3083,7 +3136,7 @@ class ControlPanel(tk.Tk):
                 if size == 0:
                     self.update_progress(clamp(copied / total * 100.0, 0.0, 99.0))
             if not stop_event.is_set() and self.is_run_active(token, "migration"):
-                DataStore(temp_root).save_settings({"training_seconds": values["training_seconds"], "sleep_seconds": values["sleep_seconds"], "still_seconds": values["still_seconds"], "experience_pool_gb": values["experience_pool_gb"]})
+                DataStore(temp_root).save_settings({"training_seconds": values["training_seconds"], "sleep_seconds": values["sleep_seconds"], "still_seconds": values["still_seconds"], "experience_pool_gb": values["experience_pool_gb"], "ai_model_limit": values["ai_model_limit"]})
                 if new_root.exists():
                     backup_root = new_root.parent / f".backup_{new_root.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                     shutil.copytree(new_root, backup_root)
@@ -3141,17 +3194,18 @@ class ControlPanel(tk.Tk):
         self.data_var.set(str(startup.get("data_path", self.data_var.get())))
         data_settings = DataStore(Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)).load_settings()
         if not data_settings:
-            DataStore(Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)).save_settings({"training_seconds": DEFAULT_TRAINING_SECONDS, "sleep_seconds": DEFAULT_SLEEP_SECONDS, "still_seconds": DEFAULT_STILL_SECONDS, "experience_pool_gb": DEFAULT_EXPERIENCE_POOL_GB})
+            DataStore(Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)).save_settings({"training_seconds": DEFAULT_TRAINING_SECONDS, "sleep_seconds": DEFAULT_SLEEP_SECONDS, "still_seconds": DEFAULT_STILL_SECONDS, "experience_pool_gb": DEFAULT_EXPERIENCE_POOL_GB, "ai_model_limit": DEFAULT_AI_MODEL_LIMIT})
         self.training_seconds_var.set(str(max(1, safe_int(data_settings.get("training_seconds", self.training_seconds_var.get()), DEFAULT_TRAINING_SECONDS))))
         self.sleep_seconds_var.set(str(max(1, safe_int(data_settings.get("sleep_seconds", self.sleep_seconds_var.get()), DEFAULT_SLEEP_SECONDS))))
         self.still_seconds_var.set(str(max(0.1, safe_float(data_settings.get("still_seconds", self.still_seconds_var.get()), DEFAULT_STILL_SECONDS))))
         self.experience_pool_gb_var.set(str(max(0.1, safe_float(data_settings.get("experience_pool_gb", self.experience_pool_gb_var.get()), DEFAULT_EXPERIENCE_POOL_GB))))
+        self.ai_model_limit_var.set(str(max(1, safe_int(data_settings.get("ai_model_limit", self.ai_model_limit_var.get()), DEFAULT_AI_MODEL_LIMIT))))
         self.update_mode_button_states()
 
     def save_persistent_settings(self):
         data_path = Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)
         self.app_config_store.save_settings({"ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH, "data_path": str(data_path)})
-        DataStore(data_path).save_settings({"training_seconds": max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS)), "sleep_seconds": max(1, safe_int(self.sleep_seconds_var.get(), DEFAULT_SLEEP_SECONDS)), "still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB))})
+        DataStore(data_path).save_settings({"training_seconds": max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS)), "sleep_seconds": max(1, safe_int(self.sleep_seconds_var.get(), DEFAULT_SLEEP_SECONDS)), "still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))})
 
     def screen_rect(self):
         width = safe_int(getattr(win32api, "GetSystemMetrics", lambda _: self.winfo_screenwidth())(0), self.winfo_screenwidth())
@@ -3174,15 +3228,17 @@ class ControlPanel(tk.Tk):
         return max(1.0, sum(cost) / len(cost)) if cost else 24.0
 
     def read_config(self):
-        AllowedUserEditPolicy.assert_allowed("ldplayer_path", "data_path", "training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb")
+        AllowedUserEditPolicy.assert_allowed("ldplayer_path", "data_path", "training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit")
         training_seconds = max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS))
         sleep_seconds = max(1, safe_int(self.sleep_seconds_var.get(), DEFAULT_SLEEP_SECONDS))
         still_seconds = max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS))
         experience_pool_gb = max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB))
+        ai_model_limit = max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))
         self.training_seconds_var.set(str(training_seconds))
         self.sleep_seconds_var.set(str(sleep_seconds))
         self.still_seconds_var.set(str(still_seconds))
         self.experience_pool_gb_var.set(str(experience_pool_gb))
+        self.ai_model_limit_var.set(str(ai_model_limit))
         self.save_persistent_settings()
         data_path = Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)
         self.hardware_state = read_hardware_state()
@@ -3197,7 +3253,7 @@ class ControlPanel(tk.Tk):
         self.settings = settings
         self.escape_monitor.debounce_seconds = settings.key_debounce_seconds
         self.ui(lambda: self.minsize(settings.ui_min_width, settings.ui_min_height))
-        return Config(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH), data_path, training_seconds, sleep_seconds, still_seconds, experience_pool_gb, settings)
+        return Config(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH), data_path, training_seconds, sleep_seconds, still_seconds, experience_pool_gb, ai_model_limit, settings)
 
     def apply_runtime_settings(self, settings):
         self.settings = settings
@@ -3444,6 +3500,10 @@ class ControlPanel(tk.Tk):
         workers = max(1, config.settings.sleep_worker_count)
         queue_depth = max(workers, config.settings.sleep_queue_depth)
         batch_size = max(1, config.settings.sleep_batch_size)
+        best_seen = None
+        stale_batches = 0
+        poor_limit = max(workers, queue_depth)
+        poor_optimization = False
         self.ui(lambda: self.progress_label_var.set("睡眠训练进度"))
         def train_once():
             return self.experience_pool.sleep_training_step(batch_size)
@@ -3490,22 +3550,55 @@ class ControlPanel(tk.Tk):
                     avg_confidence += safe_float(result.get("avg_confidence", 0.0), 0.0)
                     submit_next(executor, futures)
                 divisor = max(1, len(done))
+                batch_score = avg_score / divisor
+                batch_confidence = avg_confidence / divisor
+                if trained > 0:
+                    improved = best_seen is None or best_score > best_seen
+                    best_seen = best_score if best_seen is None else max(best_seen, best_score)
+                    stale_batches = 0 if improved else stale_batches + len(done)
+                    poor_optimization = completed >= poor_limit and stale_batches >= poor_limit and batch_confidence <= 1.0 / max(1, batch_size)
+                    if poor_optimization:
+                        stop_event.set()
+                divisor = max(1, len(done))
                 life = self.store.state.get("life_experience", 0.0) if self.store else 0.0
                 compact = self.store.compact_experience_pool(config.experience_pool_gb) if self.store else {"changed": False}
                 if compact.get("changed"):
                     self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit))
                     self.brain = ActionBrain(self.experience_pool, config.settings)
                     self.ui(lambda c=self.experience_pool.count(): self.pool_var.set(str(c)))
-                decision = {"reason": "sleep_prioritized_replay", "confidence": avg_confidence / divisor, "candidate_count": trained, "best_score": best_score, "completed_batches": completed, "workers": workers, "pool_compacted": compact.get("changed", False), "pool_removed": compact.get("removed", 0)}
-                self.update_metrics(0.0, 50.0 + clamp(avg_confidence / divisor * 50.0, 0.0, 50.0), 0.0, avg_score / divisor, best_score, life, decision)
+                decision = {"reason": "sleep_prioritized_replay", "confidence": batch_confidence, "candidate_count": trained, "best_score": best_score, "completed_batches": completed, "workers": workers, "pool_compacted": compact.get("changed", False), "pool_removed": compact.get("removed", 0)}
+                self.update_metrics(0.0, 50.0 + clamp(batch_confidence * 50.0, 0.0, 50.0), 0.0, batch_score, best_score, life, decision)
+                if poor_optimization:
+                    break
             for future in futures:
                 future.cancel()
+        save_status = "poor_optimization" if poor_optimization else ("completed" if self.is_run_active(token, "sleep") and not stop_event.is_set() else "incomplete")
+        self.save_sleep_data(config, save_status)
         if self.is_run_active(token, "sleep") and not stop_event.is_set():
             elapsed = time.perf_counter() - start
             finish_reason = "time_limit" if elapsed >= config.sleep_seconds else "completed"
             self.finish_run(token, "睡眠模式完成", 100.0, release=False, reason=finish_reason)
+        elif self.is_run_active(token, "sleep") and poor_optimization:
+            self.finish_run(token, "AI模型优化效果差，已保存数据并退出睡眠模式", self.progress_value, release=False, reason="poor_optimization")
         elif self.is_run_active(token, "sleep"):
-            self.finish_run(token, "睡眠模式已终止", 0.0, release=False, reason="esc" if self.should_stop_by_escape() else "user_stop")
+            self.finish_run(token, "睡眠模式已终止，数据已保存", 0.0, release=False, reason="esc" if self.should_stop_by_escape() else "user_stop")
+
+    def save_sleep_data(self, config, status):
+        if not self.store or not self.experience_pool:
+            return
+        try:
+            self.store.flush_state(force=True)
+            with self.experience_pool.lock:
+                records = copy.deepcopy(self.experience_pool.records)
+            self.store.save_experience_records(records)
+            self.store.save_ai_model_snapshot(records, config.settings, config.ai_model_limit, status)
+            compact = self.store.compact_experience_pool(config.experience_pool_gb)
+            if compact.get("changed"):
+                self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit))
+                self.brain = ActionBrain(self.experience_pool, config.settings)
+                self.ui(lambda c=self.experience_pool.count(): self.pool_var.set(str(c)))
+        except Exception as exc:
+            self.log_exception("sleep_save", exc, {"status": status})
 
     def restore_panel(self):
         def apply():
