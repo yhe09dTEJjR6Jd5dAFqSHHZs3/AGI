@@ -201,6 +201,17 @@ except Exception as exc:
 if "--self-test" not in sys.argv:
     bootstrap_dependencies()
 
+def configuration_failure(area, error):
+    detail = f"{area}：{error}"
+    if "--self-test" in sys.argv:
+        raise RuntimeError(detail) from error
+    fail_and_exit("配置文件生成失败或读取失败。\n" + detail)
+
+
+def default_runtime_settings_payload():
+    return {"training_seconds": AGENT_SPEC.default_training_seconds, "sleep_seconds": AGENT_SPEC.default_sleep_seconds, "still_seconds": AGENT_SPEC.default_still_seconds, "experience_pool_gb": AGENT_SPEC.default_experience_pool_gb, "ai_model_limit": AGENT_SPEC.default_ai_model_limit}
+
+
 DEFAULT_LDPLAYER_PATH = AGENT_SPEC.default_ldplayer_path
 DEFAULT_DATA_PATH = AGENT_SPEC.default_data_path
 DEFAULT_TRAINING_SECONDS = AGENT_SPEC.default_training_seconds
@@ -455,6 +466,7 @@ class ModeSession:
     deadline: Optional[float]
     stop_event: threading.Event
     termination_reason: Optional[str] = None
+    started_sequence: int = 0
 
 
 @dataclass(frozen=True)
@@ -1377,7 +1389,10 @@ class AppConfigStore:
         self.root = base / "AGI"
         self.settings_file = self.root / "startup.json"
         self.lock = threading.RLock()
-        self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            configuration_failure("创建启动配置目录失败 " + str(self.root), exc)
 
     def load_settings(self):
         if not self.settings_file.exists():
@@ -1386,20 +1401,23 @@ class AppConfigStore:
             with self.settings_file.open("r", encoding="utf-8") as file:
                 data = json.load(file)
             if not isinstance(data, dict):
-                return {}
+                raise ValueError("启动配置必须是 JSON 对象")
             return AllowedUserEditPolicy.filter(data, "startup")
-        except Exception:
-            return {}
+        except Exception as exc:
+            configuration_failure("读取启动配置失败 " + str(self.settings_file), exc)
 
     def save_settings(self, settings):
         source = AllowedUserEditPolicy.filter(settings, "startup")
         payload = {"schema_version": CONFIG_SCHEMA_VERSION, "ldplayer_path": str(source.get("ldplayer_path") or AGENT_SPEC.default_ldplayer_path), "data_path": str(source.get("data_path") or AGENT_SPEC.default_data_path)}
-        with self.lock:
-            self.root.mkdir(parents=True, exist_ok=True)
-            temporary = self.settings_file.with_suffix(".tmp")
-            with temporary.open("w", encoding="utf-8") as file:
-                json.dump(payload, file, ensure_ascii=False, indent=2)
-            temporary.replace(self.settings_file)
+        try:
+            with self.lock:
+                self.root.mkdir(parents=True, exist_ok=True)
+                temporary = self.settings_file.with_suffix(".tmp")
+                with temporary.open("w", encoding="utf-8") as file:
+                    json.dump(payload, file, ensure_ascii=False, indent=2)
+                temporary.replace(self.settings_file)
+        except Exception as exc:
+            configuration_failure("写入启动配置失败 " + str(self.settings_file), exc)
 
 
 class DataStore:
@@ -1412,9 +1430,12 @@ class DataStore:
         self.settings_file = self.root / "settings.json"
         self.error_file = self.root / "errors.jsonl"
         self.lock = threading.RLock()
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.screen_dir.mkdir(parents=True, exist_ok=True)
-        self.model_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            self.screen_dir.mkdir(parents=True, exist_ok=True)
+            self.model_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            configuration_failure("创建数据配置目录失败 " + str(self.root), exc)
         self.state = self.load_state()
         self.pending_state_writes = 0
         self.last_state_save_perf = time.perf_counter()
@@ -1523,24 +1544,27 @@ class DataStore:
 
     def load_settings(self):
         if not self.settings_file.exists():
-            return {}
+            self.save_settings(default_runtime_settings_payload())
         try:
             with self.settings_file.open("r", encoding="utf-8") as file:
                 data = json.load(file)
             if not isinstance(data, dict):
-                return {}
+                raise ValueError("运行配置必须是 JSON 对象")
             return AllowedUserEditPolicy.filter(data, "runtime")
-        except Exception:
-            return {}
+        except Exception as exc:
+            configuration_failure("读取运行配置失败 " + str(self.settings_file), exc)
 
     def save_settings(self, settings):
         source = AllowedUserEditPolicy.filter(settings, "runtime")
         payload = {"schema_version": CONFIG_SCHEMA_VERSION, "training_seconds": max(1, safe_int(source.get("training_seconds", AGENT_SPEC.default_training_seconds), AGENT_SPEC.default_training_seconds)), "sleep_seconds": max(1, safe_int(source.get("sleep_seconds", AGENT_SPEC.default_sleep_seconds), AGENT_SPEC.default_sleep_seconds)), "still_seconds": max(0.1, safe_float(source.get("still_seconds", AGENT_SPEC.default_still_seconds), AGENT_SPEC.default_still_seconds)), "experience_pool_gb": max(0.1, safe_float(source.get("experience_pool_gb", AGENT_SPEC.default_experience_pool_gb), AGENT_SPEC.default_experience_pool_gb)), "ai_model_limit": max(1, safe_int(source.get("ai_model_limit", AGENT_SPEC.default_ai_model_limit), AGENT_SPEC.default_ai_model_limit)), "runtime_generated_numbers": RUNTIME_NUMBER_AUDIT}
-        with self.lock:
-            temporary = self.settings_file.with_suffix(".tmp")
-            with temporary.open("w", encoding="utf-8") as file:
-                json.dump(payload, file, ensure_ascii=False, indent=2)
-            temporary.replace(self.settings_file)
+        try:
+            with self.lock:
+                temporary = self.settings_file.with_suffix(".tmp")
+                with temporary.open("w", encoding="utf-8") as file:
+                    json.dump(payload, file, ensure_ascii=False, indent=2)
+                temporary.replace(self.settings_file)
+        except Exception as exc:
+            configuration_failure("写入运行配置失败 " + str(self.settings_file), exc)
 
     def quarantine_bad_experience(self, line_number, text, error):
         payload = {"line": line_number, "error": str(error), "text": text}
@@ -2832,6 +2856,8 @@ class ControlPanel(tk.Tk):
         initial_capture_ms = self.measure_capture_latency()
         self.hardware_state = read_hardware_state()
         self.settings = derive_runtime_settings(rect=self.screen_rect(), pool_count=0, capture_ms=initial_capture_ms, cpu_load=safe_float(self.hardware_state.get("cpu_load", 0.0), 0.0), hardware=self.hardware_state)
+        self.event_journal = deque(maxlen=max(128, self.settings.async_queue_size * max(1, self.settings.ui_metric_columns)))
+        self.events.subscribe("*", self.remember_event)
         self.adaptive_policy.observe_capture(initial_capture_ms)
         self.progress_value = 0.0
         self.last_progress_update_perf = 0.0
@@ -2942,9 +2968,17 @@ class ControlPanel(tk.Tk):
         style.configure("Hint.TLabel", foreground="#555555")
         root = ttk.Frame(self, padding=self.settings.ui_padding)
         root.pack(fill="both", expand=True)
-        container = ttk.Frame(root)
-        container.pack(fill="both", expand=True)
-        self.scroll_canvas = None
+        self.scroll_canvas = tk.Canvas(root, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(root, orient="vertical", command=self.scroll_canvas.yview)
+        self.scroll_canvas.configure(yscrollcommand=scrollbar.set)
+        self.scroll_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        container = ttk.Frame(self.scroll_canvas)
+        self.scroll_window = self.scroll_canvas.create_window((0, 0), window=container, anchor="nw")
+        container.bind("<Configure>", self.update_scroll_region)
+        self.scroll_canvas.bind("<Configure>", self.update_scroll_width)
+        self.scroll_canvas.bind("<Enter>", self.bind_mousewheel)
+        self.scroll_canvas.bind("<Leave>", self.unbind_mousewheel)
         ttk.Label(container, text="雷电模拟器学习训练控制面板", style="Title.TLabel").pack(anchor="w")
         path_frame = ttk.LabelFrame(container, text="路径与时间", padding=self.settings.ui_section_padding)
         path_frame.pack(fill="x", pady=(16, 10))
@@ -3020,8 +3054,19 @@ class ControlPanel(tk.Tk):
             self.minsize(min(req_w, screen_w), min(req_h, screen_h))
             if self.winfo_width() < req_w or self.winfo_height() < req_h:
                 self.geometry(f"{width}x{height}")
+            self.update_scroll_region()
         except Exception as exc:
             self.log_exception("ui.fit_complete", exc)
+
+    def update_scroll_region(self, _event=None):
+        if getattr(self, "scroll_canvas", None):
+            self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all"))
+
+    def update_scroll_width(self, event=None):
+        if getattr(self, "scroll_canvas", None) and getattr(self, "scroll_window", None):
+            width = event.width if event else self.scroll_canvas.winfo_width()
+            self.scroll_canvas.itemconfigure(self.scroll_window, width=max(1, width))
+            self.update_scroll_region()
 
     def create_metric(self, parent, title, variable):
         frame = ttk.Frame(parent)
@@ -3063,6 +3108,9 @@ class ControlPanel(tk.Tk):
             self.hint_label.configure(wraplength=width)
         self.reflow_metrics()
         self.reflow_buttons()
+
+    def remember_event(self, event):
+        self.event_journal.append(event)
 
     def ui(self, func):
         try:
@@ -3117,14 +3165,32 @@ class ControlPanel(tk.Tk):
         ok, _ = validate_ldplayer_executable(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH), self.settings, require_attach=False)
         return ok and bool(windows_runtime_report(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH)).get("ok"))
 
+    def offline_sleep_environment_ready(self):
+        if self.required_import_error():
+            return False
+        path = Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return path.is_dir()
+        except Exception:
+            return False
+
     def update_mode_button_states(self):
-        enabled = self.runtime_environment_ready()
+        online_enabled = self.runtime_environment_ready()
+        sleep_enabled = self.offline_sleep_environment_ready()
         mode = self.current_mode()
-        mode_state = "normal" if enabled and mode == "idle" else "disabled"
+        online_state = "normal" if online_enabled and mode == "idle" else "disabled"
+        sleep_state = "normal" if sleep_enabled and mode == "idle" else "disabled"
         modify_state = "normal" if mode == "idle" else "disabled"
-        for button in getattr(self, "mode_buttons", []):
+        for button in (getattr(self, "learning_button", None), getattr(self, "training_button", None)):
+            if button:
+                try:
+                    button.configure(state=online_state)
+                except Exception:
+                    pass
+        if getattr(self, "sleep_button", None):
             try:
-                button.configure(state=mode_state)
+                self.sleep_button.configure(state=sleep_state)
             except Exception:
                 pass
         for button in getattr(self, "modify_buttons", []):
@@ -3132,10 +3198,10 @@ class ControlPanel(tk.Tk):
                 button.configure(state=modify_state)
             except Exception:
                 pass
-        if not enabled and mode == "idle":
-            self.status_var.set("运行环境未就绪：请确认 Windows 桌面环境、依赖和雷电模拟器路径")
-        self.runtime_environment_last_ready = enabled
-        return enabled
+        if not online_enabled and mode == "idle":
+            self.status_var.set("雷电运行环境未就绪：学习/训练需 Windows 桌面与雷电窗口；睡眠模式仅需数据存储可用")
+        self.runtime_environment_last_ready = online_enabled
+        return online_enabled
 
     def runtime_environment_refresh_delay_ms(self):
         source = max(self.settings.window_event_wait, self.settings.ui_event_coalesce_seconds, self.settings.key_debounce_seconds)
@@ -3525,7 +3591,8 @@ class ControlPanel(tk.Tk):
                     self.active_session.termination_reason = transition_reason
                 self.termination_reason = transition_reason
                 self.mode = "idle"
-                self.active_session = ModeSession(self.run_token, "idle", time.perf_counter(), None, self.stop_event, transition_reason)
+                event = self.events.publish("mode_transition", source=source, target=target, reason=transition_reason, token=self.run_token)
+                self.active_session = ModeSession(self.run_token, "idle", time.perf_counter(), None, self.stop_event, transition_reason, event["sequence"])
                 session = self.active_session
             else:
                 self.run_token += 1 if token is None else 0
@@ -3533,7 +3600,8 @@ class ControlPanel(tk.Tk):
                 stop_event = self.stop_event if token is not None else threading.Event()
                 self.stop_event = stop_event
                 self.mode = target
-                session = ModeSession(session_token, target, time.perf_counter(), deadline, stop_event, transition_reason)
+                event = self.events.publish("mode_transition", source=source, target=target, reason=transition_reason, token=session_token)
+                session = ModeSession(session_token, target, time.perf_counter(), deadline, stop_event, transition_reason, event["sequence"])
                 self.active_session = session
         self.set_mode_ui(target)
         self.ui(self.update_mode_button_states)
@@ -3611,6 +3679,18 @@ class ControlPanel(tk.Tk):
     def release_window_and_panel(self):
         self.restore_panel()
 
+    def ensure_storage_runtime(self, config):
+        reload_pool = False
+        if not self.store or self.store.root != config.data_path:
+            self.store = DataStore(config.data_path)
+            reload_pool = True
+        if reload_pool or self.experience_pool.settings != config.settings:
+            self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit))
+            self.brain = ActionBrain(self.experience_pool, config.settings)
+            self.ui(lambda: self.life_var.set(str(self.store.state.get("life_experience", 0.0))))
+            self.ui(lambda: self.pool_var.set(str(self.experience_pool.count())))
+        return True
+
     def ensure_runtime(self, config):
         valid_path, path_reason = validate_ldplayer_executable(config.ldplayer_path, config.settings, require_attach=False)
         if not valid_path:
@@ -3621,15 +3701,7 @@ class ControlPanel(tk.Tk):
             self.log_exception("runtime.environment", RuntimeError("environment_not_ready"), report)
             self.ui(lambda r=report: messagebox.showerror("运行环境不符合要求", json.dumps(r, ensure_ascii=False, indent=2)))
             return False
-        reload_pool = False
-        if not self.store or self.store.root != config.data_path:
-            self.store = DataStore(config.data_path)
-            reload_pool = True
-        if reload_pool or self.experience_pool.settings != config.settings:
-            self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit))
-            self.brain = ActionBrain(self.experience_pool, config.settings)
-            self.ui(lambda: self.life_var.set(str(self.store.state.get("life_experience", 0.0))))
-            self.ui(lambda: self.pool_var.set(str(self.experience_pool.count())))
+        self.ensure_storage_runtime(config)
         if not self.window_manager or self.window_manager.executable_path != config.ldplayer_path or self.window_manager.settings != config.settings:
             self.window_manager = WindowManager(config.ldplayer_path, config.settings)
         if not self.executor or self.executor.window_manager is not self.window_manager or self.executor.settings != config.settings:
@@ -3725,8 +3797,12 @@ class ControlPanel(tk.Tk):
             self.status_var.set("请先终止当前模式，或等待当前模式结束")
             return
         config = self.read_config()
-        if not self.ensure_runtime(config):
-            self.finish_run(token, "运行环境不符合要求", 0.0, release=False, reason="runtime_error")
+        try:
+            self.ensure_storage_runtime(config)
+        except Exception as exc:
+            self.log_exception("sleep.storage", exc, {"data_path": str(config.data_path)})
+            self.ui(lambda e=str(exc): messagebox.showerror("睡眠模式数据环境异常", e))
+            self.finish_run(token, "睡眠模式数据环境异常", 0.0, release=False, reason="runtime_error")
             return
         self.status_var.set("睡眠模式运行中")
         self.update_progress(0.0)
@@ -3734,7 +3810,7 @@ class ControlPanel(tk.Tk):
         self.mode_thread.start()
 
     def sleep_loop(self, token, config, stop_event):
-        start = time.perf_counter()
+        started = self.events.publish("sleep_started", seconds=config.sleep_seconds, data_path=str(config.data_path))
         completed = 0
         submitted = 0
         workers = max(1, config.settings.sleep_worker_count)
@@ -3744,14 +3820,8 @@ class ControlPanel(tk.Tk):
         stale_batches = 0
         poor_limit = max(workers, queue_depth)
         poor_optimization = False
-        time_limit_reached = threading.Event()
-        def mark_time_limit():
-            time_limit_reached.set()
-            stop_event.set()
-            self.events.publish("sleep_time_limit_reached", seconds=config.sleep_seconds)
-        time_limit_timer = threading.Timer(config.sleep_seconds, mark_time_limit)
-        time_limit_timer.daemon = True
-        time_limit_timer.start()
+        time_limit_reached = False
+        sleep_deadline = time.perf_counter() + max(1, config.sleep_seconds)
         self.ui(lambda: self.progress_label_var.set("睡眠训练进度"))
         def train_once():
             return self.experience_pool.sleep_training_step(batch_size)
@@ -3769,13 +3839,19 @@ class ControlPanel(tk.Tk):
                 if self.should_stop_by_escape():
                     stop_event.set()
                     break
+                if time.perf_counter() >= sleep_deadline:
+                    time_limit_reached = True
+                    stop_event.set()
+                    self.events.publish("sleep_time_limit_reached", seconds=config.sleep_seconds, started_sequence=started["sequence"])
+                    break
                 percent = clamp(completed / max(1, submitted + queue_depth) * 100.0, 0.0, 99.0)
                 self.update_progress(percent)
                 if not futures:
                     submit_next(executor, futures)
-                done, futures = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                wait_left = max(0.0, sleep_deadline - time.perf_counter())
+                done, futures = concurrent.futures.wait(futures, timeout=min(config.settings.sleep_event_wait, wait_left), return_when=concurrent.futures.FIRST_COMPLETED)
                 if not done:
-                    break
+                    continue
                 trained = 0
                 best_score = 0.0
                 avg_score = 0.0
@@ -3817,10 +3893,9 @@ class ControlPanel(tk.Tk):
                     break
             for future in futures:
                 future.cancel()
-        time_limit_timer.cancel()
-        save_status = "poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached.is_set() else ("completed" if self.is_run_active(token, "sleep") and not stop_event.is_set() else "incomplete"))
+        save_status = "poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached else ("completed" if self.is_run_active(token, "sleep") and not stop_event.is_set() else "incomplete"))
         self.save_sleep_data(config, save_status)
-        if self.is_run_active(token, "sleep") and time_limit_reached.is_set():
+        if self.is_run_active(token, "sleep") and time_limit_reached:
             self.finish_run(token, "睡眠模式到达时间上限，数据已保存", 100.0, release=False, reason="time_limit")
         elif self.is_run_active(token, "sleep") and not stop_event.is_set():
             self.finish_run(token, "睡眠模式完成", 100.0, release=False, reason="completed")
@@ -3952,7 +4027,8 @@ class ControlPanel(tk.Tk):
         offset_source = started_perf if started_perf is not None else action_anchor_perf
         offset_ms = round((float(offset_source) - snapshot.perf_time) * 1000.0, 3) if offset_source is not None else None
         sims = [round(item["similarity"], 4) for item in batch]
-        record = {"record_schema_version": 2, "id": uuid.uuid4().hex, "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": after_novelty, "before_screen": snapshot.relative_path if normalized else None, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": {"screen_novelty": reward_info["screen_novelty"], "screen_reward": reward_info["screen_reward"], "human_similarity": reward_info["human_similarity"], "human_tiebreak": reward_info["human_tiebreak"], "life_delta": reward_info["life_delta"], "basis": reward_info["basis"]}, "reward_sort_key": reward_info["reward_sort_key"], "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "life_experience_delta": max(0.0, reward), "penalty_delta": max(0.0, -reward), "life_experience": life, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "image_dropped": bool(getattr(snapshot, "image_dropped", False)), "screen_file_expected": not bool(getattr(snapshot, "image_dropped", False)), "capture_latency_ms": capture_latency_ms if capture_latency_ms is not None else getattr(snapshot, "capture_latency_ms", None), "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_event_wait": self.settings.training_event_wait, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
+        record_event = self.events.publish("record_ready", mode=mode, session_id=session_id, event_name=event_name)
+        record = {"record_schema_version": 2, "id": uuid.uuid4().hex, "event_sequence": record_event["sequence"], "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": after_novelty, "before_screen": snapshot.relative_path if normalized else None, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": {"screen_novelty": reward_info["screen_novelty"], "screen_reward": reward_info["screen_reward"], "human_similarity": reward_info["human_similarity"], "human_tiebreak": reward_info["human_tiebreak"], "life_delta": reward_info["life_delta"], "basis": reward_info["basis"]}, "reward_sort_key": reward_info["reward_sort_key"], "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "life_experience_delta": max(0.0, reward), "penalty_delta": max(0.0, -reward), "life_experience": life, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "image_dropped": bool(getattr(snapshot, "image_dropped", False)), "screen_file_expected": not bool(getattr(snapshot, "image_dropped", False)), "capture_latency_ms": capture_latency_ms if capture_latency_ms is not None else getattr(snapshot, "capture_latency_ms", None), "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_event_wait": self.settings.training_event_wait, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
         if decision:
             record["ai_decision"] = decision
         self.persistence_queue.enqueue_record(self.store, record)
