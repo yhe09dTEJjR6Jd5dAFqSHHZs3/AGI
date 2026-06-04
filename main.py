@@ -595,6 +595,9 @@ def run_self_test():
     assert details["reward_sort_key"][0] == details["screen_primary_reward"]
     assert "human_tie_break_reward" in details
     assert set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit"}
+    assert {"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("learning", "idle")])
+    assert {"esc", "time_limit", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("training", "idle")])
+    assert {"completed", "migration_error", "user_stop"}.issubset(ALLOWED_TRANSITIONS[("migration", "idle")])
     pool = ExperiencePool(settings)
     pool.add({"id": "t1", "mode": "learning", "mouse_action": {"type": "click", "start_rel": [0.5, 0.5]}, "reward": 12, "screen_hash_hex": "f", "screen_hash_bits": 4, "mouse_source": "user"})
     novelty, batch = pool.novelty(a)
@@ -620,6 +623,8 @@ def run_self_test():
         assert list(store.root.glob("state.bad.*.json")) and json.loads(store.state_file.read_text(encoding="utf-8"))["life_experience"] == 0.0
         dummy_panel = type("DummyPanel", (), {"store": store})()
         assert ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 200, "target_bytes": 100}) == 0.5
+        assert ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 100, "target_bytes": 100}) == 1.0
+        assert ControlPanel.sleep_progress_fields(dummy_panel, time.perf_counter(), 10, 0, 10, 1.0)["compaction"] == 1.0
         assert ControlPanel.sleep_compaction_complete(dummy_panel, {"size_bytes": 100, "target_bytes": 100})
         assert ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, deque([0.02, 0.02]), 0.01, 0.9, 0.8, True)
         store.save_settings({"training_seconds": 1, "sleep_seconds": 2, "still_seconds": 3, "experience_pool_gb": 4, "ai_model_limit": 5, "forbidden": 6})
@@ -629,9 +634,33 @@ def run_self_test():
         loaded = store.load_experience()
         assert len(loaded) == 1 and loaded[0]["id"] == "ok"
         assert (store.root / "experience.bad.jsonl").exists()
-        store.save_experience_records([{"id": "m1", "mouse_action": {"type": "click"}, "reward": 1.0, "sleep_confidence": 0.5}])
+        screen_path = store.screen_dir / "sample.png"
+        screen_path.write_bytes(b"screen")
+        store.save_experience_records([{"id": "m1", "mouse_action": {"type": "click"}, "reward": 1.0, "sleep_confidence": 0.5, "screen_path": store.relative_path(screen_path)}])
         model_path = store.save_ai_model_snapshot(store.load_experience(), settings, 1, "completed")
         assert model_path.exists() and len(list(store.model_dir.glob("model_*.json"))) == 1
+        model_path.write_bytes(model_path.read_bytes() + (b"m" * 2048))
+        assert store.storage_size_bytes() > store.experience_pool_size_bytes()
+        compact = store.compact_experience_pool(0.1)
+        assert compact["size_bytes"] == store.experience_pool_size_bytes() and model_path.exists()
+        old_root = store.root
+        new_root = Path(folder) / "new_data"
+        migration_panel = type("MigrationPanel", (), {"settings": settings})()
+        for name in ("migration_known_names", "migration_items", "migration_counts", "migration_sample_files", "file_digest", "verify_migration"):
+            setattr(migration_panel, name, getattr(ControlPanel, name).__get__(migration_panel, type(migration_panel)))
+        assert "models" in migration_panel.migration_known_names()
+        assert any(item[0].parts[0] == "models" for item in migration_panel.migration_items(old_root))
+        shutil.copytree(old_root, new_root)
+        counts = migration_panel.migration_counts(new_root)
+        assert counts["models"] >= 1
+        migration_panel.verify_migration(old_root, new_root)
+    recorder = MouseRecorder(lambda: "learning", lambda: (0, 0, 100, 100), lambda: None)
+    recorder.on_move(10, 10)
+    time.sleep(0.13)
+    recorder.on_move(11, 10)
+    time.sleep(0.13)
+    actions = recorder.pop_actions()
+    assert actions and actions[0]["type"] == "move" and actions[0]["source"] == "user" and len(actions[0]["path"]) >= 2
     tiny = replace(settings, async_queue_size=1, persistence_event_wait=settings.sleep_event_wait, persistence_close_seconds=settings.sleep_event_wait)
     persistence = AsyncPersistenceQueue(tiny)
     assert persistence.enqueue({"type": "noop"}, block_when_full=False)
@@ -1680,9 +1709,42 @@ class DataStore:
                     pass
         return total
 
+    def experience_record_paths(self, records):
+        paths = set()
+        for record in records or []:
+            if not isinstance(record, dict):
+                continue
+            for key in ("screen_path", "before_screen", "after_screen"):
+                value = record.get(key)
+                if not value:
+                    continue
+                try:
+                    path = (self.root / str(value)).resolve()
+                    if path.is_file() and self.root.resolve() in (path, *path.parents):
+                        paths.add(path)
+                except Exception:
+                    pass
+        return paths
+
+    def experience_pool_size_bytes(self, records=None):
+        total = 0
+        if self.experience_file.exists():
+            try:
+                total += self.experience_file.stat().st_size
+            except Exception:
+                pass
+        if records is None:
+            records = self.load_experience()
+        for path in self.experience_record_paths(records):
+            try:
+                total += path.stat().st_size
+            except Exception:
+                pass
+        return total
+
     def compact_experience_pool(self, limit_gb):
         limit_bytes = max(1, int(max(0.1, safe_float(limit_gb, DEFAULT_EXPERIENCE_POOL_GB)) * 1024 * 1024 * 1024))
-        current = self.storage_size_bytes()
+        current = self.experience_pool_size_bytes()
         if current <= limit_bytes:
             return {"changed": False, "size_bytes": current, "removed": 0, "target_bytes": limit_bytes}
         target_bytes = max(1, limit_bytes // 2)
@@ -1720,7 +1782,7 @@ class DataStore:
                             current = max(0, current - size)
                     except Exception:
                         pass
-            current = self.storage_size_bytes()
+            current = self.experience_pool_size_bytes([entry["record"] for entry in records if entry["line"] not in removed_ids])
         if removed_ids:
             temporary = self.experience_file.with_suffix(".compact.tmp")
             with temporary.open("w", encoding="utf-8") as file:
@@ -1728,7 +1790,7 @@ class DataStore:
                     if item["line"] not in removed_ids:
                         file.write(item["text"] + "\n")
             temporary.replace(self.experience_file)
-            current = self.storage_size_bytes()
+            current = self.experience_pool_size_bytes([entry["record"] for entry in records if entry["line"] not in removed_ids])
         return {"changed": bool(removed_ids), "size_bytes": current, "removed": removed, "target_bytes": target_bytes}
 
     def log_error(self, where, error, context=None):
@@ -2349,6 +2411,8 @@ class MouseRecorder:
         self.actions = deque()
         self.start_markers = deque()
         self.current = None
+        self.move_buffer = []
+        self.move_action_id = None
         self.listener = None
         self.wake = threading.Event()
 
@@ -2372,6 +2436,8 @@ class MouseRecorder:
             self.actions.clear()
             self.start_markers.clear()
             self.current = None
+            self.move_buffer.clear()
+            self.move_action_id = None
             self.wake.clear()
 
     def active(self):
@@ -2397,15 +2463,53 @@ class MouseRecorder:
         self.start_markers.append({"action_id": action_id, "action_type": action_type, "perf_time": event["t"], "created_at": now_text(), "x": event["x"], "y": event["y"]})
         self.wake.set()
 
+    def move_flush_due(self, now_perf=None):
+        now_perf = time.perf_counter() if now_perf is None else now_perf
+        if not self.move_buffer:
+            return False
+        duration = now_perf - self.move_buffer[0]["t"]
+        idle = now_perf - self.move_buffer[-1]["t"]
+        return (len(self.move_buffer) >= 2 and duration >= 0.25) or idle >= 0.12
+
+    def flush_move_locked(self, force=False, now_perf=None):
+        if not self.move_buffer or not self.move_action_id:
+            return None
+        now_perf = time.perf_counter() if now_perf is None else now_perf
+        if not force and not self.move_flush_due(now_perf):
+            return None
+        path = list(self.move_buffer)
+        if len(path) == 1:
+            last = dict(path[-1])
+            last["t"] = now_perf
+            path.append(last)
+        first = path[0]
+        last = path[-1]
+        action = {"action_id": self.move_action_id, "type": "move", "button": "none", "source": "user", "started_at": first.get("created_at", now_text()), "ended_at": now_text(), "started_perf": first["t"], "ended_perf": last["t"], "duration": round(max(0.0, last["t"] - first["t"]), 6), "start_abs": [int(first["x"]), int(first["y"])], "end_abs": [int(last["x"]), int(last["y"])], "path": path}
+        self.actions.append(action)
+        self.move_buffer = []
+        self.move_action_id = None
+        self.wake.set()
+        return action
+
     def on_move(self, x, y):
         with self.lock:
             has_current = bool(self.current)
         event = self.capture_event("move", x, y, allow_current=has_current)
         if not event:
             return
+        event["created_at"] = now_text()
         with self.lock:
             if self.current:
                 self.current["path"].append(event)
+            else:
+                if self.move_buffer and not point_inside(self.get_rect(), event["x"], event["y"]):
+                    self.flush_move_locked(force=True, now_perf=event["t"])
+                    return
+                if not self.move_buffer:
+                    self.move_action_id = uuid.uuid4().hex
+                    self.push_start_marker(self.move_action_id, event, "move")
+                self.move_buffer.append(event)
+                self.flush_move_locked(now_perf=event["t"])
 
     def on_scroll(self, x, y, dx, dy):
         event = self.capture_event("scroll", x, y, {"dx": int(dx), "dy": int(dy)})
@@ -2414,6 +2518,7 @@ class MouseRecorder:
         action_id = uuid.uuid4().hex
         action = {"action_id": action_id, "type": "scroll", "button": "scroll", "source": "user", "started_at": now_text(), "ended_at": now_text(), "started_perf": event["t"], "ended_perf": event["t"], "duration": 0.0, "start_abs": [int(x), int(y)], "end_abs": [int(x), int(y)], "path": [event], "scroll": [int(dx), int(dy)]}
         with self.lock:
+            self.flush_move_locked(force=True, now_perf=event["t"])
             self.push_start_marker(action_id, event, "scroll")
             self.actions.append(action)
             self.wake.set()
@@ -2426,6 +2531,7 @@ class MouseRecorder:
             return
         with self.lock:
             if pressed:
+                self.flush_move_locked(force=True, now_perf=event["t"])
                 action_id = uuid.uuid4().hex
                 self.current = {"action_id": action_id, "type": "click", "button": str(button), "source": "user", "started_at": now_text(), "started_perf": event["t"], "t0": event["t"], "start_abs": [int(x), int(y)], "path": [event]}
                 self.push_start_marker(action_id, event, "click")
@@ -2448,9 +2554,10 @@ class MouseRecorder:
 
     def pop_actions(self):
         with self.lock:
+            self.flush_move_locked(force=self.move_flush_due())
             items = list(self.actions)
             self.actions.clear()
-            if not self.start_markers:
+            if not self.start_markers and not self.move_buffer:
                 self.wake.clear()
             return items
 
@@ -3339,7 +3446,7 @@ class ControlPanel(tk.Tk):
     def migration_items(self, old_path):
         root = Path(old_path)
         items = []
-        for name in ("screens", "experience.jsonl", "state.json", "settings.json", "errors.jsonl"):
+        for name in ("screens", "models", "experience.jsonl", "state.json", "settings.json", "errors.jsonl"):
             source = root / name
             if source.is_dir():
                 for file_root, _, filenames in os.walk(source):
@@ -3378,7 +3485,7 @@ class ControlPanel(tk.Tk):
         return copied, True
 
     def migration_known_names(self):
-        return {"screens", "experience.jsonl", "state.json", "settings.json", "errors.jsonl"}
+        return {"screens", "models", "experience.jsonl", "state.json", "settings.json", "errors.jsonl"}
 
     def migration_target_conflicts(self, target):
         path = Path(target)
@@ -3394,6 +3501,11 @@ class ControlPanel(tk.Tk):
         if screens.exists():
             for _, _, filenames in os.walk(screens):
                 screen_count += len([name for name in filenames if name.lower().endswith(".png")])
+        models = root / "models"
+        model_count = 0
+        if models.exists():
+            for _, _, filenames in os.walk(models):
+                model_count += len([name for name in filenames if name.lower().startswith("model_")])
         lines = 0
         experience = root / "experience.jsonl"
         if experience.exists():
@@ -3403,7 +3515,7 @@ class ControlPanel(tk.Tk):
                         lines += 1
             except Exception:
                 pass
-        return {"screens": screen_count, "experience_lines": lines, "settings": (root / "settings.json").exists(), "state": (root / "state.json").exists()}
+        return {"screens": screen_count, "models": model_count, "experience_lines": lines, "settings": (root / "settings.json").exists(), "state": (root / "state.json").exists()}
 
     def migration_sample_files(self, root):
         root = Path(root)
@@ -3439,6 +3551,8 @@ class ControlPanel(tk.Tk):
             raise ValueError("迁移校验失败：experience.jsonl 行数少于源目录")
         if target_counts["screens"] < source_counts["screens"]:
             raise ValueError("迁移校验失败：screens 文件数少于源目录")
+        if target_counts["models"] < source_counts["models"]:
+            raise ValueError("迁移校验失败：models 文件数少于源目录")
         if source_counts["settings"] and not target_counts["settings"]:
             raise ValueError("迁移校验失败：settings.json 缺失")
         if source_counts["state"] and not target_counts["state"]:
@@ -3763,13 +3877,17 @@ class ControlPanel(tk.Tk):
         if self.required_import_error():
             self.show_import_error()
             return
+        config = self.read_config()
+        self.status_var.set("正在检查运行环境")
+        if not self.ensure_runtime(config):
+            self.status_var.set("运行环境不符合要求，未进入模式")
+            return
         token, stop_event = self.begin_run("starting", reason="click_learning" if target_mode == "learning" else "click_training")
         if not token:
             self.status_var.set("请先终止当前模式，或等待当前模式结束")
             return
-        config = self.read_config()
         if not self.minimize_panel_for_active_mode(config):
-            self.finish_run(token, "控制面板最小化失败", 0.0)
+            self.finish_run(token, "控制面板最小化失败", 0.0, reason="minimize_failed")
             return
         self.update_progress(0.0)
         self.status_var.set("正在启动或连接雷电模拟器")
@@ -3791,10 +3909,10 @@ class ControlPanel(tk.Tk):
             if not self.ensure_runtime(config):
                 if self.is_run_active(token):
                     self.ui(lambda: messagebox.showerror("未找到窗口", "没有找到雷电模拟器窗口，请确认路径正确或手动启动雷电模拟器。"))
-                    self.finish_run(token, "未找到雷电模拟器", 0.0)
+                    self.finish_run(token, "未找到雷电模拟器", 0.0, reason="runtime_error")
                 return
             if stop_event.is_set() or not self.is_run_active(token):
-                self.finish_run(token, "当前模式已终止", 0.0)
+                self.finish_run(token, "当前模式已终止", 0.0, reason="user_stop")
                 return
             self.window_manager.foreground()
             stop_event.wait(config.settings.window_event_wait)
@@ -3819,7 +3937,7 @@ class ControlPanel(tk.Tk):
         except Exception as exc:
             message = str(exc)
             self.ui(lambda m=message: messagebox.showerror("运行失败", m))
-            self.finish_run(token, "运行失败", 0.0)
+            self.finish_run(token, "运行失败", 0.0, reason="runtime_error")
 
     def stop_current_mode(self):
         with self.state_lock:
@@ -3854,17 +3972,23 @@ class ControlPanel(tk.Tk):
         self.mode_thread = threading.Thread(target=self.sleep_loop, args=(token, config, stop_event), daemon=True)
         self.mode_thread.start()
 
+    def sleep_progress_fields(self, started_perf, sleep_seconds, completed_steps, target_training_steps, compaction_progress):
+        elapsed_ratio = clamp((time.perf_counter() - started_perf) / max(1.0, safe_float(sleep_seconds, 1.0)), 0.0, 1.0)
+        training_ratio = clamp(safe_float(completed_steps, 0.0) / max(1.0, safe_float(target_training_steps, 1.0)), 0.0, 1.0)
+        compact_ratio = clamp(compaction_progress, 0.0, 1.0)
+        previous_ratio = clamp(getattr(self, "progress_value", 0.0) / 100.0, 0.0, 1.0)
+        active_compaction_ratio = compact_ratio if compact_ratio < 1.0 else 0.0
+        return {"time": elapsed_ratio, "training": training_ratio, "compaction": compact_ratio, "overall": max(previous_ratio, elapsed_ratio, training_ratio, active_compaction_ratio)}
+
     def sleep_progress_percent(self, started_perf, sleep_seconds, completed_steps, target_training_steps, compaction_progress):
-        elapsed_ratio = (time.perf_counter() - started_perf) / max(1.0, safe_float(sleep_seconds, 1.0))
-        training_ratio = safe_float(completed_steps, 0.0) / max(1.0, safe_float(target_training_steps, 1.0))
-        return clamp(max(elapsed_ratio, training_ratio, clamp(compaction_progress, 0.0, 1.0)) * 100.0, 0.0, 99.0)
+        return clamp(self.sleep_progress_fields(started_perf, sleep_seconds, completed_steps, target_training_steps, compaction_progress)["overall"] * 100.0, 0.0, 99.0)
 
     def sleep_compaction_progress(self, compact):
         if not isinstance(compact, dict):
             return 0.0
         size_bytes = max(0.0, safe_float(compact.get("size_bytes", 0.0), 0.0))
         target_bytes = max(1.0, safe_float(compact.get("target_bytes", 1.0), 1.0))
-        return 0.0 if size_bytes <= target_bytes else clamp(target_bytes / size_bytes, 0.0, 1.0)
+        return 1.0 if size_bytes <= target_bytes else clamp(target_bytes / size_bytes, 0.0, 1.0)
 
     def sleep_compaction_complete(self, compact):
         if not isinstance(compact, dict):
