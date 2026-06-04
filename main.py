@@ -627,6 +627,22 @@ def run_self_test():
         assert ControlPanel.sleep_progress_fields(dummy_panel, time.perf_counter(), 10, 0, 10, 1.0)["compaction"] == 1.0
         assert ControlPanel.sleep_compaction_complete(dummy_panel, {"size_bytes": 100, "target_bytes": 100})
         assert ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, deque([0.02, 0.02]), 0.01, 0.9, 0.8, True)
+        class DummyVar:
+            def __init__(self):
+                self.value = None
+            def set(self, value):
+                self.value = value
+        dummy_panel.progress_value = 0.4
+        dummy_panel.last_progress_update_perf = 0.0
+        dummy_panel.progress_var = DummyVar()
+        dummy_panel.progress_text_var = DummyVar()
+        dummy_panel.ui = lambda fn: fn()
+        dummy_panel.update_mode_button_states = lambda: None
+        dummy_panel.settings = replace(settings, ui_progress_delta=1.0)
+        ControlPanel.update_progress(dummy_panel, ControlPanel.idle_progress_value(dummy_panel, "learning", 87.0), force=True)
+        assert dummy_panel.progress_value == 0.0 and dummy_panel.progress_var.value == 0.0
+        assert ControlPanel.idle_progress_value(dummy_panel, "training", 91.0) == 0.0
+        assert ControlPanel.idle_progress_value(dummy_panel, "migration", 91.0) == 0.0
         store.save_settings({"training_seconds": 1, "sleep_seconds": 2, "still_seconds": 3, "experience_pool_gb": 4, "ai_model_limit": 5, "forbidden": 6})
         saved_settings = json.loads(store.settings_file.read_text(encoding="utf-8"))
         assert "forbidden" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0 and saved_settings["ai_model_limit"] == 5
@@ -3780,15 +3796,20 @@ class ControlPanel(tk.Tk):
         session = self.transition("starting", mode, token=token, reason="window_ok")
         return bool(session)
 
+    def idle_progress_value(self, source_mode, progress=0.0):
+        return 0.0 if source_mode in ("starting", "learning", "training", "sleep", "migration", "idle") else progress
+
     def finish_run(self, token, status, progress=0.0, release=True, reason=None):
         mapped_reason = reason or "completed"
         if mapped_reason not in TERMINATION_REASONS and not str(mapped_reason).startswith("window_"):
             mapped_reason = "runtime_error"
         if str(mapped_reason).startswith("window_"):
             mapped_reason = "window_invalid"
+        with self.state_lock:
+            source_mode = self.mode if token == self.run_token else None
         if not self.transition(None, "idle", reason=mapped_reason, token=token):
             return False
-        self.update_progress(progress)
+        self.update_progress(self.idle_progress_value(source_mode, progress), force=True)
         self.ui(self.update_mode_button_states)
         self.ui(lambda s=status: self.status_var.set(s))
         if release:
@@ -3950,7 +3971,7 @@ class ControlPanel(tk.Tk):
             progress_now = self.progress_value
         if not self.transition(mode, "idle", reason="user_stop", token=token):
             return
-        self.update_progress(0.0 if mode == "sleep" else progress_now)
+        self.update_progress(self.idle_progress_value(mode, progress_now), force=True)
         self.ui(lambda: self.status_var.set("当前模式已终止"))
         self.ui(self.release_window_and_panel)
 
@@ -4148,9 +4169,9 @@ class ControlPanel(tk.Tk):
                 pass
         self.ui(apply)
 
-    def update_progress(self, percent):
+    def update_progress(self, percent, force=False):
         percent = round(clamp(percent, 0.0, 100.0), 1)
-        if abs(percent - self.progress_value) < self.settings.ui_progress_delta:
+        if not force and abs(percent - self.progress_value) < self.settings.ui_progress_delta:
             return
         self.progress_value = percent
         self.last_progress_update_perf = time.perf_counter()
