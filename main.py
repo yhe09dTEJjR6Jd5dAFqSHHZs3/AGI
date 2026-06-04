@@ -517,6 +517,31 @@ def windows_runtime_report(ldplayer_path=None):
     return report
 
 
+
+
+def validate_ldplayer_executable(path, settings=None, require_attach=False):
+    candidate = Path(path)
+    if candidate.name.lower() != "dnplayer.exe":
+        return False, "雷电模拟器路径必须选择文件名为 dnplayer.exe 的可执行文件"
+    if not candidate.exists():
+        return False, "雷电模拟器路径不存在"
+    if not candidate.is_file():
+        return False, "雷电模拟器路径不是文件"
+    if sys.platform != "win32":
+        return True, "self_test"
+    report = windows_runtime_report(candidate)
+    if not report.get("ok"):
+        return False, "当前 Windows 桌面运行环境无法启动或附着雷电模拟器：" + json.dumps(report, ensure_ascii=False)
+    if require_attach:
+        manager = WindowManager(candidate, settings or derive_runtime_settings())
+        if not manager.launch_or_attach():
+            return False, "无法通过该 dnplayer.exe 启动或附着雷电模拟器窗口"
+        check = manager.check_window(force=True)
+        if not check.ok:
+            return False, f"已找到雷电模拟器但窗口异常：{check.reason}"
+    return True, "ok"
+
+
 def run_self_test():
     settings = derive_runtime_settings()
     assert len(settings.human_feature_weights) == len(HUMAN_FEATURE_NAMES)
@@ -1245,6 +1270,107 @@ class HumanProfile:
             return round(clamp((magnitude * self.settings.motion_score_magnitude_weight + continuity * self.settings.motion_score_continuity_weight) / total_weight, 0.0, 100.0), 2)
         return 50.0
 
+
+
+class EventBus:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.listeners = defaultdict(list)
+        self.sequence = 0
+
+    def subscribe(self, name, handler):
+        with self.lock:
+            self.listeners[name].append(handler)
+
+    def publish(self, name, **payload):
+        with self.lock:
+            self.sequence += 1
+            event = {"sequence": self.sequence, "name": name, "created_at": now_text(), **payload}
+            handlers = list(self.listeners.get(name, ())) + list(self.listeners.get("*", ()))
+        for handler in handlers:
+            try:
+                handler(event)
+            except Exception:
+                pass
+        return event
+
+
+class PolicyModel:
+    FEATURE_NAMES = ("bias", "reward", "novelty", "human", "duration", "distance", "source", "confidence", "visits")
+
+    def __init__(self, settings, state=None):
+        self.settings = settings
+        self.lock = threading.RLock()
+        state = state if isinstance(state, dict) else {}
+        weights = state.get("weights") if isinstance(state.get("weights"), dict) else {}
+        self.weights = {name: safe_float(weights.get(name, 0.0), 0.0) for name in self.FEATURE_NAMES}
+        if not any(abs(value) > 0.0 for value in self.weights.values()):
+            self.weights.update({"bias": 0.0, "reward": 0.35, "novelty": 0.25, "human": 0.25, "duration": 0.03, "distance": 0.04, "source": 0.08, "confidence": 0.12, "visits": -0.03})
+        self.trained_steps = safe_int(state.get("trained_steps", 0), 0)
+        self.loss = safe_float(state.get("loss", 1.0), 1.0)
+
+    def features(self, record):
+        action = record.get("mouse_action") or {}
+        facts = action_features(action) if action else {}
+        reward = clamp(safe_float(record.get("reward", record.get("total_reward", 0.0)), 0.0), self.settings.reward_total_min, self.settings.reward_total_max)
+        span = max(1.0, self.settings.reward_total_max - self.settings.reward_total_min)
+        return {
+            "bias": 1.0,
+            "reward": (reward - self.settings.reward_total_min) / span,
+            "novelty": clamp(safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), 0.0, 100.0) / 100.0,
+            "human": clamp(safe_float(record.get("sleep_human_score", record.get("human_score", 50.0)), 50.0), 0.0, 100.0) / 100.0,
+            "duration": clamp(safe_float(facts.get("duration", 0.0), 0.0) / max(0.001, self.settings.action_duration_max), 0.0, 1.0),
+            "distance": clamp(safe_float(facts.get("total", 0.0), 0.0), 0.0, 1.0),
+            "source": 1.0 if record.get("mode") == "learning" and record.get("mouse_source") == "user" else 0.0,
+            "confidence": clamp(safe_float(record.get("sleep_confidence", 0.0), 0.0), 0.0, 1.0),
+            "visits": clamp(math.log1p(max(0, safe_int(record.get("sleep_visits", 0), 0))) / math.log1p(max(1, self.settings.nearest_top_k)), 0.0, 1.0)
+        }
+
+    def predict_features(self, features):
+        z = sum(self.weights.get(name, 0.0) * safe_float(features.get(name, 0.0), 0.0) for name in self.FEATURE_NAMES)
+        if z >= 0.0:
+            ez = math.exp(-z) if z < 700.0 else 0.0
+            return 1.0 / (1.0 + ez)
+        ez = math.exp(z) if z > -700.0 else 0.0
+        return ez / (1.0 + ez)
+
+    def predict(self, record):
+        return self.predict_features(self.features(record))
+
+    def target(self, record):
+        reward = clamp(safe_float(record.get("reward", record.get("total_reward", 0.0)), 0.0), self.settings.reward_total_min, self.settings.reward_total_max)
+        base = (reward - self.settings.reward_total_min) / max(1.0, self.settings.reward_total_max - self.settings.reward_total_min)
+        human = clamp(safe_float(record.get("human_score", 50.0), 50.0), 0.0, 100.0) / 100.0
+        novelty = clamp(safe_float(record.get("novelty", 0.0), 0.0), 0.0, 100.0) / 100.0
+        return clamp(base * 0.55 + human * 0.25 + novelty * 0.2, 0.0, 1.0)
+
+    def train(self, records):
+        usable = [record for record in records or [] if isinstance(record, dict) and record.get("mouse_action")]
+        if not usable:
+            return {"trained": 0, "loss": self.loss, "confidence": 0.0}
+        lr = clamp(1.0 / max(4.0, math.sqrt(self.trained_steps + len(usable) + 1.0)), 0.01, 0.2)
+        total_loss = 0.0
+        with self.lock:
+            for record in usable:
+                features = self.features(record)
+                pred = self.predict_features(features)
+                target = self.target(record)
+                error = pred - target
+                total_loss += error * error
+                for name in self.FEATURE_NAMES:
+                    self.weights[name] = clamp(self.weights.get(name, 0.0) - lr * error * features.get(name, 0.0), -8.0, 8.0)
+                record["model_prediction"] = round(pred, 4)
+                record["model_target"] = round(target, 4)
+            self.trained_steps += len(usable)
+            self.loss = round(total_loss / len(usable), 6)
+            confidence = clamp(1.0 - math.sqrt(self.loss), 0.0, 1.0)
+        return {"trained": len(usable), "loss": self.loss, "confidence": confidence}
+
+    def snapshot(self):
+        with self.lock:
+            return {"type": "online_logistic_policy", "feature_names": list(self.FEATURE_NAMES), "weights": {name: round(value, 8) for name, value in self.weights.items()}, "trained_steps": self.trained_steps, "loss": self.loss}
+
+
 class AppConfigStore:
     def __init__(self):
         base = Path(os.environ.get("APPDATA") or (Path.home() / ".config"))
@@ -1369,12 +1495,12 @@ class DataStore:
         reward = safe_float(record.get("reward", record.get("total_reward", 0.0)), 0.0) if isinstance(record, dict) else 0.0
         return reward, safe_float(record.get("sleep_confidence", 0.0), 0.0) if isinstance(record, dict) else 0.0, reward
 
-    def save_ai_model_snapshot(self, records, settings, max_models, status):
+    def save_ai_model_snapshot(self, records, settings, max_models, status, model=None):
         with self.lock:
             self.model_dir.mkdir(parents=True, exist_ok=True)
             ranked = sorted([record for record in records or [] if record.get("mouse_action")], key=lambda record: (safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), safe_float(record.get("sleep_confidence", 0.0), 0.0)), reverse=True)
             limit = max(1, min(len(ranked) or 1, safe_int(getattr(settings, "global_action_heap_limit", 1), 1)))
-            payload = {"schema_version": CONFIG_SCHEMA_VERSION, "created_at": now_text(), "status": status, "life_experience": self.life, "experience_count": len(records or []), "policy": [{"id": record.get("id"), "mode": record.get("mode"), "mouse_action": record.get("mouse_action"), "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
+            payload = {"schema_version": CONFIG_SCHEMA_VERSION, "created_at": now_text(), "status": status, "life_experience": self.life, "experience_count": len(records or []), "model": model.snapshot() if model else None, "policy": [{"id": record.get("id"), "mode": record.get("mode"), "mouse_action": record.get("mouse_action"), "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_model_confidence": safe_float(record.get("sleep_model_confidence", record.get("model_prediction", 0.0)), 0.0), "model_prediction": safe_float(record.get("model_prediction", 0.0), 0.0), "model_target": safe_float(record.get("model_target", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
             path = self.model_dir / f"model_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex}.json"
             temporary = path.with_suffix(".tmp")
             with temporary.open("w", encoding="utf-8") as file:
@@ -1791,6 +1917,7 @@ class ExperiencePool:
         self.index = defaultdict(list)
         self.sorted_prefixes = []
         self.profile = HumanProfile(settings)
+        self.model = PolicyModel(settings)
         self.lock = threading.RLock()
         self.action_cache = []
         self.prefix_neighbor_cache = OrderedDict()
@@ -1812,6 +1939,7 @@ class ExperiencePool:
             rebuild = self._index_signature(settings) != self._index_signature(self.index_settings)
             self.settings = settings
             self.profile.settings = settings
+            self.model.settings = settings
             if rebuild:
                 self.index_settings = settings
                 self.rebuild_index_locked()
@@ -2019,6 +2147,7 @@ class ExperiencePool:
             value = (learned * visits + candidate) / (visits + 1)
             confidence = clamp((similarity_confidence + human_score / 100.0 + min(1.0, (visits + 1) / max(1.0, self.settings.nearest_top_k))) / 3.0, 0.0, 1.0)
             updates.append((index, value, visits + 1, confidence, novelty, human_score))
+        train_records = []
         with self.lock:
             total_score = 0.0
             best_score = None
@@ -2031,12 +2160,21 @@ class ExperiencePool:
                 record["sleep_confidence"] = round(confidence, 4)
                 record["sleep_novelty"] = round(novelty, 2)
                 record["sleep_human_score"] = round(human_score, 2)
-                score = value * (0.75 + confidence * 0.25)
+                train_records.append(record)
+            model_result = self.model.train(train_records)
+            for record in train_records:
+                model_prediction = clamp(safe_float(record.get("model_prediction", self.model.predict(record)), 0.0), 0.0, 1.0)
+                value = safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0)
+                confidence = clamp(safe_float(record.get("sleep_confidence", 0.0), 0.0), 0.0, 1.0)
+                record["sleep_model_confidence"] = round(model_prediction, 4)
+                score = value * (0.65 + confidence * 0.2 + model_prediction * 0.15)
                 total_score += score
                 best_score = score if best_score is None else max(best_score, score)
             self.rebuild_action_heap_locked()
         count = len(updates)
-        return {"trained": count, "best_score": round(best_score or 0.0, 4), "avg_score": round(total_score / count if count else 0.0, 4), "avg_confidence": round(sum(item[3] for item in updates) / count if count else 0.0, 4)}
+        model_confidence = safe_float(model_result.get("confidence", 0.0), 0.0)
+        avg_confidence = (sum(item[3] for item in updates) / count if count else 0.0)
+        return {"trained": count, "model_trained": safe_int(model_result.get("trained", 0), 0), "model_loss": safe_float(model_result.get("loss", 0.0), 0.0), "best_score": round(best_score or 0.0, 4), "avg_score": round(total_score / count if count else 0.0, 4), "avg_confidence": round(clamp(avg_confidence * 0.6 + model_confidence * 0.4, 0.0, 1.0), 4)}
 
     def rebuild_action_heap_locked(self):
         heap = []
@@ -2664,6 +2802,7 @@ class TrainingService:
             panel.adaptive_policy.observe_execution(success=False)
             return False, {"failure_reason": "window_rect_changed"}
         actual = panel.executor.execute(action, rect, stop_event, panel.should_stop_by_escape)
+        panel.events.publish("mouse_action_completed", mode="training", success=bool(actual and not actual.get("execution_error")))
         if not actual:
             panel.log_exception("training.execute", RuntimeError("empty_action_result"))
             panel.write_record("training", session_id, snapshot, None, "ai_mouse_failed", decision=decision, planned_action=action, failed_action=True, execution_error="empty_action_result")
@@ -2688,6 +2827,7 @@ class ControlPanel(tk.Tk):
     def __init__(self):
         enable_dpi_awareness()
         super().__init__()
+        self.events = EventBus()
         self.adaptive_policy = AdaptivePolicy()
         initial_capture_ms = self.measure_capture_latency()
         self.hardware_state = read_hardware_state()
@@ -2706,6 +2846,10 @@ class ControlPanel(tk.Tk):
         self.metrics_presenter = MetricsPresenter(self)
         self.learning_service = LearningService(self)
         self.training_service = TrainingService(self)
+        self.events.subscribe("window_state_changed", lambda event: self.ui(lambda e=event: self.status_var.set(f"窗口状态事件：{e.get('reason', 'ok')}")))
+        self.events.subscribe("sleep_batch_completed", lambda event: self.ui(lambda e=event: self.progress_label_var.set(f"睡眠批次完成｜已完成 {e.get('completed_batches', 0)} 批")))
+        self.events.subscribe("experience_pool_compaction_completed", lambda event: self.ui(lambda e=event: self.status_var.set(f"经验池压缩完成：删除 {e.get('removed', 0)} 条")))
+        self.events.subscribe("save_completed", lambda event: self.ui(lambda e=event: self.status_var.set(f"保存完成：{e.get('kind', 'data')}")))
         self.title("雷电模拟器学习训练控制面板")
         self.geometry(f"{self.settings.ui_width}x{self.settings.ui_height}")
         self.minsize(self.settings.ui_min_width, self.settings.ui_min_height)
@@ -2756,6 +2900,7 @@ class ControlPanel(tk.Tk):
         self.app_config_store = AppConfigStore()
         self.build_ui()
         self.load_persistent_settings()
+        self.after_idle(self.fit_complete_panel)
         self.bind("<Configure>", self.on_window_resize)
         self.bind("<Escape>", lambda event: self.stop_current_mode())
         if self.required_import_error():
@@ -2786,18 +2931,9 @@ class ControlPanel(tk.Tk):
         style.configure("Hint.TLabel", foreground="#555555")
         root = ttk.Frame(self, padding=self.settings.ui_padding)
         root.pack(fill="both", expand=True)
-        canvas = tk.Canvas(root, borderwidth=0, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(root, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        container = ttk.Frame(canvas)
-        canvas_window = canvas.create_window((0, 0), window=container, anchor="nw")
-        container.bind("<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(canvas_window, width=event.width))
-        self.scroll_canvas = canvas
-        container.bind("<Enter>", self.bind_mousewheel)
-        container.bind("<Leave>", self.unbind_mousewheel)
+        container = ttk.Frame(root)
+        container.pack(fill="both", expand=True)
+        self.scroll_canvas = None
         ttk.Label(container, text="雷电模拟器学习训练控制面板", style="Title.TLabel").pack(anchor="w")
         path_frame = ttk.LabelFrame(container, text="路径与时间", padding=self.settings.ui_section_padding)
         path_frame.pack(fill="x", pady=(16, 10))
@@ -2849,6 +2985,22 @@ class ControlPanel(tk.Tk):
         ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100).grid(row=0, column=0, sticky="ew")
         ttk.Label(progress_frame, textvariable=self.progress_text_var, width=8, anchor="e").grid(row=0, column=1, sticky="e", padx=(10, 0))
         ttk.Label(container, textvariable=self.status_var).pack(anchor="w", pady=(10, 0))
+
+
+    def fit_complete_panel(self):
+        try:
+            self.update_idletasks()
+            req_w = max(self.settings.ui_min_width, self.winfo_reqwidth())
+            req_h = max(self.settings.ui_min_height, self.winfo_reqheight())
+            screen_w = max(1, self.winfo_screenwidth())
+            screen_h = max(1, self.winfo_screenheight())
+            width = min(max(self.winfo_width(), req_w), screen_w)
+            height = min(max(self.winfo_height(), req_h), screen_h)
+            self.minsize(min(req_w, screen_w), min(req_h, screen_h))
+            if self.winfo_width() < req_w or self.winfo_height() < req_h:
+                self.geometry(f"{width}x{height}")
+        except Exception as exc:
+            self.log_exception("ui.fit_complete", exc)
 
     def create_metric(self, parent, title, variable):
         frame = ttk.Frame(parent)
@@ -2941,7 +3093,8 @@ class ControlPanel(tk.Tk):
     def runtime_environment_ready(self):
         if self.required_import_error():
             return False
-        return bool(windows_runtime_report(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH)).get("ok"))
+        ok, _ = validate_ldplayer_executable(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH), self.settings, require_attach=False)
+        return ok and bool(windows_runtime_report(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH)).get("ok"))
 
     def update_mode_button_states(self):
         enabled = self.runtime_environment_ready()
@@ -2964,11 +3117,19 @@ class ControlPanel(tk.Tk):
         self.status_var.set("依赖缺失")
 
     def choose_ldplayer(self):
-        path = filedialog.askopenfilename(title="选择 dnplayer.exe", filetypes=[("Executable", "*.exe"), ("All", "*.*")])
-        if path:
-            self.ldplayer_var.set(path)
-            self.save_persistent_settings()
+        path = filedialog.askopenfilename(title="选择 dnplayer.exe", filetypes=[("dnplayer.exe", "dnplayer.exe")])
+        if not path:
+            return
+        ok, reason = validate_ldplayer_executable(path, self.settings, require_attach=True)
+        if not ok:
+            messagebox.showerror("雷电路径不合法", reason)
+            self.status_var.set("雷电路径校验失败，未保存")
             self.update_mode_button_states()
+            return
+        self.ldplayer_var.set(path)
+        self.save_persistent_settings()
+        self.status_var.set("雷电路径已校验并保存")
+        self.update_mode_button_states()
 
     def choose_data(self):
         path = filedialog.askdirectory(title="选择数据存储目录")
@@ -3024,6 +3185,7 @@ class ControlPanel(tk.Tk):
                     break
                 dst.write(chunk)
                 copied += len(chunk)
+                self.events.publish("migration_chunk_completed", source=str(source), target=str(target), copied=copied, total=total)
                 self.update_progress(clamp(copied / max(1, total) * 100.0, 0.0, 99.0))
         try:
             shutil.copystat(source, target)
@@ -3376,6 +3538,10 @@ class ControlPanel(tk.Tk):
         self.restore_panel()
 
     def ensure_runtime(self, config):
+        valid_path, path_reason = validate_ldplayer_executable(config.ldplayer_path, config.settings, require_attach=False)
+        if not valid_path:
+            self.ui(lambda r=path_reason: messagebox.showerror("雷电路径不合法", r))
+            return False
         report = windows_runtime_report(config.ldplayer_path)
         if not report.get("ok"):
             self.log_exception("runtime.environment", RuntimeError("environment_not_ready"), report)
@@ -3504,6 +3670,14 @@ class ControlPanel(tk.Tk):
         stale_batches = 0
         poor_limit = max(workers, queue_depth)
         poor_optimization = False
+        time_limit_reached = threading.Event()
+        def mark_time_limit():
+            time_limit_reached.set()
+            stop_event.set()
+            self.events.publish("sleep_time_limit_reached", seconds=config.sleep_seconds)
+        time_limit_timer = threading.Timer(config.sleep_seconds, mark_time_limit)
+        time_limit_timer.daemon = True
+        time_limit_timer.start()
         self.ui(lambda: self.progress_label_var.set("睡眠训练进度"))
         def train_once():
             return self.experience_pool.sleep_training_step(batch_size)
@@ -3519,18 +3693,13 @@ class ControlPanel(tk.Tk):
                 submit_next(executor, futures)
             while not stop_event.is_set() and self.is_run_active(token, "sleep"):
                 if self.should_stop_by_escape():
-                    termination_reason = "esc"
                     stop_event.set()
                     break
-                elapsed = time.perf_counter() - start
-                percent = clamp(elapsed / config.sleep_seconds * 100.0, 0.0, 100.0)
+                percent = clamp(completed / max(1, submitted + queue_depth) * 100.0, 0.0, 99.0)
                 self.update_progress(percent)
-                if percent >= 100.0:
-                    break
                 if not futures:
                     submit_next(executor, futures)
-                remaining = max(0.0, config.sleep_seconds - elapsed)
-                done, futures = concurrent.futures.wait(futures, timeout=remaining, return_when=concurrent.futures.FIRST_COMPLETED)
+                done, futures = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
                 if not done:
                     break
                 trained = 0
@@ -3562,7 +3731,9 @@ class ControlPanel(tk.Tk):
                 divisor = max(1, len(done))
                 life = self.store.state.get("life_experience", 0.0) if self.store else 0.0
                 compact = self.store.compact_experience_pool(config.experience_pool_gb) if self.store else {"changed": False}
+                self.events.publish("sleep_batch_completed", trained=trained, best_score=best_score, confidence=batch_confidence, completed_batches=completed)
                 if compact.get("changed"):
+                    self.events.publish("experience_pool_compaction_completed", removed=compact.get("removed", 0), size_bytes=compact.get("size_bytes", 0))
                     self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit))
                     self.brain = ActionBrain(self.experience_pool, config.settings)
                     self.ui(lambda c=self.experience_pool.count(): self.pool_var.set(str(c)))
@@ -3572,12 +3743,13 @@ class ControlPanel(tk.Tk):
                     break
             for future in futures:
                 future.cancel()
-        save_status = "poor_optimization" if poor_optimization else ("completed" if self.is_run_active(token, "sleep") and not stop_event.is_set() else "incomplete")
+        time_limit_timer.cancel()
+        save_status = "poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached.is_set() else ("completed" if self.is_run_active(token, "sleep") and not stop_event.is_set() else "incomplete"))
         self.save_sleep_data(config, save_status)
-        if self.is_run_active(token, "sleep") and not stop_event.is_set():
-            elapsed = time.perf_counter() - start
-            finish_reason = "time_limit" if elapsed >= config.sleep_seconds else "completed"
-            self.finish_run(token, "睡眠模式完成", 100.0, release=False, reason=finish_reason)
+        if self.is_run_active(token, "sleep") and time_limit_reached.is_set():
+            self.finish_run(token, "睡眠模式到达时间上限，数据已保存", 100.0, release=False, reason="time_limit")
+        elif self.is_run_active(token, "sleep") and not stop_event.is_set():
+            self.finish_run(token, "睡眠模式完成", 100.0, release=False, reason="completed")
         elif self.is_run_active(token, "sleep") and poor_optimization:
             self.finish_run(token, "AI模型优化效果差，已保存数据并退出睡眠模式", self.progress_value, release=False, reason="poor_optimization")
         elif self.is_run_active(token, "sleep"):
@@ -3591,7 +3763,8 @@ class ControlPanel(tk.Tk):
             with self.experience_pool.lock:
                 records = copy.deepcopy(self.experience_pool.records)
             self.store.save_experience_records(records)
-            self.store.save_ai_model_snapshot(records, config.settings, config.ai_model_limit, status)
+            self.store.save_ai_model_snapshot(records, config.settings, config.ai_model_limit, status, self.experience_pool.model if self.experience_pool else None)
+            self.events.publish("save_completed", kind="sleep_data", status=status)
             compact = self.store.compact_experience_pool(config.experience_pool_gb)
             if compact.get("changed"):
                 self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit))
@@ -3652,12 +3825,15 @@ class ControlPanel(tk.Tk):
             hash_value = analyzer.fingerprint(image)
             path = self.store.new_screen_path(mode)
             snapshot = ScreenSnapshot(path=path, relative_path=self.store.relative_path(path), hash_value=hash_value, captured_at=now_text(), perf_time=perf_time, elapsed=round(perf_time - session_start, 3), rect=tuple(rect), capture_latency_ms=round((captured_perf - perf_time) * 1000.0, 3), image_priority=priority)
+            self.events.publish("screenshot_completed", mode=mode, path=str(path), latency_ms=snapshot.capture_latency_ms)
             return snapshot, image
         except Exception as exc:
             self.log_exception("capture_snapshot", exc, {"mode": mode, "rect": list(rect)})
             return None, None
 
     def mark_snapshot_image_result(self, snapshot, saved):
+        if snapshot:
+            self.events.publish("screenshot_save_completed", path=str(getattr(snapshot, "path", "")), saved=bool(saved))
         if snapshot and not saved:
             try:
                 object.__setattr__(snapshot, "image_dropped", True)
@@ -3706,6 +3882,7 @@ class ControlPanel(tk.Tk):
         if decision:
             record["ai_decision"] = decision
         self.persistence_queue.enqueue_record(self.store, record)
+        self.events.publish("save_completed", kind="record", record_id=record.get("id"))
         self.experience_pool.add(record)
         self.update_metrics(after_novelty, human_score, novelty_reward, human_delta, reward, life, decision)
         return record
