@@ -130,15 +130,16 @@ def bootstrap_dependencies():
         write_startup_install_log([sys.executable, "-m", "pip", "--version"], error=exc)
         fail_and_exit(f"无法启动 pip，不能自动安装依赖。请检查 Python 环境或网络。\n{exc}")
     command = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--user", *missing]
+    install_timeout = max(1, (os.cpu_count() or 1) * 30)
     try:
         env = dict(os.environ)
         env[install_key] = "1"
-        result = subprocess.run(command, capture_output=True, text=True, timeout=max(1, (os.cpu_count() or 1) * 30), env=env)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=install_timeout, env=env)
         write_startup_install_log(command, result=result)
     except subprocess.TimeoutExpired as exc:
         write_startup_install_log(command, error=exc)
         detail = (exc.stderr or exc.stdout or "").strip()
-        fail_and_exit(f"自动安装依赖超时（240秒）: {' '.join(missing)}\n请检查网络或手动执行: {' '.join(command)}\n{detail}")
+        fail_and_exit(f"自动安装依赖超时（{install_timeout}秒）: {' '.join(missing)}\n请检查网络或手动执行: {' '.join(command)}\n{detail}")
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         install_log_path = Path(globals().get("DEFAULT_DATA_PATH", AGENT_SPEC.default_data_path)) / "startup_install.log"
@@ -613,6 +614,14 @@ def run_self_test():
     import tempfile
     with tempfile.TemporaryDirectory() as folder:
         store = DataStore(folder)
+        store.state_file.write_text("{bad json}", encoding="utf-8")
+        rebuilt_state = store.load_state()
+        assert rebuilt_state == {"life_experience": 0.0, "penalty": 0.0}
+        assert list(store.root.glob("state.bad.*.json")) and json.loads(store.state_file.read_text(encoding="utf-8"))["life_experience"] == 0.0
+        dummy_panel = type("DummyPanel", (), {"store": store})()
+        assert ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 200, "target_bytes": 100}) == 0.5
+        assert ControlPanel.sleep_compaction_complete(dummy_panel, {"size_bytes": 100, "target_bytes": 100})
+        assert ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, deque([0.02, 0.02]), 0.01, 0.9, 0.8, True)
         store.save_settings({"training_seconds": 1, "sleep_seconds": 2, "still_seconds": 3, "experience_pool_gb": 4, "ai_model_limit": 5, "forbidden": 6})
         saved_settings = json.loads(store.settings_file.read_text(encoding="utf-8"))
         assert "forbidden" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0 and saved_settings["ai_model_limit"] == 5
@@ -1444,15 +1453,51 @@ class DataStore:
     def life(self):
         return safe_float(self.state.get("life_experience", 0.0), 0.0)
 
+    def default_state_payload(self):
+        return {"life_experience": 0.0, "penalty": 0.0}
+
+    def notify_state_rebuilt(self, message):
+        if "--self-test" in sys.argv:
+            return
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showwarning("状态文件已重建", message)
+            root.destroy()
+        except Exception:
+            pass
+
+    def rebuild_bad_state(self, error):
+        default = self.default_state_payload()
+        backup_path = self.state_file.with_name(f"state.bad.{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json")
+        backup_text = ""
+        try:
+            backup_text = str(backup_path)
+            if self.state_file.exists():
+                shutil.move(str(self.state_file), str(backup_path))
+            with self.state_file.open("w", encoding="utf-8") as file:
+                json.dump(default, file, ensure_ascii=False, indent=2)
+        except Exception as rebuild_error:
+            configuration_failure("重建状态文件失败 " + str(self.state_file), rebuild_error)
+        try:
+            self.log_error("load_state.rebuilt", error, {"state_file": str(self.state_file), "backup_file": backup_text})
+        except Exception:
+            pass
+        detail = f"状态文件损坏，已重建。\n原文件: {self.state_file}\n备份文件: {backup_text}\n错误详情: {error}"
+        self.notify_state_rebuilt(detail)
+        return default
+
     def load_state(self):
         if not self.state_file.exists():
-            return {"life_experience": 0.0, "penalty": 0.0}
+            return self.default_state_payload()
         try:
             with self.state_file.open("r", encoding="utf-8") as file:
                 data = json.load(file)
+            if not isinstance(data, dict):
+                raise ValueError("状态文件必须是 JSON 对象")
             return {"life_experience": safe_float(data.get("life_experience", 0.0), 0.0), "penalty": safe_float(data.get("penalty", 0.0), 0.0)}
-        except Exception:
-            return {"life_experience": 0.0, "penalty": 0.0}
+        except Exception as exc:
+            return self.rebuild_bad_state(exc)
 
     def save_state(self):
         with self.lock:
@@ -3809,6 +3854,30 @@ class ControlPanel(tk.Tk):
         self.mode_thread = threading.Thread(target=self.sleep_loop, args=(token, config, stop_event), daemon=True)
         self.mode_thread.start()
 
+    def sleep_progress_percent(self, started_perf, sleep_seconds, completed_steps, target_training_steps, compaction_progress):
+        elapsed_ratio = (time.perf_counter() - started_perf) / max(1.0, safe_float(sleep_seconds, 1.0))
+        training_ratio = safe_float(completed_steps, 0.0) / max(1.0, safe_float(target_training_steps, 1.0))
+        return clamp(max(elapsed_ratio, training_ratio, clamp(compaction_progress, 0.0, 1.0)) * 100.0, 0.0, 99.0)
+
+    def sleep_compaction_progress(self, compact):
+        if not isinstance(compact, dict):
+            return 0.0
+        size_bytes = max(0.0, safe_float(compact.get("size_bytes", 0.0), 0.0))
+        target_bytes = max(1.0, safe_float(compact.get("target_bytes", 1.0), 1.0))
+        return 0.0 if size_bytes <= target_bytes else clamp(target_bytes / size_bytes, 0.0, 1.0)
+
+    def sleep_compaction_complete(self, compact):
+        if not isinstance(compact, dict):
+            return True
+        size_bytes = max(0.0, safe_float(compact.get("size_bytes", 0.0), 0.0))
+        target_bytes = max(1.0, safe_float(compact.get("target_bytes", 1.0), 1.0))
+        return size_bytes <= target_bytes
+
+    def sleep_completion_reached(self, completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, compaction_complete):
+        pending_state = safe_int(getattr(self.store, "pending_state_writes", 0), 0) if self.store else 0
+        improvement_ready = bool(recent_improvements) and sum(recent_improvements) >= improvement_threshold * len(recent_improvements)
+        return completed >= target_training_steps and improvement_ready and batch_confidence >= confidence_target and compaction_complete and pending_state == 0
+
     def sleep_loop(self, token, config, stop_event):
         started = self.events.publish("sleep_started", seconds=config.sleep_seconds, data_path=str(config.data_path))
         completed = 0
@@ -3817,12 +3886,25 @@ class ControlPanel(tk.Tk):
         queue_depth = max(workers, config.settings.sleep_queue_depth)
         batch_size = max(1, config.settings.sleep_batch_size)
         best_seen = None
+        recent_improvements = deque(maxlen=max(1, min(max(workers, queue_depth), max(1, self.experience_pool.count() // batch_size if self.experience_pool else 1))))
         stale_batches = 0
         poor_limit = max(workers, queue_depth)
+        target_training_steps = max(poor_limit, math.ceil(max(1, self.experience_pool.count() if self.experience_pool else 1) / batch_size), workers * max(1, config.settings.ui_metric_columns))
+        improvement_threshold = 1.0 / max(100.0, target_training_steps * batch_size)
+        confidence_target = clamp(1.0 - 1.0 / max(2.0, config.settings.nearest_top_k + batch_size), 0.5, 0.98)
+        initial_compact = self.store.compact_experience_pool(config.experience_pool_gb) if self.store else {"changed": False}
+        if initial_compact.get("changed") and self.store:
+            self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit))
+            self.brain = ActionBrain(self.experience_pool, config.settings)
+            self.ui(lambda c=self.experience_pool.count(): self.pool_var.set(str(c)))
+        compaction_progress = self.sleep_compaction_progress(initial_compact)
+        compaction_complete = self.sleep_compaction_complete(initial_compact)
         poor_optimization = False
         time_limit_reached = False
-        sleep_deadline = time.perf_counter() + max(1, config.sleep_seconds)
-        self.ui(lambda: self.progress_label_var.set("睡眠训练进度"))
+        completed_success = False
+        started_perf = time.perf_counter()
+        sleep_deadline = started_perf + max(1, config.sleep_seconds)
+        self.ui(lambda: self.progress_label_var.set("睡眠训练进度｜剩余 -- 秒｜已训练批次 0｜当前置信度 0.0%"))
         def train_once():
             return self.experience_pool.sleep_training_step(batch_size)
         def submit_next(executor, futures):
@@ -3844,7 +3926,7 @@ class ControlPanel(tk.Tk):
                     stop_event.set()
                     self.events.publish("sleep_time_limit_reached", seconds=config.sleep_seconds, started_sequence=started["sequence"])
                     break
-                percent = clamp(completed / max(1, submitted + queue_depth) * 100.0, 0.0, 99.0)
+                percent = self.sleep_progress_percent(started_perf, config.sleep_seconds, completed, target_training_steps, compaction_progress)
                 self.update_progress(percent)
                 if not futures:
                     submit_next(executor, futures)
@@ -3872,7 +3954,9 @@ class ControlPanel(tk.Tk):
                 batch_score = avg_score / divisor
                 batch_confidence = avg_confidence / divisor
                 if trained > 0:
+                    improvement_amount = best_score if best_seen is None else max(0.0, best_score - best_seen)
                     improved = best_seen is None or best_score > best_seen
+                    recent_improvements.append(improvement_amount)
                     best_seen = best_score if best_seen is None else max(best_seen, best_score)
                     stale_batches = 0 if improved else stale_batches + len(done)
                     poor_optimization = completed >= poor_limit and stale_batches >= poor_limit and batch_confidence <= 1.0 / max(1, batch_size)
@@ -3881,24 +3965,33 @@ class ControlPanel(tk.Tk):
                 divisor = max(1, len(done))
                 life = self.store.state.get("life_experience", 0.0) if self.store else 0.0
                 compact = self.store.compact_experience_pool(config.experience_pool_gb) if self.store else {"changed": False}
+                compaction_progress = self.sleep_compaction_progress(compact)
+                compaction_complete = self.sleep_compaction_complete(compact)
                 self.events.publish("sleep_batch_completed", trained=trained, best_score=best_score, confidence=batch_confidence, completed_batches=completed)
                 if compact.get("changed"):
                     self.events.publish("experience_pool_compaction_completed", removed=compact.get("removed", 0), size_bytes=compact.get("size_bytes", 0))
                     self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit))
                     self.brain = ActionBrain(self.experience_pool, config.settings)
                     self.ui(lambda c=self.experience_pool.count(): self.pool_var.set(str(c)))
-                decision = {"reason": "sleep_prioritized_replay", "confidence": batch_confidence, "candidate_count": trained, "best_score": best_score, "completed_batches": completed, "workers": workers, "pool_compacted": compact.get("changed", False), "pool_removed": compact.get("removed", 0)}
+                decision = {"reason": "sleep_prioritized_replay", "confidence": batch_confidence, "candidate_count": trained, "best_score": best_score, "completed_batches": completed, "target_training_steps": target_training_steps, "confidence_target": confidence_target, "workers": workers, "pool_compacted": compact.get("changed", False), "pool_removed": compact.get("removed", 0)}
                 self.update_metrics(0.0, 50.0 + clamp(batch_confidence * 50.0, 0.0, 50.0), 0.0, batch_score, best_score, life, decision)
+                remaining_seconds = max(0.0, sleep_deadline - time.perf_counter())
+                self.ui(lambda r=remaining_seconds, c=completed, t=target_training_steps, q=batch_confidence: self.progress_label_var.set(f"睡眠训练进度｜剩余 {r:.1f} 秒｜已训练批次 {c}/{t}｜当前置信度 {q * 100.0:.1f}%"))
+                self.update_progress(self.sleep_progress_percent(started_perf, config.sleep_seconds, completed, target_training_steps, compaction_progress))
+                if self.sleep_completion_reached(completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, compaction_complete):
+                    completed_success = True
+                    self.events.publish("sleep_completion_reached", completed_batches=completed, target_training_steps=target_training_steps, confidence=batch_confidence, confidence_target=confidence_target)
+                    break
                 if poor_optimization:
                     break
             for future in futures:
                 future.cancel()
-        save_status = "poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached else ("completed" if self.is_run_active(token, "sleep") and not stop_event.is_set() else "incomplete"))
+        save_status = "completed" if completed_success else ("poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached else "incomplete"))
         self.save_sleep_data(config, save_status)
-        if self.is_run_active(token, "sleep") and time_limit_reached:
+        if self.is_run_active(token, "sleep") and completed_success:
+            self.finish_run(token, "睡眠模式任务完成，数据已保存", 100.0, release=False, reason="completed")
+        elif self.is_run_active(token, "sleep") and time_limit_reached:
             self.finish_run(token, "睡眠模式到达时间上限，数据已保存", 100.0, release=False, reason="time_limit")
-        elif self.is_run_active(token, "sleep") and not stop_event.is_set():
-            self.finish_run(token, "睡眠模式完成", 100.0, release=False, reason="completed")
         elif self.is_run_active(token, "sleep") and poor_optimization:
             self.finish_run(token, "AI模型优化效果差，已保存数据并退出睡眠模式", self.progress_value, release=False, reason="poor_optimization")
         elif self.is_run_active(token, "sleep"):
