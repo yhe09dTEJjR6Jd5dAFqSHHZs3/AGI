@@ -19,7 +19,7 @@ from typing import Optional
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 MIN_PYTHON_VERSION = (3, 10)
 
@@ -2894,6 +2894,16 @@ class ControlPanel(tk.Tk):
         self.hardware_last_full_refresh_perf = 0.0
         self.hardware_last_light_refresh_perf = 0.0
         self.progress_label_var = tk.StringVar(value="进度")
+        self.runtime_value_specs = {
+            "training_seconds": ("训练秒数", self.training_seconds_var, DEFAULT_TRAINING_SECONDS, safe_int, 1),
+            "sleep_seconds": ("睡眠秒数", self.sleep_seconds_var, DEFAULT_SLEEP_SECONDS, safe_int, 1),
+            "still_seconds": ("静止秒数", self.still_seconds_var, DEFAULT_STILL_SECONDS, safe_float, 0.1),
+            "experience_pool_gb": ("经验池 GB", self.experience_pool_gb_var, DEFAULT_EXPERIENCE_POOL_GB, safe_float, 0.1),
+            "ai_model_limit": ("AI 模型个数", self.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, 1)
+        }
+        self.modify_buttons = []
+        self.runtime_environment_refresh_id = None
+        self.runtime_environment_last_ready = None
         self.metric_items = []
         self.hint_label = None
         self.metrics_frame = None
@@ -2912,6 +2922,7 @@ class ControlPanel(tk.Tk):
         if not pynput_keyboard:
             self.status_var.set("全局键盘监听不可用，已启用 Windows ESC 轮询兜底")
         self.protocol("WM_DELETE_WINDOW", self.close)
+        self.refresh_runtime_environment_state()
 
     def build_ui(self):
         style = ttk.Style(self)
@@ -2940,16 +2951,26 @@ class ControlPanel(tk.Tk):
         path_frame.columnconfigure(1, weight=1)
         ttk.Label(path_frame, text="雷电模拟器").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=6)
         ttk.Entry(path_frame, textvariable=self.ldplayer_var, justify="right", state="readonly").grid(row=0, column=1, sticky="ew", pady=6)
-        ttk.Button(path_frame, text="修改", command=self.choose_ldplayer).grid(row=0, column=2, padx=(8, 0), pady=6)
+        ldplayer_modify = ttk.Button(path_frame, text="修改", command=self.choose_ldplayer)
+        ldplayer_modify.grid(row=0, column=2, padx=(8, 0), pady=6)
+        self.modify_buttons.append(ldplayer_modify)
         ttk.Label(path_frame, text="数据存储").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=6)
         ttk.Entry(path_frame, textvariable=self.data_var, justify="right", state="readonly").grid(row=1, column=1, sticky="ew", pady=6)
-        ttk.Button(path_frame, text="修改", command=self.choose_data).grid(row=1, column=2, padx=(8, 0), pady=6)
+        data_modify = ttk.Button(path_frame, text="修改", command=self.choose_data)
+        data_modify.grid(row=1, column=2, padx=(8, 0), pady=6)
+        self.modify_buttons.append(data_modify)
         time_frame = ttk.Frame(path_frame)
         time_frame.grid(row=2, column=1, columnspan=2, sticky="w", pady=6)
         ttk.Label(path_frame, text="时间设置").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=6)
-        for label, variable in (("训练/秒", self.training_seconds_var), ("睡眠/秒", self.sleep_seconds_var), ("静止/秒", self.still_seconds_var), ("经验池/GB", self.experience_pool_gb_var), ("AI模型/个", self.ai_model_limit_var)):
-            ttk.Label(time_frame, text=label).pack(side="left")
-            ttk.Entry(time_frame, textvariable=variable, width=10).pack(side="left", padx=(6, 16))
+        for field, label in (("training_seconds", "训练/秒"), ("sleep_seconds", "睡眠/秒"), ("still_seconds", "静止/秒"), ("experience_pool_gb", "经验池/GB"), ("ai_model_limit", "AI模型/个")):
+            variable = self.runtime_value_specs[field][1]
+            item_frame = ttk.Frame(time_frame)
+            item_frame.pack(side="left", padx=(0, 12))
+            ttk.Label(item_frame, text=label).pack(side="left")
+            ttk.Entry(item_frame, textvariable=variable, width=10, state="readonly", justify="right").pack(side="left", padx=(6, 4))
+            button = ttk.Button(item_frame, text="修改", command=lambda name=field: self.modify_runtime_value(name))
+            button.pack(side="left")
+            self.modify_buttons.append(button)
         button_frame = ttk.Frame(container)
         button_frame.pack(fill="x", pady=(4, 12))
         self.button_frame = button_frame
@@ -3098,14 +3119,36 @@ class ControlPanel(tk.Tk):
 
     def update_mode_button_states(self):
         enabled = self.runtime_environment_ready()
-        state = "normal" if enabled else "disabled"
+        mode = self.current_mode()
+        mode_state = "normal" if enabled and mode == "idle" else "disabled"
+        modify_state = "normal" if mode == "idle" else "disabled"
         for button in getattr(self, "mode_buttons", []):
             try:
-                button.configure(state=state)
+                button.configure(state=mode_state)
             except Exception:
                 pass
-        if not enabled and self.current_mode() == "idle":
+        for button in getattr(self, "modify_buttons", []):
+            try:
+                button.configure(state=modify_state)
+            except Exception:
+                pass
+        if not enabled and mode == "idle":
             self.status_var.set("运行环境未就绪：请确认 Windows 桌面环境、依赖和雷电模拟器路径")
+        self.runtime_environment_last_ready = enabled
+        return enabled
+
+    def runtime_environment_refresh_delay_ms(self):
+        source = max(self.settings.window_event_wait, self.settings.ui_event_coalesce_seconds, self.settings.key_debounce_seconds)
+        return max(200, min(3000, int(source * 1000)))
+
+    def refresh_runtime_environment_state(self):
+        try:
+            self.update_mode_button_states()
+        finally:
+            try:
+                self.runtime_environment_refresh_id = self.after(self.runtime_environment_refresh_delay_ms(), self.refresh_runtime_environment_state)
+            except Exception:
+                self.runtime_environment_refresh_id = None
 
     def required_import_error(self):
         return {name: IMPORT_ERRORS[name] for name in tuple(REQUIRED_MODULES) if name in IMPORT_ERRORS}
@@ -3116,7 +3159,35 @@ class ControlPanel(tk.Tk):
         messagebox.showerror("依赖异常", "依赖自动安装或加载失败。\n\n当前错误：\n" + "\n".join(lines))
         self.status_var.set("依赖缺失")
 
+    def require_idle_for_user_edit(self):
+        if self.current_mode() != "idle":
+            self.status_var.set("只能在空闲状态点击修改")
+            return False
+        return True
+
+    def format_runtime_value(self, field, value):
+        if field in ("training_seconds", "sleep_seconds", "ai_model_limit"):
+            return str(safe_int(value, self.runtime_value_specs[field][2]))
+        return str(safe_float(value, self.runtime_value_specs[field][2]))
+
+    def modify_runtime_value(self, field):
+        AllowedUserEditPolicy.assert_allowed(field)
+        if not self.require_idle_for_user_edit():
+            return
+        title, variable, default, parser, minimum = self.runtime_value_specs[field]
+        current = variable.get().strip() or str(default)
+        answer = simpledialog.askstring("修改" + title, "请输入" + title, initialvalue=current, parent=self)
+        if answer is None:
+            return
+        value = max(minimum, parser(answer, default))
+        variable.set(self.format_runtime_value(field, value))
+        self.save_persistent_settings()
+        self.status_var.set(title + "已保存")
+        self.update_mode_button_states()
+
     def choose_ldplayer(self):
+        if not self.require_idle_for_user_edit():
+            return
         path = filedialog.askopenfilename(title="选择 dnplayer.exe", filetypes=[("dnplayer.exe", "dnplayer.exe")])
         if not path:
             return
@@ -3132,6 +3203,8 @@ class ControlPanel(tk.Tk):
         self.update_mode_button_states()
 
     def choose_data(self):
+        if not self.require_idle_for_user_edit():
+            return
         path = filedialog.askdirectory(title="选择数据存储目录")
         if not path:
             return
@@ -3463,6 +3536,7 @@ class ControlPanel(tk.Tk):
                 session = ModeSession(session_token, target, time.perf_counter(), deadline, stop_event, transition_reason)
                 self.active_session = session
         self.set_mode_ui(target)
+        self.ui(self.update_mode_button_states)
         return session
 
     def is_run_active(self, token, mode=None):
@@ -4036,6 +4110,12 @@ class ControlPanel(tk.Tk):
             self.stop_event.set()
             self.run_token += 1
             self.mode = "idle"
+        if self.runtime_environment_refresh_id:
+            try:
+                self.after_cancel(self.runtime_environment_refresh_id)
+            except Exception:
+                pass
+            self.runtime_environment_refresh_id = None
         if self.mouse_recorder:
             self.mouse_recorder.stop()
         self.escape_monitor.stop()
