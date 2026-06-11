@@ -12,6 +12,7 @@ import os
 import shutil
 import threading
 import time
+import tempfile
 import uuid
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, fields, replace
@@ -183,8 +184,54 @@ except Exception as exc:
     pynput_keyboard = None
     IMPORT_ERRORS["pynput.keyboard"] = exc
 
+def startup_config_paths():
+    base = Path(os.environ.get("APPDATA") or (Path.home() / ".config"))
+    settings_file = base / "AGI" / "startup.json"
+    source = {}
+    try:
+        if settings_file.is_file():
+            with settings_file.open("r", encoding="utf-8") as file:
+                loaded = json.load(file)
+            source = loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        source = {}
+    return Path(str(source.get("ldplayer_path") or AGENT_SPEC.default_ldplayer_path)), Path(str(source.get("data_path") or AGENT_SPEC.default_data_path))
+
+
+def data_path_write_issue(path, create=False):
+    candidate = Path(path)
+    try:
+        if create:
+            candidate.mkdir(parents=True, exist_ok=True)
+        if not candidate.exists():
+            return "存储路径不存在"
+        if not candidate.is_dir():
+            return "存储路径不是文件夹"
+        probe = candidate / f".agi_startup_write_{uuid.uuid4().hex}.tmp"
+        with probe.open("wb") as file:
+            file.write(b"")
+        probe.unlink()
+        return None
+    except Exception as exc:
+        return f"存储路径不可写：{exc}"
+
+
+def startup_ldplayer_window_issue(path):
+    if sys.platform != "win32" or any(name in IMPORT_ERRORS for name in REQUIRED_MODULES):
+        return None
+    try:
+        manager = WindowManager(path, derive_runtime_settings())
+        if not manager.find_window():
+            return "雷电模拟器窗口尚未运行或无法附着"
+        check = manager.check_window(force=True)
+        return None if check.ok else f"雷电模拟器窗口异常：{check.reason}"
+    except Exception as exc:
+        return f"无法检查雷电模拟器窗口：{exc}"
+
+
 def startup_environment_issues():
     issues = []
+    ldplayer_path, data_path = startup_config_paths()
     if sys.version_info < MIN_PYTHON_VERSION:
         issues.append(f"Python 版本过低：需要 {MIN_PYTHON_VERSION[0]}.{MIN_PYTHON_VERSION[1]} 或更高版本，当前版本为 {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
     if sys.platform != "win32":
@@ -201,15 +248,36 @@ def startup_environment_issues():
     for name in REQUIRED_MODULES:
         if name in IMPORT_ERRORS:
             issues.append(f"依赖无法导入 {name}：{IMPORT_ERRORS[name]}")
+    valid_path, path_reason = validate_ldplayer_executable(ldplayer_path, require_attach=False)
+    if not valid_path:
+        issues.append(f"雷电模拟器启动路径无效 {ldplayer_path}：{path_reason}")
+    storage_issue = data_path_write_issue(data_path)
+    if storage_issue:
+        issues.append(f"存储路径无效 {data_path}：{storage_issue}")
+    window_issue = startup_ldplayer_window_issue(ldplayer_path) if valid_path else None
+    if window_issue:
+        issues.append(window_issue)
     return issues
 
 
 def attempt_startup_environment_repair(actions=None):
     actions = actions if actions is not None else []
+    ldplayer_path, data_path = startup_config_paths()
     missing = [name for name in REQUIRED_MODULES if name in IMPORT_ERRORS]
     if missing:
         actions.append("自动安装缺失或异常依赖：" + "、".join(missing))
         bootstrap_dependencies()
+    storage_issue = data_path_write_issue(data_path, create=True)
+    actions.append("已创建并验证存储路径可写" if not storage_issue else f"无法修复存储路径：{storage_issue}")
+    valid_path, path_reason = validate_ldplayer_executable(ldplayer_path, require_attach=False)
+    if valid_path and sys.platform == "win32" and not missing:
+        manager = WindowManager(ldplayer_path, derive_runtime_settings())
+        if manager.launch_or_attach() and manager.check_window(force=True).ok:
+            actions.append("已启动或附着雷电模拟器窗口")
+        else:
+            actions.append("无法自动启动或附着雷电模拟器窗口")
+    elif not valid_path:
+        actions.append(f"雷电模拟器路径无法自动修复：{path_reason}")
     if sys.version_info < MIN_PYTHON_VERSION:
         actions.append("Python 运行时版本无法由程序自动升级")
     if sys.platform != "win32":
@@ -647,9 +715,12 @@ def run_self_test():
     high_human = reward_parts(70.0, 100.0, settings)[2]
     low_human = reward_parts(70.0, 0.0, settings)[2]
     assert high_screen > low_screen
-    assert high_human > low_human
+    assert high_human == low_human
     assert high_human < high_screen
     details = reward_breakdown(70.0, 100.0, settings)
+    low_human_details = reward_breakdown(70.0, 0.0, settings)
+    assert details["life_delta"] == details["screen_primary_reward"]
+    assert details["reward_sort_key"] > low_human_details["reward_sort_key"]
     assert details["reward_sort_key"][0] == details["screen_primary_reward"]
     assert "human_tie_break_reward" in details
     assert set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit"}
@@ -672,13 +743,32 @@ def run_self_test():
     brain = ActionBrain(pool, changed)
     _, decision = brain.choose(a, novelty, batch, 0.0)
     assert isinstance(decision, dict)
-    import tempfile
     with tempfile.TemporaryDirectory() as folder:
+        root = Path(folder)
+        executable = root / "dnplayer.exe"
+        executable.write_bytes(b"")
+        assert validate_ldplayer_executable(executable)[0]
+        assert data_path_write_issue(root) is None
         store = DataStore(folder)
         store.state_file.write_text("{bad json}", encoding="utf-8")
         rebuilt_state = store.load_state()
         assert rebuilt_state == {"life_experience": 0.0, "penalty": 0.0}
         assert list(store.root.glob("state.bad.*.json")) and json.loads(store.state_file.read_text(encoding="utf-8"))["life_experience"] == 0.0
+        shared = store.screen_dir / "shared.png"
+        unique = store.screen_dir / "unique.png"
+        with shared.open("wb") as file:
+            file.truncate(40 * 1024 * 1024)
+        with unique.open("wb") as file:
+            file.truncate(100 * 1024 * 1024)
+        store.save_experience_records([
+            {"id": "low", "screen_path": "screens/shared.png", "reward_sort_key": [1.0, 1.0], "reward": 1.0},
+            {"id": "middle", "screen_path": "screens/unique.png", "reward_sort_key": [2.0, 2.0], "reward": 2.0},
+            {"id": "high", "screen_path": "screens/shared.png", "reward_sort_key": [3.0, 3.0], "reward": 3.0}
+        ])
+        compacted = store.compact_experience_pool(0.1)
+        retained = store.load_experience()
+        assert compacted["changed"] and shared.exists() and not unique.exists()
+        assert [record["id"] for record in retained] == ["high"]
         dummy_panel = type("DummyPanel", (), {"store": store})()
         assert ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 200, "target_bytes": 100}) == 0.5
         assert ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 100, "target_bytes": 100}) == 1.0
@@ -1258,8 +1348,8 @@ def reward_breakdown(novelty, human_score, settings):
     reward_span = max(1.0, abs(safe_float(settings.reward_total_max, 100.0) - safe_float(settings.reward_total_min, 0.0)))
     tie_breaker = reward_span / max(1.0, settings.global_action_heap_limit * settings.local_action_heap_limit)
     human_tiebreak = clamp(human_delta / 100.0, -1.0, 1.0) * tie_breaker
-    life_delta = round(clamp(screen_reward + human_tiebreak, settings.reward_total_min, settings.reward_total_max), 4)
-    return {"screen_novelty": screen_novelty, "screen_reward": screen_reward, "human_similarity": human_similarity, "human_tiebreak": round(human_tiebreak, 6), "life_delta": life_delta, "basis": ["nearest_screen_batch", "learning_mouse_profile"], "screen_primary_reward": screen_reward, "human_tie_break_reward": round(human_tiebreak, 6), "mouse_action_delta": human_delta, "total_reward": life_delta, "reward_sort_key": [screen_reward, round(human_tiebreak, 6)]}
+    life_delta = round(clamp(screen_reward, settings.reward_total_min, settings.reward_total_max), 4)
+    return {"screen_novelty": screen_novelty, "screen_reward": screen_reward, "human_similarity": human_similarity, "human_tiebreak": round(human_tiebreak, 6), "life_delta": life_delta, "basis": ["nearest_screen_batch", "learning_mouse_profile"], "screen_primary_reward": screen_reward, "human_tie_break_reward": round(human_tiebreak, 6), "mouse_action_delta": human_delta, "total_reward": life_delta, "reward_sort_key": [screen_reward, human_similarity]}
 
 
 def reward_parts(novelty, human_score, settings):
@@ -1837,6 +1927,13 @@ class DataStore:
                     reward = self.record_reward_sort_key(record)
                     records.append({"reward": reward, "line": line_number, "text": text, "record": record})
         records.sort(key=lambda item: (item["reward"], item["line"]))
+        path_references = defaultdict(int)
+        record_paths = {}
+        for item in records:
+            paths = self.experience_record_paths([item["record"]])
+            record_paths[item["line"]] = paths
+            for path in paths:
+                path_references[path] += 1
         removed_ids = set()
         removed = 0
         for item in records:
@@ -1844,11 +1941,9 @@ class DataStore:
                 break
             removed += 1
             removed_ids.add(item["line"])
-            record = item["record"]
-            for key in ("screen_path", "before_screen", "after_screen"):
-                value = record.get(key)
-                if value:
-                    path = self.root / value
+            for path in record_paths.get(item["line"], set()):
+                path_references[path] = max(0, path_references[path] - 1)
+                if path_references[path] == 0:
                     try:
                         if path.exists() and path.is_file():
                             size = path.stat().st_size
@@ -3121,7 +3216,7 @@ class ControlPanel(tk.Tk):
         self.last_learning_activity = time.perf_counter()
         self.activity_lock = threading.RLock()
         self.last_cursor_pos = None
-        self.escape_monitor = EscapeMonitor(self.stop_current_mode, self.settings.key_debounce_seconds)
+        self.escape_monitor = EscapeMonitor(self.request_escape, self.settings.key_debounce_seconds)
         self.ldplayer_var = tk.StringVar(value=DEFAULT_LDPLAYER_PATH)
         self.data_var = tk.StringVar(value=DEFAULT_DATA_PATH)
         self.training_seconds_var = tk.StringVar(value=str(DEFAULT_TRAINING_SECONDS))
@@ -3164,7 +3259,7 @@ class ControlPanel(tk.Tk):
         self.load_persistent_settings()
         self.after_idle(self.fit_complete_panel)
         self.bind("<Configure>", self.on_window_resize)
-        self.bind("<Escape>", lambda event: self.stop_current_mode())
+        self.bind("<Escape>", lambda event: self.request_escape())
         if self.required_import_error():
             self.after(200, self.show_import_error)
         else:
@@ -4018,6 +4113,17 @@ class ControlPanel(tk.Tk):
             self.ui(lambda m=message: messagebox.showerror("运行失败", m))
             self.finish_run(token, "运行失败", 0.0, reason="runtime_error")
 
+    def request_escape(self):
+        with self.state_lock:
+            if self.mode == "sleep":
+                self.termination_reason = "esc"
+                if self.active_session:
+                    self.active_session.termination_reason = "esc"
+                self.stop_event.set()
+                self.ui(lambda: self.status_var.set("睡眠模式正在保存数据"))
+                return
+        self.stop_current_mode()
+
     def stop_current_mode(self):
         with self.state_lock:
             mode = self.mode
@@ -4056,8 +4162,8 @@ class ControlPanel(tk.Tk):
         training_ratio = clamp(safe_float(completed_steps, 0.0) / max(1.0, safe_float(target_training_steps, 1.0)), 0.0, 1.0)
         compact_ratio = clamp(compaction_progress, 0.0, 1.0)
         previous_ratio = clamp(getattr(self, "progress_value", 0.0) / 100.0, 0.0, 1.0)
-        active_compaction_ratio = compact_ratio if compact_ratio < 1.0 else 0.0
-        return {"time": elapsed_ratio, "training": training_ratio, "compaction": compact_ratio, "overall": max(previous_ratio, elapsed_ratio, training_ratio, active_compaction_ratio)}
+        task_ratio = min(training_ratio, compact_ratio)
+        return {"time": elapsed_ratio, "training": training_ratio, "compaction": compact_ratio, "overall": max(previous_ratio, task_ratio)}
 
     def sleep_progress_percent(self, started_perf, sleep_seconds, completed_steps, target_training_steps, compaction_progress):
         return clamp(self.sleep_progress_fields(started_perf, sleep_seconds, completed_steps, target_training_steps, compaction_progress)["overall"] * 100.0, 0.0, 99.0)
@@ -4122,6 +4228,10 @@ class ControlPanel(tk.Tk):
                 submit_next(executor, futures)
             while not stop_event.is_set() and self.is_run_active(token, "sleep"):
                 if self.should_stop_by_escape():
+                    with self.state_lock:
+                        self.termination_reason = "esc"
+                        if self.active_session:
+                            self.active_session.termination_reason = "esc"
                     stop_event.set()
                     break
                 if time.perf_counter() >= sleep_deadline:
@@ -4189,7 +4299,9 @@ class ControlPanel(tk.Tk):
                     break
             for future in futures:
                 future.cancel()
-        save_status = "completed" if completed_success else ("poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached else "incomplete"))
+        with self.state_lock:
+            stopped_reason = self.termination_reason if self.termination_reason in ("esc", "user_stop") else None
+        save_status = "completed" if completed_success else ("poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached else (stopped_reason or "incomplete")))
         self.save_sleep_data(config, save_status)
         if self.is_run_active(token, "sleep") and completed_success:
             self.finish_run(token, "睡眠模式任务完成，数据已保存", 100.0, release=False, reason="completed")
@@ -4198,7 +4310,7 @@ class ControlPanel(tk.Tk):
         elif self.is_run_active(token, "sleep") and poor_optimization:
             self.finish_run(token, "AI模型优化效果差，已保存数据并退出睡眠模式", self.progress_value, release=False, reason="poor_optimization")
         elif self.is_run_active(token, "sleep"):
-            self.finish_run(token, "睡眠模式已终止，数据已保存", 0.0, release=False, reason="esc" if self.should_stop_by_escape() else "user_stop")
+            self.finish_run(token, "睡眠模式已终止，数据已保存", 0.0, release=False, reason=stopped_reason or "user_stop")
 
     def save_sleep_data(self, config, status):
         if not self.store or not self.experience_pool:
