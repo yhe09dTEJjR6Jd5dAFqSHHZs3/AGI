@@ -63,29 +63,9 @@ def fail_and_exit(message):
     sys.exit(1)
 
 
-def startup_environment_issue():
-    if "--self-test" in sys.argv:
-        return None
-    if sys.platform != "win32":
-        return f"运行环境不符合要求：本程序面向 Windows 桌面会话和雷电模拟器，当前平台为 {sys.platform}。"
-    session_name = os.environ.get("SESSIONNAME", "")
-    if not session_name:
-        return "运行环境不符合要求：未检测到 Windows 桌面会话。"
-    try:
-        if ctypes.windll.user32.GetDesktopWindow() == 0:
-            return "运行环境不符合要求：无法访问 Windows 桌面。"
-    except Exception as exc:
-        return f"运行环境不符合要求：无法检查 Windows 桌面权限：{exc}"
-    return None
+class StartupRepairError(RuntimeError):
+    pass
 
-
-_ENVIRONMENT_ISSUE = startup_environment_issue()
-if _ENVIRONMENT_ISSUE:
-    fail_and_exit(_ENVIRONMENT_ISSUE)
-
-
-if sys.version_info < MIN_PYTHON_VERSION:
-    fail_and_exit(f"需要 Python {MIN_PYTHON_VERSION[0]}.{MIN_PYTHON_VERSION[1]} 或更高版本，当前版本为 {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}。")
 
 def write_startup_install_log(command, result=None, error=None):
     try:
@@ -119,16 +99,18 @@ def bootstrap_dependencies():
         return
     install_key = "AGI_BOOTSTRAP_INSTALLING"
     if os.environ.get(install_key):
-        fail_and_exit("依赖安装后仍无法导入，已停止重复安装：" + "；".join(f"{name}: {error}" for name, error in IMPORT_ERRORS.items()))
+        raise StartupRepairError("依赖安装后仍无法导入，已停止重复安装：" + "；".join(f"{name}: {error}" for name, error in IMPORT_ERRORS.items()))
     try:
         pip_check = subprocess.run([sys.executable, "-m", "pip", "--version"], capture_output=True, text=True, timeout=30)
         write_startup_install_log([sys.executable, "-m", "pip", "--version"], result=pip_check)
         if pip_check.returncode != 0:
             detail = (pip_check.stderr or pip_check.stdout or "").strip()
-            fail_and_exit(f"无法启动 pip，不能自动安装依赖。请检查 Python 环境。\n{detail}")
+            raise StartupRepairError(f"无法启动 pip，不能自动安装依赖。请检查 Python 环境。\n{detail}")
+    except StartupRepairError:
+        raise
     except Exception as exc:
         write_startup_install_log([sys.executable, "-m", "pip", "--version"], error=exc)
-        fail_and_exit(f"无法启动 pip，不能自动安装依赖。请检查 Python 环境或网络。\n{exc}")
+        raise StartupRepairError(f"无法启动 pip，不能自动安装依赖。请检查 Python 环境或网络。\n{exc}") from exc
     command = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--user", *missing]
     install_timeout = max(1, (os.cpu_count() or 1) * 30)
     try:
@@ -139,11 +121,11 @@ def bootstrap_dependencies():
     except subprocess.TimeoutExpired as exc:
         write_startup_install_log(command, error=exc)
         detail = (exc.stderr or exc.stdout or "").strip()
-        fail_and_exit(f"自动安装依赖超时（{install_timeout}秒）: {' '.join(missing)}\n请检查网络或手动执行: {' '.join(command)}\n{detail}")
+        raise StartupRepairError(f"自动安装依赖超时（{install_timeout}秒）: {' '.join(missing)}\n请检查网络或手动执行: {' '.join(command)}\n{detail}") from exc
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         install_log_path = Path(globals().get("DEFAULT_DATA_PATH", AGENT_SPEC.default_data_path)) / "startup_install.log"
-        fail_and_exit(f"自动安装依赖失败: {' '.join(missing)}\n日志位置: {install_log_path}\n请手动执行: {' '.join(command)}\n{detail}")
+        raise StartupRepairError(f"自动安装依赖失败: {' '.join(missing)}\n日志位置: {install_log_path}\n请手动执行: {' '.join(command)}\n{detail}")
     if "pywin32" in missing:
         postinstall = [sys.executable, "-m", "pywin32_postinstall", "-install"]
         try:
@@ -151,13 +133,15 @@ def bootstrap_dependencies():
             write_startup_install_log(postinstall, result=postinstall_result)
             if postinstall_result.returncode != 0:
                 detail = (postinstall_result.stderr or postinstall_result.stdout or "").strip()
-                fail_and_exit(f"pywin32 安装后配置失败。请手动执行: {' '.join(postinstall)}\n{detail}")
+                raise StartupRepairError(f"pywin32 安装后配置失败。请手动执行: {' '.join(postinstall)}\n{detail}")
+        except StartupRepairError:
+            raise
         except Exception as exc:
             write_startup_install_log(postinstall, error=exc)
-            fail_and_exit(f"pywin32 安装后配置失败。请手动执行: {' '.join(postinstall)}\n{exc}")
+            raise StartupRepairError(f"pywin32 安装后配置失败。请手动执行: {' '.join(postinstall)}\n{exc}") from exc
     failed = verify_installed_modules()
     if failed:
-        fail_and_exit("自动安装依赖后仍无法导入：" + "；".join(failed))
+        raise StartupRepairError("自动安装依赖后仍无法导入：" + "；".join(failed))
     os.environ[install_key] = "1"
     os.execv(sys.executable, [sys.executable, *sys.argv])
 
@@ -199,8 +183,74 @@ except Exception as exc:
     pynput_keyboard = None
     IMPORT_ERRORS["pynput.keyboard"] = exc
 
-if "--self-test" not in sys.argv:
-    bootstrap_dependencies()
+def startup_environment_issues():
+    issues = []
+    if sys.version_info < MIN_PYTHON_VERSION:
+        issues.append(f"Python 版本过低：需要 {MIN_PYTHON_VERSION[0]}.{MIN_PYTHON_VERSION[1]} 或更高版本，当前版本为 {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+    if sys.platform != "win32":
+        issues.append(f"操作系统不符合要求：本程序需要 Windows 桌面会话和雷电模拟器，当前平台为 {sys.platform}")
+    else:
+        session_name = os.environ.get("SESSIONNAME", "")
+        if not session_name:
+            issues.append("未检测到 Windows 桌面会话")
+        try:
+            if ctypes.windll.user32.GetDesktopWindow() == 0:
+                issues.append("无法访问 Windows 桌面")
+        except Exception as exc:
+            issues.append(f"无法检查 Windows 桌面权限：{exc}")
+    for name in REQUIRED_MODULES:
+        if name in IMPORT_ERRORS:
+            issues.append(f"依赖无法导入 {name}：{IMPORT_ERRORS[name]}")
+    return issues
+
+
+def attempt_startup_environment_repair(actions=None):
+    actions = actions if actions is not None else []
+    missing = [name for name in REQUIRED_MODULES if name in IMPORT_ERRORS]
+    if missing:
+        actions.append("自动安装缺失或异常依赖：" + "、".join(missing))
+        bootstrap_dependencies()
+    if sys.version_info < MIN_PYTHON_VERSION:
+        actions.append("Python 运行时版本无法由程序自动升级")
+    if sys.platform != "win32":
+        actions.append("当前操作系统无法由程序自动转换为 Windows 桌面环境")
+    elif not os.environ.get("SESSIONNAME", ""):
+        actions.append("Windows 桌面会话无法由程序自动创建")
+    if not actions:
+        actions.append("未找到可自动执行的修复操作")
+    return actions
+
+
+def startup_failure_detail(initial_issues, repair_actions, repair_error, remaining_issues):
+    sections = ["初次检查：", *[f"- {item}" for item in initial_issues], "", "修复过程："]
+    sections.extend(f"- {item}" for item in repair_actions)
+    if repair_error:
+        sections.append(f"- 修复失败：{repair_error}")
+    sections.extend(["", "修复后复检：", *[f"- {item}" for item in remaining_issues]])
+    return "\n".join(sections)
+
+
+def prepare_startup_environment(check_environment=None, repair_environment=None, failure_handler=None):
+    check_environment = check_environment or startup_environment_issues
+    repair_environment = repair_environment or attempt_startup_environment_repair
+    failure_handler = failure_handler or fail_and_exit
+    initial_issues = check_environment()
+    if not initial_issues:
+        return True
+    repair_actions = []
+    repair_error = None
+    try:
+        repair_environment(repair_actions)
+    except Exception as exc:
+        repair_error = str(exc)
+    remaining_issues = check_environment()
+    if not remaining_issues:
+        return True
+    if not repair_actions:
+        repair_actions.append("自动修复未能完成")
+    failure_handler(startup_failure_detail(initial_issues, repair_actions, repair_error, remaining_issues))
+    return False
+
 
 def configuration_failure(area, error):
     detail = f"{area}：{error}"
@@ -556,6 +606,14 @@ def validate_ldplayer_executable(path, settings=None, require_attach=False):
 
 
 def run_self_test():
+    startup_checks = deque([["依赖异常"], []])
+    startup_events = []
+    assert prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: (actions.append("完成修复"), startup_events.append("repair")), startup_events.append)
+    assert startup_events == ["repair"]
+    startup_checks = deque([["桌面异常"], ["桌面异常"]])
+    startup_events = []
+    assert not prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: actions.append("无法自动修复"), startup_events.append)
+    assert len(startup_events) == 1 and "初次检查" in startup_events[0] and "修复后复检" in startup_events[0]
     settings = derive_runtime_settings()
     assert len(settings.human_feature_weights) == len(HUMAN_FEATURE_NAMES)
     assert sum(settings.human_feature_weights) > 0.0
@@ -4460,5 +4518,6 @@ if __name__ == "__main__":
     if "--self-test" in sys.argv:
         run_self_test()
         sys.exit(0)
+    prepare_startup_environment()
     app = ControlPanel()
     app.mainloop()
