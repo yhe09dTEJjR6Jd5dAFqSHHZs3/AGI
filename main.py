@@ -1316,15 +1316,23 @@ def parse_hash_value(record):
         return None
 
 
-def hash_similarity(hash_a, hash_b):
+def hash_distance(hash_a, hash_b):
     if not hash_a or not hash_b:
-        return 0.0
+        return None
     bits = min(hash_a.bits, hash_b.bits)
     if bits <= 0:
-        return 0.0
+        return None
     a_value = hash_a.value >> max(0, hash_a.bits - bits)
     b_value = hash_b.value >> max(0, hash_b.bits - bits)
-    return clamp(1.0 - (a_value ^ b_value).bit_count() / bits, 0.0, 1.0)
+    return (a_value ^ b_value).bit_count(), bits
+
+
+def hash_similarity(hash_a, hash_b):
+    distance = hash_distance(hash_a, hash_b)
+    if not distance:
+        return 0.0
+    diff, bits = distance
+    return clamp(1.0 - diff / bits, 0.0, 1.0)
 
 
 def reward_breakdown(novelty, human_score, settings):
@@ -1895,7 +1903,20 @@ class DataStore:
 
     def compact_experience_pool(self, limit_gb):
         limit_bytes = max(1, int(max(0.1, safe_float(limit_gb, DEFAULT_EXPERIENCE_POOL_GB)) * 1024 * 1024 * 1024))
-        current = self.experience_pool_size_bytes()
+        records = self.load_experience()
+        path_sizes = {}
+        for path in self.experience_record_paths(records):
+            try:
+                path_sizes[path] = path.stat().st_size
+            except Exception:
+                pass
+        experience_file_size = 0
+        if self.experience_file.exists():
+            try:
+                experience_file_size = self.experience_file.stat().st_size
+            except Exception:
+                pass
+        current = experience_file_size + sum(path_sizes.values())
         if current <= limit_bytes:
             return {"changed": False, "size_bytes": current, "removed": 0, "target_bytes": limit_bytes}
         target_bytes = max(1, limit_bytes // 2)
@@ -1933,12 +1954,12 @@ class DataStore:
                 if path_references[path] == 0:
                     try:
                         if path.exists() and path.is_file():
-                            size = path.stat().st_size
+                            size = path_sizes.get(path, path.stat().st_size)
                             path.unlink()
                             current = max(0, current - size)
+                            path_sizes.pop(path, None)
                     except Exception:
                         pass
-            current = self.experience_pool_size_bytes([entry["record"] for entry in records if entry["line"] not in removed_ids])
         if removed_ids:
             temporary = self.experience_file.with_suffix(".compact.tmp")
             with temporary.open("w", encoding="utf-8") as file:
@@ -2079,6 +2100,11 @@ class WindowManager:
             return
         try:
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            try:
+                ctypes.windll.user32.keybd_event(win32con.VK_MENU, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+            except Exception:
+                pass
             win32gui.SetForegroundWindow(hwnd)
         except Exception:
             pass
@@ -2193,6 +2219,68 @@ class ScreenAnalyzer:
             self.sct = None
 
 
+class BKHashTree:
+    def __init__(self):
+        self.root = None
+        self.items = []
+
+    def clear(self):
+        self.root = None
+        self.items = []
+
+    def add(self, hash_value, index):
+        if not hash_value:
+            return
+        node = {"hash": hash_value, "indexes": [index], "children": {}}
+        self.items.append(index)
+        if self.root is None:
+            self.root = node
+            return
+        current = self.root
+        while True:
+            distance = hash_distance(hash_value, current["hash"])
+            if not distance:
+                return
+            diff = distance[0]
+            if diff == 0:
+                current["indexes"].append(index)
+                return
+            child = current["children"].get(diff)
+            if child is None:
+                current["children"][diff] = node
+                return
+            current = child
+
+    def nearest(self, hash_value, limit):
+        if not self.root or not hash_value:
+            return []
+        limit = max(1, int(limit))
+        heap = []
+        stack = [self.root]
+        best = hash_value.bits
+        while stack:
+            node = stack.pop()
+            distance = hash_distance(hash_value, node["hash"])
+            if not distance:
+                continue
+            diff = distance[0]
+            for index in node["indexes"]:
+                item = (-diff, index)
+                if len(heap) < limit:
+                    heapq.heappush(heap, item)
+                elif item > heap[0]:
+                    heapq.heapreplace(heap, item)
+            if len(heap) >= limit:
+                best = min(best, -heap[0][0])
+            radius = best if len(heap) >= limit else hash_value.bits
+            low = max(0, diff - radius)
+            high = diff + radius
+            for edge, child in node["children"].items():
+                if low <= edge <= high:
+                    stack.append(child)
+        return [index for _, index in sorted(heap, key=lambda item: (item[0], -item[1]), reverse=True)]
+
+
 class ExperiencePool:
     INDEX_SETTING_NAMES = ("hash_prefix_bits", "nearest_candidate_limit")
 
@@ -2210,6 +2298,7 @@ class ExperiencePool:
         self.prefix_neighbor_cache = OrderedDict()
         self.global_action_heap = []
         self.nearest_cache = OrderedDict()
+        self.metric_tree = BKHashTree()
         self.index_version = 0
         for record in records or []:
             self.add(record)
@@ -2236,6 +2325,7 @@ class ExperiencePool:
         self.index = defaultdict(list)
         self.sorted_prefixes = []
         self.prefix_neighbor_cache = OrderedDict()
+        self.metric_tree.clear()
         self.index_version += 1
         for index, hash_value in enumerate(self.hashes):
             if hash_value:
@@ -2244,6 +2334,7 @@ class ExperiencePool:
                 if not bucket:
                     self.sorted_prefixes.append(prefix)
                 bucket.append(index)
+                self.metric_tree.add(hash_value, index)
 
     def add(self, record):
         with self.lock:
@@ -2258,6 +2349,7 @@ class ExperiencePool:
                     self.sorted_prefixes.append(prefix)
                     self.index_version += 1
                 bucket.append(index)
+                self.metric_tree.add(hash_value, index)
             if record.get("mouse_action") and record.get("mode") == "learning" and record.get("mouse_source") == "user":
                 self.profile.observe(record["mouse_action"])
             if record.get("mouse_action"):
@@ -2285,6 +2377,9 @@ class ExperiencePool:
         with self.lock:
             if len(self.records) <= self.index_settings.nearest_candidate_limit:
                 return [index for index, item in enumerate(self.hashes) if item]
+            tree_result = self.metric_tree.nearest(hash_value, self.index_settings.nearest_candidate_limit)
+            if len(tree_result) >= max(1, min(self.settings.nearest_top_k, self.index_settings.nearest_candidate_limit)):
+                return tree_result
             query_prefix = self._prefix(hash_value)
             result = []
             cache_key = (self.index_version, query_prefix)
@@ -2668,8 +2763,7 @@ class MouseRecorder:
 
     def on_move(self, x, y):
         with self.lock:
-            has_current = bool(self.current)
-        event = self.capture_event("move", x, y, allow_current=has_current)
+            event = self.capture_event("move", x, y, allow_current=bool(self.current))
         if not event:
             return
         event["created_at"] = now_text()
@@ -2700,8 +2794,7 @@ class MouseRecorder:
 
     def on_click(self, x, y, button, pressed):
         with self.lock:
-            has_current = bool(self.current)
-        event = self.capture_event("press" if pressed else "release", x, y, {"button": str(button)}, allow_current=(not pressed and has_current))
+            event = self.capture_event("press" if pressed else "release", x, y, {"button": str(button)}, allow_current=(not pressed and bool(self.current)))
         if not event:
             return
         with self.lock:
