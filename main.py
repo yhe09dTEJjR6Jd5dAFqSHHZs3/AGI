@@ -4286,7 +4286,7 @@ class ControlPanel(tk.Tk):
         self.ui(lambda: self.status_var.set("当前模式已终止"))
         self.ui(self.release_window_and_panel)
 
-    def sleep_mode(self):
+    def sleep_mode(self, restart_training=False):
         token, stop_event = self.begin_run("sleep")
         if not token:
             self.status_var.set("请先终止当前模式，或等待当前模式结束")
@@ -4301,7 +4301,7 @@ class ControlPanel(tk.Tk):
             return
         self.status_var.set("睡眠模式运行中")
         self.update_progress(0.0)
-        self.mode_thread = threading.Thread(target=self.sleep_loop, args=(token, config, stop_event), daemon=True)
+        self.mode_thread = threading.Thread(target=self.sleep_loop, args=(token, config, stop_event, restart_training), daemon=True)
         self.mode_thread.start()
 
     def sleep_progress_fields(self, started_perf, sleep_seconds, completed_steps, target_training_steps, compaction_progress):
@@ -4334,7 +4334,7 @@ class ControlPanel(tk.Tk):
         improvement_ready = bool(recent_improvements) and sum(recent_improvements) >= improvement_threshold * len(recent_improvements)
         return completed >= target_training_steps and improvement_ready and batch_confidence >= confidence_target and compaction_complete and pending_state == 0
 
-    def sleep_loop(self, token, config, stop_event):
+    def sleep_loop(self, token, config, stop_event, restart_training=False):
         started = self.events.publish("sleep_started", seconds=config.sleep_seconds, data_path=str(config.data_path))
         completed = 0
         submitted = 0
@@ -4450,14 +4450,22 @@ class ControlPanel(tk.Tk):
             stopped_reason = self.termination_reason if self.termination_reason in ("esc", "user_stop") else None
         save_status = "completed" if completed_success else ("poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached else (stopped_reason or "incomplete")))
         self.save_sleep_data(config, save_status)
+        final_reason = None
         if self.is_run_active(token, "sleep") and completed_success:
-            self.finish_run(token, "睡眠模式任务完成，数据已保存", 100.0, release=False, reason="completed")
+            final_reason = "completed"
+            self.finish_run(token, "睡眠模式任务完成，数据已保存", 100.0, release=False, reason=final_reason)
         elif self.is_run_active(token, "sleep") and time_limit_reached:
-            self.finish_run(token, "睡眠模式到达时间上限，数据已保存", 100.0, release=False, reason="time_limit")
+            final_reason = "time_limit"
+            self.finish_run(token, "睡眠模式到达时间上限，数据已保存", 100.0, release=False, reason=final_reason)
         elif self.is_run_active(token, "sleep") and poor_optimization:
-            self.finish_run(token, "AI模型优化效果差，已保存数据并退出睡眠模式", self.progress_value, release=False, reason="poor_optimization")
+            final_reason = "poor_optimization"
+            self.finish_run(token, "AI模型优化效果差，已保存数据并退出睡眠模式", self.progress_value, release=False, reason=final_reason)
         elif self.is_run_active(token, "sleep"):
-            self.finish_run(token, "睡眠模式已终止，数据已保存", 0.0, release=False, reason=stopped_reason or "user_stop")
+            final_reason = stopped_reason or "user_stop"
+            self.finish_run(token, "睡眠模式已终止，数据已保存", 0.0, release=False, reason=final_reason)
+        if restart_training and final_reason not in ("esc", "user_stop"):
+            self.ui(lambda: self.status_var.set("睡眠模式已保存，准备重新进入训练模式"))
+            self.request_active_mode("training")
 
     def save_sleep_data(self, config, status):
         if not self.store or not self.experience_pool:
@@ -4739,7 +4747,12 @@ class ControlPanel(tk.Tk):
                     stop_event.wait(min(self.settings.generated_action_complete_wait, deadline - time.perf_counter()))
             self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start, priority="critical"), None, "mode_end")
         if self.is_run_active(token, "training") and not stop_event.is_set():
-            self.finish_run(token, "训练模式结束", 0.0, reason=self.termination_reason or "completed")
+            final_reason = self.termination_reason or "completed"
+            if final_reason == "time_limit":
+                if self.finish_run(token, "训练模式达到时间上限，进入睡眠模式", 0.0, release=False, reason="time_limit"):
+                    self.sleep_mode(restart_training=True)
+            else:
+                self.finish_run(token, "训练模式结束", 0.0, reason=final_reason)
         elif self.is_run_active(token, "training"):
             self.finish_run(token, "训练模式已终止", self.progress_value, reason=self.termination_reason or ("esc" if self.should_stop_by_escape() else "user_stop"))
         else:
