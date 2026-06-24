@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
+from urllib.parse import urlparse
 
 MIN_PYTHON_VERSION = (3, 10)
 
@@ -112,21 +113,29 @@ def bootstrap_dependencies():
     except Exception as exc:
         write_startup_install_log([sys.executable, "-m", "pip", "--version"], error=exc)
         raise StartupRepairError(f"无法启动 pip，不能自动安装依赖。请检查 Python 环境或网络。\n{exc}") from exc
-    command = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--user", *missing]
+    base_command = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--user"]
+    mirrors = [None, "https://pypi.tuna.tsinghua.edu.cn/simple", "https://mirrors.aliyun.com/pypi/simple/"]
+    commands = [base_command + (["-i", mirror, "--trusted-host", urlparse(mirror).hostname] if mirror else []) + missing for mirror in mirrors]
     install_timeout = max(1, (os.cpu_count() or 1) * 30)
-    try:
-        env = dict(os.environ)
-        env[install_key] = "1"
-        result = subprocess.run(command, capture_output=True, text=True, timeout=install_timeout, env=env)
-        write_startup_install_log(command, result=result)
-    except subprocess.TimeoutExpired as exc:
-        write_startup_install_log(command, error=exc)
-        detail = (exc.stderr or exc.stdout or "").strip()
-        raise StartupRepairError(f"自动安装依赖超时（{install_timeout}秒）: {' '.join(missing)}\n请检查网络或手动执行: {' '.join(command)}\n{detail}") from exc
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
+    env = dict(os.environ)
+    env[install_key] = "1"
+    failures = []
+    result = None
+    command = commands[0]
+    for command in commands:
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=install_timeout, env=env)
+            write_startup_install_log(command, result=result)
+            if result.returncode == 0:
+                break
+            failures.append((command, (result.stderr or result.stdout or "").strip()))
+        except subprocess.TimeoutExpired as exc:
+            write_startup_install_log(command, error=exc)
+            failures.append((command, (exc.stderr or exc.stdout or "").strip() or str(exc)))
+    if result is None or result.returncode != 0:
         install_log_path = Path(globals().get("DEFAULT_DATA_PATH", AGENT_SPEC.default_data_path)) / "startup_install.log"
-        raise StartupRepairError(f"自动安装依赖失败: {' '.join(missing)}\n日志位置: {install_log_path}\n请手动执行: {' '.join(command)}\n{detail}")
+        detail = "\n".join(f"命令: {' '.join(item)}\n结果: {text}" for item, text in failures)
+        raise StartupRepairError(f"自动安装依赖失败: {' '.join(missing)}\n日志位置: {install_log_path}\n请手动执行: {' '.join(commands[-1])}\n{detail}")
     if "pywin32" in missing:
         postinstall = [sys.executable, "-m", "pywin32_postinstall", "-install"]
         try:
@@ -1727,8 +1736,17 @@ class DataStore:
         except Exception:
             return str(path)
 
+    def ensure_experience_newline(self):
+        if not self.experience_file.exists() or self.experience_file.stat().st_size <= 0:
+            return
+        with self.experience_file.open("rb+") as file:
+            file.seek(-1, os.SEEK_END)
+            if file.read(1) != b"\n":
+                file.write(b"\n")
+
     def append_experience(self, record):
         with self.lock:
+            self.ensure_experience_newline()
             with self.experience_file.open("a", encoding="utf-8") as file:
                 file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -2201,8 +2219,10 @@ class ScreenAnalyzer:
 
     def fingerprint(self, image):
         small = image.convert("L").resize((self.hash_size, self.hash_size), self.resample)
-        pixels = list(small.getdata())
-        average = sum(pixels) / max(1, len(pixels))
+        pixels = small.tobytes()
+        total = self.hash_size * self.hash_size
+        histogram = small.histogram()
+        average = sum(level * count for level, count in enumerate(histogram)) / max(1, total)
         value = 0
         for pixel in pixels:
             value = (value << 1) | (1 if pixel >= average else 0)
@@ -3220,11 +3240,12 @@ class TrainingService:
             stop_event.set()
             panel.ui(lambda r=check.reason: panel.status_var.set(f"训练模式结束：雷电模拟器窗口异常：{r}"))
             return True
-        if not panel.cursor_inside_window():
+        if not panel.cursor_inside_window(2):
             panel.termination_reason = "window_invalid"
             stop_event.set()
             panel.ui(lambda: panel.status_var.set("训练模式结束：鼠标位于雷电模拟器窗口外"))
             return True
+        panel.ensure_cursor_inside_window(check.rect)
         idle_seconds = panel.learning_idle_seconds()
         if idle_seconds >= config.still_seconds:
             panel.termination_reason = "still_timeout"
@@ -4101,12 +4122,13 @@ class ControlPanel(tk.Tk):
                 self.last_learning_activity = time.perf_counter()
         return pos
 
-    def cursor_inside_window(self):
+    def cursor_inside_window(self, tolerance=0):
         pos = self.observe_cursor_activity()
         rect = self.current_rect()
         if pos is None or not rect:
             return False
-        return point_inside(rect, pos[0], pos[1])
+        left, top, right, bottom = rect
+        return left - tolerance <= pos[0] < right + tolerance and top - tolerance <= pos[1] < bottom + tolerance
 
     def ensure_cursor_inside_window(self, rect=None):
         rect = rect or self.current_rect()
