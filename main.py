@@ -217,16 +217,7 @@ def data_path_write_issue(path, create=False):
 
 
 def startup_ldplayer_window_issue(path):
-    if sys.platform != "win32" or any(name in IMPORT_ERRORS for name in REQUIRED_MODULES):
-        return None
-    try:
-        manager = WindowManager(path, derive_runtime_settings())
-        if not manager.find_window():
-            return "雷电模拟器窗口尚未运行或无法附着"
-        check = manager.check_window(force=True)
-        return None if check.ok else f"雷电模拟器窗口异常：{check.reason}"
-    except Exception as exc:
-        return f"无法检查雷电模拟器窗口：{exc}"
+    return None
 
 
 def startup_environment_issues():
@@ -254,9 +245,6 @@ def startup_environment_issues():
     storage_issue = data_path_write_issue(data_path)
     if storage_issue:
         issues.append(f"存储路径无效 {data_path}：{storage_issue}")
-    window_issue = startup_ldplayer_window_issue(ldplayer_path) if valid_path else None
-    if window_issue:
-        issues.append(window_issue)
     return issues
 
 
@@ -271,11 +259,7 @@ def attempt_startup_environment_repair(actions=None):
     actions.append("已创建并验证存储路径可写" if not storage_issue else f"无法修复存储路径：{storage_issue}")
     valid_path, path_reason = validate_ldplayer_executable(ldplayer_path, require_attach=False)
     if valid_path and sys.platform == "win32" and not missing:
-        manager = WindowManager(ldplayer_path, derive_runtime_settings())
-        if manager.launch_or_attach() and manager.check_window(force=True).ok:
-            actions.append("已启动或附着雷电模拟器窗口")
-        else:
-            actions.append("无法自动启动或附着雷电模拟器窗口")
+        actions.append("启动检查已跳过雷电模拟器窗口状态")
     elif not valid_path:
         actions.append(f"雷电模拟器路径无法自动修复：{path_reason}")
     if sys.version_info < MIN_PYTHON_VERSION:
@@ -676,6 +660,7 @@ def validate_ldplayer_executable(path, settings=None, require_attach=False):
 def run_self_test():
     startup_checks = deque([["依赖异常"], []])
     startup_events = []
+    assert startup_ldplayer_window_issue(Path("D:/LDPlayer9/dnplayer.exe")) is None
     assert prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: (actions.append("完成修复"), startup_events.append("repair")), startup_events.append)
     assert startup_events == ["repair"]
     startup_checks = deque([["桌面异常"], ["桌面异常"]])
@@ -743,6 +728,8 @@ def run_self_test():
     brain = ActionBrain(pool, changed)
     _, decision = brain.choose(a, novelty, batch, 0.0)
     assert isinstance(decision, dict)
+    random_action, random_decision = brain.choose(a, novelty, [], 0.0, poor_life_factor=1.0)
+    assert random_action and random_decision["reason"] == "poor_life_random_exploration" and random_decision["poor_life_factor"] == 1.0
     with tempfile.TemporaryDirectory() as folder:
         root = Path(folder)
         executable = root / "dnplayer.exe"
@@ -2542,14 +2529,33 @@ class ActionBrain:
         result["path_rel"] = []
         return result
 
-    def fallback_action(self):
+    def random_action(self, strength=1.0):
+        action_type = random.choice(["click", "drag", "scroll"])
+        start = [round(random.random(), 6), round(random.random(), 6)]
+        if action_type == "scroll":
+            magnitude = random.choice([-1, 1]) * max(1, int(1 + strength * random.uniform(1.0, 6.0)))
+            return {"type": "scroll", "button": "scroll", "source": "ai", "start_rel": start, "end_rel": start, "duration": 0.0, "scroll": [0, magnitude], "path_rel": [[start[0], start[1], 0.0]]}
+        if action_type == "drag":
+            span = clamp(0.08 + 0.28 * strength, 0.08, 0.75)
+            end = self.mutate_point(start, span)
+        else:
+            end = list(start)
+        duration_max = self.settings.action_duration_max if action_type == "drag" else self.settings.random_click_duration_max
+        duration_min = self.settings.action_duration_min if action_type == "drag" else self.settings.random_click_duration_min
+        return {"type": action_type, "button": "Button.left", "source": "ai", "start_rel": start, "end_rel": end, "duration": round(random.uniform(min(duration_min, duration_max), max(duration_min, duration_max)), 6), "path_rel": [[start[0], start[1], 0.0], [end[0], end[1], 1.0]]}
+
+    def fallback_action(self, randomness=0.0):
         learned = self.pool.best_global_action()
+        if randomness > 0.0 and random.random() < clamp(randomness, 0.0, 1.0):
+            return self.random_action(1.0 + randomness), "poor_life_random_exploration"
         if learned and random.random() < self.settings.global_action_probability:
-            return self.mutate_action(learned, 1.8), "global_experience"
+            return self.mutate_action(learned, 1.8 + randomness), "global_experience"
+        if randomness > 0.0:
+            return self.random_action(1.0 + randomness), "poor_life_random_exploration"
         return None, "observe_only"
 
-    def choose(self, hash_value, novelty, batch, life):
-        rate = self.exploration_rate(novelty, life)
+    def choose(self, hash_value, novelty, batch, life, poor_life_factor=0.0):
+        rate = clamp(self.exploration_rate(novelty, life) + clamp(poor_life_factor, 0.0, 1.0) * (1.0 - self.settings.explore_min_rate), self.settings.explore_min_rate, self.settings.explore_max_rate)
         usable = []
         for item in batch:
             action = item["record"].get("mouse_action")
@@ -2558,14 +2564,14 @@ class ActionBrain:
             score = self.score_candidate(item)
             usable.append((math.exp(clamp(score, self.settings.reward_total_min, self.settings.reward_total_max) / self.settings.softmax_temperature), {"item": item, "score": score, "action": action}))
         if random.random() < rate or not usable:
-            action, reason = self.fallback_action()
-            decision = {"reason": reason, "exploration_rate": rate, "candidate_count": len(usable), "confidence": 0.0, "nearest_similarity": round(batch[0]["similarity"], 4) if batch else 0.0}
+            action, reason = self.fallback_action(poor_life_factor)
+            decision = {"reason": reason, "exploration_rate": rate, "poor_life_factor": round(clamp(poor_life_factor, 0.0, 1.0), 4), "candidate_count": len(usable), "confidence": 0.0, "nearest_similarity": round(batch[0]["similarity"], 4) if batch else 0.0}
         else:
             chosen = weighted_choice(usable)
             item = chosen["item"]
             confidence = clamp(item.get("similarity", 0.0) * 0.65 + clamp(chosen.get("score", 0.0), 0.0, 200.0) / 200.0 * (35.0 / 100.0), 0.0, 1.0)
-            action = self.mutate_action(chosen["action"], 1.0 - confidence + rate)
-            decision = {"reason": "nearest_rewarded_experience", "exploration_rate": rate, "candidate_count": len(usable), "confidence": round(confidence, 4), "nearest_similarity": round(batch[0]["similarity"], 4) if batch else 0.0, "chosen_similarity": round(item.get("similarity", 0.0), 4), "chosen_reward": round(safe_float(item["record"].get("reward", 0.0), 0.0), 2), "chosen_record_id": item["record"].get("id")}
+            action = self.mutate_action(chosen["action"], 1.0 - confidence + rate + poor_life_factor)
+            decision = {"reason": "nearest_rewarded_experience", "exploration_rate": rate, "poor_life_factor": round(clamp(poor_life_factor, 0.0, 1.0), 4), "candidate_count": len(usable), "confidence": round(confidence, 4), "nearest_similarity": round(batch[0]["similarity"], 4) if batch else 0.0, "chosen_similarity": round(item.get("similarity", 0.0), 4), "chosen_reward": round(safe_float(item["record"].get("reward", 0.0), 0.0), 2), "chosen_record_id": item["record"].get("id")}
         self.last_action = copy.deepcopy(action) if action else None
         self.last_decision = decision
         return action, decision
@@ -3099,11 +3105,11 @@ class TrainingService:
     def observe_screen(self, analyzer, session_id, start, rect):
         return self.panel.capture_snapshot(analyzer, "training", session_id, start, rect=rect)
 
-    def decide_action(self, snapshot):
+    def decide_action(self, snapshot, poor_life_factor=0.0):
         panel = self.panel
         novelty, batch = panel.experience_pool.novelty(snapshot.hash_value)
         life = panel.store.life if panel.store else 0.0
-        return panel.brain.choose(snapshot.hash_value, novelty, batch, life)
+        return panel.brain.choose(snapshot.hash_value, novelty, batch, life, poor_life_factor=poor_life_factor)
 
     def should_stop(self, start, config, stop_event):
         panel = self.panel
@@ -4009,6 +4015,29 @@ class ControlPanel(tk.Tk):
             return False
         return point_inside(rect, pos[0], pos[1])
 
+    def ensure_cursor_inside_window(self, rect=None):
+        rect = rect or self.current_rect()
+        if not rect:
+            return False
+        pos = self.cursor_position()
+        if pos and point_inside(rect, pos[0], pos[1]):
+            self.observe_cursor_activity()
+            return True
+        left, top, right, bottom = rect
+        target = (int((left + right) / 2), int((top + bottom) / 2))
+        try:
+            if self.executor:
+                self.executor.controller.position = target
+            elif pynput_mouse:
+                pynput_mouse.Controller().position = target
+            else:
+                win32api.SetCursorPos(target)
+            self.mark_learning_activity()
+            return True
+        except Exception as exc:
+            self.log_exception("cursor.ensure_inside", exc, {"rect": list(rect), "target": list(target)})
+            return False
+
     def release_window_and_panel(self):
         self.restore_panel()
 
@@ -4093,6 +4122,9 @@ class ControlPanel(tk.Tk):
             check = self.window_manager.check_window(force=True)
             if not check.ok:
                 self.finish_run(token, f"雷电模拟器窗口异常：{check.reason}", 0.0, reason=f"window_{check.reason}")
+                return
+            if not self.ensure_cursor_inside_window(check.rect):
+                self.finish_run(token, "无法确保鼠标位于雷电模拟器窗口内", 0.0, reason="window_invalid")
                 return
             if not self.activate_run(token, mode):
                 return
@@ -4539,6 +4571,8 @@ class ControlPanel(tk.Tk):
         session_id = uuid.uuid4().hex
         start = time.perf_counter()
         consecutive_failures = 0
+        poor_life_events = 0
+        last_life_value = self.store.life if self.store else 0.0
         last_training_error = None
         self.termination_reason = "completed"
         service = self.training_service
@@ -4558,7 +4592,8 @@ class ControlPanel(tk.Tk):
                     self.termination_reason = "window_invalid"
                     stop_event.set()
                     break
-                action, decision = service.decide_action(snapshot)
+                poor_life_factor = clamp(poor_life_events / max(1, self.settings.training_fail_stop_count), 0.0, 1.0)
+                action, decision = service.decide_action(snapshot, poor_life_factor=poor_life_factor)
                 if not action:
                     self.write_record("training", session_id, snapshot, None, "screen_event", decision=decision)
                     continue
@@ -4573,6 +4608,12 @@ class ControlPanel(tk.Tk):
                         self.ui(lambda e=last_training_error: self.status_var.set(f"训练模式结束：连续执行失败：{e}"))
                     continue
                 consecutive_failures = 0
+                current_life_value = self.store.life if self.store else last_life_value
+                if current_life_value <= last_life_value:
+                    poor_life_events += 1
+                else:
+                    poor_life_events = 0
+                last_life_value = current_life_value
                 delay = safe_float(record["mouse_action"].get("duration", 0.0), 0.0) if record and record.get("mouse_action") else 0.0
                 deadline = time.perf_counter() + max(self.settings.min_action_delay_seconds, delay)
                 while time.perf_counter() < deadline and not stop_event.is_set():
