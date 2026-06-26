@@ -3,6 +3,7 @@ import copy
 import ctypes
 import json
 import heapq
+import hashlib
 import math
 import random
 import queue
@@ -1237,6 +1238,28 @@ def abs_from_rel(rect, point):
     return int(round(x)), int(round(y))
 
 
+
+def build_mouse_event(kind, x, y, rect, previous=None, extra=None, now_perf=None, created_at=None):
+    now_perf = time.perf_counter() if now_perf is None else safe_float(now_perf, time.perf_counter())
+    inside = point_inside(rect, x, y) if rect else False
+    px = safe_float(previous.get("x", x), x) if isinstance(previous, dict) else float(x)
+    py = safe_float(previous.get("y", y), y) if isinstance(previous, dict) else float(y)
+    pt = safe_float(previous.get("t", previous.get("timestamp", now_perf)), now_perf) if isinstance(previous, dict) else now_perf
+    vx0 = safe_float(previous.get("instant_speed_x", 0.0), 0.0) if isinstance(previous, dict) else 0.0
+    vy0 = safe_float(previous.get("instant_speed_y", 0.0), 0.0) if isinstance(previous, dict) else 0.0
+    dt = max(1e-6, now_perf - pt)
+    dx = float(x) - px
+    dy = float(y) - py
+    speed_x = dx / dt
+    speed_y = dy / dt
+    width, height = rect_size(rect) if rect else (1.0, 1.0)
+    rel_x = (float(x) - rect[0]) / max(1.0, width) if rect else 0.0
+    rel_y = (float(y) - rect[1]) / max(1.0, height) if rect else 0.0
+    event = {"type": kind, "t": now_perf, "timestamp": now_perf, "created_at": created_at or now_text(), "x": int(x), "y": int(y), "abs": [int(x), int(y)], "rel": [round(rel_x, 6), round(rel_y, 6)], "inside": bool(inside), "dx": round(dx, 6), "dy": round(dy, 6), "dt": round(dt, 6), "direction_angle": round(math.degrees(math.atan2(dy, dx)), 6) if dx or dy else 0.0, "instant_speed": round(math.hypot(speed_x, speed_y), 6), "instant_speed_x": round(speed_x, 6), "instant_speed_y": round(speed_y, 6), "acceleration": round(math.hypot(speed_x - vx0, speed_y - vy0) / dt, 6)}
+    if extra:
+        event.update(extra)
+    return event
+
 def distance(a, b):
     return math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
 
@@ -1842,7 +1865,10 @@ class DataStore:
             self.model_dir.mkdir(parents=True, exist_ok=True)
             ranked = sorted([record for record in records or [] if record.get("mouse_action")], key=lambda record: (safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), safe_float(record.get("sleep_confidence", 0.0), 0.0)), reverse=True)
             limit = max(1, min(len(ranked) or 1, safe_int(getattr(settings, "global_action_heap_limit", 1), 1)))
-            payload = {"schema_version": CONFIG_SCHEMA_VERSION, "created_at": now_text(), "status": status, "screen_score_total": self.screen_score_total, "experience_count": len(records or []), "model": model.snapshot() if model else None, "policy": [{"id": record.get("id"), "mode": record.get("mode"), "mouse_action": record.get("mouse_action"), "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_model_confidence": safe_float(record.get("sleep_model_confidence", record.get("model_prediction", 0.0)), 0.0), "model_prediction": safe_float(record.get("model_prediction", 0.0), 0.0), "model_target": safe_float(record.get("model_target", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
+            model_payload = model.snapshot() if model else None
+            identity = hashlib.sha256(str(self.root.resolve()).encode("utf-8", "replace")).hexdigest()
+            training_digest = hashlib.sha256(json.dumps([record.get("id") for record in ranked[:limit]], ensure_ascii=False).encode("utf-8")).hexdigest()
+            payload = {"schema_version": CONFIG_SCHEMA_VERSION, "model_version": 1, "training_data_version": 1, "data_path_id": identity, "checksum": training_digest, "created_at": now_text(), "status": status, "screen_score_total": self.screen_score_total, "experience_count": len(records or []), "model": model_payload, "policy": [{"id": record.get("id"), "mode": record.get("mode"), "mouse_action": record.get("mouse_action"), "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_model_confidence": safe_float(record.get("sleep_model_confidence", record.get("model_prediction", 0.0)), 0.0), "model_prediction": safe_float(record.get("model_prediction", 0.0), 0.0), "model_target": safe_float(record.get("model_target", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
             path = self.model_dir / f"model_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex}.json"
             temporary = path.with_suffix(".tmp")
             with temporary.open("w", encoding="utf-8") as file:
@@ -1863,6 +1889,47 @@ class DataStore:
             except Exception:
                 pass
         return {"changed": removed > 0, "removed": removed, "limit": limit, "target_count": keep}
+
+
+    def validate_model_state(self, payload, settings=None):
+        model = payload.get("model") if isinstance(payload, dict) else None
+        if not isinstance(model, dict):
+            raise ValueError("模型快照缺少模型对象")
+        if model.get("type") != "online_logistic_policy":
+            raise ValueError("模型类型不匹配")
+        names = tuple(model.get("feature_names") or ())
+        if names != PolicyModel.FEATURE_NAMES:
+            raise ValueError("模型特征不匹配")
+        weights = model.get("weights")
+        if not isinstance(weights, dict):
+            raise ValueError("模型权重缺失")
+        clean = {}
+        for name in PolicyModel.FEATURE_NAMES:
+            value = safe_float(weights.get(name), None)
+            if value is None or not math.isfinite(value) or value < -8.0 or value > 8.0:
+                raise ValueError("模型权重越界 " + name)
+            clean[name] = value
+        trained_steps = safe_int(model.get("trained_steps", 0), 0)
+        loss = safe_float(model.get("loss", 1.0), 1.0)
+        if trained_steps < 0 or not math.isfinite(loss) or loss < 0.0:
+            raise ValueError("模型训练状态无效")
+        return {"weights": clean, "trained_steps": trained_steps, "loss": loss}
+
+    def load_latest_model_state(self, settings=None):
+        candidates = sorted(self.model_dir.glob("model_*.json"), key=lambda path: path.stat().st_mtime if path.exists() else 0.0, reverse=True)
+        for path in candidates:
+            try:
+                with path.open("r", encoding="utf-8") as file:
+                    payload = json.load(file)
+                state = self.validate_model_state(payload, settings)
+                state["loaded_from"] = str(path)
+                return state
+            except Exception as exc:
+                try:
+                    self.log_error("load_latest_model_state", exc, {"path": str(path)})
+                except Exception:
+                    pass
+        return None
 
     def load_settings(self):
         if not self.settings_file.exists():
@@ -2378,7 +2445,7 @@ class BKHashTree:
 class ExperiencePool:
     INDEX_SETTING_NAMES = ("hash_prefix_bits", "nearest_candidate_limit")
 
-    def __init__(self, settings, records=None):
+    def __init__(self, settings, records=None, model_state=None):
         self.settings = settings
         self.index_settings = settings
         self.records = []
@@ -2386,7 +2453,7 @@ class ExperiencePool:
         self.index = defaultdict(list)
         self.sorted_prefixes = []
         self.profile = HumanProfile(settings)
-        self.model = PolicyModel(settings)
+        self.model = PolicyModel(settings, model_state)
         self.lock = threading.RLock()
         self.action_cache = []
         self.prefix_neighbor_cache = OrderedDict()
@@ -2603,6 +2670,10 @@ class ExperiencePool:
         rescored = 0
         missing = 0
         errors = 0
+        image_missing = 0
+        image_corrupt = 0
+        hash_missing = 0
+        unrecoverable = 0
         with self.lock:
             snapshot = [(index, copy.deepcopy(record)) for index, record in enumerate(self.records)]
         updates = []
@@ -2616,8 +2687,13 @@ class ExperiencePool:
                     if path.is_file() and store.root.resolve() in (path, *path.parents):
                         with Image.open(path) as image:
                             file_hash = analyzer.fingerprint(image.convert("RGB"))
+                    else:
+                        record["score_status"] = "image_missing"
+                        image_missing += 1
                 except Exception as exc:
                     record["screen_file_error"] = str(exc)
+                    record["score_status"] = "image_corrupt"
+                    image_corrupt += 1
             if file_hash and (not hash_value or file_hash.hex != hash_value.hex or file_hash.bits != hash_value.bits):
                 hash_value = file_hash
                 record["screen_hash"] = file_hash.hex
@@ -2626,6 +2702,11 @@ class ExperiencePool:
                 record["screen_hash_bits"] = file_hash.bits
                 errors += 1
             if not hash_value:
+                hash_missing += 1
+                unrecoverable += 1
+                record["score_status"] = "unrecoverable"
+                record["score_checked_at"] = now_text()
+                updates.append((index, record, None))
                 continue
             score, neighbors, confidence = self.compute_screen_score(hash_value, exclude_id=record.get("id"), before_index=index)
             old_score = safe_float(record.get("screen_score", record.get("novelty", record.get("after_novelty", None))), None)
@@ -2639,7 +2720,7 @@ class ExperiencePool:
                 rescored += 1
             human_score = self.human_score(record.get("mouse_action")) if record.get("mouse_action") else self.settings.score_default
             reward_info = reward_breakdown(score, human_score, self.settings)
-            record.update({"screen_score": score, "novelty": score, "score_version": 1, "score_basis": "nearest_screen_content_recheck", "score_checked_at": now_text(), "score_neighbors": [{"id": item["record"].get("id"), "similarity": round(item.get("similarity", 0.0), 4)} for item in neighbors], "score_confidence": round(confidence, 4), "score_rechecked": True, "score_recomputed": bool(lacks or wrong), "reward_version": reward_info["reward_version"], "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": reward_info, "reward_sort_key": reward_info["reward_sort_key"], "total_reward": reward_info["total_reward"], "reward": reward_info["total_reward"], "screen_score_delta": max(0.0, reward_info["screen_score_delta"])})
+            record.update({"screen_score": score, "novelty": score, "score_version": 1, "score_status": "rescored" if bool(lacks or wrong) else "scored", "score_basis": "nearest_screen_content_recheck", "score_checked_at": now_text(), "score_neighbors": [{"id": item["record"].get("id"), "similarity": round(item.get("similarity", 0.0), 4)} for item in neighbors], "score_confidence": round(confidence, 4), "score_rechecked": True, "score_recomputed": bool(lacks or wrong), "reward_version": reward_info["reward_version"], "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": reward_info, "reward_sort_key": reward_info["reward_sort_key"], "total_reward": reward_info["total_reward"], "reward": reward_info["total_reward"], "screen_score_delta": max(0.0, reward_info["screen_score_delta"])})
             checked += 1
             updates.append((index, record, hash_value))
         with self.lock:
@@ -2650,7 +2731,7 @@ class ExperiencePool:
             self.rebuild_index_locked()
             self.rebuild_action_heap_locked()
             self.nearest_cache.clear()
-        return {"checked": checked, "rescored": rescored, "missing": missing, "errors": errors}
+        return {"checked": checked, "rescored": rescored, "missing": missing, "errors": errors, "image_missing": image_missing, "image_corrupt": image_corrupt, "hash_missing": hash_missing, "unrecoverable": unrecoverable}
 
     def sleep_training_step(self, batch_size, settle_screen_score=None):
         indices = self.sleep_training_batch_indices(batch_size)
@@ -2884,31 +2965,12 @@ class MouseRecorder:
         inside = point_inside(rect, x, y)
         if not inside and not allow_current:
             return None
-        now_perf = time.perf_counter()
         previous = None
         if self.current and self.current.get("path"):
             previous = self.current["path"][-1]
         elif self.move_buffer:
             previous = self.move_buffer[-1]
-        px = safe_float(previous.get("x", x), x) if previous else float(x)
-        py = safe_float(previous.get("y", y), y) if previous else float(y)
-        pt = safe_float(previous.get("t", now_perf), now_perf) if previous else now_perf
-        vx0 = safe_float(previous.get("instant_speed_x", 0.0), 0.0) if previous else 0.0
-        vy0 = safe_float(previous.get("instant_speed_y", 0.0), 0.0) if previous else 0.0
-        dt = max(1e-6, now_perf - pt)
-        dx = float(x) - px
-        dy = float(y) - py
-        speed_x = dx / dt
-        speed_y = dy / dt
-        speed = math.hypot(speed_x, speed_y)
-        acceleration = math.hypot(speed_x - vx0, speed_y - vy0) / dt
-        width, height = rect_size(rect)
-        rel_x = (float(x) - rect[0]) / max(1.0, width)
-        rel_y = (float(y) - rect[1]) / max(1.0, height)
-        event = {"type": kind, "t": now_perf, "timestamp": now_perf, "created_at": now_text(), "x": int(x), "y": int(y), "abs": [int(x), int(y)], "rel": [round(rel_x, 6), round(rel_y, 6)], "inside": bool(inside), "dx": round(dx, 6), "dy": round(dy, 6), "dt": round(dt, 6), "direction_angle": round(math.degrees(math.atan2(dy, dx)), 6) if dx or dy else 0.0, "instant_speed": round(speed, 6), "instant_speed_x": round(speed_x, 6), "instant_speed_y": round(speed_y, 6), "acceleration": round(acceleration, 6)}
-        if extra:
-            event.update(extra)
-        return event
+        return build_mouse_event(kind, x, y, rect, previous=previous, extra=extra)
 
     def push_start_marker(self, action_id, event, action_type):
         self.start_markers.append({"action_id": action_id, "action_type": action_type, "perf_time": event["t"], "created_at": now_text(), "x": event["x"], "y": event["y"]})
@@ -3053,17 +3115,20 @@ class HumanMouseExecutor:
                 break
             stop_event.wait(min(self.settings.generated_sleep_event_wait, max(0.0, deadline - time.perf_counter())))
 
-    def move_smooth(self, start, end, duration, stop_event, should_stop):
+    def move_smooth(self, start, end, duration, stop_event, should_stop, rect=None, previous=None):
         points = self.smooth_points(start, end, duration)
         actual = []
         delay = duration / max(1, len(points) - 1) if duration > 0.0 else 0.0
-        base_t = time.perf_counter()
+        last = previous
         for point in points:
             if stop_event.is_set() or should_stop():
                 stop_event.set()
                 break
             self.controller.position = point
-            actual.append({"x": int(point[0]), "y": int(point[1]), "t": time.perf_counter() - base_t})
+            event = build_mouse_event("move", point[0], point[1], rect, previous=last)
+            event["source"] = "ai"
+            actual.append(event)
+            last = event
             if delay > 0.0:
                 self.stoppable_sleep(delay, stop_event, should_stop)
         return actual
@@ -3094,7 +3159,7 @@ class HumanMouseExecutor:
         approach_ratio = distance_to_start / max(1.0, distance_to_start + main_distance)
         approach_duration = clamp(duration * approach_ratio, 0.02, duration * 0.85)
         main_duration = clamp(duration - approach_duration, 0.03, duration)
-        actual_path = self.move_smooth(current, start_abs, approach_duration, stop_event, should_stop)
+        actual_path = self.move_smooth(current, start_abs, approach_duration, stop_event, should_stop, rect=rect)
         if stop_event.is_set():
             return None
         started_at = now_text()
@@ -3104,11 +3169,11 @@ class HumanMouseExecutor:
             if action_type == "drag":
                 self.controller.press(button)
                 pressed = True
-                actual_path.extend(self.move_smooth(start_abs, end_abs, main_duration, stop_event, should_stop))
+                actual_path.extend(self.move_smooth(start_abs, end_abs, main_duration, stop_event, should_stop, rect=rect, previous=actual_path[-1] if actual_path else None))
             elif action_type == "scroll":
                 scroll = action.get("scroll") or [0, 0]
                 self.controller.scroll(int(scroll[0]), int(scroll[1]))
-                actual_path.append({"x": int(start_abs[0]), "y": int(start_abs[1]), "t": time.perf_counter() - action_t})
+                actual_path.append(build_mouse_event("scroll", start_abs[0], start_abs[1], rect, previous=actual_path[-1] if actual_path else None, extra={"source": "ai", "scroll": action.get("scroll") or [0, 0]}))
             else:
                 self.controller.press(button)
                 pressed = True
@@ -3116,7 +3181,7 @@ class HumanMouseExecutor:
                 hold_ceiling = max(self.settings.random_click_duration_min, self.settings.random_click_duration_max)
                 hold_duration = clamp(main_duration, hold_floor, hold_ceiling if hold_ceiling > 0.0 else self.settings.generated_click_hold_max)
                 self.stoppable_sleep(clamp(hold_duration, 0.0, self.settings.generated_click_hold_max), stop_event, should_stop)
-                actual_path.append({"x": int(end_abs[0]), "y": int(end_abs[1]), "t": time.perf_counter() - action_t})
+                actual_path.append(build_mouse_event("release", end_abs[0], end_abs[1], rect, previous=actual_path[-1] if actual_path else None, extra={"source": "ai", "button": str(button)}))
         except Exception as exc:
             return {"execution_error": str(exc), "error_type": type(exc).__name__, "action_type": action_type, "start_abs": [int(start_abs[0]), int(start_abs[1])], "end_abs": [int(end_abs[0]), int(end_abs[1])]}
         finally:
@@ -3376,7 +3441,7 @@ class TrainingService:
         return settings
 
     def observe_screen(self, analyzer, session_id, start, rect):
-        return self.panel.capture_snapshot(analyzer, "training", session_id, start, rect=rect)
+        return self.panel.capture_snapshot(analyzer, "training", session_id, start, rect=rect, priority="critical")
 
     def decide_action(self, snapshot, zero_score_factor=0.0):
         panel = self.panel
@@ -4080,7 +4145,7 @@ class ControlPanel(tk.Tk):
                 self.ui(lambda path=str(new_root): self.data_var.set(path))
                 self.app_config_store.save_settings({"ldplayer_path": values["ldplayer_path"], "data_path": str(new_root)})
                 self.store = DataStore(new_root)
-                self.experience_pool = ExperiencePool(self.settings, self.store.load_experience(self.settings.experience_load_limit))
+                self.experience_pool = ExperiencePool(self.settings, self.store.load_experience(self.settings.experience_load_limit), self.store.load_latest_model_state(self.settings))
                 self.brain = ActionBrain(self.experience_pool, self.settings)
                 self.update_progress(100.0)
                 self.finish_run(token, reason, 100.0, release=False, reason="completed")
@@ -4337,7 +4402,7 @@ class ControlPanel(tk.Tk):
             self.store = DataStore(config.data_path)
             reload_pool = True
         if reload_pool or self.experience_pool.settings != config.settings:
-            self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit))
+            self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit), self.store.load_latest_model_state(config.settings))
             self.brain = ActionBrain(self.experience_pool, config.settings)
             self.ui(lambda: self.screen_score_total_var.set(str(self.store.state.get("screen_score_total", 0.0))))
             self.ui(lambda: self.pool_var.set(str(self.experience_pool.count())))
@@ -4484,8 +4549,11 @@ class ControlPanel(tk.Tk):
         training_ratio = clamp(safe_float(completed_steps, 0.0) / max(1.0, safe_float(target_training_steps, 1.0)), 0.0, 1.0)
         compact_ratio = clamp(compaction_progress, 0.0, 1.0)
         previous_ratio = clamp(getattr(self, "progress_value", 0.0) / 100.0, 0.0, 1.0)
-        task_ratio = min(training_ratio, compact_ratio)
-        return {"time": elapsed_ratio, "training": training_ratio, "compaction": compact_ratio, "overall": max(previous_ratio, task_ratio)}
+        review_ratio = 1.0 if completed_steps > 0 or target_training_steps <= 0 else min(elapsed_ratio, 0.25)
+        save_ratio = 0.0
+        task_ratio = review_ratio * 0.2 + training_ratio * 0.55 + compact_ratio * 0.2 + save_ratio * 0.05
+        floor_ratio = elapsed_ratio * 0.15
+        return {"time": elapsed_ratio, "review": review_ratio, "training": training_ratio, "compaction": compact_ratio, "save": save_ratio, "overall": max(previous_ratio, task_ratio, floor_ratio)}
 
     def sleep_progress_percent(self, started_perf, sleep_seconds, completed_steps, target_training_steps, compaction_progress):
         return clamp(self.sleep_progress_fields(started_perf, sleep_seconds, completed_steps, target_training_steps, compaction_progress)["overall"] * 100.0, 0.0, 99.0)
@@ -4532,7 +4600,7 @@ class ControlPanel(tk.Tk):
         started_perf = time.perf_counter()
         sleep_deadline = started_perf + max(1, config.sleep_seconds)
         self.ui(lambda: self.progress_label_var.set("睡眠评分复核中｜正在检查全部画面评分"))
-        recheck_result = {"checked": 0, "rescored": 0, "missing": 0, "errors": 0}
+        recheck_result = {"checked": 0, "rescored": 0, "missing": 0, "errors": 0, "image_missing": 0, "image_corrupt": 0, "hash_missing": 0, "unrecoverable": 0}
         try:
             with ScreenAnalyzer(config.settings.hash_size) as analyzer:
                 recheck_result = self.experience_pool.recheck_screen_scores(self.store, analyzer)
@@ -4540,7 +4608,9 @@ class ControlPanel(tk.Tk):
             self.store.merge_experience_records_by_id(copy.deepcopy(self.experience_pool.records))
         except Exception as exc:
             self.log_exception("sleep_score_recheck", exc, recheck_result)
-        self.ui(lambda r=recheck_result: self.progress_label_var.set(f"睡眠训练进度｜评分复核 {r.get('checked', 0)} 条｜重评 {r.get('rescored', 0)} 条"))
+        self.ui(lambda r=recheck_result: self.progress_label_var.set(f"睡眠训练进度｜评分复核 {r.get('checked', 0)} 条｜重评 {r.get('rescored', 0)} 条｜不可恢复 {r.get('unrecoverable', 0)} 条"))
+        if self.store and recheck_result.get("unrecoverable", 0):
+            self.store.log_error("sleep_score_recheck_unrecoverable", RuntimeError("unrecoverable_screen_records"), recheck_result)
         def train_once():
             return self.experience_pool.sleep_training_step(batch_size, self.store.add_screen_score_total if self.store else None)
         def submit_next(executor, futures):
@@ -4661,7 +4731,7 @@ class ControlPanel(tk.Tk):
                 compact = self.store.compact_experience_pool(config.experience_pool_gb)
                 if compact.get("changed"):
                     self.events.publish("experience_pool_compaction_completed", removed=compact.get("removed", 0), size_bytes=compact.get("size_bytes", 0))
-                    self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit))
+                    self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit), self.store.load_latest_model_state(config.settings))
                     self.brain = ActionBrain(self.experience_pool, config.settings)
                 records = copy.deepcopy(self.experience_pool.records)
                 model = self.experience_pool.model
