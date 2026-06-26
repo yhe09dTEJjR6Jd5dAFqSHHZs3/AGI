@@ -711,11 +711,11 @@ def run_self_test():
     high_human = reward_parts(70.0, 100.0, settings)[2]
     low_human = reward_parts(70.0, 0.0, settings)[2]
     assert high_screen > low_screen
-    assert high_human > low_human
+    assert high_human == low_human
     assert high_human < high_screen
     details = reward_breakdown(70.0, 100.0, settings)
     low_human_details = reward_breakdown(70.0, 0.0, settings)
-    assert details["screen_score_delta"] == details["screen_primary_reward"] + details["human_tie_break_reward"]
+    assert details["screen_score_delta"] == details["screen_primary_reward"]
     assert details["reward_sort_key"] > low_human_details["reward_sort_key"]
     assert details["reward_sort_key"][0] == details["screen_primary_reward"]
     assert "human_tie_break_reward" in details
@@ -1357,11 +1357,9 @@ def reward_breakdown(novelty, human_score, settings):
     screen_reward = screen_novelty
     human_similarity = round(clamp(human_score, 0.0, 100.0), 2)
     human_delta = round(human_similarity - clamp(settings.score_default, 0.0, 100.0), 2)
-    reward_span = max(1.0, abs(safe_float(settings.reward_total_max, 100.0) - safe_float(settings.reward_total_min, 0.0)))
-    tie_breaker = reward_span / max(1.0, settings.global_action_heap_limit * settings.local_action_heap_limit)
-    human_tiebreak = 0.0 if screen_reward <= 0.0 else clamp(human_similarity / 100.0, 0.0, 1.0) * tie_breaker
-    screen_score_delta = round(clamp(screen_reward + human_tiebreak, settings.reward_total_min, settings.reward_total_max), 6)
-    return {"reward_version": 2, "screen_novelty": screen_novelty, "screen_reward": screen_reward, "human_similarity": human_similarity, "human_tiebreak": round(human_tiebreak, 6), "screen_score_delta": screen_score_delta, "basis": ["nearest_screen_batch", "learning_mouse_profile"], "screen_primary_reward": screen_reward, "human_tie_break_reward": round(human_tiebreak, 6), "mouse_action_delta": human_delta, "total_reward": screen_score_delta, "reward_sort_key": [screen_reward, human_similarity]}
+    human_tiebreak = human_similarity
+    screen_score_delta = round(clamp(screen_reward, settings.reward_total_min, settings.reward_total_max), 6)
+    return {"reward_version": 3, "screen_novelty": screen_novelty, "screen_reward": screen_reward, "human_similarity": human_similarity, "human_tiebreak": round(human_tiebreak, 6), "screen_score_delta": screen_score_delta, "basis": ["nearest_screen_batch", "learning_mouse_profile", "lexicographic_screen_then_human"], "screen_primary_reward": screen_reward, "human_tie_break_reward": round(human_tiebreak, 6), "mouse_action_delta": human_delta, "total_reward": screen_score_delta, "reward_sort_key": [round(screen_reward, 2), round(human_similarity, 2)]}
 
 
 def reward_parts(novelty, human_score, settings):
@@ -2522,6 +2520,73 @@ class ExperiencePool:
             sampled = random.sample(action_indices, min(len(action_indices), max(0, remaining))) if remaining > 0 else []
             return list(dict.fromkeys(ranked + recent + sampled))[:target]
 
+    def compute_screen_score(self, hash_value, exclude_id=None, before_index=None):
+        neighbors = self.nearest(hash_value, exclude_id=exclude_id, limit=self.settings.nearest_top_k, before_index=before_index)
+        sims = [clamp(item.get("similarity", 0.0), 0.0, 1.0) for item in neighbors]
+        if sims:
+            top = sims[:max(1, min(self.settings.nearest_top_k, len(sims)))]
+            density = sum(1 for item in top if item >= 0.95) / len(top)
+            score = clamp((1.0 - (top[0] * 0.5 + sum(top) / len(top) * 0.35 + density * 0.15)) * 100.0, 0.0, 100.0)
+            confidence = clamp(top[0] * 0.65 + (1.0 - density) * 0.35, 0.0, 1.0)
+        else:
+            score = 100.0
+            confidence = 0.0
+        return round(score, 2), neighbors, confidence
+
+    def recheck_screen_scores(self, store=None, analyzer=None, tolerance=0.01):
+        checked = 0
+        rescored = 0
+        missing = 0
+        errors = 0
+        with self.lock:
+            snapshot = [(index, copy.deepcopy(record)) for index, record in enumerate(self.records)]
+        updates = []
+        for index, record in snapshot:
+            hash_value = parse_hash_value(record)
+            file_hash = None
+            screen_path = record.get("screen_path")
+            if store and analyzer and screen_path:
+                path = (store.root / str(screen_path)).resolve()
+                try:
+                    if path.is_file() and store.root.resolve() in (path, *path.parents):
+                        with Image.open(path) as image:
+                            file_hash = analyzer.fingerprint(image.convert("RGB"))
+                except Exception as exc:
+                    record["screen_file_error"] = str(exc)
+            if file_hash and (not hash_value or file_hash.hex != hash_value.hex or file_hash.bits != hash_value.bits):
+                hash_value = file_hash
+                record["screen_hash"] = file_hash.hex
+                record["screen_hash_hex"] = file_hash.hex
+                record["screen_hash_int"] = file_hash.value
+                record["screen_hash_bits"] = file_hash.bits
+                errors += 1
+            if not hash_value:
+                continue
+            score, neighbors, confidence = self.compute_screen_score(hash_value, exclude_id=record.get("id"), before_index=index)
+            old_score = safe_float(record.get("screen_score", record.get("novelty", record.get("after_novelty", None))), None)
+            lacks = old_score is None or record.get("score_version") != 1 or not record.get("score_basis")
+            wrong = old_score is not None and abs(score - old_score) > tolerance
+            if lacks:
+                missing += 1
+            if wrong:
+                errors += 1
+            if lacks or wrong:
+                rescored += 1
+            human_score = self.human_score(record.get("mouse_action")) if record.get("mouse_action") else self.settings.score_default
+            reward_info = reward_breakdown(score, human_score, self.settings)
+            record.update({"screen_score": score, "novelty": score, "score_version": 1, "score_basis": "nearest_screen_content_recheck", "score_checked_at": now_text(), "score_neighbors": [{"id": item["record"].get("id"), "similarity": round(item.get("similarity", 0.0), 4)} for item in neighbors], "score_confidence": round(confidence, 4), "score_rechecked": True, "score_recomputed": bool(lacks or wrong), "reward_version": reward_info["reward_version"], "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": reward_info, "reward_sort_key": reward_info["reward_sort_key"], "total_reward": reward_info["total_reward"], "reward": reward_info["total_reward"], "screen_score_delta": max(0.0, reward_info["screen_score_delta"])})
+            checked += 1
+            updates.append((index, record, hash_value))
+        with self.lock:
+            for index, record, hash_value in updates:
+                if index < len(self.records):
+                    self.records[index] = record
+                    self.hashes[index] = hash_value
+            self.rebuild_index_locked()
+            self.rebuild_action_heap_locked()
+            self.nearest_cache.clear()
+        return {"checked": checked, "rescored": rescored, "missing": missing, "errors": errors}
+
     def sleep_training_step(self, batch_size, settle_screen_score=None):
         indices = self.sleep_training_batch_indices(batch_size)
         if not indices:
@@ -2531,16 +2596,7 @@ class ExperiencePool:
             snapshot = [(index, self.hashes[index], copy.deepcopy(self.records[index])) for index in indices if index < records_len and self.hashes[index]]
         updates = []
         for index, hash_value, record in snapshot:
-            neighbors = self.nearest(hash_value, exclude_id=record.get("id"), limit=self.settings.nearest_top_k, before_index=index)
-            sims = [clamp(item.get("similarity", 0.0), 0.0, 1.0) for item in neighbors]
-            if sims:
-                top = sims[:max(1, min(self.settings.nearest_top_k, len(sims)))]
-                density = sum(1 for item in top if item >= 0.95) / len(top)
-                novelty = clamp((1.0 - (top[0] * 0.5 + sum(top) / len(top) * (35.0 / 100.0) + density * 0.15)) * 100.0, 0.0, 100.0)
-                similarity_confidence = clamp(top[0] * 0.65 + (1.0 - density) * (35.0 / 100.0), 0.0, 1.0)
-            else:
-                novelty = 100.0
-                similarity_confidence = 0.0
+            novelty, neighbors, similarity_confidence = self.compute_screen_score(hash_value, exclude_id=record.get("id"), before_index=index)
             action = record.get("mouse_action")
             human_score = clamp(record.get("human_score", self.profile.score(action)), 0.0, 100.0) if action else self.settings.score_default
             reward = safe_float(record.get("reward", 0.0), 0.0)
@@ -3142,11 +3198,11 @@ class AsyncPersistenceQueue:
 
     def close(self):
         self.stop_event.set()
-        self.drop_pending_images()
+        self.flush()
         try:
             self.jobs.put_nowait(None)
         except queue.Full:
-            self.drop_pending_images()
+            self.flush()
             self.jobs.put(None)
         self.thread.join(timeout=self.close_seconds)
 
@@ -4379,7 +4435,16 @@ class ControlPanel(tk.Tk):
         completed_success = False
         started_perf = time.perf_counter()
         sleep_deadline = started_perf + max(1, config.sleep_seconds)
-        self.ui(lambda: self.progress_label_var.set("睡眠训练进度｜剩余 -- 秒｜已训练批次 0｜当前置信度 0.0%"))
+        self.ui(lambda: self.progress_label_var.set("睡眠评分复核中｜正在检查全部画面评分"))
+        recheck_result = {"checked": 0, "rescored": 0, "missing": 0, "errors": 0}
+        try:
+            with ScreenAnalyzer(config.settings.hash_size) as analyzer:
+                recheck_result = self.experience_pool.recheck_screen_scores(self.store, analyzer)
+            self.events.publish("sleep_screen_scores_rechecked", **recheck_result)
+            self.store.save_experience_records(copy.deepcopy(self.experience_pool.records))
+        except Exception as exc:
+            self.log_exception("sleep_score_recheck", exc, recheck_result)
+        self.ui(lambda r=recheck_result: self.progress_label_var.set(f"睡眠训练进度｜评分复核 {r.get('checked', 0)} 条｜重评 {r.get('rescored', 0)} 条"))
         def train_once():
             return self.experience_pool.sleep_training_step(batch_size, self.store.add_screen_score_total if self.store else None)
         def submit_next(executor, futures):
@@ -4603,7 +4668,8 @@ class ControlPanel(tk.Tk):
         human_score = self.experience_pool.human_score(normalized) if normalized else 50.0
         after_novelty = self.experience_pool.novelty(after_snapshot.hash_value)[0] if after_snapshot else before_novelty
         transition_reward = round(after_novelty - before_novelty, 2)
-        reward_info = reward_breakdown(after_novelty, human_score if normalized else self.settings.score_default, self.settings)
+        scoring_novelty = after_novelty if normalized and after_snapshot else before_novelty
+        reward_info = reward_breakdown(scoring_novelty, human_score if normalized else self.settings.score_default, self.settings)
         novelty_reward = reward_info["screen_primary_reward"]
         human_delta = reward_info["mouse_action_delta"]
         reward = reward_info["total_reward"]
@@ -4617,7 +4683,7 @@ class ControlPanel(tk.Tk):
         offset_ms = round((float(offset_source) - snapshot.perf_time) * 1000.0, 3) if offset_source is not None else None
         sims = [round(item["similarity"], 4) for item in batch]
         record_event = self.events.publish("record_ready", mode=mode, session_id=session_id, event_name=event_name)
-        record = {"record_schema_version": 2, "reward_version": reward_info["reward_version"], "id": uuid.uuid4().hex, "event_sequence": record_event["sequence"], "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": after_novelty, "before_screen": snapshot.relative_path if normalized else None, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": {"screen_novelty": reward_info["screen_novelty"], "screen_reward": reward_info["screen_reward"], "human_similarity": reward_info["human_similarity"], "human_tiebreak": reward_info["human_tiebreak"], "screen_score_delta": reward_info["screen_score_delta"], "basis": reward_info["basis"]}, "reward_sort_key": reward_info["reward_sort_key"], "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "screen_score_delta": max(0.0, reward), "screen_score_settled": max(0.0, reward), "penalty_delta": max(0.0, -reward), "screen_score_total": screen_score_total, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "image_dropped": bool(getattr(snapshot, "image_dropped", False)), "screen_file_expected": not bool(getattr(snapshot, "image_dropped", False)), "capture_latency_ms": capture_latency_ms if capture_latency_ms is not None else getattr(snapshot, "capture_latency_ms", None), "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_event_wait": self.settings.training_event_wait, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
+        record = {"record_schema_version": 2, "reward_version": reward_info["reward_version"], "id": uuid.uuid4().hex, "event_sequence": record_event["sequence"], "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": before_novelty, "screen_score": before_novelty, "score_version": 1, "score_basis": "nearest_screen_content_live", "score_checked_at": now_text(), "score_neighbors": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "before_screen": snapshot.relative_path, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_screen_hash": snapshot.hash_value.hex, "before_screen_score": before_novelty, "after_screen_hash": after_snapshot.hash_value.hex if after_snapshot else snapshot.hash_value.hex, "after_screen_hash_int": after_snapshot.hash_value.value if after_snapshot else snapshot.hash_value.value, "after_screen_hash_bits": after_snapshot.hash_value.bits if after_snapshot else snapshot.hash_value.bits, "after_screen_score": after_novelty, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": {"screen_novelty": reward_info["screen_novelty"], "screen_reward": reward_info["screen_reward"], "human_similarity": reward_info["human_similarity"], "human_tiebreak": reward_info["human_tiebreak"], "screen_score_delta": reward_info["screen_score_delta"], "basis": reward_info["basis"]}, "reward_sort_key": reward_info["reward_sort_key"], "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "screen_score_delta": max(0.0, reward), "screen_score_settled": max(0.0, reward), "penalty_delta": max(0.0, -reward), "screen_score_total": screen_score_total, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "image_dropped": bool(getattr(snapshot, "image_dropped", False)), "screen_file_expected": not bool(getattr(snapshot, "image_dropped", False)), "capture_latency_ms": capture_latency_ms if capture_latency_ms is not None else getattr(snapshot, "capture_latency_ms", None), "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_event_wait": self.settings.training_event_wait, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
         if decision:
             record["ai_decision"] = decision
         self.persistence_queue.enqueue_record(self.store, record)
@@ -4721,7 +4787,6 @@ class ControlPanel(tk.Tk):
         start = time.perf_counter()
         consecutive_failures = 0
         zero_score_events = 0
-        last_screen_score = self.store.screen_score_total if self.store else 0.0
         last_training_error = None
         self.termination_reason = "completed"
         service = self.training_service
@@ -4743,6 +4808,11 @@ class ControlPanel(tk.Tk):
                     break
                 zero_score_factor = clamp(zero_score_events / max(1, self.settings.training_fail_stop_count), 0.0, 1.0)
                 action, decision = service.decide_action(snapshot, zero_score_factor=zero_score_factor)
+                if decision is not None:
+                    zero_stage = min(5, 1 + int(zero_score_factor * 5.0)) if zero_score_events > 0 else 0
+                    decision["zero_score_streak"] = zero_score_events
+                    decision["zero_score_strategy_stage"] = zero_stage
+                    decision["zero_score_strategy"] = ["normal", "recapture_validate_window", "refresh_neighbors", "trusted_history_action", "bounded_random_exploration", "alternate_mouse_action"][zero_stage]
                 if not action:
                     self.write_record("training", session_id, snapshot, None, "screen_event", decision=decision)
                     continue
@@ -4757,12 +4827,12 @@ class ControlPanel(tk.Tk):
                         self.ui(lambda e=last_training_error: self.status_var.set(f"训练模式结束：连续执行失败：{e}"))
                     continue
                 consecutive_failures = 0
-                current_screen_score_total_value = self.store.screen_score_total if self.store else last_screen_score
-                if current_screen_score_total_value <= last_screen_score:
+                current_screen_score = safe_float(record.get("after_screen_score", record.get("screen_score", 0.0)), 0.0) if record else 0.0
+                if current_screen_score <= 0.0:
                     zero_score_events += 1
+                    self.events.publish("training_zero_screen_score", streak=zero_score_events, strategy_stage=min(5, 1 + int(clamp(zero_score_events / max(1, self.settings.training_fail_stop_count), 0.0, 1.0) * 5.0)), screen_score=current_screen_score)
                 else:
                     zero_score_events = 0
-                last_screen_score = current_screen_score_total_value
                 delay = safe_float(record["mouse_action"].get("duration", 0.0), 0.0) if record and record.get("mouse_action") else 0.0
                 deadline = time.perf_counter() + max(self.settings.min_action_delay_seconds, delay)
                 while time.perf_counter() < deadline and not stop_event.is_set():
@@ -4775,8 +4845,13 @@ class ControlPanel(tk.Tk):
         if self.is_run_active(token, "training") and not stop_event.is_set():
             final_reason = self.termination_reason or "completed"
             if final_reason == "time_limit":
-                if self.finish_run(token, "训练模式达到时间上限，进入睡眠模式", 0.0, release=False, reason="time_limit"):
-                    self.sleep_mode(restart_training=True)
+                session = self.transition("training", "sleep", reason="time_limit", token=token)
+                if session:
+                    self.update_progress(0.0, force=True)
+                    self.ui(self.update_mode_button_states)
+                    self.ui(lambda: self.status_var.set("训练模式达到时间上限，进入睡眠模式"))
+                    self.mode_thread = threading.Thread(target=self.sleep_loop, args=(session.token, config, session.stop_event, True), daemon=True)
+                    self.mode_thread.start()
             else:
                 self.finish_run(token, "训练模式结束", 0.0, reason=final_reason)
         elif self.is_run_active(token, "training"):
