@@ -369,6 +369,8 @@ ALLOWED_TRANSITIONS = {
     ("starting", "idle"): {"window_invalid", "user_stop", "runtime_error", "minimize_failed"},
     ("learning", "idle"): {"esc", "still_timeout", "window_invalid", "user_stop", "runtime_error"},
     ("training", "idle"): {"esc", "time_limit", "still_timeout", "window_invalid", "user_stop", "runtime_error", "executor_error"},
+    ("training", "sleep"): {"time_limit"},
+    ("sleep", "training"): {"completed", "time_limit", "poor_optimization"},
     ("sleep", "idle"): {"completed", "esc", "time_limit", "poor_optimization", "user_stop", "runtime_error"},
     ("migration", "idle"): {"completed", "migration_error", "user_stop"}
 }
@@ -709,22 +711,26 @@ def run_self_test():
     high_human = reward_parts(70.0, 100.0, settings)[2]
     low_human = reward_parts(70.0, 0.0, settings)[2]
     assert high_screen > low_screen
-    assert high_human == low_human
+    assert high_human > low_human
     assert high_human < high_screen
     details = reward_breakdown(70.0, 100.0, settings)
     low_human_details = reward_breakdown(70.0, 0.0, settings)
-    assert details["life_delta"] == details["screen_primary_reward"]
+    assert details["life_delta"] == details["screen_primary_reward"] + details["human_tie_break_reward"]
     assert details["reward_sort_key"] > low_human_details["reward_sort_key"]
     assert details["reward_sort_key"][0] == details["screen_primary_reward"]
     assert "human_tie_break_reward" in details
     assert set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit"}
     assert {"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("learning", "idle")])
     assert {"esc", "time_limit", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("training", "idle")])
+    assert "time_limit" in ALLOWED_TRANSITIONS[("training", "sleep")]
+    assert {"completed", "time_limit", "poor_optimization"}.issubset(ALLOWED_TRANSITIONS[("sleep", "training")])
     assert {"completed", "migration_error", "user_stop"}.issubset(ALLOWED_TRANSITIONS[("migration", "idle")])
     pool = ExperiencePool(settings)
     pool.add({"id": "t1", "mode": "learning", "mouse_action": {"type": "click", "start_rel": [0.5, 0.5]}, "reward": 12, "screen_hash_hex": "f", "screen_hash_bits": 4, "mouse_source": "user"})
+    pool.add({"id": "t2", "mode": "training", "mouse_action": {"type": "click", "start_rel": [0.52, 0.52]}, "reward": 10, "screen_hash_hex": "d", "screen_hash_bits": 4, "mouse_source": "ai"})
     novelty, batch = pool.novelty(a)
     assert novelty >= 0.0
+    assert all(item["record"].get("id") != "t1" for item in pool.nearest(a, exclude_id="t1"))
     values = {item.name: getattr(settings, item.name) for item in fields(Settings)}
     values["hash_prefix_bits"] = max(1, settings.hash_prefix_bits - 1)
     changed = Settings(**values)
@@ -1351,9 +1357,9 @@ def reward_breakdown(novelty, human_score, settings):
     human_delta = round(human_similarity - clamp(settings.score_default, 0.0, 100.0), 2)
     reward_span = max(1.0, abs(safe_float(settings.reward_total_max, 100.0) - safe_float(settings.reward_total_min, 0.0)))
     tie_breaker = reward_span / max(1.0, settings.global_action_heap_limit * settings.local_action_heap_limit)
-    human_tiebreak = clamp(human_delta / 100.0, -1.0, 1.0) * tie_breaker
-    life_delta = round(clamp(screen_reward, settings.reward_total_min, settings.reward_total_max), 4)
-    return {"screen_novelty": screen_novelty, "screen_reward": screen_reward, "human_similarity": human_similarity, "human_tiebreak": round(human_tiebreak, 6), "life_delta": life_delta, "basis": ["nearest_screen_batch", "learning_mouse_profile"], "screen_primary_reward": screen_reward, "human_tie_break_reward": round(human_tiebreak, 6), "mouse_action_delta": human_delta, "total_reward": life_delta, "reward_sort_key": [screen_reward, human_similarity]}
+    human_tiebreak = 0.0 if screen_reward <= 0.0 else clamp(human_similarity / 100.0, 0.0, 1.0) * tie_breaker
+    life_delta = round(clamp(screen_reward + human_tiebreak, settings.reward_total_min, settings.reward_total_max), 6)
+    return {"reward_version": 2, "screen_novelty": screen_novelty, "screen_reward": screen_reward, "human_similarity": human_similarity, "human_tiebreak": round(human_tiebreak, 6), "life_delta": life_delta, "basis": ["nearest_screen_batch", "learning_mouse_profile"], "screen_primary_reward": screen_reward, "human_tie_break_reward": round(human_tiebreak, 6), "mouse_action_delta": human_delta, "total_reward": life_delta, "reward_sort_key": [screen_reward, human_similarity]}
 
 
 def reward_parts(novelty, human_score, settings):
@@ -1967,6 +1973,7 @@ class DataStore:
                 break
             removed += 1
             removed_ids.add(item["line"])
+            current = max(0, current - (len(item["text"].encode("utf-8")) + 1))
             for path in record_paths.get(item["line"], set()):
                 path_references[path] = max(0, path_references[path] - 1)
                 if path_references[path] == 0:
@@ -2158,9 +2165,11 @@ class WindowManager:
                     cache.update({"ok": result.ok, "reason": result.reason, "check": result})
                     return result
                 left, top, right, bottom = rect
-                screen_w = max(1, safe_int(win32api.GetSystemMetrics(0), 1))
-                screen_h = max(1, safe_int(win32api.GetSystemMetrics(1), 1))
-                if left < 0 or top < 0 or right > screen_w or bottom > screen_h:
+                virtual_left = safe_int(win32api.GetSystemMetrics(76), 0)
+                virtual_top = safe_int(win32api.GetSystemMetrics(77), 0)
+                virtual_w = max(1, safe_int(win32api.GetSystemMetrics(78), win32api.GetSystemMetrics(0)))
+                virtual_h = max(1, safe_int(win32api.GetSystemMetrics(79), win32api.GetSystemMetrics(1)))
+                if left < virtual_left or top < virtual_top or right > virtual_left + virtual_w or bottom > virtual_top + virtual_h:
                     result = WindowCheck(False, "out_of_screen", rect)
                     cache.update({"ok": result.ok, "reason": result.reason, "check": result})
                     return result
@@ -2428,13 +2437,13 @@ class ExperiencePool:
             valid = [index for index, item in enumerate(self.hashes) if item]
             return random.sample(valid, self.index_settings.nearest_candidate_limit) if len(valid) > self.index_settings.nearest_candidate_limit else valid
 
-    def nearest(self, hash_value):
+    def nearest(self, hash_value, exclude_id=None, limit=None):
         if not hash_value:
             return []
         with self.lock:
-            top_k = max(1, self.settings.nearest_top_k)
-            cache_key = (self.index_version, hash_value.bits, hash_value.hex, self.index_settings.hash_prefix_bits, self.index_settings.nearest_candidate_limit, self.settings.nearest_top_k)
-            cached = self.nearest_cache.get(cache_key)
+            top_k = max(1, safe_int(limit, self.settings.nearest_top_k))
+            cache_key = None if exclude_id is not None or limit is not None else (self.index_version, hash_value.bits, hash_value.hex, self.index_settings.hash_prefix_bits, self.index_settings.nearest_candidate_limit, self.settings.nearest_top_k)
+            cached = self.nearest_cache.get(cache_key) if cache_key is not None else None
             if cached is not None:
                 self.nearest_cache.move_to_end(cache_key)
                 return [copy.deepcopy(item) for item in cached]
@@ -2442,7 +2451,7 @@ class ExperiencePool:
             if len(self.records) > self.index_settings.nearest_candidate_limit:
                 recent_limit = min(len(self.records), max(top_k, self.index_settings.nearest_candidate_limit // 4))
                 candidate_indexes = list(dict.fromkeys(candidate_indexes + list(range(len(self.records) - recent_limit, len(self.records))) + [index for _, index in heapq.nlargest(min(len(self.global_action_heap), top_k), self.global_action_heap)]))
-            snapshot = [(index, self.hashes[index], self.records[index]) for index in candidate_indexes if self.hashes[index]]
+            snapshot = [(index, self.hashes[index], self.records[index]) for index in candidate_indexes if self.hashes[index] and (exclude_id is None or self.records[index].get("id") != exclude_id)]
         scored = []
         for index, other, record in snapshot:
             if other:
@@ -2453,12 +2462,13 @@ class ExperiencePool:
                 elif similarity > scored[0][0]:
                     heapq.heapreplace(scored, (similarity, index, item))
         result = [item for _, _, item in sorted(scored, key=lambda pair: (pair[0], pair[1]), reverse=True)]
-        with self.lock:
-            self.nearest_cache[cache_key] = copy.deepcopy(result)
-            self.nearest_cache.move_to_end(cache_key)
-            capacity = max(1, min(self.settings.global_action_heap_limit, self.index_settings.nearest_candidate_limit // max(1, self.settings.ui_metric_columns)))
-            while len(self.nearest_cache) > capacity:
-                self.nearest_cache.popitem(last=False)
+        if cache_key is not None:
+            with self.lock:
+                self.nearest_cache[cache_key] = copy.deepcopy(result)
+                self.nearest_cache.move_to_end(cache_key)
+                capacity = max(1, min(self.settings.global_action_heap_limit, self.index_settings.nearest_candidate_limit // max(1, self.settings.ui_metric_columns)))
+                while len(self.nearest_cache) > capacity:
+                    self.nearest_cache.popitem(last=False)
         return result
 
     def novelty(self, hash_value):
@@ -2510,27 +2520,18 @@ class ExperiencePool:
             sampled = random.sample(action_indices, min(len(action_indices), max(0, remaining))) if remaining > 0 else []
             return list(dict.fromkeys(ranked + recent + sampled))[:target]
 
-    def sleep_training_step(self, batch_size):
+    def sleep_training_step(self, batch_size, settle_life=None):
         indices = self.sleep_training_batch_indices(batch_size)
         if not indices:
             return {"trained": 0, "best_score": 0.0, "avg_score": 0.0, "avg_confidence": 0.0}
         with self.lock:
             records_len = len(self.records)
-            sample_limit = max(len(indices), min(records_len, self.settings.nearest_candidate_limit))
-            sample_indexes = list(range(max(0, records_len - sample_limit), records_len))
-            if records_len > sample_limit:
-                sample_indexes.extend(random.sample(range(records_len), min(sample_limit, records_len)))
-            sample_indexes = list(dict.fromkeys(sample_indexes))
-            hash_sample = [(index, self.hashes[index]) for index in sample_indexes if self.hashes[index]]
             snapshot = [(index, self.hashes[index], copy.deepcopy(self.records[index])) for index in indices if index < records_len and self.hashes[index]]
         updates = []
         for index, hash_value, record in snapshot:
-            sims = []
-            for other_index, other_hash in hash_sample:
-                if other_index != index and other_hash:
-                    sims.append(hash_similarity(hash_value, other_hash))
+            neighbors = self.nearest(hash_value, exclude_id=record.get("id"), limit=self.settings.nearest_top_k)
+            sims = [clamp(item.get("similarity", 0.0), 0.0, 1.0) for item in neighbors]
             if sims:
-                sims.sort(reverse=True)
                 top = sims[:max(1, min(self.settings.nearest_top_k, len(sims)))]
                 density = sum(1 for item in top if item >= 0.95) / len(top)
                 novelty = clamp((1.0 - (top[0] * 0.5 + sum(top) / len(top) * (35.0 / 100.0) + density * 0.15)) * 100.0, 0.0, 100.0)
@@ -2548,12 +2549,18 @@ class ExperiencePool:
             candidate = reward + novelty * self.settings.action_score_novelty_weight + (human_score - self.settings.score_default) * self.settings.action_score_human_weight + transition * self.settings.action_score_reward_weight + source * self.settings.score_default
             value = (learned * visits + candidate) / (visits + 1)
             confidence = clamp((similarity_confidence + human_score / 100.0 + min(1.0, (visits + 1) / max(1.0, self.settings.nearest_top_k))) / 3.0, 0.0, 1.0)
-            updates.append((index, value, visits + 1, confidence, novelty, human_score))
+            reward_info = reward_breakdown(novelty, human_score, self.settings)
+            settled_delta = 0.0
+            if record.get("reward_version") != reward_info["reward_version"] and callable(settle_life):
+                settled_delta = max(0.0, safe_float(reward_info["life_delta"], 0.0) - max(0.0, safe_float(record.get("life_settled", record.get("life_experience_delta", 0.0)), 0.0)))
+                if settled_delta > 0.0:
+                    settle_life(settled_delta)
+            updates.append((index, value, visits + 1, confidence, novelty, human_score, reward_info, settled_delta))
         train_records = []
         with self.lock:
             total_score = 0.0
             best_score = None
-            for index, value, visits, confidence, novelty, human_score in updates:
+            for index, value, visits, confidence, novelty, human_score, reward_info, settled_delta in updates:
                 if index >= len(self.records):
                     continue
                 record = self.records[index]
@@ -2562,6 +2569,16 @@ class ExperiencePool:
                 record["sleep_confidence"] = round(confidence, 4)
                 record["sleep_novelty"] = round(novelty, 2)
                 record["sleep_human_score"] = round(human_score, 2)
+                record["reward_version"] = reward_info["reward_version"]
+                record["sleep_evaluated_at"] = now_text()
+                record["screen_primary_reward"] = reward_info["screen_primary_reward"]
+                record["human_tie_break_reward"] = reward_info["human_tie_break_reward"]
+                record["reward_breakdown"] = reward_info
+                record["reward_sort_key"] = reward_info["reward_sort_key"]
+                record["total_reward"] = reward_info["total_reward"]
+                record["reward"] = reward_info["total_reward"]
+                record["life_experience_delta"] = max(0.0, reward_info["life_delta"])
+                record["life_settled"] = max(0.0, safe_float(record.get("life_settled", 0.0), 0.0)) + settled_delta
                 train_records.append(record)
             model_result = self.model.train(train_records)
             for record in train_records:
@@ -4362,7 +4379,7 @@ class ControlPanel(tk.Tk):
         sleep_deadline = started_perf + max(1, config.sleep_seconds)
         self.ui(lambda: self.progress_label_var.set("睡眠训练进度｜剩余 -- 秒｜已训练批次 0｜当前置信度 0.0%"))
         def train_once():
-            return self.experience_pool.sleep_training_step(batch_size)
+            return self.experience_pool.sleep_training_step(batch_size, self.store.add_life_experience if self.store else None)
         def submit_next(executor, futures):
             nonlocal submitted
             if stop_event.is_set() or not self.is_run_active(token, "sleep"):
@@ -4449,7 +4466,12 @@ class ControlPanel(tk.Tk):
         with self.state_lock:
             stopped_reason = self.termination_reason if self.termination_reason in ("esc", "user_stop") else None
         save_status = "completed" if completed_success else ("poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached else (stopped_reason or "incomplete")))
-        self.save_sleep_data(config, save_status)
+        saved, save_error = self.save_sleep_data(config, save_status)
+        if not saved:
+            if self.is_run_active(token, "sleep"):
+                self.finish_run(token, "保存失败：" + str(save_error), self.progress_value, release=False, reason="runtime_error")
+                self.ui(lambda e=str(save_error): messagebox.showerror("保存失败", e))
+            return
         final_reason = None
         if self.is_run_active(token, "sleep") and completed_success:
             final_reason = "completed"
@@ -4469,7 +4491,7 @@ class ControlPanel(tk.Tk):
 
     def save_sleep_data(self, config, status):
         if not self.store or not self.experience_pool:
-            return
+            return True, None
         try:
             self.store.flush_state(force=True)
             with self.experience_pool.lock:
@@ -4482,8 +4504,10 @@ class ControlPanel(tk.Tk):
                 self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit))
                 self.brain = ActionBrain(self.experience_pool, config.settings)
                 self.ui(lambda c=self.experience_pool.count(): self.pool_var.set(str(c)))
+            return True, None
         except Exception as exc:
             self.log_exception("sleep_save", exc, {"status": status})
+            return False, exc
 
     def restore_panel(self):
         def apply():
@@ -4591,7 +4615,7 @@ class ControlPanel(tk.Tk):
         offset_ms = round((float(offset_source) - snapshot.perf_time) * 1000.0, 3) if offset_source is not None else None
         sims = [round(item["similarity"], 4) for item in batch]
         record_event = self.events.publish("record_ready", mode=mode, session_id=session_id, event_name=event_name)
-        record = {"record_schema_version": 2, "id": uuid.uuid4().hex, "event_sequence": record_event["sequence"], "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": after_novelty, "before_screen": snapshot.relative_path if normalized else None, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": {"screen_novelty": reward_info["screen_novelty"], "screen_reward": reward_info["screen_reward"], "human_similarity": reward_info["human_similarity"], "human_tiebreak": reward_info["human_tiebreak"], "life_delta": reward_info["life_delta"], "basis": reward_info["basis"]}, "reward_sort_key": reward_info["reward_sort_key"], "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "life_experience_delta": max(0.0, reward), "penalty_delta": max(0.0, -reward), "life_experience": life, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "image_dropped": bool(getattr(snapshot, "image_dropped", False)), "screen_file_expected": not bool(getattr(snapshot, "image_dropped", False)), "capture_latency_ms": capture_latency_ms if capture_latency_ms is not None else getattr(snapshot, "capture_latency_ms", None), "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_event_wait": self.settings.training_event_wait, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
+        record = {"record_schema_version": 2, "reward_version": reward_info["reward_version"], "id": uuid.uuid4().hex, "event_sequence": record_event["sequence"], "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": after_novelty, "before_screen": snapshot.relative_path if normalized else None, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": {"screen_novelty": reward_info["screen_novelty"], "screen_reward": reward_info["screen_reward"], "human_similarity": reward_info["human_similarity"], "human_tiebreak": reward_info["human_tiebreak"], "life_delta": reward_info["life_delta"], "basis": reward_info["basis"]}, "reward_sort_key": reward_info["reward_sort_key"], "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "life_experience_delta": max(0.0, reward), "life_settled": max(0.0, reward), "penalty_delta": max(0.0, -reward), "life_experience": life, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "image_dropped": bool(getattr(snapshot, "image_dropped", False)), "screen_file_expected": not bool(getattr(snapshot, "image_dropped", False)), "capture_latency_ms": capture_latency_ms if capture_latency_ms is not None else getattr(snapshot, "capture_latency_ms", None), "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_event_wait": self.settings.training_event_wait, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
         if decision:
             record["ai_decision"] = decision
         self.persistence_queue.enqueue_record(self.store, record)
