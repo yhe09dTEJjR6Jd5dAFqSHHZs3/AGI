@@ -381,14 +381,14 @@ HUMAN_FEATURE_NAMES = ("duration", "direct", "bend", "points", "speed_mean", "sp
 
 RUNTIME_NUMBER_RULES = {
     "hash_size": ("screen_pixels", "pool_count", "capture_ms"),
-    "nearest_top_k": ("pool_count", "cpu_count", "life_experience"),
+    "nearest_top_k": ("pool_count", "cpu_count", "screen_score_total"),
     "nearest_candidate_limit": ("pool_count", "window_instability", "cpu_count", "gpu_count"),
     "hash_prefix_bits": ("pool_count", "screen_pixels"),
     "mouse_activity_wait": ("capture_ms", "cpu_load"),
     "training_event_wait": ("capture_ms", "execution_ms", "cpu_load", "gpu_factor", "window_instability"),
     "sleep_event_wait": ("cpu_load", "cpu_count", "memory_free_ratio"),
     "sleep_worker_count": ("cpu_count", "gpu_count", "memory_free_ratio", "cpu_load"),
-    "sleep_batch_size": ("pool_count", "cpu_count", "memory_free_ratio", "life_experience"),
+    "sleep_batch_size": ("pool_count", "cpu_count", "memory_free_ratio", "screen_score_total"),
     "sleep_queue_depth": ("cpu_count", "gpu_count", "memory_free_ratio"),
     "key_debounce_seconds": ("cpu_load", "capture_ms"),
     "window_attach_seconds": ("cpu_load", "window_instability"),
@@ -396,7 +396,7 @@ RUNTIME_NUMBER_RULES = {
     "explore_max_rate": ("recent_success", "learning_similarity", "window_instability"),
     "explore_min_rate": ("recent_success", "learning_similarity", "pool_count"),
     "action_jitter": ("recent_success", "window_instability", "screen_pixels"),
-    "softmax_temperature": ("pool_count", "recent_success", "life_experience"),
+    "softmax_temperature": ("pool_count", "recent_success", "screen_score_total"),
     "human_profile_min_samples": ("pool_count", "human_feature_count"),
     "human_profile_max_samples": ("pool_count", "memory_free_ratio"),
     "human_profile_keep_samples": ("pool_count", "memory_free_ratio"),
@@ -408,8 +408,8 @@ RUNTIME_NUMBER_RULES = {
     "ui_section_padding": ("screen_pixels", "screen_width", "screen_height"),
     "ui_metric_columns": ("screen_width", "ui_width"),
     "ui_metric_min_column_width": ("screen_width", "ui_metric_columns"),
-    "reward_total_min": ("life_experience", "recent_success"),
-    "reward_total_max": ("life_experience", "recent_success"),
+    "reward_total_min": ("screen_score_total", "recent_success"),
+    "reward_total_max": ("screen_score_total", "recent_success"),
     "experience_load_limit": ("pool_count", "memory_free_ratio", "cpu_count"),
     "global_action_probability": ("pool_count", "recent_success"),
     "random_action_min": ("window_instability", "recent_success"),
@@ -437,7 +437,7 @@ RUNTIME_NUMBER_RULES = {
     "global_action_heap_limit": ("pool_count", "cpu_count"),
     "local_action_heap_limit": ("pool_count", "window_instability"),
     "action_score_similarity_weight": ("nearest_similarity", "pool_count"),
-    "action_score_reward_weight": ("recent_success", "life_experience"),
+    "action_score_reward_weight": ("recent_success", "screen_score_total"),
     "action_score_human_weight": ("recent_success", "learning_similarity"),
     "action_score_novelty_weight": ("window_instability", "pool_count"),
     "motion_score_magnitude_weight": ("recent_success", "screen_pixels"),
@@ -560,7 +560,7 @@ class AdaptivePolicy:
     def _avg(self, values, fallback):
         return sum(values) / len(values) if values else fallback
 
-    def build(self, base_settings, rect, pool_count, life, hardware=None):
+    def build(self, base_settings, rect, pool_count, screen_score_total, hardware=None):
         capture_ms = self._avg(self.capture_latency_ms, 24.0)
         execution_ms = self._avg(self.execution_latency_ms, 140.0)
         window_instability = self._avg(self.window_change_flags, 0.0)
@@ -569,7 +569,7 @@ class AdaptivePolicy:
         cpu_load = 0.0
         if hardware:
             cpu_load = safe_float(hardware.get("cpu_load", 0.0), 0.0)
-        return derive_runtime_settings(base_settings=base_settings, rect=rect, pool_count=pool_count, capture_ms=capture_ms, cpu_load=cpu_load, execution_ms=execution_ms, window_instability=window_instability, recent_success=recent_success, life=life, learning_similarity=similarity, hardware=hardware)
+        return derive_runtime_settings(base_settings=base_settings, rect=rect, pool_count=pool_count, capture_ms=capture_ms, cpu_load=cpu_load, execution_ms=execution_ms, window_instability=window_instability, recent_success=recent_success, screen_score_total=screen_score_total, learning_similarity=similarity, hardware=hardware)
 
 
 @dataclass
@@ -715,7 +715,7 @@ def run_self_test():
     assert high_human < high_screen
     details = reward_breakdown(70.0, 100.0, settings)
     low_human_details = reward_breakdown(70.0, 0.0, settings)
-    assert details["life_delta"] == details["screen_primary_reward"] + details["human_tie_break_reward"]
+    assert details["screen_score_delta"] == details["screen_primary_reward"] + details["human_tie_break_reward"]
     assert details["reward_sort_key"] > low_human_details["reward_sort_key"]
     assert details["reward_sort_key"][0] == details["screen_primary_reward"]
     assert "human_tie_break_reward" in details
@@ -731,6 +731,8 @@ def run_self_test():
     novelty, batch = pool.novelty(a)
     assert novelty >= 0.0
     assert all(item["record"].get("id") != "t1" for item in pool.nearest(a, exclude_id="t1"))
+    assert not pool.nearest(a, before_index=0)
+    assert all(item["record"].get("id") == "t1" for item in pool.nearest(a, before_index=1))
     values = {item.name: getattr(settings, item.name) for item in fields(Settings)}
     values["hash_prefix_bits"] = max(1, settings.hash_prefix_bits - 1)
     changed = Settings(**values)
@@ -743,8 +745,8 @@ def run_self_test():
     brain = ActionBrain(pool, changed)
     _, decision = brain.choose(a, novelty, batch, 0.0)
     assert isinstance(decision, dict)
-    random_action, random_decision = brain.choose(a, novelty, [], 0.0, poor_life_factor=1.0)
-    assert random_action and random_decision["reason"] == "poor_life_random_exploration" and random_decision["poor_life_factor"] == 1.0
+    random_action, random_decision = brain.choose(a, novelty, [], 0.0, zero_score_factor=1.0)
+    assert random_action and random_decision["reason"] == "zero_score_random_exploration" and random_decision["zero_score_factor"] == 1.0
     with tempfile.TemporaryDirectory() as folder:
         root = Path(folder)
         executable = root / "dnplayer.exe"
@@ -754,8 +756,8 @@ def run_self_test():
         store = DataStore(folder)
         store.state_file.write_text("{bad json}", encoding="utf-8")
         rebuilt_state = store.load_state()
-        assert rebuilt_state == {"life_experience": 0.0, "penalty": 0.0}
-        assert list(store.root.glob("state.bad.*.json")) and json.loads(store.state_file.read_text(encoding="utf-8"))["life_experience"] == 0.0
+        assert rebuilt_state == {"screen_score_total": 0.0, "penalty": 0.0}
+        assert list(store.root.glob("state.bad.*.json")) and json.loads(store.state_file.read_text(encoding="utf-8"))["screen_score_total"] == 0.0
         shared = store.screen_dir / "shared.png"
         unique = store.screen_dir / "unique.png"
         with shared.open("wb") as file:
@@ -997,7 +999,7 @@ class RuntimeGeneratedNumbers:
 
 
 class RuntimeNumberFactory:
-    def __init__(self, hardware, screen, pool_count, capture_ms, execution_ms, latency, success_rate, window_instability, learning_similarity, life):
+    def __init__(self, hardware, screen, pool_count, capture_ms, execution_ms, latency, success_rate, window_instability, learning_similarity, screen_score_total):
         width, height = screen
         self.width = max(1, safe_int(width, 1))
         self.height = max(1, safe_int(height, 1))
@@ -1008,7 +1010,7 @@ class RuntimeNumberFactory:
         self.success_rate = clamp(success_rate, 0.0, 1.0)
         self.window_instability = clamp(window_instability, 0.0, 1.0)
         self.learning_similarity = clamp(learning_similarity, 0.0, 1.0)
-        self.life = max(0.0, safe_float(life, 0.0))
+        self.screen_score_total = max(0.0, safe_float(screen_score_total, 0.0))
         hardware = hardware or {}
         self.cpu_load = clamp(safe_float(hardware.get("cpu_load", 0.0), 0.0), 0.0, 100.0)
         self.memory_free_ratio = clamp(safe_float(hardware.get("memory_free_ratio", 0.5), 0.5), 0.0, 1.0)
@@ -1023,7 +1025,7 @@ class RuntimeNumberFactory:
         self.cpu_factor = clamp((1.0 + self.cpu_load / 200.0) * (1.12 - self.memory_free_ratio * 0.22) / max(0.5, self.core_factor), 0.65, 2.4)
         self.timing_factor = clamp((self.capture_ms + self.execution_ms * 0.5) / 80.0, 0.5, 2.5)
         self.generator = RuntimeGeneratedNumbers()
-        self.context = {"screen_width": self.width, "screen_height": self.height, "screen_pixels": self.width * self.height, "pool_count": self.pool_count, "capture_ms": self.capture_ms, "execution_ms": self.execution_ms, "cpu_load": self.cpu_load, "cpu_count": self.cpu_count, "memory_free_ratio": self.memory_free_ratio, "gpu_count": self.gpu_count, "gpu_memory_total": self.gpu_memory_total, "success_rate": self.success_rate, "window_instability": self.window_instability, "learning_similarity": self.learning_similarity, "life_experience": self.life}
+        self.context = {"screen_width": self.width, "screen_height": self.height, "screen_pixels": self.width * self.height, "pool_count": self.pool_count, "capture_ms": self.capture_ms, "execution_ms": self.execution_ms, "cpu_load": self.cpu_load, "cpu_count": self.cpu_count, "memory_free_ratio": self.memory_free_ratio, "gpu_count": self.gpu_count, "gpu_memory_total": self.gpu_memory_total, "success_rate": self.success_rate, "window_instability": self.window_instability, "learning_similarity": self.learning_similarity, "screen_score_total": self.screen_score_total}
         self.audit = {}
 
     def generated(self, name, semantic_goal, minimum, maximum):
@@ -1049,7 +1051,7 @@ class RuntimeNumberFactory:
             "training_event_wait": self.capture_factor * self.cpu_factor * self.timing_factor * g("event_gap", "next screenshot follows action result and hardware readiness", 0.0, 0.12) / self.gpu_factor,
             "sleep_event_wait": self.cpu_factor / self.core_factor * g("batch_event_gap", "sleep advances on batch completion events", 0.0, 0.18),
             "sleep_worker_count": self.cpu_count * clamp(self.memory_free_ratio * g("worker_memory", "parallelism respects free memory and cpu load", 0.2, 1.6), 0.0, max(1.0, self.cpu_count)) + self.gpu_count,
-            "sleep_batch_size": (self.record_factor + self.core_factor + self.memory_free_ratio + math.log1p(self.life)) * g("batch_scale", "batch size grows with experience pool and hardware", 1.0, 64.0),
+            "sleep_batch_size": (self.record_factor + self.core_factor + self.memory_free_ratio + math.log1p(self.screen_score_total)) * g("batch_scale", "batch size grows with experience pool and hardware", 1.0, 64.0),
             "sleep_queue_depth": (self.cpu_count + max(1, self.gpu_count) + self.memory_free_ratio) * g("queue_scale", "queue absorbs worker completion events", 0.5, 4.0),
             "key_debounce_seconds": self.cpu_factor * g("debounce", "human escape key debounce", 0.0, 0.6),
             "window_attach_seconds": g("attach_budget", "ldplayer launch and attach budget", self.capture_ms, self.execution_ms + self.cpu_load),
@@ -1077,7 +1079,7 @@ class RuntimeNumberFactory:
             "learning_screen_similarity_threshold": 1.0 - g("learning_delta", "screen change novelty threshold", 0.0, 0.08),
             "ui_progress_delta": g("progress_delta", "visible progress refresh threshold", 0.0, 1.0),
             "action_score_similarity_weight": g("similarity_weight", "nearest screen action score", 0.1, 2.0),
-            "action_score_reward_weight": g("reward_weight", "life reward action score", 0.05, 1.5),
+            "action_score_reward_weight": g("reward_weight", "screen score reward action score", 0.05, 1.5),
             "action_score_human_weight": g("human_weight", "learning mouse similarity score", 0.05, 1.5),
             "action_score_novelty_weight": g("novelty_weight", "novel screen score", 0.01, 1.0),
             "motion_score_magnitude_weight": g("magnitude_weight", "scroll magnitude weight", 0.1, 0.9),
@@ -1103,8 +1105,8 @@ class RuntimeNumberFactory:
             "global_action_heap_limit": (self.record_factor + self.core_factor) * g("global_heap", "global action ranking memory", 64.0, 512.0),
             "local_action_heap_limit": (self.record_factor + self.window_instability + 1.0) * g("local_heap", "local action ranking memory", 32.0, 256.0),
             "softmax_temperature": self.record_factor * g("temperature", "softmax action diversity", 1.0, 6.0),
-            "reward_total_min": -max(self.life, g("reward_min", "minimum auditable reward", 1000.0, 20000.0)),
-            "reward_total_max": max(self.life, g("reward_max", "maximum auditable reward", 1000.0, 20000.0)),
+            "reward_total_min": -max(self.screen_score_total, g("reward_min", "minimum auditable reward", 1000.0, 20000.0)),
+            "reward_total_max": max(self.screen_score_total, g("reward_max", "maximum auditable reward", 1000.0, 20000.0)),
             "motion_steps_per_second": (self.width / g("motion_divisor", "mouse interpolation density", 12.0, 42.0)) / max(0.1, self.cpu_factor),
             "learning_screen_change_capacity": clamp(self.core_factor * self.gpu_factor, 0.1, 4.0) / max(0.001, self.capture_ms / g("capacity_ms", "screen-change event capacity", 700.0, 1400.0))
         }
@@ -1129,12 +1131,12 @@ class RuntimeNumberFactory:
         return values
 
 
-def derive_runtime_settings(base_settings=None, rect=None, pool_count=0, capture_ms=None, cpu_load=0.0, execution_ms=None, window_instability=0.0, recent_success=1.0, life=0.0, learning_similarity=0.97, hardware=None):
+def derive_runtime_settings(base_settings=None, rect=None, pool_count=0, capture_ms=None, cpu_load=0.0, execution_ms=None, window_instability=0.0, recent_success=1.0, screen_score_total=0.0, learning_similarity=0.97, hardware=None):
     source = base_settings or Settings()
     width, height = rect_size(rect) if rect else (safe_int(getattr(win32api, "GetSystemMetrics", lambda _: 1920)(0), 1920), safe_int(getattr(win32api, "GetSystemMetrics", lambda _: 1080)(1), 1080))
     hardware = dict(hardware or {})
     hardware["cpu_load"] = cpu_load
-    factory = RuntimeNumberFactory(hardware, (width, height), pool_count, capture_ms, execution_ms, capture_ms, recent_success, window_instability, learning_similarity, life)
+    factory = RuntimeNumberFactory(hardware, (width, height), pool_count, capture_ms, execution_ms, capture_ms, recent_success, window_instability, learning_similarity, screen_score_total)
     values = {item.name: getattr(source, item.name) for item in fields(Settings)}
     values.update({
         "hash_size": factory.count("hash_size", 8, 24),
@@ -1358,8 +1360,8 @@ def reward_breakdown(novelty, human_score, settings):
     reward_span = max(1.0, abs(safe_float(settings.reward_total_max, 100.0) - safe_float(settings.reward_total_min, 0.0)))
     tie_breaker = reward_span / max(1.0, settings.global_action_heap_limit * settings.local_action_heap_limit)
     human_tiebreak = 0.0 if screen_reward <= 0.0 else clamp(human_similarity / 100.0, 0.0, 1.0) * tie_breaker
-    life_delta = round(clamp(screen_reward + human_tiebreak, settings.reward_total_min, settings.reward_total_max), 6)
-    return {"reward_version": 2, "screen_novelty": screen_novelty, "screen_reward": screen_reward, "human_similarity": human_similarity, "human_tiebreak": round(human_tiebreak, 6), "life_delta": life_delta, "basis": ["nearest_screen_batch", "learning_mouse_profile"], "screen_primary_reward": screen_reward, "human_tie_break_reward": round(human_tiebreak, 6), "mouse_action_delta": human_delta, "total_reward": life_delta, "reward_sort_key": [screen_reward, human_similarity]}
+    screen_score_delta = round(clamp(screen_reward + human_tiebreak, settings.reward_total_min, settings.reward_total_max), 6)
+    return {"reward_version": 2, "screen_novelty": screen_novelty, "screen_reward": screen_reward, "human_similarity": human_similarity, "human_tiebreak": round(human_tiebreak, 6), "screen_score_delta": screen_score_delta, "basis": ["nearest_screen_batch", "learning_mouse_profile"], "screen_primary_reward": screen_reward, "human_tie_break_reward": round(human_tiebreak, 6), "mouse_action_delta": human_delta, "total_reward": screen_score_delta, "reward_sort_key": [screen_reward, human_similarity]}
 
 
 def reward_parts(novelty, human_score, settings):
@@ -1653,11 +1655,11 @@ class DataStore:
         self.last_state_save_perf = time.perf_counter()
 
     @property
-    def life(self):
-        return safe_float(self.state.get("life_experience", 0.0), 0.0)
+    def screen_score_total(self):
+        return safe_float(self.state.get("screen_score_total", 0.0), 0.0)
 
     def default_state_payload(self):
-        return {"life_experience": 0.0, "penalty": 0.0}
+        return {"screen_score_total": 0.0, "penalty": 0.0}
 
     def notify_state_rebuilt(self, message):
         if "--self-test" in sys.argv:
@@ -1698,7 +1700,7 @@ class DataStore:
                 data = json.load(file)
             if not isinstance(data, dict):
                 raise ValueError("状态文件必须是 JSON 对象")
-            return {"life_experience": safe_float(data.get("life_experience", 0.0), 0.0), "penalty": safe_float(data.get("penalty", 0.0), 0.0)}
+            return {"screen_score_total": safe_float(data.get("screen_score_total", 0.0), 0.0), "penalty": safe_float(data.get("penalty", 0.0), 0.0)}
         except Exception as exc:
             return self.rebuild_bad_state(exc)
 
@@ -1709,17 +1711,17 @@ class DataStore:
                 json.dump(self.state, file, ensure_ascii=False, indent=2)
             temporary.replace(self.state_file)
 
-    def add_life_experience(self, value):
+    def add_screen_score_total(self, value):
         with self.lock:
             delta = safe_float(value, 0.0)
-            current = safe_float(self.state.get("life_experience", 0.0), 0.0)
+            current = safe_float(self.state.get("screen_score_total", 0.0), 0.0)
             penalty = safe_float(self.state.get("penalty", 0.0), 0.0)
             if delta >= 0.0:
-                self.state["life_experience"] = round(current + delta, 2)
+                self.state["screen_score_total"] = round(current + delta, 2)
             else:
-                self.state["life_experience"] = round(current, 2)
+                self.state["screen_score_total"] = round(current, 2)
                 self.state["penalty"] = round(penalty + abs(delta), 2)
-            return self.state["life_experience"]
+            return self.state["screen_score_total"]
 
     def flush_state(self, force=False, min_interval=1.5, max_pending=36):
         with self.lock:
@@ -1778,7 +1780,7 @@ class DataStore:
             self.model_dir.mkdir(parents=True, exist_ok=True)
             ranked = sorted([record for record in records or [] if record.get("mouse_action")], key=lambda record: (safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), safe_float(record.get("sleep_confidence", 0.0), 0.0)), reverse=True)
             limit = max(1, min(len(ranked) or 1, safe_int(getattr(settings, "global_action_heap_limit", 1), 1)))
-            payload = {"schema_version": CONFIG_SCHEMA_VERSION, "created_at": now_text(), "status": status, "life_experience": self.life, "experience_count": len(records or []), "model": model.snapshot() if model else None, "policy": [{"id": record.get("id"), "mode": record.get("mode"), "mouse_action": record.get("mouse_action"), "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_model_confidence": safe_float(record.get("sleep_model_confidence", record.get("model_prediction", 0.0)), 0.0), "model_prediction": safe_float(record.get("model_prediction", 0.0), 0.0), "model_target": safe_float(record.get("model_target", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
+            payload = {"schema_version": CONFIG_SCHEMA_VERSION, "created_at": now_text(), "status": status, "screen_score_total": self.screen_score_total, "experience_count": len(records or []), "model": model.snapshot() if model else None, "policy": [{"id": record.get("id"), "mode": record.get("mode"), "mouse_action": record.get("mouse_action"), "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_model_confidence": safe_float(record.get("sleep_model_confidence", record.get("model_prediction", 0.0)), 0.0), "model_prediction": safe_float(record.get("model_prediction", 0.0), 0.0), "model_target": safe_float(record.get("model_target", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
             path = self.model_dir / f"model_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex}.json"
             temporary = path.with_suffix(".tmp")
             with temporary.open("w", encoding="utf-8") as file:
@@ -2437,12 +2439,12 @@ class ExperiencePool:
             valid = [index for index, item in enumerate(self.hashes) if item]
             return random.sample(valid, self.index_settings.nearest_candidate_limit) if len(valid) > self.index_settings.nearest_candidate_limit else valid
 
-    def nearest(self, hash_value, exclude_id=None, limit=None):
+    def nearest(self, hash_value, exclude_id=None, limit=None, before_index=None):
         if not hash_value:
             return []
         with self.lock:
             top_k = max(1, safe_int(limit, self.settings.nearest_top_k))
-            cache_key = None if exclude_id is not None or limit is not None else (self.index_version, hash_value.bits, hash_value.hex, self.index_settings.hash_prefix_bits, self.index_settings.nearest_candidate_limit, self.settings.nearest_top_k)
+            cache_key = None if exclude_id is not None or limit is not None or before_index is not None else (self.index_version, hash_value.bits, hash_value.hex, self.index_settings.hash_prefix_bits, self.index_settings.nearest_candidate_limit, self.settings.nearest_top_k)
             cached = self.nearest_cache.get(cache_key) if cache_key is not None else None
             if cached is not None:
                 self.nearest_cache.move_to_end(cache_key)
@@ -2451,7 +2453,7 @@ class ExperiencePool:
             if len(self.records) > self.index_settings.nearest_candidate_limit:
                 recent_limit = min(len(self.records), max(top_k, self.index_settings.nearest_candidate_limit // 4))
                 candidate_indexes = list(dict.fromkeys(candidate_indexes + list(range(len(self.records) - recent_limit, len(self.records))) + [index for _, index in heapq.nlargest(min(len(self.global_action_heap), top_k), self.global_action_heap)]))
-            snapshot = [(index, self.hashes[index], self.records[index]) for index in candidate_indexes if self.hashes[index] and (exclude_id is None or self.records[index].get("id") != exclude_id)]
+            snapshot = [(index, self.hashes[index], self.records[index]) for index in candidate_indexes if self.hashes[index] and (before_index is None or index < before_index) and (exclude_id is None or self.records[index].get("id") != exclude_id)]
         scored = []
         for index, other, record in snapshot:
             if other:
@@ -2520,7 +2522,7 @@ class ExperiencePool:
             sampled = random.sample(action_indices, min(len(action_indices), max(0, remaining))) if remaining > 0 else []
             return list(dict.fromkeys(ranked + recent + sampled))[:target]
 
-    def sleep_training_step(self, batch_size, settle_life=None):
+    def sleep_training_step(self, batch_size, settle_screen_score=None):
         indices = self.sleep_training_batch_indices(batch_size)
         if not indices:
             return {"trained": 0, "best_score": 0.0, "avg_score": 0.0, "avg_confidence": 0.0}
@@ -2529,7 +2531,7 @@ class ExperiencePool:
             snapshot = [(index, self.hashes[index], copy.deepcopy(self.records[index])) for index in indices if index < records_len and self.hashes[index]]
         updates = []
         for index, hash_value, record in snapshot:
-            neighbors = self.nearest(hash_value, exclude_id=record.get("id"), limit=self.settings.nearest_top_k)
+            neighbors = self.nearest(hash_value, exclude_id=record.get("id"), limit=self.settings.nearest_top_k, before_index=index)
             sims = [clamp(item.get("similarity", 0.0), 0.0, 1.0) for item in neighbors]
             if sims:
                 top = sims[:max(1, min(self.settings.nearest_top_k, len(sims)))]
@@ -2551,10 +2553,10 @@ class ExperiencePool:
             confidence = clamp((similarity_confidence + human_score / 100.0 + min(1.0, (visits + 1) / max(1.0, self.settings.nearest_top_k))) / 3.0, 0.0, 1.0)
             reward_info = reward_breakdown(novelty, human_score, self.settings)
             settled_delta = 0.0
-            if record.get("reward_version") != reward_info["reward_version"] and callable(settle_life):
-                settled_delta = max(0.0, safe_float(reward_info["life_delta"], 0.0) - max(0.0, safe_float(record.get("life_settled", record.get("life_experience_delta", 0.0)), 0.0)))
+            if record.get("reward_version") != reward_info["reward_version"] and callable(settle_screen_score):
+                settled_delta = max(0.0, safe_float(reward_info["screen_score_delta"], 0.0) - max(0.0, safe_float(record.get("screen_score_settled", record.get("screen_score_delta", 0.0)), 0.0)))
                 if settled_delta > 0.0:
-                    settle_life(settled_delta)
+                    settle_screen_score(settled_delta)
             updates.append((index, value, visits + 1, confidence, novelty, human_score, reward_info, settled_delta))
         train_records = []
         with self.lock:
@@ -2577,8 +2579,8 @@ class ExperiencePool:
                 record["reward_sort_key"] = reward_info["reward_sort_key"]
                 record["total_reward"] = reward_info["total_reward"]
                 record["reward"] = reward_info["total_reward"]
-                record["life_experience_delta"] = max(0.0, reward_info["life_delta"])
-                record["life_settled"] = max(0.0, safe_float(record.get("life_settled", 0.0), 0.0)) + settled_delta
+                record["screen_score_delta"] = max(0.0, reward_info["screen_score_delta"])
+                record["screen_score_settled"] = max(0.0, safe_float(record.get("screen_score_settled", 0.0), 0.0)) + settled_delta
                 train_records.append(record)
             model_result = self.model.train(train_records)
             for record in train_records:
@@ -2620,12 +2622,12 @@ class ActionBrain:
         self.last_action = None
         self.last_decision = None
 
-    def exploration_rate(self, novelty, life):
+    def exploration_rate(self, novelty, screen_score_total):
         action_count = len(self.pool.action_records())
         count_factor = 1.0 / math.sqrt(max(1.0, action_count))
         novelty_factor = clamp(novelty / 100.0, 0.0, 1.0)
-        life_factor = 1.0 / math.sqrt(max(1.0, 1.0 + life / 200.0))
-        rate = (0.12 + 0.28 * count_factor + 0.18 * novelty_factor) * life_factor
+        score_factor = 1.0 / math.sqrt(max(1.0, 1.0 + screen_score_total / 200.0))
+        rate = (0.12 + 0.28 * count_factor + 0.18 * novelty_factor) * score_factor
         return round(clamp(rate, self.settings.explore_min_rate, self.settings.explore_max_rate), 4)
 
     def score_candidate(self, item):
@@ -2679,15 +2681,15 @@ class ActionBrain:
     def fallback_action(self, randomness=0.0):
         learned = self.pool.best_global_action()
         if randomness > 0.0 and random.random() < clamp(randomness, 0.0, 1.0):
-            return self.random_action(1.0 + randomness), "poor_life_random_exploration"
+            return self.random_action(1.0 + randomness), "zero_score_random_exploration"
         if learned and random.random() < self.settings.global_action_probability:
             return self.mutate_action(learned, 1.8 + randomness), "global_experience"
         if randomness > 0.0:
-            return self.random_action(1.0 + randomness), "poor_life_random_exploration"
+            return self.random_action(1.0 + randomness), "zero_score_random_exploration"
         return None, "observe_only"
 
-    def choose(self, hash_value, novelty, batch, life, poor_life_factor=0.0):
-        rate = clamp(self.exploration_rate(novelty, life) + clamp(poor_life_factor, 0.0, 1.0) * (1.0 - self.settings.explore_min_rate), self.settings.explore_min_rate, self.settings.explore_max_rate)
+    def choose(self, hash_value, novelty, batch, screen_score_total, zero_score_factor=0.0):
+        rate = clamp(self.exploration_rate(novelty, screen_score_total) + clamp(zero_score_factor, 0.0, 1.0) * (1.0 - self.settings.explore_min_rate), self.settings.explore_min_rate, self.settings.explore_max_rate)
         usable = []
         for item in batch:
             action = item["record"].get("mouse_action")
@@ -2696,14 +2698,14 @@ class ActionBrain:
             score = self.score_candidate(item)
             usable.append((math.exp(clamp(score, self.settings.reward_total_min, self.settings.reward_total_max) / self.settings.softmax_temperature), {"item": item, "score": score, "action": action}))
         if random.random() < rate or not usable:
-            action, reason = self.fallback_action(poor_life_factor)
-            decision = {"reason": reason, "exploration_rate": rate, "poor_life_factor": round(clamp(poor_life_factor, 0.0, 1.0), 4), "candidate_count": len(usable), "confidence": 0.0, "nearest_similarity": round(batch[0]["similarity"], 4) if batch else 0.0}
+            action, reason = self.fallback_action(zero_score_factor)
+            decision = {"reason": reason, "exploration_rate": rate, "zero_score_factor": round(clamp(zero_score_factor, 0.0, 1.0), 4), "candidate_count": len(usable), "confidence": 0.0, "nearest_similarity": round(batch[0]["similarity"], 4) if batch else 0.0}
         else:
             chosen = weighted_choice(usable)
             item = chosen["item"]
             confidence = clamp(item.get("similarity", 0.0) * 0.65 + clamp(chosen.get("score", 0.0), 0.0, 200.0) / 200.0 * (35.0 / 100.0), 0.0, 1.0)
-            action = self.mutate_action(chosen["action"], 1.0 - confidence + rate + poor_life_factor)
-            decision = {"reason": "nearest_rewarded_experience", "exploration_rate": rate, "poor_life_factor": round(clamp(poor_life_factor, 0.0, 1.0), 4), "candidate_count": len(usable), "confidence": round(confidence, 4), "nearest_similarity": round(batch[0]["similarity"], 4) if batch else 0.0, "chosen_similarity": round(item.get("similarity", 0.0), 4), "chosen_reward": round(safe_float(item["record"].get("reward", 0.0), 0.0), 2), "chosen_record_id": item["record"].get("id")}
+            action = self.mutate_action(chosen["action"], 1.0 - confidence + rate + zero_score_factor)
+            decision = {"reason": "nearest_rewarded_experience", "exploration_rate": rate, "zero_score_factor": round(clamp(zero_score_factor, 0.0, 1.0), 4), "candidate_count": len(usable), "confidence": round(confidence, 4), "nearest_similarity": round(batch[0]["similarity"], 4) if batch else 0.0, "chosen_similarity": round(item.get("similarity", 0.0), 4), "chosen_reward": round(safe_float(item["record"].get("reward", 0.0), 0.0), 2), "chosen_record_id": item["record"].get("id")}
         self.last_action = copy.deepcopy(action) if action else None
         self.last_decision = decision
         return action, decision
@@ -3199,8 +3201,8 @@ class MetricsPresenter:
     def __init__(self, panel):
         self.panel = panel
 
-    def update(self, novelty, human_score, screen_reward, action_reward, reward, life, decision=None):
-        return self.panel.update_metrics(novelty, human_score, screen_reward, action_reward, reward, life, decision=decision)
+    def update(self, novelty, human_score, screen_reward, action_reward, reward, screen_score_total, decision=None):
+        return self.panel.update_metrics(novelty, human_score, screen_reward, action_reward, reward, screen_score_total, decision=decision)
 
 
 class MigrationService:
@@ -3226,20 +3228,20 @@ class TrainingService:
     def prepare_for_event(self, rect):
         panel = self.panel
         pool_count = panel.experience_pool.count() if panel.experience_pool else 0
-        life_value = panel.store.life if panel.store else 0.0
+        screen_score_total_value = panel.store.screen_score_total if panel.store else 0.0
         panel.hardware_state = panel.refresh_hardware_state()
-        settings = panel.adaptive_policy.build(panel.settings, rect, pool_count, life_value, hardware=panel.hardware_state)
+        settings = panel.adaptive_policy.build(panel.settings, rect, pool_count, screen_score_total_value, hardware=panel.hardware_state)
         panel.apply_runtime_settings(settings)
         return settings
 
     def observe_screen(self, analyzer, session_id, start, rect):
         return self.panel.capture_snapshot(analyzer, "training", session_id, start, rect=rect)
 
-    def decide_action(self, snapshot, poor_life_factor=0.0):
+    def decide_action(self, snapshot, zero_score_factor=0.0):
         panel = self.panel
         novelty, batch = panel.experience_pool.novelty(snapshot.hash_value)
-        life = panel.store.life if panel.store else 0.0
-        return panel.brain.choose(snapshot.hash_value, novelty, batch, life, poor_life_factor=poor_life_factor)
+        screen_score_total = panel.store.screen_score_total if panel.store else 0.0
+        return panel.brain.choose(snapshot.hash_value, novelty, batch, screen_score_total, zero_score_factor=zero_score_factor)
 
     def should_stop(self, start, config, stop_event):
         panel = self.panel
@@ -3363,7 +3365,7 @@ class ControlPanel(tk.Tk):
         self.ai_model_limit_var = tk.StringVar(value=str(DEFAULT_AI_MODEL_LIMIT))
         self.mode_var = tk.StringVar(value=MODE_NAMES["idle"])
         self.status_var = tk.StringVar(value="等待开始")
-        self.life_var = tk.StringVar(value="0")
+        self.screen_score_total_var = tk.StringVar(value="0")
         self.reward_var = tk.StringVar(value="0")
         self.screen_reward_var = tk.StringVar(value="0")
         self.action_reward_var = tk.StringVar(value="0")
@@ -3483,7 +3485,7 @@ class ControlPanel(tk.Tk):
         self.metrics_frame = ttk.Frame(status_frame)
         self.metrics_frame.grid(row=0, column=0, sticky="nsew")
         status_frame.columnconfigure(0, weight=1)
-        metrics = [("当前模式", self.mode_var), ("人生阅历", self.life_var), ("经验条数", self.pool_var), ("新颖度", self.novelty_var), ("真人评分", self.human_var), ("画面奖励", self.screen_reward_var), ("鼠标奖惩", self.action_reward_var), ("本次奖励", self.reward_var), ("AI决策", self.ai_var)]
+        metrics = [("当前模式", self.mode_var), ("画面评分累计", self.screen_score_total_var), ("经验条数", self.pool_var), ("画面评分", self.novelty_var), ("鼠标相似度", self.human_var), ("画面奖励", self.screen_reward_var), ("鼠标奖惩", self.action_reward_var), ("本次奖励", self.reward_var), ("AI决策", self.ai_var)]
         for title, variable in metrics:
             self.metric_items.append(self.create_metric(self.metrics_frame, title, variable))
         self.reflow_metrics()
@@ -4014,8 +4016,8 @@ class ControlPanel(tk.Tk):
         capture_ms = self.adaptive_policy._avg(self.adaptive_policy.capture_latency_ms, 0.0)
         if capture_ms <= 0.0:
             capture_ms = self.measure_capture_latency()
-        life_value = self.store.life if self.store else 0.0
-        settings = derive_runtime_settings(base_settings=self.settings, rect=self.current_rect() or self.screen_rect(), pool_count=self.experience_pool.count() if self.experience_pool else 0, capture_ms=capture_ms, cpu_load=cpu_load, execution_ms=self.adaptive_policy._avg(self.adaptive_policy.execution_latency_ms, 0.0), window_instability=self.adaptive_policy._avg(self.adaptive_policy.window_change_flags, 0.0), recent_success=self.adaptive_policy._avg(self.adaptive_policy.outcome_flags, 1.0), life=life_value, learning_similarity=self.adaptive_policy._avg(self.adaptive_policy.learning_similarity, 0.97), hardware=self.hardware_state)
+        screen_score_total_value = self.store.screen_score_total if self.store else 0.0
+        settings = derive_runtime_settings(base_settings=self.settings, rect=self.current_rect() or self.screen_rect(), pool_count=self.experience_pool.count() if self.experience_pool else 0, capture_ms=capture_ms, cpu_load=cpu_load, execution_ms=self.adaptive_policy._avg(self.adaptive_policy.execution_latency_ms, 0.0), window_instability=self.adaptive_policy._avg(self.adaptive_policy.window_change_flags, 0.0), recent_success=self.adaptive_policy._avg(self.adaptive_policy.outcome_flags, 1.0), screen_score_total=screen_score_total_value, learning_similarity=self.adaptive_policy._avg(self.adaptive_policy.learning_similarity, 0.97), hardware=self.hardware_state)
         self.settings = settings
         self.escape_monitor.debounce_seconds = settings.key_debounce_seconds
         self.ui(lambda: self.minsize(settings.ui_min_width, settings.ui_min_height))
@@ -4181,7 +4183,7 @@ class ControlPanel(tk.Tk):
         if reload_pool or self.experience_pool.settings != config.settings:
             self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit))
             self.brain = ActionBrain(self.experience_pool, config.settings)
-            self.ui(lambda: self.life_var.set(str(self.store.state.get("life_experience", 0.0))))
+            self.ui(lambda: self.screen_score_total_var.set(str(self.store.state.get("screen_score_total", 0.0))))
             self.ui(lambda: self.pool_var.set(str(self.experience_pool.count())))
         return True
 
@@ -4379,7 +4381,7 @@ class ControlPanel(tk.Tk):
         sleep_deadline = started_perf + max(1, config.sleep_seconds)
         self.ui(lambda: self.progress_label_var.set("睡眠训练进度｜剩余 -- 秒｜已训练批次 0｜当前置信度 0.0%"))
         def train_once():
-            return self.experience_pool.sleep_training_step(batch_size, self.store.add_life_experience if self.store else None)
+            return self.experience_pool.sleep_training_step(batch_size, self.store.add_screen_score_total if self.store else None)
         def submit_next(executor, futures):
             nonlocal submitted
             if stop_event.is_set() or not self.is_run_active(token, "sleep"):
@@ -4440,7 +4442,7 @@ class ControlPanel(tk.Tk):
                     if poor_optimization:
                         stop_event.set()
                 divisor = max(1, len(done))
-                life = self.store.state.get("life_experience", 0.0) if self.store else 0.0
+                screen_score_total = self.store.state.get("screen_score_total", 0.0) if self.store else 0.0
                 compact = self.store.compact_experience_pool(config.experience_pool_gb) if self.store else {"changed": False}
                 compaction_progress = self.sleep_compaction_progress(compact)
                 compaction_complete = self.sleep_compaction_complete(compact)
@@ -4451,7 +4453,7 @@ class ControlPanel(tk.Tk):
                     self.brain = ActionBrain(self.experience_pool, config.settings)
                     self.ui(lambda c=self.experience_pool.count(): self.pool_var.set(str(c)))
                 decision = {"reason": "sleep_prioritized_replay", "confidence": batch_confidence, "candidate_count": trained, "best_score": best_score, "completed_batches": completed, "target_training_steps": target_training_steps, "confidence_target": confidence_target, "workers": workers, "pool_compacted": compact.get("changed", False), "pool_removed": compact.get("removed", 0)}
-                self.update_metrics(0.0, 50.0 + clamp(batch_confidence * 50.0, 0.0, 50.0), 0.0, batch_score, best_score, life, decision)
+                self.update_metrics(0.0, 50.0 + clamp(batch_confidence * 50.0, 0.0, 50.0), 0.0, batch_score, best_score, screen_score_total, decision)
                 remaining_seconds = max(0.0, sleep_deadline - time.perf_counter())
                 self.ui(lambda r=remaining_seconds, c=completed, t=target_training_steps, q=batch_confidence: self.progress_label_var.set(f"睡眠训练进度｜剩余 {r:.1f} 秒｜已训练批次 {c}/{t}｜当前置信度 {q * 100.0:.1f}%"))
                 self.update_progress(self.sleep_progress_percent(started_perf, config.sleep_seconds, completed, target_training_steps, compaction_progress))
@@ -4529,8 +4531,8 @@ class ControlPanel(tk.Tk):
             self.progress_text_var.set(f"{percent:.1f}%")
         self.ui(apply)
 
-    def update_metrics(self, novelty, human_score, screen_reward, action_reward, reward, life, decision=None):
-        payload = (round(float(novelty), 2), round(float(human_score), 2), round(float(screen_reward), 2), round(float(action_reward), 2), round(float(reward), 2), round(float(life), 2), decision.get("reason") if decision else None, round(safe_float(decision.get("confidence", 0.0), 0.0), 3) if decision else None)
+    def update_metrics(self, novelty, human_score, screen_reward, action_reward, reward, screen_score_total, decision=None):
+        payload = (round(float(novelty), 2), round(float(human_score), 2), round(float(screen_reward), 2), round(float(action_reward), 2), round(float(reward), 2), round(float(screen_score_total), 2), decision.get("reason") if decision else None, round(safe_float(decision.get("confidence", 0.0), 0.0), 3) if decision else None)
         if payload == self.last_metric_payload:
             return
         self.last_metric_payload = payload
@@ -4541,7 +4543,7 @@ class ControlPanel(tk.Tk):
             self.screen_reward_var.set(str(round(float(screen_reward), 2)))
             self.action_reward_var.set(str(round(float(action_reward), 2)))
             self.reward_var.set(str(round(float(reward), 2)))
-            self.life_var.set(str(round(float(life), 2)))
+            self.screen_score_total_var.set(str(round(float(screen_score_total), 2)))
             self.pool_var.set(str(self.experience_pool.count()))
             if decision:
                 confidence = round(safe_float(decision.get("confidence", 0.0), 0.0) * 100.0, 1)
@@ -4609,19 +4611,19 @@ class ControlPanel(tk.Tk):
         human_action_penalty = max(0.0, -human_delta)
         if failed_action:
             reward = round(-abs(max(1.0, human_action_penalty, 100.0 - human_score)), 2)
-        life = self.store.add_life_experience(reward)
+        screen_score_total = self.store.add_screen_score_total(reward)
         started_perf = safe_float(normalized.get("started_perf"), None) if normalized else None
         offset_source = started_perf if started_perf is not None else action_anchor_perf
         offset_ms = round((float(offset_source) - snapshot.perf_time) * 1000.0, 3) if offset_source is not None else None
         sims = [round(item["similarity"], 4) for item in batch]
         record_event = self.events.publish("record_ready", mode=mode, session_id=session_id, event_name=event_name)
-        record = {"record_schema_version": 2, "reward_version": reward_info["reward_version"], "id": uuid.uuid4().hex, "event_sequence": record_event["sequence"], "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": after_novelty, "before_screen": snapshot.relative_path if normalized else None, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": {"screen_novelty": reward_info["screen_novelty"], "screen_reward": reward_info["screen_reward"], "human_similarity": reward_info["human_similarity"], "human_tiebreak": reward_info["human_tiebreak"], "life_delta": reward_info["life_delta"], "basis": reward_info["basis"]}, "reward_sort_key": reward_info["reward_sort_key"], "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "life_experience_delta": max(0.0, reward), "life_settled": max(0.0, reward), "penalty_delta": max(0.0, -reward), "life_experience": life, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "image_dropped": bool(getattr(snapshot, "image_dropped", False)), "screen_file_expected": not bool(getattr(snapshot, "image_dropped", False)), "capture_latency_ms": capture_latency_ms if capture_latency_ms is not None else getattr(snapshot, "capture_latency_ms", None), "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_event_wait": self.settings.training_event_wait, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
+        record = {"record_schema_version": 2, "reward_version": reward_info["reward_version"], "id": uuid.uuid4().hex, "event_sequence": record_event["sequence"], "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": after_novelty, "before_screen": snapshot.relative_path if normalized else None, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": {"screen_novelty": reward_info["screen_novelty"], "screen_reward": reward_info["screen_reward"], "human_similarity": reward_info["human_similarity"], "human_tiebreak": reward_info["human_tiebreak"], "screen_score_delta": reward_info["screen_score_delta"], "basis": reward_info["basis"]}, "reward_sort_key": reward_info["reward_sort_key"], "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "screen_score_delta": max(0.0, reward), "screen_score_settled": max(0.0, reward), "penalty_delta": max(0.0, -reward), "screen_score_total": screen_score_total, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "image_dropped": bool(getattr(snapshot, "image_dropped", False)), "screen_file_expected": not bool(getattr(snapshot, "image_dropped", False)), "capture_latency_ms": capture_latency_ms if capture_latency_ms is not None else getattr(snapshot, "capture_latency_ms", None), "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_event_wait": self.settings.training_event_wait, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
         if decision:
             record["ai_decision"] = decision
         self.persistence_queue.enqueue_record(self.store, record)
         self.events.publish("save_completed", kind="record", record_id=record.get("id"))
         self.experience_pool.add(record)
-        self.update_metrics(after_novelty, human_score, novelty_reward, human_delta, reward, life, decision)
+        self.update_metrics(after_novelty, human_score, novelty_reward, human_delta, reward, screen_score_total, decision)
         return record
 
     def capture_learning_screen_change(self, analyzer, session_id, start, now_perf, config):
@@ -4718,8 +4720,8 @@ class ControlPanel(tk.Tk):
         session_id = uuid.uuid4().hex
         start = time.perf_counter()
         consecutive_failures = 0
-        poor_life_events = 0
-        last_life_value = self.store.life if self.store else 0.0
+        zero_score_events = 0
+        last_screen_score = self.store.screen_score_total if self.store else 0.0
         last_training_error = None
         self.termination_reason = "completed"
         service = self.training_service
@@ -4739,8 +4741,8 @@ class ControlPanel(tk.Tk):
                     self.termination_reason = "window_invalid"
                     stop_event.set()
                     break
-                poor_life_factor = clamp(poor_life_events / max(1, self.settings.training_fail_stop_count), 0.0, 1.0)
-                action, decision = service.decide_action(snapshot, poor_life_factor=poor_life_factor)
+                zero_score_factor = clamp(zero_score_events / max(1, self.settings.training_fail_stop_count), 0.0, 1.0)
+                action, decision = service.decide_action(snapshot, zero_score_factor=zero_score_factor)
                 if not action:
                     self.write_record("training", session_id, snapshot, None, "screen_event", decision=decision)
                     continue
@@ -4755,12 +4757,12 @@ class ControlPanel(tk.Tk):
                         self.ui(lambda e=last_training_error: self.status_var.set(f"训练模式结束：连续执行失败：{e}"))
                     continue
                 consecutive_failures = 0
-                current_life_value = self.store.life if self.store else last_life_value
-                if current_life_value <= last_life_value:
-                    poor_life_events += 1
+                current_screen_score_total_value = self.store.screen_score_total if self.store else last_screen_score
+                if current_screen_score_total_value <= last_screen_score:
+                    zero_score_events += 1
                 else:
-                    poor_life_events = 0
-                last_life_value = current_life_value
+                    zero_score_events = 0
+                last_screen_score = current_screen_score_total_value
                 delay = safe_float(record["mouse_action"].get("duration", 0.0), 0.0) if record and record.get("mouse_action") else 0.0
                 deadline = time.perf_counter() + max(self.settings.min_action_delay_seconds, delay)
                 while time.perf_counter() < deadline and not stop_event.is_set():
