@@ -1786,6 +1786,48 @@ class DataStore:
                     file.write(json.dumps(record, ensure_ascii=False) + "\n")
             temporary.replace(self.experience_file)
 
+    def merge_experience_records_by_id(self, records):
+        updates = {str(record.get("id")): record for record in records or [] if isinstance(record, dict) and record.get("id")}
+        if not updates:
+            return {"changed": False, "updated": 0, "appended": 0}
+        with self.lock:
+            self.ensure_experience_newline()
+            temporary = self.experience_file.with_suffix(".merge.tmp")
+            seen = set()
+            changed = 0
+            if self.experience_file.exists():
+                with self.experience_file.open("r", encoding="utf-8") as source, temporary.open("w", encoding="utf-8") as target:
+                    for line_number, line in enumerate(source, start=1):
+                        text = line.strip()
+                        if not text:
+                            continue
+                        try:
+                            record = json.loads(text)
+                        except Exception as exc:
+                            self.quarantine_bad_experience(line_number, text, exc)
+                            target.write(text + "\n")
+                            continue
+                        record_id = str(record.get("id")) if isinstance(record, dict) and record.get("id") else None
+                        if record_id in updates:
+                            target.write(json.dumps(updates[record_id], ensure_ascii=False) + "\n")
+                            seen.add(record_id)
+                            changed += 1
+                        else:
+                            target.write(text + "\n")
+                    appended = 0
+                    for record_id, record in updates.items():
+                        if record_id not in seen:
+                            target.write(json.dumps(record, ensure_ascii=False) + "\n")
+                            appended += 1
+                temporary.replace(self.experience_file)
+            else:
+                with temporary.open("w", encoding="utf-8") as target:
+                    for record in updates.values():
+                        target.write(json.dumps(record, ensure_ascii=False) + "\n")
+                temporary.replace(self.experience_file)
+                appended = len(updates)
+            return {"changed": bool(changed or appended), "updated": changed, "appended": appended}
+
     def record_reward_sort_key(self, record):
         key = record.get("reward_sort_key") if isinstance(record, dict) else None
         if isinstance(key, (list, tuple)) and key:
@@ -2860,8 +2902,9 @@ class MouseRecorder:
         speed_y = dy / dt
         speed = math.hypot(speed_x, speed_y)
         acceleration = math.hypot(speed_x - vx0, speed_y - vy0) / dt
-        rel_x = (float(x) - rect[0]) / max(1.0, rect[2])
-        rel_y = (float(y) - rect[1]) / max(1.0, rect[3])
+        width, height = rect_size(rect)
+        rel_x = (float(x) - rect[0]) / max(1.0, width)
+        rel_y = (float(y) - rect[1]) / max(1.0, height)
         event = {"type": kind, "t": now_perf, "timestamp": now_perf, "created_at": now_text(), "x": int(x), "y": int(y), "abs": [int(x), int(y)], "rel": [round(rel_x, 6), round(rel_y, 6)], "inside": bool(inside), "dx": round(dx, 6), "dy": round(dy, 6), "dt": round(dt, 6), "direction_angle": round(math.degrees(math.atan2(dy, dx)), 6) if dx or dy else 0.0, "instant_speed": round(speed, 6), "instant_speed_x": round(speed_x, 6), "instant_speed_y": round(speed_y, 6), "acceleration": round(acceleration, 6)}
         if extra:
             event.update(extra)
@@ -4494,7 +4537,7 @@ class ControlPanel(tk.Tk):
             with ScreenAnalyzer(config.settings.hash_size) as analyzer:
                 recheck_result = self.experience_pool.recheck_screen_scores(self.store, analyzer)
             self.events.publish("sleep_screen_scores_rechecked", **recheck_result)
-            self.store.save_experience_records(copy.deepcopy(self.experience_pool.records))
+            self.store.merge_experience_records_by_id(copy.deepcopy(self.experience_pool.records))
         except Exception as exc:
             self.log_exception("sleep_score_recheck", exc, recheck_result)
         self.ui(lambda r=recheck_result: self.progress_label_var.set(f"睡眠训练进度｜评分复核 {r.get('checked', 0)} 条｜重评 {r.get('rescored', 0)} 条"))
@@ -4614,7 +4657,7 @@ class ControlPanel(tk.Tk):
             self.store.flush_state(force=True)
             with self.experience_pool.lock:
                 recheck_records = copy.deepcopy(self.experience_pool.records)
-                self.store.save_experience_records(recheck_records)
+                self.store.merge_experience_records_by_id(recheck_records)
                 compact = self.store.compact_experience_pool(config.experience_pool_gb)
                 if compact.get("changed"):
                     self.events.publish("experience_pool_compaction_completed", removed=compact.get("removed", 0), size_bytes=compact.get("size_bytes", 0))
@@ -4622,7 +4665,6 @@ class ControlPanel(tk.Tk):
                     self.brain = ActionBrain(self.experience_pool, config.settings)
                 records = copy.deepcopy(self.experience_pool.records)
                 model = self.experience_pool.model
-            self.store.save_experience_records(records)
             self.store.save_ai_model_snapshot(records, config.settings, config.ai_model_limit, status, model)
             self.store.flush_state(force=True)
             self.events.publish("save_completed", kind="sleep_data", status=status)
@@ -4841,9 +4883,25 @@ class ControlPanel(tk.Tk):
             self.release_window_and_panel()
 
 
-    def recover_zero_screen_score(self, analyzer, session_id, start, stop_event, zero_score_started_at, current_score):
+    def best_zero_score_recovery_action(self, hash_value):
+        batch = self.experience_pool.nearest(hash_value, limit=max(1, self.settings.nearest_top_k)) if self.experience_pool else []
+        weighted = []
+        for item in batch:
+            record = item.get("record", {})
+            action = record.get("mouse_action")
+            if action:
+                reward = safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0)
+                similarity = clamp(item.get("similarity", 0.0), 0.0, 1.0)
+                weighted.append((max(0.01, reward + 100.0) * max(0.05, similarity), action))
+        action = weighted_choice(weighted) if weighted else (self.experience_pool.best_global_action() if self.experience_pool else None)
+        if action:
+            return self.brain.mutate_action(action, 0.8)
+        return self.brain.random_action(0.15)
+
+    def recover_zero_screen_score(self, analyzer, session_id, start, stop_event, zero_score_started_at, current_score, config=None):
         stage_names = ("recapture", "verify_window", "refresh_index", "wait_render", "trusted_history", "bounded_random", "rescore")
-        threshold = max(self.settings.training_event_wait, min(self.settings.still_check_seconds, self.settings.generated_action_complete_wait * max(1, self.settings.training_fail_stop_count)))
+        still_seconds = safe_float(getattr(config, "still_seconds", self.settings.generated_action_complete_wait), self.settings.generated_action_complete_wait)
+        threshold = max(self.settings.training_event_wait, min(still_seconds, self.settings.generated_action_complete_wait * max(1, self.settings.training_fail_stop_count)))
         if not zero_score_started_at or time.perf_counter() - zero_score_started_at < threshold:
             return current_score, zero_score_started_at, False
         score = current_score
@@ -4852,7 +4910,7 @@ class ControlPanel(tk.Tk):
             stage = stage_names[min(stage_index, len(stage_names) - 1)]
             self.events.publish("training_zero_score_recovery", stage=stage, elapsed=round(time.perf_counter() - zero_score_started_at, 3), screen_score=score)
             if stage == "verify_window":
-                check = self.window_manager.window_state()
+                check = self.window_manager.check_window(force=True)
                 if not check.ok:
                     self.termination_reason = "window_invalid"
                     stop_event.set()
@@ -4874,10 +4932,13 @@ class ControlPanel(tk.Tk):
                 return score, None, True
             if stage in ("trusted_history", "bounded_random"):
                 rect = snapshot.rect
-                action = self.brain.random_action(0.35 if stage == "bounded_random" else 0.15)
+                if stage == "trusted_history":
+                    action = self.best_zero_score_recovery_action(snapshot.hash_value)
+                else:
+                    action = self.brain.random_action(0.35)
                 if action and self.executor:
                     try:
-                        self.executor.execute(action, rect)
+                        self.executor.execute(action, rect, stop_event, self.should_stop_by_escape)
                     except Exception as exc:
                         self.log_exception("zero_score_recovery_action", exc, {"stage": stage})
             stage_index += 1
@@ -4937,7 +4998,7 @@ class ControlPanel(tk.Tk):
                     zero_score_events += 1
                     if zero_score_started_at is None:
                         zero_score_started_at = time.perf_counter()
-                    current_screen_score, zero_score_started_at, recovered = self.recover_zero_screen_score(analyzer, session_id, start, stop_event, zero_score_started_at, current_screen_score)
+                    current_screen_score, zero_score_started_at, recovered = self.recover_zero_screen_score(analyzer, session_id, start, stop_event, zero_score_started_at, current_screen_score, config)
                     self.events.publish("training_zero_screen_score", streak=zero_score_events, zero_score_elapsed=round(time.perf_counter() - zero_score_started_at, 3) if zero_score_started_at else 0.0, strategy_stage=min(5, 1 + int(clamp(zero_score_events / max(1, self.settings.training_fail_stop_count), 0.0, 1.0) * 5.0)), screen_score=current_screen_score, recovered=bool(recovered))
                     if recovered:
                         zero_score_events = 0
