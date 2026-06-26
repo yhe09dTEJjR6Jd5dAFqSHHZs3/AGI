@@ -711,7 +711,7 @@ def run_self_test():
     high_human = reward_parts(70.0, 100.0, settings)[2]
     low_human = reward_parts(70.0, 0.0, settings)[2]
     assert high_screen > low_screen
-    assert high_human == low_human
+    assert high_human > low_human
     assert high_human < high_screen
     details = reward_breakdown(70.0, 100.0, settings)
     low_human_details = reward_breakdown(70.0, 0.0, settings)
@@ -719,6 +719,7 @@ def run_self_test():
     assert details["reward_sort_key"] > low_human_details["reward_sort_key"]
     assert details["reward_sort_key"][0] == details["screen_primary_reward"]
     assert "human_tie_break_reward" in details
+    assert 0.0 < details["human_bonus"] < details["screen_score_resolution"]
     assert set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit"}
     assert {"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("learning", "idle")])
     assert {"esc", "time_limit", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("training", "idle")])
@@ -1269,6 +1270,20 @@ def normalize_path(rect, path, start_abs):
     return result
 
 
+def normalize_motion_events(rect, path, start_abs):
+    result = []
+    base_t = None
+    for item in path or []:
+        if not isinstance(item, dict):
+            continue
+        t = safe_float(item.get("t", item.get("timestamp", 0.0)), 0.0)
+        if base_t is None:
+            base_t = t
+        rel = item.get("rel") if isinstance(item.get("rel"), (list, tuple)) and len(item.get("rel")) >= 2 else rel_from_abs(rect, item.get("x", start_abs[0]), item.get("y", start_abs[1]))
+        result.append({"type": item.get("type", "move"), "timestamp": t, "time_offset": round(max(0.0, t - base_t), 6), "created_at": item.get("created_at"), "x": safe_int(item.get("x", start_abs[0]), safe_int(start_abs[0], 0)), "y": safe_int(item.get("y", start_abs[1]), safe_int(start_abs[1], 0)), "abs": [safe_int(item.get("x", start_abs[0]), safe_int(start_abs[0], 0)), safe_int(item.get("y", start_abs[1]), safe_int(start_abs[1], 0))], "rel": normalize_rel_point(rel), "dx": round(safe_float(item.get("dx", 0.0), 0.0), 6), "dy": round(safe_float(item.get("dy", 0.0), 0.0), 6), "dt": round(max(0.0, safe_float(item.get("dt", 0.0), 0.0)), 6), "direction_angle": round(safe_float(item.get("direction_angle", 0.0), 0.0), 6), "instant_speed": round(max(0.0, safe_float(item.get("instant_speed", 0.0), 0.0)), 6), "instant_speed_x": round(safe_float(item.get("instant_speed_x", 0.0), 0.0), 6), "instant_speed_y": round(safe_float(item.get("instant_speed_y", 0.0), 0.0), 6), "acceleration": round(max(0.0, safe_float(item.get("acceleration", 0.0), 0.0)), 6), "inside": bool(item.get("inside", True))})
+    return result
+
+
 def normalize_mouse_action(action, rect):
     if not action:
         return None
@@ -1297,7 +1312,10 @@ def normalize_mouse_action(action, rect):
         "duration": round(max(0.0, safe_float(action.get("duration", 0.0), 0.0)), 6),
         "start_rel": rel_from_abs(rect, start_abs[0], start_abs[1]),
         "end_rel": rel_from_abs(rect, end_abs[0], end_abs[1]),
-        "path_rel": normalize_path(rect, action.get("path", []), start_abs)
+        "path_rel": normalize_path(rect, action.get("path", []), start_abs),
+        "motion_events": normalize_motion_events(rect, action.get("path", []), start_abs),
+        "start_abs": [safe_int(start_abs[0], 0), safe_int(start_abs[1], 0)],
+        "end_abs": [safe_int(end_abs[0], 0), safe_int(end_abs[1], 0)]
     }
     if action.get("scroll"):
         result["scroll"] = [safe_int(action["scroll"][0], 0), safe_int(action["scroll"][1], 0)]
@@ -1353,13 +1371,17 @@ def hash_similarity(hash_a, hash_b):
 
 
 def reward_breakdown(novelty, human_score, settings):
-    screen_novelty = round(clamp(novelty, 0.0, 100.0), 2)
+    score_precision = 2
+    screen_resolution = 10 ** (-score_precision)
+    screen_novelty = round(clamp(novelty, 0.0, 100.0), score_precision)
     screen_reward = screen_novelty
-    human_similarity = round(clamp(human_score, 0.0, 100.0), 2)
-    human_delta = round(human_similarity - clamp(settings.score_default, 0.0, 100.0), 2)
+    human_similarity = round(clamp(human_score, 0.0, 100.0), score_precision)
+    human_delta = round(human_similarity - clamp(settings.score_default, 0.0, 100.0), score_precision)
     human_tiebreak = human_similarity
+    human_bonus = round((human_similarity / 100.0) * screen_resolution * (1.0 - 1e-6), 8)
     screen_score_delta = round(clamp(screen_reward, settings.reward_total_min, settings.reward_total_max), 6)
-    return {"reward_version": 3, "screen_novelty": screen_novelty, "screen_reward": screen_reward, "human_similarity": human_similarity, "human_tiebreak": round(human_tiebreak, 6), "screen_score_delta": screen_score_delta, "basis": ["nearest_screen_batch", "learning_mouse_profile", "lexicographic_screen_then_human"], "screen_primary_reward": screen_reward, "human_tie_break_reward": round(human_tiebreak, 6), "mouse_action_delta": human_delta, "total_reward": screen_score_delta, "reward_sort_key": [round(screen_reward, 2), round(human_similarity, 2)]}
+    total_reward = round(clamp(screen_score_delta + human_bonus, settings.reward_total_min, settings.reward_total_max + screen_resolution), 8)
+    return {"reward_version": 4, "screen_novelty": screen_novelty, "screen_reward": screen_reward, "human_similarity": human_similarity, "human_tiebreak": round(human_tiebreak, 6), "human_bonus": human_bonus, "screen_score_resolution": screen_resolution, "screen_score_delta": screen_score_delta, "basis": ["nearest_screen_batch", "learning_mouse_profile", "lexicographic_screen_then_human", "numeric_human_bonus_below_screen_resolution"], "screen_primary_reward": screen_reward, "human_tie_break_reward": round(human_tiebreak, 6), "mouse_action_delta": human_delta, "total_reward": total_reward, "reward_sort_key": [round(screen_reward, score_precision), round(human_similarity, score_precision)]}
 
 
 def reward_parts(novelty, human_score, settings):
@@ -1790,14 +1812,15 @@ class DataStore:
     def compact_ai_models(self, max_models):
         limit = max(1, safe_int(max_models, AGENT_SPEC.default_ai_model_limit))
         models = sorted(self.model_dir.glob("model_*.json"), key=lambda path: path.stat().st_mtime if path.exists() else 0.0, reverse=True)
+        keep = len(models) if len(models) <= limit else max(1, limit // 2)
         removed = 0
-        for path in models[limit:]:
+        for path in models[keep:]:
             try:
                 path.unlink()
                 removed += 1
             except Exception:
                 pass
-        return {"changed": removed > 0, "removed": removed, "limit": limit}
+        return {"changed": removed > 0, "removed": removed, "limit": limit, "target_count": keep}
 
     def load_settings(self):
         if not self.settings_file.exists():
@@ -2819,7 +2842,27 @@ class MouseRecorder:
         inside = point_inside(rect, x, y)
         if not inside and not allow_current:
             return None
-        event = {"type": kind, "t": time.perf_counter(), "x": int(x), "y": int(y), "inside": bool(inside)}
+        now_perf = time.perf_counter()
+        previous = None
+        if self.current and self.current.get("path"):
+            previous = self.current["path"][-1]
+        elif self.move_buffer:
+            previous = self.move_buffer[-1]
+        px = safe_float(previous.get("x", x), x) if previous else float(x)
+        py = safe_float(previous.get("y", y), y) if previous else float(y)
+        pt = safe_float(previous.get("t", now_perf), now_perf) if previous else now_perf
+        vx0 = safe_float(previous.get("instant_speed_x", 0.0), 0.0) if previous else 0.0
+        vy0 = safe_float(previous.get("instant_speed_y", 0.0), 0.0) if previous else 0.0
+        dt = max(1e-6, now_perf - pt)
+        dx = float(x) - px
+        dy = float(y) - py
+        speed_x = dx / dt
+        speed_y = dy / dt
+        speed = math.hypot(speed_x, speed_y)
+        acceleration = math.hypot(speed_x - vx0, speed_y - vy0) / dt
+        rel_x = (float(x) - rect[0]) / max(1.0, rect[2])
+        rel_y = (float(y) - rect[1]) / max(1.0, rect[3])
+        event = {"type": kind, "t": now_perf, "timestamp": now_perf, "created_at": now_text(), "x": int(x), "y": int(y), "abs": [int(x), int(y)], "rel": [round(rel_x, 6), round(rel_y, 6)], "inside": bool(inside), "dx": round(dx, 6), "dy": round(dy, 6), "dt": round(dt, 6), "direction_angle": round(math.degrees(math.atan2(dy, dx)), 6) if dx or dy else 0.0, "instant_speed": round(speed, 6), "instant_speed_x": round(speed_x, 6), "instant_speed_y": round(speed_y, 6), "acceleration": round(acceleration, 6)}
         if extra:
             event.update(extra)
         return event
@@ -2861,7 +2904,6 @@ class MouseRecorder:
             event = self.capture_event("move", x, y, allow_current=bool(self.current))
         if not event:
             return
-        event["created_at"] = now_text()
         with self.lock:
             if self.current:
                 self.current["path"].append(event)
@@ -3382,6 +3424,7 @@ class ControlPanel(tk.Tk):
         self.last_metric_payload = None
         self.persistence_queue = AsyncPersistenceQueue(self.settings)
         self.persistence_paused = threading.Event()
+        self.main_thread_events = queue.Queue()
         self.runtime_context = RuntimeContext(self)
         self.mode_controller = ModeController(self)
         self.migration_service = MigrationService(self)
@@ -3723,8 +3766,22 @@ class ControlPanel(tk.Tk):
         source = max(self.settings.window_event_wait, self.settings.ui_event_coalesce_seconds, self.settings.key_debounce_seconds)
         return max(200, min(3000, int(source * 1000)))
 
+    def process_main_thread_events(self):
+        while True:
+            try:
+                event = self.main_thread_events.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if event.get("type") == "restart_training":
+                    self.status_var.set("睡眠模式已保存，准备重新进入训练模式")
+                    self.request_active_mode("training")
+            except Exception as exc:
+                self.log_exception("main_thread_event", exc, event)
+
     def refresh_runtime_environment_state(self):
         try:
+            self.process_main_thread_events()
             self.update_mode_button_states()
         finally:
             try:
@@ -4423,11 +4480,7 @@ class ControlPanel(tk.Tk):
         target_training_steps = max(poor_limit, math.ceil(max(1, self.experience_pool.count() if self.experience_pool else 1) / batch_size), workers * max(1, config.settings.ui_metric_columns))
         improvement_threshold = 1.0 / max(100.0, target_training_steps * batch_size)
         confidence_target = clamp(1.0 - 1.0 / max(2.0, config.settings.nearest_top_k + batch_size), 0.5, 0.98)
-        initial_compact = self.store.compact_experience_pool(config.experience_pool_gb) if self.store else {"changed": False}
-        if initial_compact.get("changed") and self.store:
-            self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit))
-            self.brain = ActionBrain(self.experience_pool, config.settings)
-            self.ui(lambda c=self.experience_pool.count(): self.pool_var.set(str(c)))
+        initial_compact = {"changed": False, "size_bytes": self.store.experience_pool_size_bytes() if self.store else 0, "target_bytes": max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))}
         compaction_progress = self.sleep_compaction_progress(initial_compact)
         compaction_complete = self.sleep_compaction_complete(initial_compact)
         poor_optimization = False
@@ -4508,15 +4561,10 @@ class ControlPanel(tk.Tk):
                         stop_event.set()
                 divisor = max(1, len(done))
                 screen_score_total = self.store.state.get("screen_score_total", 0.0) if self.store else 0.0
-                compact = self.store.compact_experience_pool(config.experience_pool_gb) if self.store else {"changed": False}
+                compact = {"changed": False, "size_bytes": self.store.experience_pool_size_bytes() if self.store else 0, "target_bytes": max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))}
                 compaction_progress = self.sleep_compaction_progress(compact)
-                compaction_complete = self.sleep_compaction_complete(compact)
+                compaction_complete = True
                 self.events.publish("sleep_batch_completed", trained=trained, best_score=best_score, confidence=batch_confidence, completed_batches=completed)
-                if compact.get("changed"):
-                    self.events.publish("experience_pool_compaction_completed", removed=compact.get("removed", 0), size_bytes=compact.get("size_bytes", 0))
-                    self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit))
-                    self.brain = ActionBrain(self.experience_pool, config.settings)
-                    self.ui(lambda c=self.experience_pool.count(): self.pool_var.set(str(c)))
                 decision = {"reason": "sleep_prioritized_replay", "confidence": batch_confidence, "candidate_count": trained, "best_score": best_score, "completed_batches": completed, "target_training_steps": target_training_steps, "confidence_target": confidence_target, "workers": workers, "pool_compacted": compact.get("changed", False), "pool_removed": compact.get("removed", 0)}
                 self.update_metrics(0.0, 50.0 + clamp(batch_confidence * 50.0, 0.0, 50.0), 0.0, batch_score, best_score, screen_score_total, decision)
                 remaining_seconds = max(0.0, sleep_deadline - time.perf_counter())
@@ -4553,28 +4601,38 @@ class ControlPanel(tk.Tk):
             final_reason = stopped_reason or "user_stop"
             self.finish_run(token, "睡眠模式已终止，数据已保存", 0.0, release=False, reason=final_reason)
         if restart_training and final_reason not in ("esc", "user_stop"):
-            self.ui(lambda: self.status_var.set("睡眠模式已保存，准备重新进入训练模式"))
-            self.request_active_mode("training")
+            self.main_thread_events.put({"type": "restart_training", "reason": final_reason, "created_at": now_text()})
+            self.ui(self.process_main_thread_events)
 
     def save_sleep_data(self, config, status):
         if not self.store or not self.experience_pool:
             return True, None
         try:
+            self.persistence_paused.set()
+            if self.persistence_queue:
+                self.persistence_queue.flush()
             self.store.flush_state(force=True)
             with self.experience_pool.lock:
+                recheck_records = copy.deepcopy(self.experience_pool.records)
+                self.store.save_experience_records(recheck_records)
+                compact = self.store.compact_experience_pool(config.experience_pool_gb)
+                if compact.get("changed"):
+                    self.events.publish("experience_pool_compaction_completed", removed=compact.get("removed", 0), size_bytes=compact.get("size_bytes", 0))
+                    self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit))
+                    self.brain = ActionBrain(self.experience_pool, config.settings)
                 records = copy.deepcopy(self.experience_pool.records)
+                model = self.experience_pool.model
             self.store.save_experience_records(records)
-            self.store.save_ai_model_snapshot(records, config.settings, config.ai_model_limit, status, self.experience_pool.model if self.experience_pool else None)
+            self.store.save_ai_model_snapshot(records, config.settings, config.ai_model_limit, status, model)
+            self.store.flush_state(force=True)
             self.events.publish("save_completed", kind="sleep_data", status=status)
-            compact = self.store.compact_experience_pool(config.experience_pool_gb)
-            if compact.get("changed"):
-                self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit))
-                self.brain = ActionBrain(self.experience_pool, config.settings)
-                self.ui(lambda c=self.experience_pool.count(): self.pool_var.set(str(c)))
+            self.ui(lambda c=self.experience_pool.count(): self.pool_var.set(str(c)))
             return True, None
         except Exception as exc:
             self.log_exception("sleep_save", exc, {"status": status})
             return False, exc
+        finally:
+            self.persistence_paused.clear()
 
     def restore_panel(self):
         def apply():
@@ -4782,11 +4840,58 @@ class ControlPanel(tk.Tk):
         else:
             self.release_window_and_panel()
 
+
+    def recover_zero_screen_score(self, analyzer, session_id, start, stop_event, zero_score_started_at, current_score):
+        stage_names = ("recapture", "verify_window", "refresh_index", "wait_render", "trusted_history", "bounded_random", "rescore")
+        threshold = max(self.settings.training_event_wait, min(self.settings.still_check_seconds, self.settings.generated_action_complete_wait * max(1, self.settings.training_fail_stop_count)))
+        if not zero_score_started_at or time.perf_counter() - zero_score_started_at < threshold:
+            return current_score, zero_score_started_at, False
+        score = current_score
+        stage_index = 0
+        while score <= 0.0 and not stop_event.is_set() and self.is_run_active(self.active_session.token if self.active_session else None, "training"):
+            stage = stage_names[min(stage_index, len(stage_names) - 1)]
+            self.events.publish("training_zero_score_recovery", stage=stage, elapsed=round(time.perf_counter() - zero_score_started_at, 3), screen_score=score)
+            if stage == "verify_window":
+                check = self.window_manager.window_state()
+                if not check.ok:
+                    self.termination_reason = "window_invalid"
+                    stop_event.set()
+                    break
+            elif stage == "refresh_index":
+                with self.experience_pool.lock:
+                    self.experience_pool.rebuild_index_locked()
+                    self.experience_pool.nearest_cache.clear()
+            elif stage == "wait_render":
+                stop_event.wait(max(self.settings.generated_action_complete_wait, self.settings.training_event_wait))
+            snapshot = self.capture_snapshot(analyzer, "training", session_id, start, priority="critical")
+            if not snapshot:
+                self.termination_reason = "window_invalid"
+                stop_event.set()
+                break
+            score = self.experience_pool.novelty(snapshot.hash_value)[0]
+            self.events.publish("training_zero_score_recovery_recheck", stage=stage, screen_score=score)
+            if score > 0.0:
+                return score, None, True
+            if stage in ("trusted_history", "bounded_random"):
+                rect = snapshot.rect
+                action = self.brain.random_action(0.35 if stage == "bounded_random" else 0.15)
+                if action and self.executor:
+                    try:
+                        self.executor.execute(action, rect)
+                    except Exception as exc:
+                        self.log_exception("zero_score_recovery_action", exc, {"stage": stage})
+            stage_index += 1
+            if self.should_stop_by_escape():
+                self.termination_reason = "esc"
+                stop_event.set()
+        return score, zero_score_started_at, score > 0.0
+
     def training_loop(self, token, stop_event, config):
         session_id = uuid.uuid4().hex
         start = time.perf_counter()
         consecutive_failures = 0
         zero_score_events = 0
+        zero_score_started_at = None
         last_training_error = None
         self.termination_reason = "completed"
         service = self.training_service
@@ -4830,9 +4935,15 @@ class ControlPanel(tk.Tk):
                 current_screen_score = safe_float(record.get("after_screen_score", record.get("screen_score", 0.0)), 0.0) if record else 0.0
                 if current_screen_score <= 0.0:
                     zero_score_events += 1
-                    self.events.publish("training_zero_screen_score", streak=zero_score_events, strategy_stage=min(5, 1 + int(clamp(zero_score_events / max(1, self.settings.training_fail_stop_count), 0.0, 1.0) * 5.0)), screen_score=current_screen_score)
+                    if zero_score_started_at is None:
+                        zero_score_started_at = time.perf_counter()
+                    current_screen_score, zero_score_started_at, recovered = self.recover_zero_screen_score(analyzer, session_id, start, stop_event, zero_score_started_at, current_screen_score)
+                    self.events.publish("training_zero_screen_score", streak=zero_score_events, zero_score_elapsed=round(time.perf_counter() - zero_score_started_at, 3) if zero_score_started_at else 0.0, strategy_stage=min(5, 1 + int(clamp(zero_score_events / max(1, self.settings.training_fail_stop_count), 0.0, 1.0) * 5.0)), screen_score=current_screen_score, recovered=bool(recovered))
+                    if recovered:
+                        zero_score_events = 0
                 else:
                     zero_score_events = 0
+                    zero_score_started_at = None
                 delay = safe_float(record["mouse_action"].get("duration", 0.0), 0.0) if record and record.get("mouse_action") else 0.0
                 deadline = time.perf_counter() + max(self.settings.min_action_delay_seconds, delay)
                 while time.perf_counter() < deadline and not stop_event.is_set():
