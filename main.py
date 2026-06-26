@@ -55,6 +55,16 @@ AGENT_SPEC = AgentSpec(
 )
 
 
+def should_stop_run(stop_event, deadline, escape_check):
+    if stop_event and stop_event.is_set():
+        return "esc"
+    if escape_check and escape_check():
+        return "esc"
+    if deadline is not None and time.perf_counter() >= deadline:
+        return "time_limit"
+    return None
+
+
 def fail_and_exit(message):
     try:
         root = tk.Tk()
@@ -371,6 +381,7 @@ ALLOWED_TRANSITIONS = {
     ("learning", "idle"): {"esc", "still_timeout", "window_invalid", "user_stop", "runtime_error"},
     ("training", "idle"): {"esc", "time_limit", "still_timeout", "window_invalid", "user_stop", "runtime_error", "executor_error"},
     ("training", "sleep"): {"time_limit"},
+    ("sleep", "starting"): {"completed", "time_limit", "poor_optimization"},
     ("sleep", "training"): {"completed", "time_limit", "poor_optimization"},
     ("sleep", "idle"): {"completed", "esc", "time_limit", "poor_optimization", "user_stop", "runtime_error"},
     ("migration", "idle"): {"completed", "migration_error", "user_stop"}
@@ -615,6 +626,14 @@ class ScreenSnapshot:
     image_dropped: bool = False
     capture_latency_ms: Optional[float] = None
     image_priority: str = "normal"
+    image_checksum: str = ""
+
+
+def image_content_checksum(image):
+    if image is None:
+        return ""
+    normalized = image.convert("RGB")
+    return hashlib.sha256(f"{normalized.size[0]}x{normalized.size[1]}|".encode("ascii") + normalized.tobytes()).hexdigest()
 
 
 def enable_dpi_awareness():
@@ -1860,7 +1879,9 @@ class DataStore:
         reward = safe_float(record.get("reward", record.get("total_reward", 0.0)), 0.0) if isinstance(record, dict) else 0.0
         return reward, safe_float(record.get("sleep_confidence", 0.0), 0.0) if isinstance(record, dict) else 0.0, reward
 
-    def save_ai_model_snapshot(self, records, settings, max_models, status, model=None):
+    def save_ai_model_snapshot(self, records, settings, max_models, status, model=None, run_guard=None):
+        if run_guard and run_guard():
+            return None
         with self.lock:
             self.model_dir.mkdir(parents=True, exist_ok=True)
             ranked = sorted([record for record in records or [] if record.get("mouse_action")], key=lambda record: (safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), safe_float(record.get("sleep_confidence", 0.0), 0.0)), reverse=True)
@@ -1873,6 +1894,12 @@ class DataStore:
             temporary = path.with_suffix(".tmp")
             with temporary.open("w", encoding="utf-8") as file:
                 json.dump(payload, file, ensure_ascii=False, indent=2)
+            if run_guard and run_guard():
+                try:
+                    temporary.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return None
             temporary.replace(path)
             self.compact_ai_models(max_models)
             return path
@@ -1880,7 +1907,7 @@ class DataStore:
     def compact_ai_models(self, max_models):
         limit = max(1, safe_int(max_models, AGENT_SPEC.default_ai_model_limit))
         models = sorted(self.model_dir.glob("model_*.json"), key=lambda path: path.stat().st_mtime if path.exists() else 0.0, reverse=True)
-        keep = len(models) if len(models) <= limit else max(1, limit // 2)
+        keep = min(len(models), limit)
         removed = 0
         for path in models[keep:]:
             try:
@@ -2057,7 +2084,7 @@ class DataStore:
                 pass
         return total
 
-    def compact_experience_pool(self, limit_gb):
+    def compact_experience_pool(self, limit_gb, run_guard=None):
         limit_bytes = max(1, int(max(0.1, safe_float(limit_gb, DEFAULT_EXPERIENCE_POOL_GB)) * 1024 * 1024 * 1024))
         records = self.load_experience()
         path_sizes = {}
@@ -2101,6 +2128,8 @@ class DataStore:
         removed_ids = set()
         removed = 0
         for item in records:
+            if run_guard and run_guard():
+                break
             if current <= target_bytes:
                 break
             removed += 1
@@ -2351,12 +2380,16 @@ class ScreenAnalyzer:
 
     def save_image(self, image, path, priority="normal", settings=None):
         save_kwargs = {}
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
         if str(path).lower().endswith(".png"):
             compression = 1 if priority == "critical" else 3
             if settings is not None and settings.training_event_wait > settings.ui_event_coalesce_seconds:
                 compression = 1
             save_kwargs = {"optimize": priority == "critical", "compress_level": int(clamp(compression, 0, 9))}
-        image.save(path, **save_kwargs)
+        temporary = path.with_name(path.name + f".{uuid.uuid4().hex}.tmp")
+        image.save(temporary, **save_kwargs)
+        temporary.replace(path)
 
     def fingerprint(self, image):
         small = image.convert("L").resize((self.hash_size, self.hash_size), self.resample)
@@ -2652,20 +2685,24 @@ class ExperiencePool:
             sampled = random.sample(action_indices, min(len(action_indices), max(0, remaining))) if remaining > 0 else []
             return list(dict.fromkeys(ranked + recent + sampled))[:target]
 
-    def compute_screen_score(self, hash_value, exclude_id=None, before_index=None):
+    def compute_screen_score(self, hash_value, exclude_id=None, before_index=None, exact_checksum=None):
         neighbors = self.nearest(hash_value, exclude_id=exclude_id, limit=self.settings.nearest_top_k, before_index=before_index)
         sims = [clamp(item.get("similarity", 0.0), 0.0, 1.0) for item in neighbors]
         if sims:
             top = sims[:max(1, min(self.settings.nearest_top_k, len(sims)))]
             density = sum(1 for item in top if item >= 0.95) / len(top)
             score = clamp((1.0 - (top[0] * 0.5 + sum(top) / len(top) * 0.35 + density * 0.15)) * 100.0, 0.0, 100.0)
+            if score <= 0.0 and exact_checksum:
+                exact_match = any(exact_checksum and exact_checksum == item.get("record", {}).get("image_checksum") for item in neighbors)
+                if not exact_match:
+                    score = 0.01
             confidence = clamp(top[0] * 0.65 + (1.0 - density) * 0.35, 0.0, 1.0)
         else:
             score = 100.0
             confidence = 0.0
         return round(score, 2), neighbors, confidence
 
-    def recheck_screen_scores(self, store=None, analyzer=None, tolerance=0.01):
+    def recheck_screen_scores(self, store=None, analyzer=None, tolerance=0.01, run_guard=None):
         checked = 0
         rescored = 0
         missing = 0
@@ -2678,6 +2715,8 @@ class ExperiencePool:
             snapshot = [(index, copy.deepcopy(record)) for index, record in enumerate(self.records)]
         updates = []
         for index, record in snapshot:
+            if run_guard and run_guard():
+                break
             hash_value = parse_hash_value(record)
             file_hash = None
             screen_path = record.get("screen_path")
@@ -2686,7 +2725,9 @@ class ExperiencePool:
                 try:
                     if path.is_file() and store.root.resolve() in (path, *path.parents):
                         with Image.open(path) as image:
-                            file_hash = analyzer.fingerprint(image.convert("RGB"))
+                            rgb_image = image.convert("RGB")
+                            file_hash = analyzer.fingerprint(rgb_image)
+                            record["image_checksum"] = image_content_checksum(rgb_image)
                     else:
                         record["score_status"] = "image_missing"
                         image_missing += 1
@@ -2708,7 +2749,7 @@ class ExperiencePool:
                 record["score_checked_at"] = now_text()
                 updates.append((index, record, None))
                 continue
-            score, neighbors, confidence = self.compute_screen_score(hash_value, exclude_id=record.get("id"), before_index=index)
+            score, neighbors, confidence = self.compute_screen_score(hash_value, exclude_id=record.get("id"), before_index=index, exact_checksum=record.get("image_checksum"))
             old_score = safe_float(record.get("screen_score", record.get("novelty", record.get("after_novelty", None))), None)
             lacks = old_score is None or record.get("score_version") != 1 or not record.get("score_basis")
             wrong = old_score is not None and abs(score - old_score) > tolerance
@@ -2733,7 +2774,7 @@ class ExperiencePool:
             self.nearest_cache.clear()
         return {"checked": checked, "rescored": rescored, "missing": missing, "errors": errors, "image_missing": image_missing, "image_corrupt": image_corrupt, "hash_missing": hash_missing, "unrecoverable": unrecoverable}
 
-    def sleep_training_step(self, batch_size, settle_screen_score=None):
+    def sleep_training_step(self, batch_size, settle_screen_score=None, run_guard=None):
         indices = self.sleep_training_batch_indices(batch_size)
         if not indices:
             return {"trained": 0, "best_score": 0.0, "avg_score": 0.0, "avg_confidence": 0.0}
@@ -2742,6 +2783,8 @@ class ExperiencePool:
             snapshot = [(index, self.hashes[index], copy.deepcopy(self.records[index])) for index in indices if index < records_len and self.hashes[index]]
         updates = []
         for index, hash_value, record in snapshot:
+            if run_guard and run_guard():
+                break
             novelty, neighbors, similarity_confidence = self.compute_screen_score(hash_value, exclude_id=record.get("id"), before_index=index)
             action = record.get("mouse_action")
             human_score = clamp(record.get("human_score", self.profile.score(action)), 0.0, 100.0) if action else self.settings.score_default
@@ -3451,14 +3494,13 @@ class TrainingService:
 
     def should_stop(self, start, config, stop_event):
         panel = self.panel
-        if panel.should_stop_by_escape():
-            panel.termination_reason = "esc"
+        deadline = start + max(1, config.training_seconds)
+        guarded = should_stop_run(stop_event, deadline, panel.should_stop_by_escape)
+        if guarded:
+            panel.termination_reason = guarded
             stop_event.set()
             return True
         elapsed = time.perf_counter() - start
-        if elapsed >= config.training_seconds:
-            panel.termination_reason = "time_limit"
-            return True
         check = panel.window_manager.check_window(force=True)
         if not check.ok:
             panel.termination_reason = "window_invalid"
@@ -3883,7 +3925,15 @@ class ControlPanel(tk.Tk):
             try:
                 if event.get("type") == "restart_training":
                     self.status_var.set("睡眠模式已保存，准备重新进入训练模式")
-                    self.request_active_mode("training")
+                    config = event.get("config") or self.read_config()
+                    old_token = event.get("token")
+                    session = self.transition("sleep", "starting", reason=event.get("reason") or "completed", token=old_token)
+                    if session:
+                        self.update_progress(0.0, force=True)
+                        self.mode_thread = threading.Thread(target=self.mode_job, args=(session.token, "training", config, session.stop_event), daemon=True)
+                        self.mode_thread.start()
+                    else:
+                        self.request_active_mode("training")
             except Exception as exc:
                 self.log_exception("main_thread_event", exc, event)
 
@@ -4599,11 +4649,12 @@ class ControlPanel(tk.Tk):
         completed_success = False
         started_perf = time.perf_counter()
         sleep_deadline = started_perf + max(1, config.sleep_seconds)
+        run_guard = lambda: should_stop_run(stop_event, sleep_deadline, self.should_stop_by_escape)
         self.ui(lambda: self.progress_label_var.set("睡眠评分复核中｜正在检查全部画面评分"))
         recheck_result = {"checked": 0, "rescored": 0, "missing": 0, "errors": 0, "image_missing": 0, "image_corrupt": 0, "hash_missing": 0, "unrecoverable": 0}
         try:
             with ScreenAnalyzer(config.settings.hash_size) as analyzer:
-                recheck_result = self.experience_pool.recheck_screen_scores(self.store, analyzer)
+                recheck_result = self.experience_pool.recheck_screen_scores(self.store, analyzer, run_guard=run_guard)
             self.events.publish("sleep_screen_scores_rechecked", **recheck_result)
             self.store.merge_experience_records_by_id(copy.deepcopy(self.experience_pool.records))
         except Exception as exc:
@@ -4612,7 +4663,9 @@ class ControlPanel(tk.Tk):
         if self.store and recheck_result.get("unrecoverable", 0):
             self.store.log_error("sleep_score_recheck_unrecoverable", RuntimeError("unrecoverable_screen_records"), recheck_result)
         def train_once():
-            return self.experience_pool.sleep_training_step(batch_size, self.store.add_screen_score_total if self.store else None)
+            if run_guard():
+                return {"trained": 0, "best_score": 0.0, "avg_score": 0.0, "avg_confidence": 0.0}
+            return self.experience_pool.sleep_training_step(batch_size, self.store.add_screen_score_total if self.store else None, run_guard=run_guard)
         def submit_next(executor, futures):
             nonlocal submitted
             if stop_event.is_set() or not self.is_run_active(token, "sleep"):
@@ -4624,17 +4677,16 @@ class ControlPanel(tk.Tk):
             for _ in range(queue_depth):
                 submit_next(executor, futures)
             while not stop_event.is_set() and self.is_run_active(token, "sleep"):
-                if self.should_stop_by_escape():
+                guarded = run_guard()
+                if guarded:
                     with self.state_lock:
-                        self.termination_reason = "esc"
+                        self.termination_reason = guarded
                         if self.active_session:
-                            self.active_session.termination_reason = "esc"
+                            self.active_session.termination_reason = guarded
+                    if guarded == "time_limit":
+                        time_limit_reached = True
+                        self.events.publish("sleep_time_limit_reached", seconds=config.sleep_seconds, started_sequence=started["sequence"])
                     stop_event.set()
-                    break
-                if time.perf_counter() >= sleep_deadline:
-                    time_limit_reached = True
-                    stop_event.set()
-                    self.events.publish("sleep_time_limit_reached", seconds=config.sleep_seconds, started_sequence=started["sequence"])
                     break
                 percent = self.sleep_progress_percent(started_perf, config.sleep_seconds, completed, target_training_steps, compaction_progress)
                 self.update_progress(percent)
@@ -4694,13 +4746,17 @@ class ControlPanel(tk.Tk):
         with self.state_lock:
             stopped_reason = self.termination_reason if self.termination_reason in ("esc", "user_stop") else None
         save_status = "completed" if completed_success else ("poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached else (stopped_reason or "incomplete")))
-        saved, save_error = self.save_sleep_data(config, save_status)
+        saved, save_error = self.save_sleep_data(config, save_status, run_guard=run_guard)
         if not saved:
             if self.is_run_active(token, "sleep"):
                 self.finish_run(token, "保存失败：" + str(save_error), self.progress_value, release=False, reason="runtime_error")
                 self.ui(lambda e=str(save_error): messagebox.showerror("保存失败", e))
             return
         final_reason = None
+        if restart_training and self.is_run_active(token, "sleep") and save_status not in ("esc", "user_stop"):
+            self.main_thread_events.put({"type": "restart_training", "reason": save_status, "config": config, "token": token, "created_at": now_text()})
+            self.ui(self.process_main_thread_events)
+            return
         if self.is_run_active(token, "sleep") and completed_success:
             final_reason = "completed"
             self.finish_run(token, "睡眠模式任务完成，数据已保存", 100.0, release=False, reason=final_reason)
@@ -4714,10 +4770,10 @@ class ControlPanel(tk.Tk):
             final_reason = stopped_reason or "user_stop"
             self.finish_run(token, "睡眠模式已终止，数据已保存", 0.0, release=False, reason=final_reason)
         if restart_training and final_reason not in ("esc", "user_stop"):
-            self.main_thread_events.put({"type": "restart_training", "reason": final_reason, "created_at": now_text()})
+            self.main_thread_events.put({"type": "restart_training", "reason": final_reason, "config": config, "token": token, "created_at": now_text()})
             self.ui(self.process_main_thread_events)
 
-    def save_sleep_data(self, config, status):
+    def save_sleep_data(self, config, status, run_guard=None):
         if not self.store or not self.experience_pool:
             return True, None
         try:
@@ -4728,14 +4784,14 @@ class ControlPanel(tk.Tk):
             with self.experience_pool.lock:
                 recheck_records = copy.deepcopy(self.experience_pool.records)
                 self.store.merge_experience_records_by_id(recheck_records)
-                compact = self.store.compact_experience_pool(config.experience_pool_gb)
+                compact = self.store.compact_experience_pool(config.experience_pool_gb, run_guard=run_guard)
                 if compact.get("changed"):
                     self.events.publish("experience_pool_compaction_completed", removed=compact.get("removed", 0), size_bytes=compact.get("size_bytes", 0))
                     self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit), self.store.load_latest_model_state(config.settings))
                     self.brain = ActionBrain(self.experience_pool, config.settings)
                 records = copy.deepcopy(self.experience_pool.records)
                 model = self.experience_pool.model
-            self.store.save_ai_model_snapshot(records, config.settings, config.ai_model_limit, status, model)
+            self.store.save_ai_model_snapshot(records, config.settings, config.ai_model_limit, status, model, run_guard=run_guard)
             self.store.flush_state(force=True)
             self.events.publish("save_completed", kind="sleep_data", status=status)
             self.ui(lambda c=self.experience_pool.count(): self.pool_var.set(str(c)))
@@ -4797,7 +4853,8 @@ class ControlPanel(tk.Tk):
             captured_perf = time.perf_counter()
             hash_value = analyzer.fingerprint(image)
             path = self.store.new_screen_path(mode)
-            snapshot = ScreenSnapshot(path=path, relative_path=self.store.relative_path(path), hash_value=hash_value, captured_at=now_text(), perf_time=perf_time, elapsed=round(perf_time - session_start, 3), rect=tuple(rect), capture_latency_ms=round((captured_perf - perf_time) * 1000.0, 3), image_priority=priority)
+            checksum = image_content_checksum(image)
+            snapshot = ScreenSnapshot(path=path, relative_path=self.store.relative_path(path), hash_value=hash_value, captured_at=now_text(), perf_time=perf_time, elapsed=round(perf_time - session_start, 3), rect=tuple(rect), capture_latency_ms=round((captured_perf - perf_time) * 1000.0, 3), image_priority=priority, image_checksum=checksum)
             self.events.publish("screenshot_completed", mode=mode, path=str(path), latency_ms=snapshot.capture_latency_ms)
             return snapshot, image
         except Exception as exc:
@@ -4820,7 +4877,10 @@ class ControlPanel(tk.Tk):
             self.adaptive_policy.observe_capture(getattr(snapshot, "capture_latency_ms", 0.0))
         if snapshot and persist:
             try:
-                if self.persistence_paused.is_set() and priority != "critical":
+                if priority == "critical":
+                    analyzer.save_image(image, snapshot.path, priority=priority, settings=self.settings)
+                    self.mark_snapshot_image_result(snapshot, snapshot.path.is_file())
+                elif self.persistence_paused.is_set():
                     self.mark_snapshot_image_result(snapshot, False)
                 else:
                     self.mark_snapshot_image_result(snapshot, self.persistence_queue.enqueue_image(analyzer, image, snapshot.path, self.store, priority=priority))
@@ -4832,11 +4892,11 @@ class ControlPanel(tk.Tk):
     def write_record(self, mode, session_id, snapshot, action, event_name, decision=None, action_anchor_perf=None, after_snapshot=None, planned_action=None, failed_action=False, window_rect_changed=False, capture_latency_ms=None, execution_latency_ms=None, execution_error=None):
         if not self.store or not snapshot:
             return None
-        before_novelty, batch = self.experience_pool.novelty(snapshot.hash_value)
+        before_novelty, batch = self.experience_pool.compute_screen_score(snapshot.hash_value, exact_checksum=getattr(snapshot, "image_checksum", ""))[:2]
         normalized = normalize_mouse_action(action, snapshot.rect) if action else None
         mouse_source = normalized.get("source") if normalized else "idle"
         human_score = self.experience_pool.human_score(normalized) if normalized else 50.0
-        after_novelty = self.experience_pool.novelty(after_snapshot.hash_value)[0] if after_snapshot else before_novelty
+        after_novelty = self.experience_pool.compute_screen_score(after_snapshot.hash_value, exact_checksum=getattr(after_snapshot, "image_checksum", ""))[0] if after_snapshot else before_novelty
         transition_reward = round(after_novelty - before_novelty, 2)
         scoring_novelty = after_novelty if normalized and after_snapshot else before_novelty
         reward_info = reward_breakdown(scoring_novelty, human_score if normalized else self.settings.score_default, self.settings)
@@ -4853,7 +4913,7 @@ class ControlPanel(tk.Tk):
         offset_ms = round((float(offset_source) - snapshot.perf_time) * 1000.0, 3) if offset_source is not None else None
         sims = [round(item["similarity"], 4) for item in batch]
         record_event = self.events.publish("record_ready", mode=mode, session_id=session_id, event_name=event_name)
-        record = {"record_schema_version": 2, "reward_version": reward_info["reward_version"], "id": uuid.uuid4().hex, "event_sequence": record_event["sequence"], "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": before_novelty, "screen_score": before_novelty, "score_version": 1, "score_basis": "nearest_screen_content_live", "score_checked_at": now_text(), "score_neighbors": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "before_screen": snapshot.relative_path, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_screen_hash": snapshot.hash_value.hex, "before_screen_score": before_novelty, "after_screen_hash": after_snapshot.hash_value.hex if after_snapshot else snapshot.hash_value.hex, "after_screen_hash_int": after_snapshot.hash_value.value if after_snapshot else snapshot.hash_value.value, "after_screen_hash_bits": after_snapshot.hash_value.bits if after_snapshot else snapshot.hash_value.bits, "after_screen_score": after_novelty, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": {"screen_novelty": reward_info["screen_novelty"], "screen_reward": reward_info["screen_reward"], "human_similarity": reward_info["human_similarity"], "human_tiebreak": reward_info["human_tiebreak"], "screen_score_delta": reward_info["screen_score_delta"], "basis": reward_info["basis"]}, "reward_sort_key": reward_info["reward_sort_key"], "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "screen_score_delta": max(0.0, reward), "screen_score_settled": max(0.0, reward), "penalty_delta": max(0.0, -reward), "screen_score_total": screen_score_total, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "image_dropped": bool(getattr(snapshot, "image_dropped", False)), "screen_file_expected": not bool(getattr(snapshot, "image_dropped", False)), "capture_latency_ms": capture_latency_ms if capture_latency_ms is not None else getattr(snapshot, "capture_latency_ms", None), "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_event_wait": self.settings.training_event_wait, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
+        record = {"record_schema_version": 2, "reward_version": reward_info["reward_version"], "id": uuid.uuid4().hex, "event_sequence": record_event["sequence"], "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": before_novelty, "screen_score": before_novelty, "score_version": 1, "score_basis": "nearest_screen_content_live", "score_checked_at": now_text(), "score_neighbors": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "before_screen": snapshot.relative_path, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_screen_hash": snapshot.hash_value.hex, "before_screen_score": before_novelty, "after_screen_hash": after_snapshot.hash_value.hex if after_snapshot else snapshot.hash_value.hex, "after_screen_hash_int": after_snapshot.hash_value.value if after_snapshot else snapshot.hash_value.value, "after_screen_hash_bits": after_snapshot.hash_value.bits if after_snapshot else snapshot.hash_value.bits, "after_screen_score": after_novelty, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": {"screen_novelty": reward_info["screen_novelty"], "screen_reward": reward_info["screen_reward"], "human_similarity": reward_info["human_similarity"], "human_tiebreak": reward_info["human_tiebreak"], "screen_score_delta": reward_info["screen_score_delta"], "basis": reward_info["basis"]}, "reward_sort_key": reward_info["reward_sort_key"], "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "screen_score_delta": max(0.0, reward), "screen_score_settled": max(0.0, reward), "penalty_delta": max(0.0, -reward), "screen_score_total": screen_score_total, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "image_checksum": getattr(snapshot, "image_checksum", ""), "after_image_checksum": getattr(after_snapshot, "image_checksum", "") if after_snapshot else getattr(snapshot, "image_checksum", ""), "image_dropped": bool(getattr(snapshot, "image_dropped", False)), "screen_file_expected": not bool(getattr(snapshot, "image_dropped", False)), "capture_latency_ms": capture_latency_ms if capture_latency_ms is not None else getattr(snapshot, "capture_latency_ms", None), "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_event_wait": self.settings.training_event_wait, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
         if decision:
             record["ai_decision"] = decision
         self.persistence_queue.enqueue_record(self.store, record)
@@ -4976,7 +5036,9 @@ class ControlPanel(tk.Tk):
             return current_score, zero_score_started_at, False
         score = current_score
         stage_index = 0
-        while score <= 0.0 and not stop_event.is_set() and self.is_run_active(self.active_session.token if self.active_session else None, "training"):
+        deadline = start + max(1, safe_int(getattr(config, "training_seconds", DEFAULT_TRAINING_SECONDS), DEFAULT_TRAINING_SECONDS))
+        run_guard = lambda: should_stop_run(stop_event, deadline, self.should_stop_by_escape)
+        while score <= 0.0 and not run_guard() and self.is_run_active(self.active_session.token if self.active_session else None, "training"):
             stage = stage_names[min(stage_index, len(stage_names) - 1)]
             self.events.publish("training_zero_score_recovery", stage=stage, elapsed=round(time.perf_counter() - zero_score_started_at, 3), screen_score=score)
             if stage == "verify_window":
@@ -5006,14 +5068,24 @@ class ControlPanel(tk.Tk):
                     action = self.best_zero_score_recovery_action(snapshot.hash_value)
                 else:
                     action = self.brain.random_action(0.35)
-                if action and self.executor:
+                if action and self.executor and not run_guard():
                     try:
-                        self.executor.execute(action, rect, stop_event, self.should_stop_by_escape)
+                        decision = {"reason": "zero_score_recovery", "zero_score_recovery_stage": stage, "zero_score_factor": 1.0}
+                        before_snapshot = snapshot
+                        actual = self.executor.execute(action, rect, stop_event, lambda: bool(run_guard()))
+                        after_snapshot = self.capture_snapshot(analyzer, "training", session_id, start, rect=rect, priority="critical") if not run_guard() else None
+                        if actual:
+                            record = self.write_record("training", session_id, before_snapshot, actual, "ai_mouse_zero_score_recovery", decision=decision, action_anchor_perf=actual.get("started_perf"), after_snapshot=after_snapshot, planned_action=action, execution_error=actual.get("execution_error"))
+                            if record:
+                                score = safe_float(record.get("after_screen_score", record.get("screen_score", score)), score)
+                        elif before_snapshot:
+                            self.write_record("training", session_id, before_snapshot, None, "ai_mouse_zero_score_recovery_failed", decision=decision, planned_action=action, failed_action=True, execution_error="empty_action_result")
                     except Exception as exc:
                         self.log_exception("zero_score_recovery_action", exc, {"stage": stage})
             stage_index += 1
-            if self.should_stop_by_escape():
-                self.termination_reason = "esc"
+            guarded = run_guard()
+            if guarded:
+                self.termination_reason = guarded
                 stop_event.set()
         return score, zero_score_started_at, score > 0.0
 
