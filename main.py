@@ -379,10 +379,8 @@ ALLOWED_TRANSITIONS = {
     ("idle", "migration"): {"click_modify_data_path"},
     ("starting", "idle"): {"window_invalid", "user_stop", "runtime_error", "minimize_failed"},
     ("learning", "idle"): {"esc", "still_timeout", "window_invalid", "user_stop", "runtime_error"},
-    ("training", "idle"): {"esc", "time_limit", "still_timeout", "window_invalid", "user_stop", "runtime_error", "executor_error"},
+    ("training", "idle"): {"esc", "still_timeout", "window_invalid", "user_stop", "runtime_error", "executor_error"},
     ("training", "sleep"): {"time_limit"},
-    ("sleep", "starting"): {"completed", "time_limit", "poor_optimization"},
-    ("sleep", "training"): {"completed", "time_limit", "poor_optimization"},
     ("sleep", "idle"): {"completed", "esc", "time_limit", "poor_optimization", "user_stop", "runtime_error"},
     ("migration", "idle"): {"completed", "migration_error", "user_stop"}
 }
@@ -742,9 +740,12 @@ def run_self_test():
     assert 0.0 < details["human_bonus"] < details["screen_score_resolution"]
     assert set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit"}
     assert {"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("learning", "idle")])
-    assert {"esc", "time_limit", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("training", "idle")])
+    assert {"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("training", "idle")])
+    assert "time_limit" not in ALLOWED_TRANSITIONS[("training", "idle")]
     assert "time_limit" in ALLOWED_TRANSITIONS[("training", "sleep")]
-    assert {"completed", "time_limit", "poor_optimization"}.issubset(ALLOWED_TRANSITIONS[("sleep", "training")])
+    assert ("sleep", "training") not in ALLOWED_TRANSITIONS
+    assert ("sleep", "starting") not in ALLOWED_TRANSITIONS
+    assert {"completed", "time_limit", "poor_optimization"}.issubset(ALLOWED_TRANSITIONS[("sleep", "idle")])
     assert {"completed", "migration_error", "user_stop"}.issubset(ALLOWED_TRANSITIONS[("migration", "idle")])
     pool = ExperiencePool(settings)
     pool.add({"id": "t1", "mode": "learning", "mouse_action": {"type": "click", "start_rel": [0.5, 0.5]}, "reward": 12, "screen_hash_hex": "f", "screen_hash_bits": 4, "mouse_source": "user"})
@@ -3927,12 +3928,10 @@ class ControlPanel(tk.Tk):
                     self.status_var.set("睡眠模式已保存，准备重新进入训练模式")
                     config = event.get("config") or self.read_config()
                     old_token = event.get("token")
-                    session = self.transition("sleep", "starting", reason=event.get("reason") or "completed", token=old_token)
-                    if session:
-                        self.update_progress(0.0, force=True)
-                        self.mode_thread = threading.Thread(target=self.mode_job, args=(session.token, "training", config, session.stop_event), daemon=True)
-                        self.mode_thread.start()
-                    else:
+                    reason = event.get("reason") or "completed"
+                    if self.is_run_active(old_token, "sleep"):
+                        self.finish_run(old_token, "睡眠模式已退出，数据已保存", 0.0, release=False, reason=reason)
+                    if self.current_mode() == "idle":
                         self.request_active_mode("training")
             except Exception as exc:
                 self.log_exception("main_thread_event", exc, event)
@@ -5156,8 +5155,8 @@ class ControlPanel(tk.Tk):
                         break
                     stop_event.wait(min(self.settings.generated_action_complete_wait, deadline - time.perf_counter()))
             self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start, priority="critical"), None, "mode_end")
-        if self.is_run_active(token, "training") and not stop_event.is_set():
-            final_reason = self.termination_reason or "completed"
+        if self.is_run_active(token, "training"):
+            final_reason = self.termination_reason or ("esc" if self.should_stop_by_escape() else "user_stop")
             if final_reason == "time_limit":
                 session = self.transition("training", "sleep", reason="time_limit", token=token)
                 if session:
@@ -5167,9 +5166,7 @@ class ControlPanel(tk.Tk):
                     self.mode_thread = threading.Thread(target=self.sleep_loop, args=(session.token, config, session.stop_event, True), daemon=True)
                     self.mode_thread.start()
             else:
-                self.finish_run(token, "训练模式结束", 0.0, reason=final_reason)
-        elif self.is_run_active(token, "training"):
-            self.finish_run(token, "训练模式已终止", self.progress_value, reason=self.termination_reason or ("esc" if self.should_stop_by_escape() else "user_stop"))
+                self.finish_run(token, "训练模式已终止" if stop_event.is_set() else "训练模式结束", 0.0, reason=final_reason)
         else:
             self.release_window_and_panel()
 
