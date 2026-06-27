@@ -650,6 +650,21 @@ def enable_dpi_awareness():
             pass
 
 
+def can_access_input_desktop():
+    handle = None
+    try:
+        handle = ctypes.windll.user32.OpenInputDesktop(0, False, 0x0100)
+        return bool(handle)
+    except Exception:
+        return False
+    finally:
+        if handle:
+            try:
+                ctypes.windll.user32.CloseDesktop(handle)
+            except Exception:
+                pass
+
+
 def windows_runtime_report(ldplayer_path=None):
     report = {"platform": sys.platform, "desktop_session": bool(os.environ.get("SESSIONNAME")), "dpi_awareness_checked": False, "admin_or_ui_access_checked": False, "ldplayer_path_exists": None}
     if sys.platform == "win32":
@@ -657,10 +672,7 @@ def windows_runtime_report(ldplayer_path=None):
             report["dpi_awareness_checked"] = ctypes.windll.user32.GetDpiForSystem() > 0
         except Exception:
             report["dpi_awareness_checked"] = False
-        try:
-            report["admin_or_ui_access_checked"] = ctypes.windll.user32.OpenInputDesktop(0, False, 0x0100) != 0
-        except Exception:
-            report["admin_or_ui_access_checked"] = False
+        report["admin_or_ui_access_checked"] = can_access_input_desktop()
     if ldplayer_path:
         report["ldplayer_path_exists"] = Path(ldplayer_path).exists()
     report["ok"] = report["platform"] == "win32" and report["desktop_session"] and report["dpi_awareness_checked"] and report["admin_or_ui_access_checked"] and report["ldplayer_path_exists"] is not False
@@ -1445,6 +1457,27 @@ def reward_breakdown(novelty, human_score, settings):
     return {"reward_version": 4, "screen_novelty": screen_novelty, "screen_reward": screen_reward, "human_similarity": human_similarity, "human_tiebreak": round(human_tiebreak, 6), "human_bonus": human_bonus, "screen_score_resolution": screen_resolution, "screen_score_delta": screen_score_delta, "basis": ["nearest_screen_batch", "learning_mouse_profile", "lexicographic_screen_then_human", "numeric_human_bonus_below_screen_resolution"], "screen_primary_reward": screen_reward, "human_tie_break_reward": round(human_tiebreak, 6), "mouse_action_delta": human_delta, "total_reward": total_reward, "reward_sort_key": [round(screen_reward, score_precision), round(human_similarity, score_precision)]}
 
 
+def strict_reward_key(screen_score, human_similarity):
+    return (round(clamp(safe_float(screen_score, 0.0), 0.0, 100.0), 2), round(clamp(safe_float(human_similarity, 0.0), 0.0, 100.0), 2))
+
+
+def strict_reward_value(screen_score, human_similarity):
+    screen, human = strict_reward_key(screen_score, human_similarity)
+    return screen + (human / 100.0) * 0.000099999
+
+
+def strict_reward_target(screen_score, human_similarity):
+    screen, human = strict_reward_key(screen_score, human_similarity)
+    tie_cap = 0.000099999
+    return clamp((screen / 100.0 + human / 100.0 * tie_cap) / (1.0 + tie_cap), 0.0, 1.0)
+
+
+def record_screen_human(record):
+    screen = record.get("sleep_novelty", record.get("screen_primary_reward", record.get("novelty", record.get("screen_score", 0.0))))
+    human = record.get("sleep_human_score", record.get("human_tie_break_reward", record.get("human_score", 50.0)))
+    return strict_reward_key(screen, human)
+
+
 def reward_parts(novelty, human_score, settings):
     parts = reward_breakdown(novelty, human_score, settings)
     return parts["screen_primary_reward"], parts["mouse_action_delta"], parts["total_reward"]
@@ -1645,11 +1678,8 @@ class PolicyModel:
         return self.predict_features(self.features(record))
 
     def target(self, record):
-        reward = clamp(safe_float(record.get("reward", record.get("total_reward", 0.0)), 0.0), self.settings.reward_total_min, self.settings.reward_total_max)
-        base = (reward - self.settings.reward_total_min) / max(1.0, self.settings.reward_total_max - self.settings.reward_total_min)
-        human = clamp(safe_float(record.get("human_score", 50.0), 50.0), 0.0, 100.0) / 100.0
-        novelty = clamp(safe_float(record.get("novelty", 0.0), 0.0), 0.0, 100.0) / 100.0
-        return clamp(base * 0.55 + human * 0.25 + novelty * 0.2, 0.0, 1.0)
+        screen, human = record_screen_human(record)
+        return strict_reward_target(screen, human)
 
     def train(self, records):
         usable = [record for record in records or [] if isinstance(record, dict) and record.get("mouse_action")]
@@ -2846,13 +2876,10 @@ class ExperiencePool:
             novelty, neighbors, similarity_confidence = self.compute_screen_score(hash_value, exclude_id=record.get("id"), before_index=index)
             action = record.get("mouse_action")
             human_score = clamp(record.get("human_score", self.profile.score(action)), 0.0, 100.0) if action else self.settings.score_default
-            reward = safe_float(record.get("reward", 0.0), 0.0)
-            transition = safe_float(record.get("transition_reward", 0.0), 0.0)
-            source = 1.0 if record.get("mode") == "learning" and record.get("mouse_source") == "user" else 0.0
+            reward = strict_reward_value(novelty, human_score)
             visits = max(0, safe_int(record.get("sleep_visits", 0), 0))
-            learned = safe_float(record.get("sleep_policy_reward", reward), reward)
-            candidate = reward + novelty * self.settings.action_score_novelty_weight + (human_score - self.settings.score_default) * self.settings.action_score_human_weight + transition * self.settings.action_score_reward_weight + source * self.settings.score_default
-            value = (learned * visits + candidate) / (visits + 1)
+            candidate = reward
+            value = candidate
             confidence = clamp((similarity_confidence + human_score / 100.0 + min(1.0, (visits + 1) / max(1.0, self.settings.nearest_top_k))) / 3.0, 0.0, 1.0)
             reward_info = reward_breakdown(novelty, human_score, self.settings)
             settled_delta = 0.0
@@ -2891,7 +2918,7 @@ class ExperiencePool:
                 value = safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0)
                 confidence = clamp(safe_float(record.get("sleep_confidence", 0.0), 0.0), 0.0, 1.0)
                 record["sleep_model_confidence"] = round(model_prediction, 4)
-                score = value * (0.65 + confidence * 0.2 + model_prediction * 0.15)
+                score = value + (confidence * 0.000000001) + (model_prediction * 0.0000000001)
                 total_score += score
                 best_score = score if best_score is None else max(best_score, score)
             self.rebuild_action_heap_locked()
@@ -2905,9 +2932,10 @@ class ExperiencePool:
         for index, record in enumerate(self.records):
             if not record.get("mouse_action"):
                 continue
-            reward = safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0)
+            screen, human = record_screen_human(record)
+            reward = strict_reward_value(screen, human)
             confidence = clamp(record.get("sleep_confidence", 0.0), 0.0, 1.0)
-            item = (reward * (0.75 + confidence * 0.25), index)
+            item = (reward + confidence * 0.000000001, index)
             if len(heap) < self.settings.global_action_heap_limit:
                 heapq.heappush(heap, item)
             elif item[0] > heap[0][0]:
@@ -2936,12 +2964,11 @@ class ActionBrain:
     def score_candidate(self, item):
         record = item["record"]
         similarity = clamp(item.get("similarity", 0.0), 0.0, 1.0)
-        reward = max(-80.0, safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0))
-        human_score = clamp(record.get("human_score", 50.0), 0.0, 100.0)
-        novelty = clamp(record.get("sleep_novelty", record.get("novelty", 50.0)), 0.0, 100.0)
-        source_bonus = 4.0 if record.get("mode") == "learning" else 0.0
+        screen, human_score = record_screen_human(record)
+        reward = strict_reward_value(screen, human_score)
+        source_bonus = 0.0000000001 if record.get("mode") == "learning" else 0.0
         sleep_confidence = clamp(record.get("sleep_confidence", 0.0), 0.0, 1.0)
-        return similarity * 100.0 * self.settings.action_score_similarity_weight + reward * self.settings.action_score_reward_weight * (1.0 + sleep_confidence * (35.0 / 100.0)) + human_score * self.settings.action_score_human_weight + novelty * self.settings.action_score_novelty_weight + source_bonus
+        return reward + similarity * 0.00000001 + sleep_confidence * 0.000000001 + source_bonus
 
     def mutate_point(self, point, scale):
         return [
