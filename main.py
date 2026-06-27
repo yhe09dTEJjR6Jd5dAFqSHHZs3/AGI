@@ -2924,6 +2924,21 @@ class ActionBrain:
         duration_min = self.settings.action_duration_min if action_type == "drag" else self.settings.random_click_duration_min
         return {"type": action_type, "button": "Button.left", "source": "ai", "start_rel": start, "end_rel": end, "duration": round(random.uniform(min(duration_min, duration_max), max(duration_min, duration_max)), 6), "path_rel": [[start[0], start[1], 0.0], [end[0], end[1], 1.0]]}
 
+    def bootstrap_action(self, strength=0.2):
+        action_type = random.choice(["click", "drag", "scroll"])
+        margin = clamp(0.2 + random.random() * 0.1, 0.15, 0.35)
+        start = [round(random.uniform(margin, 1.0 - margin), 6), round(random.uniform(margin, 1.0 - margin), 6)]
+        if action_type == "scroll":
+            magnitude = random.choice([-1, 1])
+            return {"type": "scroll", "button": "scroll", "source": "ai_bootstrap", "start_rel": start, "end_rel": start, "duration": 0.0, "scroll": [0, magnitude], "path_rel": [[start[0], start[1], 0.0]], "exploration_policy": "bounded_bootstrap"}
+        if action_type == "drag":
+            end = self.mutate_point(start, clamp(0.04 + strength * 0.12, 0.04, 0.18))
+        else:
+            end = list(start)
+        duration_max = self.settings.action_duration_max if action_type == "drag" else self.settings.random_click_duration_max
+        duration_min = self.settings.action_duration_min if action_type == "drag" else self.settings.random_click_duration_min
+        return {"type": action_type, "button": "Button.left", "source": "ai_bootstrap", "start_rel": start, "end_rel": end, "duration": round(random.uniform(min(duration_min, duration_max), max(duration_min, duration_max)), 6), "path_rel": [[start[0], start[1], 0.0], [end[0], end[1], 1.0]], "exploration_policy": "bounded_bootstrap"}
+
     def fallback_action(self, randomness=0.0):
         learned = self.pool.best_global_action()
         if randomness > 0.0 and random.random() < clamp(randomness, 0.0, 1.0):
@@ -2932,7 +2947,7 @@ class ActionBrain:
             return self.mutate_action(learned, 1.8 + randomness), "global_experience"
         if randomness > 0.0:
             return self.random_action(1.0 + randomness), "zero_score_random_exploration"
-        return None, "observe_only"
+        return self.bootstrap_action(0.2), "bounded_bootstrap_exploration"
 
     def choose(self, hash_value, novelty, batch, screen_score_total, zero_score_factor=0.0):
         rate = clamp(self.exploration_rate(novelty, screen_score_total) + clamp(zero_score_factor, 0.0, 1.0) * (1.0 - self.settings.explore_min_rate), self.settings.explore_min_rate, self.settings.explore_max_rate)
@@ -4569,6 +4584,12 @@ class ControlPanel(tk.Tk):
                 return
             self.stop_event.set()
             progress_now = self.progress_value
+            if mode == "sleep":
+                self.termination_reason = "user_stop"
+                if self.active_session:
+                    self.active_session.termination_reason = "user_stop"
+                self.ui(lambda: self.status_var.set("正在终止睡眠模式，等待数据保存完成"))
+                return
         if not self.transition(mode, "idle", reason="user_stop", token=token):
             return
         self.update_progress(self.idle_progress_value(mode, progress_now), force=True)
@@ -4777,20 +4798,21 @@ class ControlPanel(tk.Tk):
             return True, None
         try:
             self.persistence_paused.set()
+            persistence_guard = lambda: False
             if self.persistence_queue:
                 self.persistence_queue.flush()
             self.store.flush_state(force=True)
             with self.experience_pool.lock:
                 recheck_records = copy.deepcopy(self.experience_pool.records)
                 self.store.merge_experience_records_by_id(recheck_records)
-                compact = self.store.compact_experience_pool(config.experience_pool_gb, run_guard=run_guard)
+                compact = self.store.compact_experience_pool(config.experience_pool_gb, run_guard=persistence_guard)
                 if compact.get("changed"):
                     self.events.publish("experience_pool_compaction_completed", removed=compact.get("removed", 0), size_bytes=compact.get("size_bytes", 0))
                     self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit), self.store.load_latest_model_state(config.settings))
                     self.brain = ActionBrain(self.experience_pool, config.settings)
                 records = copy.deepcopy(self.experience_pool.records)
                 model = self.experience_pool.model
-            self.store.save_ai_model_snapshot(records, config.settings, config.ai_model_limit, status, model, run_guard=run_guard)
+            self.store.save_ai_model_snapshot(records, config.settings, config.ai_model_limit, status, model, run_guard=persistence_guard)
             self.store.flush_state(force=True)
             self.events.publish("save_completed", kind="sleep_data", status=status)
             self.ui(lambda c=self.experience_pool.count(): self.pool_var.set(str(c)))
@@ -4933,11 +4955,13 @@ class ControlPanel(tk.Tk):
                 return
         try:
             if self.persistence_paused.is_set():
-                self.mark_snapshot_image_result(snapshot, False)
+                saved = self.mark_snapshot_image_result(snapshot, False)
             else:
-                self.mark_snapshot_image_result(snapshot, self.persistence_queue.enqueue_image(analyzer, image, snapshot.path, self.store, priority="low"))
+                saved = self.mark_snapshot_image_result(snapshot, self.persistence_queue.enqueue_image(analyzer, image, snapshot.path, self.store, priority="low"))
         except Exception as exc:
             self.log_exception("learning_screen_event.save", exc, {"path": str(snapshot.path)})
+            return
+        if not saved:
             return
         self.adaptive_policy.observe_capture(getattr(snapshot, "capture_latency_ms", 0.0))
         self.last_learning_event_perf = now_perf
@@ -5092,6 +5116,7 @@ class ControlPanel(tk.Tk):
         session_id = uuid.uuid4().hex
         start = time.perf_counter()
         consecutive_failures = 0
+        consecutive_no_actions = 0
         zero_score_events = 0
         zero_score_started_at = None
         last_training_error = None
@@ -5121,8 +5146,16 @@ class ControlPanel(tk.Tk):
                     decision["zero_score_strategy_stage"] = zero_stage
                     decision["zero_score_strategy"] = ["normal", "recapture_validate_window", "refresh_neighbors", "trusted_history_action", "bounded_random_exploration", "alternate_mouse_action"][zero_stage]
                 if not action:
+                    consecutive_no_actions += 1
                     self.write_record("training", session_id, snapshot, None, "screen_event", decision=decision)
-                    continue
+                    if consecutive_no_actions >= max(1, self.settings.training_fail_stop_count):
+                        action = self.brain.bootstrap_action(0.2)
+                        decision = {"reason": "forced_bounded_bootstrap_exploration", "consecutive_no_actions": consecutive_no_actions, "candidate_count": 0, "confidence": 0.0}
+                    else:
+                        stop_event.wait(max(self.settings.training_event_wait, self.settings.min_action_delay_seconds))
+                        continue
+                else:
+                    consecutive_no_actions = 0
                 success, record = service.execute_and_record(analyzer, session_id, start, rect, snapshot, action, decision, stop_event)
                 if not success:
                     consecutive_failures += 1
