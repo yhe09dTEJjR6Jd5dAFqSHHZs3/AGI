@@ -279,7 +279,7 @@ def attempt_startup_environment_repair(actions=None):
     actions.append("已创建并验证存储路径可写" if not storage_issue else f"无法修复存储路径：{storage_issue}")
     valid_path, path_reason = validate_ldplayer_executable(ldplayer_path, require_attach=False)
     if valid_path and sys.platform == "win32" and not missing:
-        actions.append("启动检查已跳过雷电模拟器窗口状态")
+        actions.append("启动检查已跳过雷电模拟器客户区状态")
     elif not valid_path:
         actions.append(f"雷电模拟器路径无法自动修复：{path_reason}")
     if sys.version_info < MIN_PYTHON_VERSION:
@@ -697,10 +697,10 @@ def validate_ldplayer_executable(path, settings=None, require_attach=False):
     if require_attach:
         manager = WindowManager(candidate, settings or derive_runtime_settings())
         if not manager.launch_or_attach():
-            return False, "无法通过该 dnplayer.exe 启动或附着雷电模拟器窗口"
+            return False, "无法通过该 dnplayer.exe 启动或附着雷电模拟器客户区"
         check = manager.check_window(force=True)
         if not check.ok:
-            return False, f"已找到雷电模拟器但窗口异常：{check.reason}"
+            return False, f"已找到雷电模拟器但客户区异常：{check.reason}"
     return True, "ok"
 
 
@@ -761,6 +761,8 @@ def run_self_test():
     assert {"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("training", "idle")])
     assert "time_limit" not in ALLOWED_TRANSITIONS[("training", "idle")]
     assert "time_limit" in ALLOWED_TRANSITIONS[("training", "sleep")]
+    assert should_stop_run(threading.Event(), time.perf_counter() - 1.0, None) == "time_limit"
+    assert should_stop_run(threading.Event(), None, None) is None
     assert ("sleep", "training") not in ALLOWED_TRANSITIONS
     assert ("sleep", "starting") not in ALLOWED_TRANSITIONS
     assert {"completed", "time_limit", "poor_optimization"}.issubset(ALLOWED_TRANSITIONS[("sleep", "idle")])
@@ -3605,12 +3607,12 @@ class TrainingService:
         if not check.ok:
             panel.termination_reason = "window_invalid"
             stop_event.set()
-            panel.ui(lambda r=check.reason: panel.status_var.set(f"训练模式结束：雷电模拟器窗口异常：{r}"))
+            panel.ui(lambda r=check.reason: panel.status_var.set(f"训练模式结束：雷电模拟器客户区异常：{r}"))
             return True
         if not panel.cursor_inside_window():
             panel.termination_reason = "window_invalid"
             stop_event.set()
-            panel.ui(lambda: panel.status_var.set("训练模式结束：鼠标位于雷电模拟器窗口外"))
+            panel.ui(lambda: panel.status_var.set("训练模式结束：鼠标位于雷电模拟器客户区外"))
             return True
         idle_seconds = panel.learning_idle_seconds()
         if idle_seconds >= config.still_seconds:
@@ -3680,7 +3682,7 @@ class ControlPanel(tk.Tk):
         self.metrics_presenter = MetricsPresenter(self)
         self.learning_service = LearningService(self)
         self.training_service = TrainingService(self)
-        self.events.subscribe("window_state_changed", lambda event: self.ui(lambda e=event: self.status_var.set(f"窗口状态事件：{e.get('reason', 'ok')}")))
+        self.events.subscribe("window_state_changed", lambda event: self.ui(lambda e=event: self.status_var.set(f"客户区状态事件：{e.get('reason', 'ok')}")))
         self.events.subscribe("sleep_batch_completed", lambda event: self.ui(lambda e=event: self.progress_label_var.set(f"睡眠批次完成｜已完成 {e.get('completed_batches', 0)} 批")))
         self.events.subscribe("experience_pool_compaction_completed", lambda event: self.ui(lambda e=event: self.status_var.set(f"经验池压缩完成：删除 {e.get('removed', 0)} 条")))
         self.events.subscribe("save_completed", lambda event: self.ui(lambda e=event: self.status_var.set(f"保存完成：{e.get('kind', 'data')}")))
@@ -3838,7 +3840,7 @@ class ControlPanel(tk.Tk):
             self.metric_items.append(self.create_metric(self.metrics_frame, title, variable))
         self.reflow_metrics()
         ttk.Label(status_frame, text="快捷键", style="CardTitle.TLabel").grid(row=1, column=0, sticky="w", pady=(18, 6), padx=(0, 12))
-        hint = "学习模式期间，全局鼠标静止超时会自动结束。雷电模拟器窗口外的新动作不会记录为学习动作，但会重置静止倒计时。ESC 终止当前学习、训练或睡眠。截图与坐标均使用雷电客户区。"
+        hint = "学习模式期间，全局鼠标静止超时会自动结束。雷电模拟器客户区外的新动作不会记录为学习动作，但会重置静止倒计时。ESC 终止当前学习、训练或睡眠。截图与坐标均使用雷电模拟器客户区。"
         self.hint_label = ttk.Label(status_frame, text=hint, wraplength=max(320, self.settings.ui_width - 120), style="Hint.TLabel")
         self.hint_label.grid(row=2, column=0, sticky="ew", pady=6)
         progress_frame = ttk.LabelFrame(container, text=self.progress_label_var.get(), padding=self.settings.ui_section_padding)
@@ -4627,7 +4629,7 @@ class ControlPanel(tk.Tk):
         try:
             if not self.ensure_runtime(config):
                 if self.is_run_active(token):
-                    self.ui(lambda: messagebox.showerror("未找到窗口", "没有找到雷电模拟器窗口，请确认路径正确或手动启动雷电模拟器。"))
+                    self.ui(lambda: messagebox.showerror("未找到客户区", "没有找到雷电模拟器客户区，请确认路径正确或手动启动雷电模拟器。"))
                     self.finish_run(token, "未找到雷电模拟器", 0.0, reason="runtime_error")
                 return
             if stop_event.is_set() or not self.is_run_active(token):
@@ -4637,10 +4639,10 @@ class ControlPanel(tk.Tk):
             stop_event.wait(config.settings.window_event_wait)
             check = self.window_manager.check_window(force=True)
             if not check.ok:
-                self.finish_run(token, f"雷电模拟器窗口异常：{check.reason}", 0.0, reason=f"window_{check.reason}")
+                self.finish_run(token, f"雷电模拟器客户区异常：{check.reason}", 0.0, reason=f"window_{check.reason}")
                 return
             if not self.ensure_cursor_inside_window(check.rect):
-                self.finish_run(token, "无法确保鼠标位于雷电模拟器窗口内", 0.0, reason="window_invalid")
+                self.finish_run(token, "无法确保鼠标位于雷电模拟器客户区内", 0.0, reason="window_invalid")
                 return
             if not self.activate_run(token, mode):
                 return
@@ -5105,12 +5107,12 @@ class ControlPanel(tk.Tk):
                 if not check.ok:
                     termination_reason = "window_invalid"
                     stop_event.set()
-                    self.ui(lambda r=check.reason: self.status_var.set(f"学习模式结束：雷电模拟器窗口异常：{r}"))
+                    self.ui(lambda r=check.reason: self.status_var.set(f"学习模式结束：雷电模拟器客户区异常：{r}"))
                     break
                 if not self.cursor_inside_window():
                     termination_reason = "window_invalid"
                     stop_event.set()
-                    self.ui(lambda: self.status_var.set("学习模式结束：鼠标位于雷电模拟器窗口外"))
+                    self.ui(lambda: self.status_var.set("学习模式结束：鼠标位于雷电模拟器客户区外"))
                     break
                 idle_seconds = self.learning_idle_seconds()
                 remaining = max(0.0, config.still_seconds - idle_seconds)
@@ -5174,8 +5176,7 @@ class ControlPanel(tk.Tk):
             return current_score, zero_score_started_at, False
         score = current_score
         stage_index = 0
-        deadline = start + max(1, safe_int(getattr(config, "training_seconds", DEFAULT_TRAINING_SECONDS), DEFAULT_TRAINING_SECONDS))
-        run_guard = lambda: should_stop_run(stop_event, deadline, self.should_stop_by_escape)
+        run_guard = lambda: should_stop_run(stop_event, None, self.should_stop_by_escape)
         while score <= 0.0 and not run_guard() and self.is_run_active(self.active_session.token if self.active_session else None, "training"):
             stage = stage_names[min(stage_index, len(stage_names) - 1)]
             self.events.publish("training_zero_score_recovery", stage=stage, elapsed=round(time.perf_counter() - zero_score_started_at, 3), screen_score=score)
