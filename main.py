@@ -342,7 +342,7 @@ DEFAULT_SLEEP_SECONDS = AGENT_SPEC.default_sleep_seconds
 DEFAULT_STILL_SECONDS = AGENT_SPEC.default_still_seconds
 DEFAULT_EXPERIENCE_POOL_GB = AGENT_SPEC.default_experience_pool_gb
 DEFAULT_AI_MODEL_LIMIT = AGENT_SPEC.default_ai_model_limit
-MODE_NAMES = {"idle": "空闲", "starting": "准备中", "learning": "学习模式", "training": "训练模式", "sleep": "睡眠模式", "migration": "数据迁移"}
+MODE_NAMES = {"idle": "空闲", "starting": "准备中", "learning": "学习模式", "training": "训练模式", "sleep": "睡眠模式", "migration": "数据迁移", "stopping": "正在退出"}
 CONFIG_SCHEMA_VERSION = 1
 USER_EDITABLE_STARTUP_FIELDS = ("ldplayer_path", "data_path")
 USER_EDITABLE_RUNTIME_FIELDS = ("training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit")
@@ -378,9 +378,15 @@ ALLOWED_TRANSITIONS = {
     ("idle", "sleep"): {"click_sleep"},
     ("idle", "migration"): {"click_modify_data_path"},
     ("starting", "idle"): {"window_invalid", "user_stop", "runtime_error", "minimize_failed"},
+    ("learning", "stopping"): {"user_stop", "esc", "still_timeout", "window_invalid", "runtime_error"},
+    ("training", "stopping"): {"user_stop", "esc", "still_timeout", "window_invalid", "runtime_error", "executor_error"},
+    ("starting", "stopping"): {"user_stop"},
+    ("migration", "stopping"): {"user_stop"},
+    ("stopping", "idle"): {"esc", "still_timeout", "window_invalid", "user_stop", "runtime_error", "executor_error", "migration_error", "completed"},
     ("learning", "idle"): {"esc", "still_timeout", "window_invalid", "user_stop", "runtime_error"},
     ("training", "idle"): {"esc", "still_timeout", "window_invalid", "user_stop", "runtime_error", "executor_error"},
     ("training", "sleep"): {"time_limit"},
+    ("sleep", "stopping"): {"user_stop", "esc", "runtime_error"},
     ("sleep", "idle"): {"completed", "esc", "time_limit", "poor_optimization", "user_stop", "runtime_error"},
     ("migration", "idle"): {"completed", "migration_error", "user_stop"}
 }
@@ -1234,6 +1240,18 @@ def create_runtime_settings(base_settings=None, rect=None, pool_count=0, capture
 def rect_size(rect):
     left, top, right, bottom = rect
     return max(1, int(right - left)), max(1, int(bottom - top))
+
+
+def rect_intersection(a, b):
+    left = max(a[0], b[0])
+    top = max(a[1], b[1])
+    right = min(a[2], b[2])
+    bottom = min(a[3], b[3])
+    return (left, top, right, bottom) if right > left and bottom > top else None
+
+
+def rect_area(rect):
+    return max(0, int(rect[2] - rect[0])) * max(0, int(rect[3] - rect[1])) if rect else 0
 
 
 def point_inside(rect, x, y):
@@ -2299,6 +2317,34 @@ class WindowManager:
     def topmost(self):
         self.foreground()
 
+
+    def occluded_area_ratio(self, hwnd, rect):
+        front = []
+        target_area = max(1, rect_area(rect))
+        def handler(other, _):
+            try:
+                if other == hwnd or win32gui.IsChild(hwnd, other) or not win32gui.IsWindowVisible(other) or win32gui.IsIconic(other):
+                    return
+                other_rect = win32gui.GetWindowRect(other)
+                inter = rect_intersection(rect, other_rect)
+                if inter:
+                    front.append((other, inter))
+            except Exception:
+                pass
+        win32gui.EnumWindows(handler, None)
+        ordered = []
+        current = win32gui.GetTopWindow(0)
+        seen = set()
+        while current and current not in seen:
+            seen.add(current)
+            if current == hwnd:
+                break
+            ordered.append(current)
+            current = win32gui.GetWindow(current, win32con.GW_HWNDNEXT)
+        front_hwnds = set(ordered)
+        covered = sum(rect_area(inter) for other, inter in front if other in front_hwnds)
+        return clamp(covered / target_area, 0.0, 1.0)
+
     def check_window(self, force=False):
         with self.lock:
             hwnd = self.hwnd
@@ -2350,7 +2396,11 @@ class WindowManager:
                 if hit == hwnd or win32gui.IsChild(hwnd, hit):
                     hits += 1
             cache["occlusion_perf"] = now_perf
-            result = WindowCheck(hits == len(points), "ok" if hits == len(points) else "occluded", rect, hits, len(points))
+            occluded_ratio = self.occluded_area_ratio(hwnd, rect)
+            ok = hits == len(points) and occluded_ratio <= (1.0 / max(100.0, width * height))
+            reason = "ok" if ok else "occluded"
+            result = WindowCheck(ok, reason, rect, hits, len(points))
+            result.occluded_ratio = occluded_ratio
             cache.update({"ok": result.ok, "reason": result.reason, "check": result})
             return result
         except Exception as exc:
@@ -2531,6 +2581,9 @@ class ExperiencePool:
                 bucket.append(index)
                 self.metric_tree.add(hash_value, index)
 
+    def record_trainable(self, record):
+        return not bool(record.get("quarantined") or record.get("exclude_from_training") or record.get("score_status") in ("image_missing", "image_corrupt", "unrecoverable"))
+
     def add(self, record):
         with self.lock:
             index = len(self.records)
@@ -2545,9 +2598,9 @@ class ExperiencePool:
                     self.index_version += 1
                 bucket.append(index)
                 self.metric_tree.add(hash_value, index)
-            if record.get("mouse_action") and record.get("mode") == "learning" and record.get("mouse_source") == "user":
+            if self.record_trainable(record) and record.get("mouse_action") and record.get("mode") == "learning" and record.get("mouse_source") == "user":
                 self.profile.observe(record["mouse_action"])
-            if record.get("mouse_action"):
+            if self.record_trainable(record) and record.get("mouse_action"):
                 self.action_cache.append(record)
                 reward = safe_float(record.get("reward", 0.0), 0.0)
                 item = (reward, index)
@@ -2617,7 +2670,7 @@ class ExperiencePool:
             if len(self.records) > self.index_settings.nearest_candidate_limit:
                 recent_limit = min(len(self.records), max(top_k, self.index_settings.nearest_candidate_limit // 4))
                 candidate_indexes = list(dict.fromkeys(candidate_indexes + list(range(len(self.records) - recent_limit, len(self.records))) + [index for _, index in heapq.nlargest(min(len(self.global_action_heap), top_k), self.global_action_heap)]))
-            snapshot = [(index, self.hashes[index], self.records[index]) for index in candidate_indexes if self.hashes[index] and (before_index is None or index < before_index) and (exclude_id is None or self.records[index].get("id") != exclude_id)]
+            snapshot = [(index, self.hashes[index], self.records[index]) for index in candidate_indexes if self.hashes[index] and self.record_trainable(self.records[index]) and (before_index is None or index < before_index) and (exclude_id is None or self.records[index].get("id") != exclude_id)]
         scored = []
         for index, other, record in snapshot:
             if other:
@@ -2676,7 +2729,7 @@ class ExperiencePool:
 
     def sleep_training_batch_indices(self, batch_size):
         with self.lock:
-            action_indices = [index for index, record in enumerate(self.records) if record.get("mouse_action")]
+            action_indices = [index for index, record in enumerate(self.records) if record.get("mouse_action") and self.record_trainable(record)]
             if not action_indices:
                 return []
             target = max(1, min(safe_int(batch_size, 1), len(action_indices)))
@@ -2689,14 +2742,15 @@ class ExperiencePool:
     def compute_screen_score(self, hash_value, exclude_id=None, before_index=None, exact_checksum=None):
         neighbors = self.nearest(hash_value, exclude_id=exclude_id, limit=self.settings.nearest_top_k, before_index=before_index)
         sims = [clamp(item.get("similarity", 0.0), 0.0, 1.0) for item in neighbors]
+        exact_match = bool(exact_checksum) and any(exact_checksum == item.get("record", {}).get("image_checksum") for item in neighbors)
+        if exact_match:
+            return 0.0, neighbors, 1.0
         if sims:
             top = sims[:max(1, min(self.settings.nearest_top_k, len(sims)))]
             density = sum(1 for item in top if item >= 0.95) / len(top)
             score = clamp((1.0 - (top[0] * 0.5 + sum(top) / len(top) * 0.35 + density * 0.15)) * 100.0, 0.0, 100.0)
             if score <= 0.0 and exact_checksum:
-                exact_match = any(exact_checksum and exact_checksum == item.get("record", {}).get("image_checksum") for item in neighbors)
-                if not exact_match:
-                    score = 0.01
+                score = 0.01
             confidence = clamp(top[0] * 0.65 + (1.0 - density) * 0.35, 0.0, 1.0)
         else:
             score = 100.0
@@ -2730,11 +2784,11 @@ class ExperiencePool:
                             file_hash = analyzer.fingerprint(rgb_image)
                             record["image_checksum"] = image_content_checksum(rgb_image)
                     else:
-                        record["score_status"] = "image_missing"
+                        record.update({"score_status": "image_missing", "exclude_from_training": True, "quarantined": True, "quarantine_reason": "image_missing", "score_checked_at": now_text()})
                         image_missing += 1
                 except Exception as exc:
                     record["screen_file_error"] = str(exc)
-                    record["score_status"] = "image_corrupt"
+                    record.update({"score_status": "image_corrupt", "exclude_from_training": True, "quarantined": True, "quarantine_reason": "image_corrupt", "score_checked_at": now_text()})
                     image_corrupt += 1
             if file_hash and (not hash_value or file_hash.hex != hash_value.hex or file_hash.bits != hash_value.bits):
                 hash_value = file_hash
@@ -2747,6 +2801,9 @@ class ExperiencePool:
                 hash_missing += 1
                 unrecoverable += 1
                 record["score_status"] = "unrecoverable"
+                record["exclude_from_training"] = True
+                record["quarantined"] = True
+                record["quarantine_reason"] = record.get("quarantine_reason") or "hash_missing"
                 record["score_checked_at"] = now_text()
                 updates.append((index, record, None))
                 continue
@@ -3523,12 +3580,11 @@ class TrainingService:
             stop_event.set()
             panel.ui(lambda r=check.reason: panel.status_var.set(f"训练模式结束：雷电模拟器窗口异常：{r}"))
             return True
-        if not panel.cursor_inside_window(2):
+        if not panel.cursor_inside_window():
             panel.termination_reason = "window_invalid"
             stop_event.set()
             panel.ui(lambda: panel.status_var.set("训练模式结束：鼠标位于雷电模拟器窗口外"))
             return True
-        panel.ensure_cursor_inside_window(check.rect)
         idle_seconds = panel.learning_idle_seconds()
         if idle_seconds >= config.still_seconds:
             panel.termination_reason = "still_timeout"
@@ -3887,8 +3943,17 @@ class ControlPanel(tk.Tk):
     def runtime_environment_ready(self):
         if self.required_import_error():
             return False
-        ok, _ = validate_ldplayer_executable(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH), self.settings, require_attach=False)
-        return ok and bool(windows_runtime_report(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH)).get("ok"))
+        storage_issue = data_path_write_issue(Path(self.data_var.get().strip() or DEFAULT_DATA_PATH), create=True)
+        if storage_issue:
+            self.runtime_environment_issue = "存储路径无效：" + storage_issue
+            return False
+        ok, reason = validate_ldplayer_executable(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH), self.settings, require_attach=False)
+        if not ok:
+            self.runtime_environment_issue = reason
+            return False
+        ready = bool(windows_runtime_report(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH)).get("ok"))
+        self.runtime_environment_issue = "" if ready else "Windows 桌面运行环境不可用"
+        return ready
 
     def offline_sleep_environment_ready(self):
         if self.required_import_error():
@@ -3924,7 +3989,7 @@ class ControlPanel(tk.Tk):
             except Exception:
                 pass
         if not online_enabled and mode == "idle":
-            self.status_var.set("雷电运行环境未就绪：学习/训练需 Windows 桌面与雷电窗口；睡眠模式仅需数据存储可用")
+            self.status_var.set("雷电运行环境未就绪：" + (getattr(self, "runtime_environment_issue", "") or "学习/训练需 Windows 桌面、雷电路径与可写存储路径"))
         self.runtime_environment_last_ready = online_enabled
         return online_enabled
 
@@ -4376,6 +4441,11 @@ class ControlPanel(tk.Tk):
     def idle_progress_value(self, source_mode, progress=0.0):
         return 0.0 if source_mode in ("starting", "learning", "training", "sleep", "migration", "idle") else progress
 
+    def render_sleep_completion_before_idle(self, label):
+        if self.current_mode() == "sleep":
+            self.update_progress(100.0, force=True)
+            self.ui_sync(lambda l=label: (self.progress_label_var.set(l), self.update_idletasks()), self.settings.ui_event_coalesce_seconds)
+
     def finish_run(self, token, status, progress=0.0, release=True, reason=None):
         mapped_reason = reason or "completed"
         if mapped_reason not in TERMINATION_REASONS and not str(mapped_reason).startswith("window_"):
@@ -4583,18 +4653,21 @@ class ControlPanel(tk.Tk):
                 self.ui(lambda: self.status_var.set("当前没有正在运行的模式"))
                 return
             self.stop_event.set()
+            self.termination_reason = "user_stop"
+            if self.active_session:
+                self.active_session.termination_reason = "user_stop"
             progress_now = self.progress_value
             if mode == "sleep":
                 self.termination_reason = "user_stop"
                 if self.active_session:
                     self.active_session.termination_reason = "user_stop"
+                self.transition("sleep", "stopping", reason="user_stop", token=token)
                 self.ui(lambda: self.status_var.set("正在终止睡眠模式，等待数据保存完成"))
                 return
-        if not self.transition(mode, "idle", reason="user_stop", token=token):
+        if not self.transition(mode, "stopping", reason="user_stop", token=token):
             return
         self.update_progress(self.idle_progress_value(mode, progress_now), force=True)
-        self.ui(lambda: self.status_var.set("当前模式已终止"))
-        self.ui(self.release_window_and_panel)
+        self.ui(lambda: self.status_var.set("正在终止当前模式，等待后台任务清理完成"))
 
     def sleep_mode(self, restart_training=False):
         token, stop_event = self.begin_run("sleep")
@@ -4626,7 +4699,7 @@ class ControlPanel(tk.Tk):
         return {"time": elapsed_ratio, "review": review_ratio, "training": training_ratio, "compaction": compact_ratio, "save": save_ratio, "overall": max(previous_ratio, task_ratio, floor_ratio)}
 
     def sleep_progress_percent(self, started_perf, sleep_seconds, completed_steps, target_training_steps, compaction_progress):
-        return clamp(self.sleep_progress_fields(started_perf, sleep_seconds, completed_steps, target_training_steps, compaction_progress)["overall"] * 100.0, 0.0, 99.0)
+        return clamp(self.sleep_progress_fields(started_perf, sleep_seconds, completed_steps, target_training_steps, compaction_progress)["overall"] * 100.0, 0.0, 100.0)
 
     def sleep_compaction_progress(self, compact):
         if not isinstance(compact, dict):
@@ -4670,6 +4743,19 @@ class ControlPanel(tk.Tk):
         started_perf = time.perf_counter()
         sleep_deadline = started_perf + max(1, config.sleep_seconds)
         run_guard = lambda: should_stop_run(stop_event, sleep_deadline, self.should_stop_by_escape)
+        self.ui(lambda: self.progress_label_var.set("睡眠资源整理中｜正在立即压缩经验池并裁剪模型"))
+        try:
+            self.store.compact_ai_models(config.ai_model_limit)
+            initial_compact = self.store.compact_experience_pool(config.experience_pool_gb, run_guard=run_guard)
+            compaction_progress = self.sleep_compaction_progress(initial_compact)
+            compaction_complete = self.sleep_compaction_complete(initial_compact)
+            if initial_compact.get("changed"):
+                self.events.publish("experience_pool_compaction_completed", removed=initial_compact.get("removed", 0), size_bytes=initial_compact.get("size_bytes", 0))
+                self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit), self.store.load_latest_model_state(config.settings))
+                self.brain = ActionBrain(self.experience_pool, config.settings)
+        except Exception as exc:
+            self.log_exception("sleep_initial_compaction", exc, initial_compact)
+        self.update_progress(15.0)
         self.ui(lambda: self.progress_label_var.set("睡眠评分复核中｜正在检查全部画面评分"))
         recheck_result = {"checked": 0, "rescored": 0, "missing": 0, "errors": 0, "image_missing": 0, "image_corrupt": 0, "hash_missing": 0, "unrecoverable": 0}
         try:
@@ -4688,7 +4774,7 @@ class ControlPanel(tk.Tk):
             return self.experience_pool.sleep_training_step(batch_size, self.store.add_screen_score_total if self.store else None, run_guard=run_guard)
         def submit_next(executor, futures):
             nonlocal submitted
-            if stop_event.is_set() or not self.is_run_active(token, "sleep"):
+            if stop_event.is_set() or not (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
                 return
             futures.add(executor.submit(train_once))
             submitted += 1
@@ -4696,7 +4782,7 @@ class ControlPanel(tk.Tk):
             futures = set()
             for _ in range(queue_depth):
                 submit_next(executor, futures)
-            while not stop_event.is_set() and self.is_run_active(token, "sleep"):
+            while not stop_event.is_set() and (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
                 guarded = run_guard()
                 if guarded:
                     with self.state_lock:
@@ -4748,7 +4834,7 @@ class ControlPanel(tk.Tk):
                 screen_score_total = self.store.state.get("screen_score_total", 0.0) if self.store else 0.0
                 compact = {"changed": False, "size_bytes": self.store.experience_pool_size_bytes() if self.store else 0, "target_bytes": max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))}
                 compaction_progress = self.sleep_compaction_progress(compact)
-                compaction_complete = True
+                compaction_complete = self.sleep_compaction_complete(compact)
                 self.events.publish("sleep_batch_completed", trained=trained, best_score=best_score, confidence=batch_confidence, completed_batches=completed)
                 decision = {"reason": "sleep_prioritized_replay", "confidence": batch_confidence, "candidate_count": trained, "best_score": best_score, "completed_batches": completed, "target_training_steps": target_training_steps, "confidence_target": confidence_target, "workers": workers, "pool_compacted": compact.get("changed", False), "pool_removed": compact.get("removed", 0)}
                 self.update_metrics(0.0, 50.0 + clamp(batch_confidence * 50.0, 0.0, 50.0), 0.0, batch_score, best_score, screen_score_total, decision)
@@ -4768,25 +4854,27 @@ class ControlPanel(tk.Tk):
         save_status = "completed" if completed_success else ("poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached else (stopped_reason or "incomplete")))
         saved, save_error = self.save_sleep_data(config, save_status, run_guard=run_guard)
         if not saved:
-            if self.is_run_active(token, "sleep"):
+            if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
                 self.finish_run(token, "保存失败：" + str(save_error), self.progress_value, release=False, reason="runtime_error")
                 self.ui(lambda e=str(save_error): messagebox.showerror("保存失败", e))
             return
         final_reason = None
-        if restart_training and self.is_run_active(token, "sleep") and save_status not in ("esc", "user_stop"):
+        if restart_training and (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and save_status not in ("esc", "user_stop"):
             self.main_thread_events.put({"type": "restart_training", "reason": save_status, "config": config, "token": token, "created_at": now_text()})
             self.ui(self.process_main_thread_events)
             return
-        if self.is_run_active(token, "sleep") and completed_success:
+        if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and completed_success:
             final_reason = "completed"
+            self.render_sleep_completion_before_idle("睡眠模式进度 100%｜任务完成，数据已保存")
             self.finish_run(token, "睡眠模式任务完成，数据已保存", 100.0, release=False, reason=final_reason)
-        elif self.is_run_active(token, "sleep") and time_limit_reached:
+        elif (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and time_limit_reached:
             final_reason = "time_limit"
+            self.render_sleep_completion_before_idle("睡眠模式进度 100%｜到达时间上限，数据已保存")
             self.finish_run(token, "睡眠模式到达时间上限，数据已保存", 100.0, release=False, reason=final_reason)
-        elif self.is_run_active(token, "sleep") and poor_optimization:
+        elif (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and poor_optimization:
             final_reason = "poor_optimization"
             self.finish_run(token, "AI模型优化效果差，已保存数据并退出睡眠模式", self.progress_value, release=False, reason=final_reason)
-        elif self.is_run_active(token, "sleep"):
+        elif (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
             final_reason = stopped_reason or "user_stop"
             self.finish_run(token, "睡眠模式已终止，数据已保存", 0.0, release=False, reason=final_reason)
         if restart_training and final_reason not in ("esc", "user_stop"):
@@ -5030,8 +5118,8 @@ class ControlPanel(tk.Tk):
                 else:
                     stop_event.wait(max(0.0, config.still_seconds - idle_seconds))
             self.write_record("learning", session_id, self.capture_snapshot(analyzer, "learning", session_id, start, priority="critical"), None, "mode_end")
-        if self.is_run_active(token, "learning"):
-            self.finish_run(token, "学习模式结束", 0.0, reason=termination_reason)
+        if self.is_run_active(token, "learning") or self.is_run_active(token, "stopping"):
+            self.finish_run(token, "学习模式结束", 0.0, reason=termination_reason if not stop_event.is_set() else (termination_reason or "user_stop"))
         else:
             self.release_window_and_panel()
 
@@ -5188,7 +5276,7 @@ class ControlPanel(tk.Tk):
                         break
                     stop_event.wait(min(self.settings.generated_action_complete_wait, deadline - time.perf_counter()))
             self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start, priority="critical"), None, "mode_end")
-        if self.is_run_active(token, "training"):
+        if self.is_run_active(token, "training") or self.is_run_active(token, "stopping"):
             final_reason = self.termination_reason or ("esc" if self.should_stop_by_escape() else "user_stop")
             if final_reason == "time_limit":
                 session = self.transition("training", "sleep", reason="time_limit", token=token)
