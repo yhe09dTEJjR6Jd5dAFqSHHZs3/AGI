@@ -78,6 +78,20 @@ class StartupRepairError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class EnvironmentEnsureResult:
+    ok: bool
+    stage: str
+    checks: tuple
+    repair_actions: tuple
+    recheck: tuple
+    unrecoverable: tuple
+
+    def detail(self):
+        sections = [f"阶段：{self.stage}", "检查项：", *[f"- {item}" for item in self.checks], "", "修复动作：", *[f"- {item}" for item in self.repair_actions], "", "复检结果：", *[f"- {item}" for item in self.recheck], "", "不可修复原因：", *[f"- {item}" for item in self.unrecoverable]]
+        return "\n".join(sections)
+
+
 def write_startup_install_log(command, result=None, error=None):
     try:
         log_dir = Path(globals().get("DEFAULT_DATA_PATH", AGENT_SPEC.default_data_path))
@@ -308,25 +322,32 @@ def startup_failure_detail(initial_issues, repair_actions, repair_error, remaini
     return "\n".join(sections)
 
 
-def prepare_startup_environment(check_environment=None, repair_environment=None, failure_handler=None):
+def ensure_environment(stage, allow_repair=True, check_environment=None, repair_environment=None):
     check_environment = check_environment or startup_environment_issues
     repair_environment = repair_environment or attempt_startup_environment_repair
-    failure_handler = failure_handler or fail_and_exit
-    initial_issues = check_environment()
+    initial_issues = tuple(check_environment())
     if not initial_issues:
-        return True
+        return EnvironmentEnsureResult(True, stage, initial_issues, tuple(), tuple(), tuple())
     repair_actions = []
     repair_error = None
-    try:
-        repair_environment(repair_actions)
-    except Exception as exc:
-        repair_error = str(exc)
-    remaining_issues = check_environment()
-    if not remaining_issues:
+    if allow_repair:
+        try:
+            repair_environment(repair_actions)
+        except Exception as exc:
+            repair_error = str(exc)
+    else:
+        repair_actions.append("当前阶段禁止自动修复")
+    remaining_issues = tuple(check_environment())
+    unrecoverable = tuple([repair_error] if repair_error else []) + remaining_issues
+    return EnvironmentEnsureResult(not remaining_issues, stage, initial_issues, tuple(repair_actions), remaining_issues, unrecoverable)
+
+
+def prepare_startup_environment(check_environment=None, repair_environment=None, failure_handler=None):
+    failure_handler = failure_handler or fail_and_exit
+    result = ensure_environment("startup", True, check_environment, repair_environment)
+    if result.ok:
         return True
-    if not repair_actions:
-        repair_actions.append("自动修复未能完成")
-    failure_handler(startup_failure_detail(initial_issues, repair_actions, repair_error, remaining_issues))
+    failure_handler(startup_failure_detail(list(result.checks), list(result.repair_actions), result.unrecoverable[0] if result.unrecoverable else None, list(result.recheck)))
     return False
 
 
@@ -382,18 +403,13 @@ ALLOWED_TRANSITIONS = {
     ("starting", "training"): {"window_ok"},
     ("idle", "sleep"): {"click_sleep"},
     ("idle", "migration"): {"click_modify_data_path"},
-    ("starting", "idle"): {"window_invalid", "user_stop", "runtime_error", "minimize_failed"},
     ("learning", "stopping"): {"user_stop", "esc", "still_timeout", "window_invalid", "cursor_outside", "runtime_error"},
     ("training", "stopping"): {"user_stop", "esc", "still_timeout", "window_invalid", "cursor_outside", "runtime_error", "executor_error"},
-    ("starting", "stopping"): {"user_stop", "esc"},
-    ("migration", "stopping"): {"user_stop", "esc"},
+    ("starting", "stopping"): {"user_stop", "esc", "runtime_error", "minimize_failed", "window_invalid", "completed"},
+    ("migration", "stopping"): {"user_stop", "esc", "runtime_error", "migration_error", "completed"},
     ("stopping", "idle"): {"esc", "still_timeout", "window_invalid", "cursor_outside", "user_stop", "runtime_error", "executor_error", "migration_error", "completed"},
-    ("learning", "idle"): {"esc", "still_timeout", "window_invalid", "cursor_outside", "user_stop", "runtime_error"},
-    ("training", "idle"): {"esc", "still_timeout", "window_invalid", "cursor_outside", "user_stop", "runtime_error", "executor_error"},
     ("training", "sleep"): {"time_limit"},
-    ("sleep", "stopping"): {"user_stop", "esc", "runtime_error"},
-    ("sleep", "idle"): {"esc", "user_stop", "runtime_error", "completed"},
-    ("migration", "idle"): {"completed", "migration_error", "user_stop"}
+    ("sleep", "stopping"): {"user_stop", "esc", "runtime_error", "completed"}
 }
 
 
@@ -762,9 +778,9 @@ def run_self_test():
     assert "human_tie_break_reward" in details
     assert 0.0 < details["human_bonus"] < details["screen_score_resolution"]
     assert set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "training_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit"}
-    assert {"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("learning", "idle")])
-    assert {"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("training", "idle")])
-    assert "time_limit" not in ALLOWED_TRANSITIONS[("training", "idle")]
+    assert {"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("learning", "stopping")])
+    assert {"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("training", "stopping")])
+    assert ("training", "idle") not in ALLOWED_TRANSITIONS
     assert "time_limit" in ALLOWED_TRANSITIONS[("training", "sleep")]
     assert should_stop_run(threading.Event(), time.perf_counter() - 1.0, None) == "time_limit"
     assert should_stop_run(threading.Event(), None, None) is None
@@ -792,10 +808,10 @@ def run_self_test():
     assert not suspended_event.is_set()
     assert ("sleep", "training") not in ALLOWED_TRANSITIONS
     assert ("sleep", "starting") not in ALLOWED_TRANSITIONS
-    assert "time_limit" not in ALLOWED_TRANSITIONS[("sleep", "idle")]
-    assert "poor_optimization" not in ALLOWED_TRANSITIONS[("sleep", "idle")]
-    assert "completed" in ALLOWED_TRANSITIONS[("sleep", "idle")]
-    assert {"completed", "migration_error", "user_stop"}.issubset(ALLOWED_TRANSITIONS[("migration", "idle")])
+    assert ("sleep", "idle") not in ALLOWED_TRANSITIONS
+    assert "poor_optimization" not in ALLOWED_TRANSITIONS[("sleep", "stopping")]
+    assert "completed" in ALLOWED_TRANSITIONS[("sleep", "stopping")]
+    assert {"completed", "migration_error", "user_stop"}.issubset(ALLOWED_TRANSITIONS[("migration", "stopping")])
     pool = ExperiencePool(settings)
     pool.add({"id": "t1", "mode": "learning", "mouse_action": {"type": "click", "start_rel": [0.5, 0.5]}, "reward": 12, "screen_hash_hex": "f", "screen_hash_bits": 4, "mouse_source": "user"})
     pool.add({"id": "t2", "mode": "training", "mouse_action": {"type": "click", "start_rel": [0.52, 0.52]}, "reward": 10, "screen_hash_hex": "d", "screen_hash_bits": 4, "mouse_source": "ai"})
@@ -4866,7 +4882,18 @@ class ControlPanel(tk.Tk):
             mapped_reason = "window_invalid"
         with self.state_lock:
             source_mode = self.mode if token == self.run_token else None
-        if not self.transition(None, "idle", reason=mapped_reason, token=token):
+        if source_mode in ("starting", "learning", "training", "sleep", "migration"):
+            if not self.transition(source_mode, "stopping", reason=mapped_reason, token=token):
+                return False
+            flushed, _ = self.flush_mode_data()
+            if not flushed:
+                return False
+            source_mode = "stopping"
+        elif source_mode == "stopping":
+            flushed, _ = self.flush_mode_data()
+            if not flushed:
+                return False
+        if not self.transition("stopping", "idle", reason=mapped_reason, token=token):
             return False
         self.update_progress(self.idle_progress_value(source_mode, progress), force=True)
         self.ui(self.update_mode_button_states)
@@ -4986,22 +5013,67 @@ class ControlPanel(tk.Tk):
             self.ui(lambda: self.pool_var.set(str(self.experience_pool.count())))
         return True
 
-    def ensure_runtime(self, config):
+    def runtime_environment_issues_for_config(self, config):
+        issues = []
+        if sys.version_info < MIN_PYTHON_VERSION:
+            issues.append(f"Python 版本过低：需要 {MIN_PYTHON_VERSION[0]}.{MIN_PYTHON_VERSION[1]} 或更高版本")
+        if sys.platform != "win32":
+            issues.append(f"操作系统不符合要求：本程序需要 Windows 桌面会话和雷电模拟器，当前平台为 {sys.platform}")
+        for name in REQUIRED_MODULES:
+            if name in IMPORT_ERRORS:
+                issues.append(f"依赖无法导入 {name}：{IMPORT_ERRORS[name]}")
+        storage_issue = data_path_write_issue(config.data_path)
+        if storage_issue:
+            issues.append(f"存储路径无效 {config.data_path}：{storage_issue}")
         valid_path, path_reason = validate_ldplayer_executable(config.ldplayer_path, config.settings, require_attach=False)
         if not valid_path:
-            self.ui(lambda r=path_reason: messagebox.showerror("雷电路径不合法", r))
-            return False
+            issues.append(f"雷电模拟器启动路径无效 {config.ldplayer_path}：{path_reason}")
         report = windows_runtime_report(config.ldplayer_path)
         if not report.get("ok"):
-            self.log_exception("runtime.environment", RuntimeError("environment_not_ready"), report)
-            self.ui(lambda r=report: messagebox.showerror("运行环境不符合要求", json.dumps(r, ensure_ascii=False, indent=2)))
-            return False
+            issues.append("Windows 桌面运行环境不可用：" + json.dumps(report, ensure_ascii=False))
+        return issues
+
+    def repair_runtime_environment_for_config(self, config, actions=None):
+        actions = actions if actions is not None else []
+        missing = [name for name in REQUIRED_MODULES if name in IMPORT_ERRORS]
+        if missing:
+            actions.append("自动安装缺失或异常依赖：" + "、".join(missing))
+            bootstrap_dependencies()
+        storage_issue = data_path_write_issue(config.data_path, create=True)
+        actions.append("已创建并验证存储路径可写" if not storage_issue else f"无法修复存储路径：{storage_issue}")
+        valid_path, path_reason = validate_ldplayer_executable(config.ldplayer_path, config.settings, require_attach=False)
+        if not valid_path:
+            actions.append(f"雷电模拟器路径无法自动修复：{path_reason}")
+        if sys.platform != "win32":
+            actions.append("当前操作系统无法由程序自动转换为 Windows 桌面环境")
+        return actions
+
+    def ensure_environment(self, stage, config=None, allow_repair=True, require_attach=False, show_error=True):
+        config = config or self.read_config()
+        result = ensure_environment(stage, allow_repair, lambda: self.runtime_environment_issues_for_config(config), lambda actions: self.repair_runtime_environment_for_config(config, actions))
+        if not result.ok:
+            self.runtime_environment_issue = "；".join(result.unrecoverable) or "运行环境不符合要求"
+            self.log_exception("runtime.environment", RuntimeError("environment_not_ready"), {"stage": stage, "result": result.detail()})
+            if show_error:
+                self.ui(lambda r=result: messagebox.showerror("运行环境不符合要求", r.detail()))
+            return result
+        self.runtime_environment_issue = ""
         self.ensure_storage_runtime(config)
-        if not self.window_manager or self.window_manager.executable_path != config.ldplayer_path or self.window_manager.settings != config.settings:
-            self.window_manager = WindowManager(config.ldplayer_path, config.settings)
-        if not self.executor or self.executor.window_manager is not self.window_manager or self.executor.settings != config.settings:
-            self.executor = HumanMouseExecutor(self.window_manager, config.settings)
-        return self.window_manager.launch_or_attach()
+        if require_attach:
+            if not self.window_manager or self.window_manager.executable_path != config.ldplayer_path or self.window_manager.settings != config.settings:
+                self.window_manager = WindowManager(config.ldplayer_path, config.settings)
+            if not self.executor or self.executor.window_manager is not self.window_manager or self.executor.settings != config.settings:
+                self.executor = HumanMouseExecutor(self.window_manager, config.settings)
+            attached = self.window_manager.launch_or_attach()
+            if not attached:
+                result = EnvironmentEnsureResult(False, stage, result.checks, result.repair_actions, ("无法启动或附着雷电模拟器客户区",), ("无法启动或附着雷电模拟器客户区",))
+                if show_error:
+                    self.ui(lambda r=result: messagebox.showerror("运行环境不符合要求", r.detail()))
+                return result
+        return result
+
+    def ensure_runtime(self, config):
+        return self.ensure_environment("runtime", config, allow_repair=True, require_attach=True).ok
 
     def learning_mode(self):
         self.request_active_mode("learning")
@@ -5011,13 +5083,9 @@ class ControlPanel(tk.Tk):
 
     def request_active_mode(self, target_mode, auto_restart=False):
         self.last_active_mode_failure = ""
-        if self.required_import_error():
-            self.last_active_mode_failure = "依赖缺失"
-            self.show_import_error()
-            return False
         config = self.read_config()
         self.status_var.set("正在检查运行环境")
-        if not self.ensure_runtime(config):
+        if not self.ensure_environment("自动重启训练" if auto_restart else target_mode, config, allow_repair=True, require_attach=True).ok:
             self.last_active_mode_failure = getattr(self, "runtime_environment_issue", "运行环境不符合要求") or "运行环境不符合要求"
             self.status_var.set("运行环境不符合要求，未进入模式")
             if auto_restart:
@@ -5125,7 +5193,9 @@ class ControlPanel(tk.Tk):
             return
         config = self.read_config()
         try:
-            self.ensure_storage_runtime(config)
+            env_result = self.ensure_environment("sleep", config, allow_repair=True, require_attach=False)
+            if not env_result.ok:
+                raise RuntimeError(env_result.detail())
         except Exception as exc:
             self.log_exception("sleep.storage", exc, {"data_path": str(config.data_path)})
             self.ui(lambda e=str(exc): messagebox.showerror("睡眠模式数据环境异常", e))
@@ -5217,13 +5287,32 @@ class ControlPanel(tk.Tk):
             visual_model = self.experience_pool.train_local_vision_model() if self.experience_pool else {"status": "missing_pool"}
             self.events.publish("sleep_local_vision_model_trained", status=visual_model.get("status"), records=visual_model.get("records", 0), clusters=len(visual_model.get("clusters", [])))
             self.store.merge_experience_records_by_id(copy.deepcopy(self.experience_pool.records))
-            review_status = "quarantined" if recheck_result.get("unrecoverable", 0) else "completed"
+            blocking_records = sum(safe_int(recheck_result.get(name, 0), 0) for name in ("unrecoverable", "image_missing", "image_corrupt"))
+            review_status = "failed" if blocking_records else "completed"
         except Exception as exc:
             review_status = "failed"
             self.log_exception("sleep_score_recheck", exc, recheck_result)
         self.ui(lambda r=recheck_result: self.progress_label_var.set(f"睡眠训练进度｜评分复核 {r.get('checked', 0)} 条｜重评 {r.get('rescored', 0)} 条｜不可恢复 {r.get('unrecoverable', 0)} 条"))
-        if self.store and recheck_result.get("unrecoverable", 0):
-            self.store.log_error("sleep_score_recheck_unrecoverable", RuntimeError("unrecoverable_screen_records"), recheck_result)
+        blocking_records = sum(safe_int(recheck_result.get(name, 0), 0) for name in ("unrecoverable", "image_missing", "image_corrupt"))
+        if self.store and blocking_records:
+            self.store.log_error("sleep_score_recheck_unrecoverable", RuntimeError("unrecoverable_or_invalid_screen_records"), recheck_result)
+        if review_status == "failed":
+            failure_detail = {"stage": "评分复核", "review_status": review_status, "result": recheck_result, "auto_restart_allowed": False}
+            if self.store:
+                self.store.log_error("sleep_review_failed_exit", RuntimeError("sleep_review_failed"), failure_detail)
+            self.ui(lambda r=recheck_result: self.progress_label_var.set(f"睡眠评分复核失败｜缺失 {r.get('image_missing', 0)}｜损坏 {r.get('image_corrupt', 0)}｜不可恢复 {r.get('unrecoverable', 0)}"))
+            self.update_progress(max(self.progress_value, 25.0), force=True)
+            saved, save_error, save_report = self.save_sleep_data(config, "review_failed", run_guard=run_guard, status_detail=failure_detail)
+            if not saved:
+                if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
+                    self.finish_run(token, "保存失败：" + str(save_error), self.progress_value, release=False, reason="runtime_error")
+                    self.ui(lambda e=str(save_error): messagebox.showerror("保存失败", e))
+                return
+            if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
+                self.render_sleep_completion_before_idle("睡眠评分复核失败，已保存失败上下文 100%", 100.0)
+                self.finish_run(token, "睡眠模式已退出：评分复核失败，需人工处理或明确降级策略", 100.0, release=True, reason="runtime_error")
+                self.ui(lambda d=json.dumps(failure_detail, ensure_ascii=False, indent=2): messagebox.showerror("评分复核失败", d))
+            return
         def train_once():
             if run_guard():
                 return {"trained": 0, "best_score": 0.0, "avg_score": 0.0, "avg_confidence": 0.0}
