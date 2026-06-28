@@ -840,6 +840,62 @@ def run_self_test():
         assert ControlPanel.sleep_compaction_complete(dummy_panel, {"size_bytes": 100, "target_bytes": 100})
         assert ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, deque([0.02, 0.02]), 0.01, 0.9, 0.8, True)
         assert not ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, deque([0.02, 0.02]), 0.01, 0.9, 0.8, True, "failed")
+        assert WindowCheck(True, "ok", (0, 0, 10, 10), 9, 9, 0.0).occluded_ratio == 0.0
+        for name, created in (("model_new.json", "2025-01-02T00:00:00.000"), ("model_old.json", "2025-01-01T00:00:00.000"), ("model_mid.json", "2025-01-01T12:00:00.000")):
+            (store.model_dir / name).write_text(json.dumps({"created_at": created, "model": {"type": "bad"}}), encoding="utf-8")
+        compact_models = store.compact_ai_models(2)
+        assert compact_models["removed"] == 1 and not (store.model_dir / "model_old.json").exists() and (store.model_dir / "model_mid.json").exists() and (store.model_dir / "model_new.json").exists()
+        original_win32gui, original_win32api, original_win32con = globals().get("win32gui"), globals().get("win32api"), globals().get("win32con")
+        class FakeWin32Gui:
+            @staticmethod
+            def IsWindow(hwnd):
+                return True
+            @staticmethod
+            def GetClientRect(hwnd):
+                return (0, 0, 100, 80)
+            @staticmethod
+            def ClientToScreen(hwnd, point):
+                return point
+            @staticmethod
+            def IsWindowVisible(hwnd):
+                return True
+            @staticmethod
+            def IsIconic(hwnd):
+                return False
+            @staticmethod
+            def WindowFromPoint(point):
+                return 101
+            @staticmethod
+            def IsChild(hwnd, other):
+                return False
+            @staticmethod
+            def EnumWindows(handler, arg):
+                return None
+            @staticmethod
+            def GetTopWindow(value):
+                return 101
+            @staticmethod
+            def GetWindow(hwnd, flag):
+                return 0
+        class FakeWin32Api:
+            @staticmethod
+            def GetSystemMetrics(index):
+                values = {76: 0, 77: 0, 78: 1000, 79: 800, 0: 1000, 1: 800}
+                return values.get(index, 0)
+        class FakeWin32Con:
+            GW_HWNDNEXT = 2
+        globals()["win32gui"] = FakeWin32Gui
+        globals()["win32api"] = FakeWin32Api
+        globals()["win32con"] = FakeWin32Con
+        try:
+            manager = WindowManager(executable, settings)
+            manager.hwnd = 101
+            checked_window = manager.check_window(force=True)
+            assert checked_window.ok and checked_window.occluded_ratio == 0.0
+        finally:
+            globals()["win32gui"] = original_win32gui
+            globals()["win32api"] = original_win32api
+            globals()["win32con"] = original_win32con
         transition_panel = ControlPanel.__new__(ControlPanel)
         transition_panel.state_lock = threading.RLock()
         transition_panel.mode = "training"
@@ -1989,9 +2045,18 @@ class DataStore:
             self.compact_ai_models(max_models)
             return path
 
+    def model_created_key(self, path):
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+            created = payload.get("created_at") if isinstance(payload, dict) else None
+            return str(created or path.name)
+        except Exception:
+            return path.name
+
     def compact_ai_models(self, max_models):
         limit = max(1, safe_int(max_models, AGENT_SPEC.default_ai_model_limit))
-        models = sorted(self.model_dir.glob("model_*.json"), key=lambda path: path.stat().st_mtime if path.exists() else 0.0, reverse=True)
+        models = sorted(self.model_dir.glob("model_*.json"), key=self.model_created_key, reverse=True)
         keep = min(len(models), limit)
         removed = 0
         for path in models[keep:]:
@@ -2000,7 +2065,7 @@ class DataStore:
                 removed += 1
             except Exception:
                 pass
-        return {"changed": removed > 0, "removed": removed, "limit": limit, "target_count": keep}
+        return {"changed": removed > 0, "removed": removed, "limit": limit, "target_count": keep, "model_count": len(models) - removed}
 
 
     def validate_model_state(self, payload, settings=None):
@@ -2028,7 +2093,7 @@ class DataStore:
         return {"weights": clean, "trained_steps": trained_steps, "loss": loss}
 
     def load_latest_model_state(self, settings=None):
-        candidates = sorted(self.model_dir.glob("model_*.json"), key=lambda path: path.stat().st_mtime if path.exists() else 0.0, reverse=True)
+        candidates = sorted(self.model_dir.glob("model_*.json"), key=self.model_created_key, reverse=True)
         for path in candidates:
             try:
                 with path.open("r", encoding="utf-8") as file:
@@ -2272,6 +2337,7 @@ class WindowCheck:
     rect: tuple = ()
     hits: int = 0
     expected: int = 0
+    occluded_ratio: float = 1.0
 
 
 class WindowManager:
@@ -2475,8 +2541,7 @@ class WindowManager:
             occluded_ratio = self.occluded_area_ratio(hwnd, rect)
             ok = hits == len(points) and occluded_ratio <= (1.0 / max(100.0, width * height))
             reason = "ok" if ok else "occluded"
-            result = WindowCheck(ok, reason, rect, hits, len(points))
-            result.occluded_ratio = occluded_ratio
+            result = WindowCheck(ok, reason, rect, hits, len(points), occluded_ratio)
             cache.update({"ok": result.ok, "reason": result.reason, "check": result})
             return result
         except Exception as exc:
@@ -3684,6 +3749,7 @@ class TrainingService:
             return False, {"failure_reason": actual.get("execution_error") or "execution_error"}
         latency_ms = safe_float(actual.get("duration", 0.0), 0.0) * 1000.0
         panel.adaptive_policy.observe_execution(latency_ms=latency_ms, success=True)
+        panel.mark_learning_activity()
         after_snapshot = panel.capture_snapshot(analyzer, "training", session_id, start, rect=rect, priority="critical")
         record = panel.write_record("training", session_id, snapshot, actual, "ai_mouse", decision=decision, action_anchor_perf=actual.get("started_perf"), after_snapshot=after_snapshot, planned_action=action, execution_latency_ms=round(latency_ms, 3))
         return True, record
@@ -4914,7 +4980,7 @@ class ControlPanel(tk.Tk):
                 remaining_seconds = max(0.0, sleep_deadline - time.perf_counter())
                 self.ui(lambda r=remaining_seconds, c=completed, t=target_training_steps, q=batch_confidence: self.progress_label_var.set(f"睡眠训练进度｜剩余 {r:.1f} 秒｜已训练批次 {c}/{t}｜当前置信度 {q * 100.0:.1f}%"))
                 self.update_progress(self.sleep_progress_percent(started_perf, config.sleep_seconds, completed, target_training_steps, compaction_progress))
-                if self.sleep_completion_reached(completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, True, review_status):
+                if self.sleep_completion_reached(completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, compaction_complete, review_status):
                     completed_success = True
                     self.events.publish("sleep_completion_reached", completed_batches=completed, target_training_steps=target_training_steps, confidence=batch_confidence, confidence_target=confidence_target)
                     break
@@ -4928,7 +4994,14 @@ class ControlPanel(tk.Tk):
         if save_status in ("completed", "time_limit", "poor_optimization") and (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
             self.update_progress(max(self.progress_value, 85.0), force=True)
             self.ui(lambda: self.progress_label_var.set("睡眠模式保存中｜进度 85%"))
-        saved, save_error = self.save_sleep_data(config, save_status, run_guard=run_guard)
+        saved, save_error, save_report = self.save_sleep_data(config, save_status, run_guard=run_guard)
+        compaction_complete = bool(save_report.get("compaction_complete", compaction_complete)) if isinstance(save_report, dict) else compaction_complete
+        models_complete = bool(save_report.get("models_complete", True)) if isinstance(save_report, dict) else True
+        completed_success = completed_success and compaction_complete and models_complete
+        if completed_success and save_status == "completed":
+            self.events.publish("sleep_completion_saved", model_count=save_report.get("model_count") if isinstance(save_report, dict) else None, experience_size=save_report.get("experience_size") if isinstance(save_report, dict) else None, target_bytes=save_report.get("target_bytes") if isinstance(save_report, dict) else None)
+        elif save_status == "completed":
+            save_status = "incomplete"
         if not saved:
             if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
                 self.finish_run(token, "保存失败：" + str(save_error), self.progress_value, release=False, reason="runtime_error")
@@ -4976,7 +5049,7 @@ class ControlPanel(tk.Tk):
 
     def save_sleep_data(self, config, status, run_guard=None):
         if not self.store or not self.experience_pool:
-            return True, None
+            return True, None, {"model_count": 0, "experience_size": 0, "target_bytes": 0, "compaction_complete": True, "models_complete": True}
         try:
             self.persistence_paused.set()
             persistence_guard = lambda: False
@@ -4998,12 +5071,16 @@ class ControlPanel(tk.Tk):
                 self.brain = ActionBrain(self.experience_pool, config.settings)
             self.update_progress(max(self.progress_value, 95.0), force=True)
             self.store.flush_state(force=True)
-            self.events.publish("save_completed", kind="sleep_data", status=status)
+            model_count = len(list(self.store.model_dir.glob("model_*.json")))
+            target_bytes = max(1, safe_int(compact.get("target_bytes", 0), 0))
+            experience_size = max(0, safe_int(compact.get("size_bytes", 0), 0))
+            report = {"model_count": model_count, "experience_size": experience_size, "target_bytes": target_bytes, "compaction_complete": experience_size <= target_bytes, "models_complete": model_count <= max(1, safe_int(config.ai_model_limit, AGENT_SPEC.default_ai_model_limit)), "compact": compact}
+            self.events.publish("save_completed", kind="sleep_data", status=status, **report)
             self.ui(lambda c=self.experience_pool.count(): self.pool_var.set(str(c)))
-            return True, None
+            return True, None, report
         except Exception as exc:
             self.log_exception("sleep_save", exc, {"status": status})
-            return False, exc
+            return False, exc, {"model_count": None, "experience_size": None, "target_bytes": None, "compaction_complete": False, "models_complete": False}
         finally:
             self.persistence_paused.clear()
 
