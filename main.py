@@ -55,9 +55,9 @@ AGENT_SPEC = AgentSpec(
 )
 
 
-def should_stop_run(stop_event, deadline, escape_check):
+def should_stop_run(stop_event, deadline, escape_check, termination_reason=None):
     if stop_event and stop_event.is_set():
-        return "esc"
+        return termination_reason if termination_reason in TERMINATION_REASONS else "user_stop"
     if escape_check and escape_check():
         return "esc"
     if deadline is not None and time.perf_counter() >= deadline:
@@ -763,6 +763,9 @@ def run_self_test():
     assert "time_limit" in ALLOWED_TRANSITIONS[("training", "sleep")]
     assert should_stop_run(threading.Event(), time.perf_counter() - 1.0, None) == "time_limit"
     assert should_stop_run(threading.Event(), None, None) is None
+    stopped_for_user = threading.Event()
+    stopped_for_user.set()
+    assert should_stop_run(stopped_for_user, None, None, "user_stop") == "user_stop"
     stop_check_panel = type("StopCheckPanel", (), {})()
     stop_check_panel.termination_reason = None
     stop_check_panel.should_stop_by_escape = lambda: False
@@ -3630,7 +3633,7 @@ class TrainingService:
     def should_stop(self, start, config, stop_event, suspend_time_limit=False):
         panel = self.panel
         deadline = None if suspend_time_limit else start + max(1, config.training_seconds)
-        guarded = should_stop_run(stop_event, deadline, panel.should_stop_by_escape)
+        guarded = should_stop_run(stop_event, deadline, panel.should_stop_by_escape, getattr(panel, "termination_reason", None))
         if guarded:
             panel.termination_reason = guarded
             stop_event.set()
@@ -4760,9 +4763,8 @@ class ControlPanel(tk.Tk):
         previous_ratio = clamp(getattr(self, "progress_value", 0.0) / 100.0, 0.0, 1.0)
         review_ratio = 1.0 if completed_steps > 0 or target_training_steps <= 0 else min(elapsed_ratio, 0.25)
         save_ratio = 0.0
-        task_ratio = review_ratio * 0.2 + training_ratio * 0.55 + compact_ratio * 0.2 + save_ratio * 0.05
-        floor_ratio = elapsed_ratio * 0.15
-        return {"time": elapsed_ratio, "review": review_ratio, "training": training_ratio, "compaction": compact_ratio, "save": save_ratio, "overall": max(previous_ratio, task_ratio, floor_ratio)}
+        task_ratio = review_ratio * 0.2 + training_ratio * 0.5 + compact_ratio * 0.15 + save_ratio * 0.15
+        return {"time": elapsed_ratio, "review": review_ratio, "training": training_ratio, "compaction": compact_ratio, "save": save_ratio, "overall": max(previous_ratio, task_ratio)}
 
     def sleep_progress_percent(self, started_perf, sleep_seconds, completed_steps, target_training_steps, compaction_progress):
         return clamp(self.sleep_progress_fields(started_perf, sleep_seconds, completed_steps, target_training_steps, compaction_progress)["overall"] * 100.0, 0.0, 100.0)
@@ -4808,26 +4810,22 @@ class ControlPanel(tk.Tk):
         completed_success = False
         started_perf = time.perf_counter()
         sleep_deadline = started_perf + max(1, config.sleep_seconds)
-        run_guard = lambda: should_stop_run(stop_event, sleep_deadline, self.should_stop_by_escape)
-        self.ui(lambda: self.progress_label_var.set("睡眠资源整理中｜正在立即压缩经验池并裁剪模型"))
+        run_guard = lambda: should_stop_run(stop_event, sleep_deadline, self.should_stop_by_escape, getattr(self.active_session, "termination_reason", None) or self.termination_reason)
+        self.ui(lambda: self.progress_label_var.set("睡眠准备中｜暂停异步写入并刷盘"))
         try:
             self.persistence_paused.set()
             if self.persistence_queue:
                 self.persistence_queue.flush()
             self.store.flush_state(force=True)
-            self.store.compact_ai_models(config.ai_model_limit)
-            initial_compact = self.store.compact_experience_pool(config.experience_pool_gb, run_guard=run_guard)
+            initial_compact = {"changed": False, "size_bytes": self.store.experience_pool_size_bytes() if self.store else 0, "target_bytes": max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))}
             compaction_progress = self.sleep_compaction_progress(initial_compact)
             compaction_complete = self.sleep_compaction_complete(initial_compact)
-            if initial_compact.get("changed"):
-                self.events.publish("experience_pool_compaction_completed", removed=initial_compact.get("removed", 0), size_bytes=initial_compact.get("size_bytes", 0))
-                self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit), self.store.load_latest_model_state(config.settings))
-                self.brain = ActionBrain(self.experience_pool, config.settings)
+            self.events.publish("sleep_capacity_review", size_bytes=initial_compact.get("size_bytes", 0), target_bytes=initial_compact.get("target_bytes", 0), over_limit=not compaction_complete)
         except Exception as exc:
-            self.log_exception("sleep_initial_compaction", exc, initial_compact)
+            self.log_exception("sleep_prepare", exc, initial_compact)
         finally:
             self.persistence_paused.clear()
-        self.update_progress(15.0)
+        self.update_progress(0.0, force=True)
         self.ui(lambda: self.progress_label_var.set("睡眠评分复核中｜正在检查全部画面评分"))
         recheck_result = {"checked": 0, "rescored": 0, "missing": 0, "errors": 0, "image_missing": 0, "image_corrupt": 0, "hash_missing": 0, "unrecoverable": 0}
         review_status = "failed"
@@ -4916,7 +4914,7 @@ class ControlPanel(tk.Tk):
                 remaining_seconds = max(0.0, sleep_deadline - time.perf_counter())
                 self.ui(lambda r=remaining_seconds, c=completed, t=target_training_steps, q=batch_confidence: self.progress_label_var.set(f"睡眠训练进度｜剩余 {r:.1f} 秒｜已训练批次 {c}/{t}｜当前置信度 {q * 100.0:.1f}%"))
                 self.update_progress(self.sleep_progress_percent(started_perf, config.sleep_seconds, completed, target_training_steps, compaction_progress))
-                if self.sleep_completion_reached(completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, compaction_complete, review_status):
+                if self.sleep_completion_reached(completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, True, review_status):
                     completed_success = True
                     self.events.publish("sleep_completion_reached", completed_batches=completed, target_training_steps=target_training_steps, confidence=batch_confidence, confidence_target=confidence_target)
                     break
@@ -4928,8 +4926,8 @@ class ControlPanel(tk.Tk):
             stopped_reason = self.termination_reason if self.termination_reason in ("esc", "user_stop") else None
         save_status = "completed" if completed_success else ("poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached else (stopped_reason or "incomplete")))
         if save_status in ("completed", "time_limit", "poor_optimization") and (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
-            self.update_progress(max(self.progress_value, 95.0), force=True)
-            self.ui(lambda: self.progress_label_var.set("睡眠模式保存中｜进度 95%"))
+            self.update_progress(max(self.progress_value, 85.0), force=True)
+            self.ui(lambda: self.progress_label_var.set("睡眠模式保存中｜进度 85%"))
         saved, save_error = self.save_sleep_data(config, save_status, run_guard=run_guard)
         if not saved:
             if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
@@ -4985,17 +4983,20 @@ class ControlPanel(tk.Tk):
             if self.persistence_queue:
                 self.persistence_queue.flush()
             self.store.flush_state(force=True)
+            self.update_progress(max(self.progress_value, 85.0), force=True)
             with self.experience_pool.lock:
                 recheck_records = copy.deepcopy(self.experience_pool.records)
                 self.store.merge_experience_records_by_id(recheck_records)
-                compact = self.store.compact_experience_pool(config.experience_pool_gb, run_guard=persistence_guard)
-                if compact.get("changed"):
-                    self.events.publish("experience_pool_compaction_completed", removed=compact.get("removed", 0), size_bytes=compact.get("size_bytes", 0))
-                    self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit), self.store.load_latest_model_state(config.settings))
-                    self.brain = ActionBrain(self.experience_pool, config.settings)
                 records = copy.deepcopy(self.experience_pool.records)
                 model = self.experience_pool.model
             self.store.save_ai_model_snapshot(records, config.settings, config.ai_model_limit, status, model, run_guard=persistence_guard)
+            self.update_progress(max(self.progress_value, 90.0), force=True)
+            compact = self.store.compact_experience_pool(config.experience_pool_gb, run_guard=persistence_guard)
+            if compact.get("changed"):
+                self.events.publish("experience_pool_compaction_completed", removed=compact.get("removed", 0), size_bytes=compact.get("size_bytes", 0))
+                self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit), self.store.load_latest_model_state(config.settings))
+                self.brain = ActionBrain(self.experience_pool, config.settings)
+            self.update_progress(max(self.progress_value, 95.0), force=True)
             self.store.flush_state(force=True)
             self.events.publish("save_completed", kind="sleep_data", status=status)
             self.ui(lambda c=self.experience_pool.count(): self.pool_var.set(str(c)))
@@ -5218,7 +5219,12 @@ class ControlPanel(tk.Tk):
             if not saved:
                 self.finish_run(token, "保存失败：" + str(save_error), 0.0, release=False, reason="runtime_error")
             else:
-                self.finish_run(token, "学习模式结束", 0.0, reason=termination_reason if not stop_event.is_set() else (termination_reason or "user_stop"))
+                final_reason = self.termination_reason
+                if final_reason not in TERMINATION_REASONS:
+                    final_reason = termination_reason
+                if stop_event.is_set() and final_reason == "completed":
+                    final_reason = "user_stop"
+                self.finish_run(token, "学习模式结束", 0.0, reason=final_reason)
         else:
             self.release_window_and_panel()
 
