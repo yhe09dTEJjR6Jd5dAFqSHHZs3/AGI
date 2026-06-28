@@ -640,6 +640,7 @@ class ScreenSnapshot:
     capture_latency_ms: Optional[float] = None
     image_priority: str = "normal"
     image_checksum: str = ""
+    semantic_vector: tuple = ()
 
 
 def image_content_checksum(image):
@@ -809,6 +810,9 @@ def run_self_test():
     pool.apply_settings(changed)
     assert pool.index_settings.hash_prefix_bits == changed.hash_prefix_bits
     assert pool.nearest(a)
+    assert semantic_similarity((1.0, 0.0), (1.0, 0.0)) == 1.0
+    pool.add({"id": "t3", "mode": "learning", "mouse_action": {"type": "click", "start_rel": [0.1, 0.1]}, "reward": 1, "screen_hash_hex": "0", "screen_hash_bits": 4, "mouse_source": "user", "image_checksum": "exact-a", "screen_semantic_vector": [1.0, 0.0]})
+    assert pool.compute_screen_score(a, exact_checksum="exact-a", semantic_vector=[0.0, 1.0])[0] == 0.0
     sleep_result = pool.sleep_training_step(changed.sleep_batch_size)
     assert sleep_result["trained"] >= 1
     assert pool.records[0].get("sleep_visits", 0) >= 1
@@ -1569,6 +1573,39 @@ def hash_similarity(hash_a, hash_b):
         return 0.0
     diff, bits = distance
     return clamp(1.0 - diff / bits, 0.0, 1.0)
+
+
+def parse_semantic_vector(value):
+    if not value:
+        return ()
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            return ()
+    if not isinstance(value, (list, tuple)):
+        return ()
+    result = []
+    for item in value:
+        try:
+            result.append(float(item))
+        except Exception:
+            return ()
+    return tuple(result)
+
+
+def semantic_similarity(vector_a, vector_b):
+    vector_a = parse_semantic_vector(vector_a)
+    vector_b = parse_semantic_vector(vector_b)
+    size = min(len(vector_a), len(vector_b))
+    if size <= 0:
+        return None
+    dot = sum(vector_a[index] * vector_b[index] for index in range(size))
+    norm_a = math.sqrt(sum(vector_a[index] * vector_a[index] for index in range(size)))
+    norm_b = math.sqrt(sum(vector_b[index] * vector_b[index] for index in range(size)))
+    if norm_a <= 0.0 or norm_b <= 0.0:
+        return None
+    return clamp((dot / (norm_a * norm_b) + 1.0) * 0.5, 0.0, 1.0)
 
 
 def reward_breakdown(novelty, human_score, settings):
@@ -2632,6 +2669,29 @@ class ScreenAnalyzer:
         width = max(1, math.ceil(bits / 4))
         return HashValue(value=value, bits=bits, hex=f"{value:0{width}x}")
 
+    def semantic_fingerprint(self, image):
+        size = max(4, min(16, self.hash_size))
+        rgb = image.convert("RGB").resize((size, size), self.resample)
+        gray = rgb.convert("L")
+        gray_pixels = list(gray.tobytes())
+        mean = sum(gray_pixels) / max(1, len(gray_pixels))
+        variance = sum((pixel - mean) * (pixel - mean) for pixel in gray_pixels) / max(1, len(gray_pixels))
+        features = [(pixel - mean) / 255.0 for pixel in gray_pixels]
+        channels = list(rgb.getdata())
+        for channel in range(3):
+            values = [pixel[channel] for pixel in channels]
+            features.append((sum(values) / max(1, len(values)) - 127.5) / 127.5)
+            buckets = [0, 0, 0, 0]
+            for value in values:
+                buckets[min(3, int(value) * 4 // 256)] += 1
+            features.extend(count / max(1, len(values)) for count in buckets)
+        features.append((mean - 127.5) / 127.5)
+        features.append(math.sqrt(variance) / 127.5)
+        norm = math.sqrt(sum(value * value for value in features))
+        if norm <= 0.0:
+            return tuple(round(value, 6) for value in features)
+        return tuple(round(value / norm, 6) for value in features)
+
     def close(self):
         if self.sct:
             try:
@@ -2833,12 +2893,14 @@ class ExperiencePool:
             valid = [index for index, item in enumerate(self.hashes) if item]
             return random.sample(valid, self.index_settings.nearest_candidate_limit) if len(valid) > self.index_settings.nearest_candidate_limit else valid
 
-    def nearest(self, hash_value, exclude_id=None, limit=None, before_index=None):
+    def nearest(self, hash_value, exclude_id=None, limit=None, before_index=None, semantic_vector=None):
         if not hash_value:
             return []
         with self.lock:
             top_k = max(1, safe_int(limit, self.settings.nearest_top_k))
-            cache_key = None if exclude_id is not None or limit is not None or before_index is not None else (self.index_version, hash_value.bits, hash_value.hex, self.index_settings.hash_prefix_bits, self.index_settings.nearest_candidate_limit, self.settings.nearest_top_k)
+            query_semantic = parse_semantic_vector(semantic_vector)
+            semantic_key = tuple(round(value, 4) for value in query_semantic[:32]) if query_semantic else ()
+            cache_key = None if exclude_id is not None or limit is not None or before_index is not None else (self.index_version, hash_value.bits, hash_value.hex, semantic_key, self.index_settings.hash_prefix_bits, self.index_settings.nearest_candidate_limit, self.settings.nearest_top_k)
             cached = self.nearest_cache.get(cache_key) if cache_key is not None else None
             if cached is not None:
                 self.nearest_cache.move_to_end(cache_key)
@@ -2851,8 +2913,10 @@ class ExperiencePool:
         scored = []
         for index, other, record in snapshot:
             if other:
-                similarity = hash_similarity(hash_value, other)
-                item = {"similarity": similarity, "record": record}
+                hash_score = hash_similarity(hash_value, other)
+                semantic_score = semantic_similarity(query_semantic, record.get("screen_semantic_vector"))
+                similarity = clamp(hash_score if semantic_score is None else hash_score * 0.35 + semantic_score * 0.65, 0.0, 1.0)
+                item = {"similarity": similarity, "hash_similarity": hash_score, "semantic_similarity": semantic_score, "record": record}
                 if len(scored) < top_k:
                     heapq.heappush(scored, (similarity, index, item))
                 elif similarity > scored[0][0]:
@@ -2867,14 +2931,14 @@ class ExperiencePool:
                     self.nearest_cache.popitem(last=False)
         return result
 
-    def novelty(self, hash_value, exact_checksum=None):
-        score, neighbors, _ = self.compute_screen_score(hash_value, exact_checksum=exact_checksum)
+    def novelty(self, hash_value, exact_checksum=None, semantic_vector=None):
+        score, neighbors, _ = self.compute_screen_score(hash_value, exact_checksum=exact_checksum, semantic_vector=semantic_vector)
         return score, neighbors
 
     def score_snapshot(self, snapshot, exclude_id=None, before_index=None):
         if not snapshot:
             return 0.0, [], 0.0
-        return self.compute_screen_score(snapshot.hash_value, exclude_id=exclude_id, before_index=before_index, exact_checksum=getattr(snapshot, "image_checksum", ""))
+        return self.compute_screen_score(snapshot.hash_value, exclude_id=exclude_id, before_index=before_index, exact_checksum=getattr(snapshot, "image_checksum", ""), semantic_vector=getattr(snapshot, "semantic_vector", ()))
 
     def best_global_action(self):
         with self.lock:
@@ -2905,12 +2969,14 @@ class ExperiencePool:
             sampled = random.sample(action_indices, min(len(action_indices), max(0, remaining))) if remaining > 0 else []
             return list(dict.fromkeys(ranked + recent + sampled))[:target]
 
-    def compute_screen_score(self, hash_value, exclude_id=None, before_index=None, exact_checksum=None):
-        neighbors = self.nearest(hash_value, exclude_id=exclude_id, limit=self.settings.nearest_top_k, before_index=before_index)
+    def compute_screen_score(self, hash_value, exclude_id=None, before_index=None, exact_checksum=None, semantic_vector=None):
+        if exact_checksum:
+            with self.lock:
+                for index, record in enumerate(self.records):
+                    if (before_index is None or index < before_index) and (exclude_id is None or record.get("id") != exclude_id) and self.record_trainable(record) and exact_checksum == record.get("image_checksum"):
+                        return 0.0, [{"similarity": 1.0, "hash_similarity": 1.0, "semantic_similarity": 1.0, "record": record}], 1.0
+        neighbors = self.nearest(hash_value, exclude_id=exclude_id, limit=self.settings.nearest_top_k, before_index=before_index, semantic_vector=semantic_vector)
         sims = [clamp(item.get("similarity", 0.0), 0.0, 1.0) for item in neighbors]
-        exact_match = bool(exact_checksum) and any(exact_checksum == item.get("record", {}).get("image_checksum") for item in neighbors)
-        if exact_match:
-            return 0.0, neighbors, 1.0
         if sims:
             top = sims[:max(1, min(self.settings.nearest_top_k, len(sims)))]
             density = sum(1 for item in top if item >= 0.95) / len(top)
@@ -2951,6 +3017,7 @@ class ExperiencePool:
                         with Image.open(path) as image:
                             rgb_image = image.convert("RGB")
                             file_hash = analyzer.fingerprint(rgb_image)
+                            record["screen_semantic_vector"] = analyzer.semantic_fingerprint(rgb_image)
                             record["image_checksum"] = image_content_checksum(rgb_image)
                     else:
                         if record.get("image_dropped") or record.get("screen_file_expected") is False:
@@ -2981,7 +3048,7 @@ class ExperiencePool:
                 if callable(progress_callback):
                     progress_callback(processed, total)
                 continue
-            score, neighbors, confidence = self.compute_screen_score(hash_value, exclude_id=record.get("id"), before_index=index, exact_checksum=record.get("image_checksum"))
+            score, neighbors, confidence = self.compute_screen_score(hash_value, exclude_id=record.get("id"), before_index=index, exact_checksum=record.get("image_checksum"), semantic_vector=record.get("screen_semantic_vector"))
             old_score = safe_float(record.get("screen_score", record.get("novelty", record.get("after_novelty", None))), None)
             lacks = old_score is None or record.get("score_version") != 1 or not record.get("score_basis")
             wrong = old_score is not None and abs(score - old_score) > tolerance
@@ -3021,7 +3088,7 @@ class ExperiencePool:
         for index, hash_value, record in snapshot:
             if run_guard and run_guard():
                 break
-            novelty, neighbors, similarity_confidence = self.compute_screen_score(hash_value, exclude_id=record.get("id"), before_index=index)
+            novelty, neighbors, similarity_confidence = self.compute_screen_score(hash_value, exclude_id=record.get("id"), before_index=index, exact_checksum=record.get("image_checksum"), semantic_vector=record.get("screen_semantic_vector"))
             action = record.get("mouse_action")
             human_score = clamp(record.get("human_score", self.profile.score(action)), 0.0, 100.0) if action else self.settings.score_default
             reward = strict_reward_value(novelty, human_score)
@@ -3748,7 +3815,7 @@ class TrainingService:
 
     def decide_action(self, snapshot, zero_score_factor=0.0):
         panel = self.panel
-        novelty, batch = panel.experience_pool.novelty(snapshot.hash_value)
+        novelty, batch = panel.experience_pool.novelty(snapshot.hash_value, exact_checksum=getattr(snapshot, "image_checksum", ""), semantic_vector=getattr(snapshot, "semantic_vector", ()))
         screen_score_total = panel.store.screen_score_total if panel.store else 0.0
         return panel.brain.choose(snapshot.hash_value, novelty, batch, screen_score_total, zero_score_factor=zero_score_factor)
 
@@ -5275,9 +5342,10 @@ class ControlPanel(tk.Tk):
             image = analyzer.capture(rect)
             captured_perf = time.perf_counter()
             hash_value = analyzer.fingerprint(image)
+            semantic_vector = analyzer.semantic_fingerprint(image)
             path = self.store.new_screen_path(mode)
             checksum = image_content_checksum(image)
-            snapshot = ScreenSnapshot(path=path, relative_path=self.store.relative_path(path), hash_value=hash_value, captured_at=now_text(), perf_time=perf_time, elapsed=round(perf_time - session_start, 3), rect=tuple(rect), capture_latency_ms=round((captured_perf - perf_time) * 1000.0, 3), image_priority=priority, image_checksum=checksum)
+            snapshot = ScreenSnapshot(path=path, relative_path=self.store.relative_path(path), hash_value=hash_value, captured_at=now_text(), perf_time=perf_time, elapsed=round(perf_time - session_start, 3), rect=tuple(rect), capture_latency_ms=round((captured_perf - perf_time) * 1000.0, 3), image_priority=priority, image_checksum=checksum, semantic_vector=semantic_vector)
             self.events.publish("screenshot_completed", mode=mode, path=str(path), latency_ms=snapshot.capture_latency_ms)
             return snapshot, image
         except Exception as exc:
@@ -5315,11 +5383,11 @@ class ControlPanel(tk.Tk):
     def write_record(self, mode, session_id, snapshot, action, event_name, decision=None, action_anchor_perf=None, after_snapshot=None, planned_action=None, failed_action=False, window_rect_changed=False, capture_latency_ms=None, execution_latency_ms=None, execution_error=None):
         if not self.store or not snapshot:
             return None
-        before_novelty, batch = self.experience_pool.compute_screen_score(snapshot.hash_value, exact_checksum=getattr(snapshot, "image_checksum", ""))[:2]
+        before_novelty, batch = self.experience_pool.compute_screen_score(snapshot.hash_value, exact_checksum=getattr(snapshot, "image_checksum", ""), semantic_vector=getattr(snapshot, "semantic_vector", ()))[:2]
         normalized = normalize_mouse_action(action, snapshot.rect) if action else None
         mouse_source = normalized.get("source") if normalized else "idle"
         human_score = self.experience_pool.human_score(normalized) if normalized else 50.0
-        after_novelty = self.experience_pool.compute_screen_score(after_snapshot.hash_value, exact_checksum=getattr(after_snapshot, "image_checksum", ""))[0] if after_snapshot else before_novelty
+        after_novelty = self.experience_pool.compute_screen_score(after_snapshot.hash_value, exact_checksum=getattr(after_snapshot, "image_checksum", ""), semantic_vector=getattr(after_snapshot, "semantic_vector", ()))[0] if after_snapshot else before_novelty
         transition_reward = round(after_novelty - before_novelty, 2)
         scoring_novelty = after_novelty if normalized and after_snapshot else before_novelty
         reward_info = reward_breakdown(scoring_novelty, human_score if normalized else self.settings.score_default, self.settings)
@@ -5336,7 +5404,7 @@ class ControlPanel(tk.Tk):
         offset_ms = round((float(offset_source) - snapshot.perf_time) * 1000.0, 3) if offset_source is not None else None
         sims = [round(item["similarity"], 4) for item in batch]
         record_event = self.events.publish("record_ready", mode=mode, session_id=session_id, event_name=event_name)
-        record = {"record_schema_version": 2, "reward_version": reward_info["reward_version"], "id": uuid.uuid4().hex, "event_sequence": record_event["sequence"], "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": before_novelty, "screen_score": before_novelty, "score_version": 1, "score_basis": "nearest_screen_content_live", "score_checked_at": now_text(), "score_neighbors": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "before_screen": snapshot.relative_path, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_screen_hash": snapshot.hash_value.hex, "before_screen_score": before_novelty, "after_screen_hash": after_snapshot.hash_value.hex if after_snapshot else snapshot.hash_value.hex, "after_screen_hash_int": after_snapshot.hash_value.value if after_snapshot else snapshot.hash_value.value, "after_screen_hash_bits": after_snapshot.hash_value.bits if after_snapshot else snapshot.hash_value.bits, "after_screen_score": after_novelty, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": {"screen_novelty": reward_info["screen_novelty"], "screen_reward": reward_info["screen_reward"], "human_similarity": reward_info["human_similarity"], "human_tiebreak": reward_info["human_tiebreak"], "screen_score_delta": reward_info["screen_score_delta"], "basis": reward_info["basis"]}, "reward_sort_key": reward_info["reward_sort_key"], "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "screen_score_delta": max(0.0, reward), "screen_score_settled": max(0.0, reward), "penalty_delta": max(0.0, -reward), "screen_score_total": screen_score_total, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "image_checksum": getattr(snapshot, "image_checksum", ""), "after_image_checksum": getattr(after_snapshot, "image_checksum", "") if after_snapshot else getattr(snapshot, "image_checksum", ""), "image_dropped": bool(getattr(snapshot, "image_dropped", False)), "screen_file_expected": not bool(getattr(snapshot, "image_dropped", False)), "capture_latency_ms": capture_latency_ms if capture_latency_ms is not None else getattr(snapshot, "capture_latency_ms", None), "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_event_wait": self.settings.training_event_wait, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
+        record = {"record_schema_version": 2, "reward_version": reward_info["reward_version"], "id": uuid.uuid4().hex, "event_sequence": record_event["sequence"], "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_semantic_vector": list(getattr(snapshot, "semantic_vector", ())), "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": before_novelty, "screen_score": before_novelty, "score_version": 1, "score_basis": "nearest_screen_content_live", "score_checked_at": now_text(), "score_neighbors": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "before_screen": snapshot.relative_path, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_screen_hash": snapshot.hash_value.hex, "before_screen_score": before_novelty, "after_screen_hash": after_snapshot.hash_value.hex if after_snapshot else snapshot.hash_value.hex, "after_screen_hash_int": after_snapshot.hash_value.value if after_snapshot else snapshot.hash_value.value, "after_screen_hash_bits": after_snapshot.hash_value.bits if after_snapshot else snapshot.hash_value.bits, "after_screen_semantic_vector": list(getattr(after_snapshot, "semantic_vector", ())) if after_snapshot else list(getattr(snapshot, "semantic_vector", ())), "after_screen_score": after_novelty, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": {"screen_novelty": reward_info["screen_novelty"], "screen_reward": reward_info["screen_reward"], "human_similarity": reward_info["human_similarity"], "human_tiebreak": reward_info["human_tiebreak"], "screen_score_delta": reward_info["screen_score_delta"], "basis": reward_info["basis"]}, "reward_sort_key": reward_info["reward_sort_key"], "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "screen_score_delta": max(0.0, reward), "screen_score_settled": max(0.0, reward), "penalty_delta": max(0.0, -reward), "screen_score_total": screen_score_total, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "image_checksum": getattr(snapshot, "image_checksum", ""), "after_image_checksum": getattr(after_snapshot, "image_checksum", "") if after_snapshot else getattr(snapshot, "image_checksum", ""), "image_dropped": bool(getattr(snapshot, "image_dropped", False)), "screen_file_expected": not bool(getattr(snapshot, "image_dropped", False)), "capture_latency_ms": capture_latency_ms if capture_latency_ms is not None else getattr(snapshot, "capture_latency_ms", None), "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_event_wait": self.settings.training_event_wait, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
         if decision:
             record["ai_decision"] = decision
         self.persistence_queue.enqueue_record(self.store, record)
