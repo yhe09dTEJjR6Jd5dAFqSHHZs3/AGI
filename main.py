@@ -818,6 +818,26 @@ def run_self_test():
         store.state_file.write_text("{bad json}", encoding="utf-8")
         rebuilt_state = store.load_state()
         assert rebuilt_state == {"screen_score_total": 0.0, "penalty": 0.0}
+        analyzer = ScreenAnalyzer(settings.hash_size)
+        image = Image.new("RGB", (16, 16), (24, 64, 128))
+        png_path = root / "screen.png"
+        analyzer.save_image(image, png_path, priority="critical", settings=settings)
+        assert png_path.exists()
+        reopened = Image.open(png_path)
+        reopened.load()
+        assert reopened.format == "PNG"
+        assert image_content_checksum(reopened) == image_content_checksum(image)
+        queued_path = root / "queued.png"
+        persistence = AsyncPersistenceQueue(settings)
+        try:
+            assert persistence.enqueue_image(analyzer, image, queued_path, priority="critical")
+            persistence.flush()
+        finally:
+            persistence.close()
+        reopened_queue = Image.open(queued_path)
+        reopened_queue.load()
+        assert reopened_queue.format == "PNG"
+        assert image_content_checksum(reopened_queue) == image_content_checksum(image)
         assert list(store.root.glob("state.bad.*.json")) and json.loads(store.state_file.read_text(encoding="utf-8"))["screen_score_total"] == 0.0
         shared = store.screen_dir / "shared.png"
         unique = store.screen_dir / "unique.png"
@@ -2585,8 +2605,8 @@ class ScreenAnalyzer:
             compression = 1 if priority == "critical" else 3
             if settings is not None and settings.training_event_wait > settings.ui_event_coalesce_seconds:
                 compression = 1
-            save_kwargs = {"optimize": priority == "critical", "compress_level": int(clamp(compression, 0, 9))}
-        temporary = path.with_name(path.name + f".{uuid.uuid4().hex}.tmp")
+            save_kwargs = {"format": "PNG", "optimize": priority == "critical", "compress_level": int(clamp(compression, 0, 9))}
+        temporary = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp{path.suffix}")
         image.save(temporary, **save_kwargs)
         temporary.replace(path)
 
@@ -4439,6 +4459,9 @@ class ControlPanel(tk.Tk):
                 self.finish_run(token, reason, 0.0, release=False, reason="completed")
             elif self.is_run_active(token, "migration"):
                 self.finish_run(token, reason, 0.0, release=False, reason="user_stop")
+            elif self.is_run_active(token, "stopping"):
+                final_reason = self.termination_reason if self.termination_reason in ("esc", "user_stop") else "user_stop"
+                self.finish_run(token, "数据迁移已终止", 0.0, release=False, reason=final_reason)
         except Exception as exc:
             if backup_root and Path(backup_root).exists():
                 try:
@@ -5544,10 +5567,22 @@ class ControlPanel(tk.Tk):
             self.release_window_and_panel()
 
     def close(self):
+        mode_thread = self.mode_thread
+        with self.state_lock:
+            active_mode = self.mode
+        if active_mode in ["starting", "learning", "training", "sleep", "migration"]:
+            self.request_stop("user_stop")
+            if mode_thread and mode_thread.is_alive():
+                mode_thread.join(timeout=max(self.settings.persistence_close_seconds, self.settings.persistence_close_seconds * 3.0))
         with self.state_lock:
             self.stop_event.set()
-            self.run_token += 1
-            self.mode = "idle"
+            if self.mode not in ("idle",):
+                self.run_token += 1
+                self.mode = "idle"
+        if self.persistence_queue:
+            self.persistence_queue.flush()
+        if self.store:
+            self.store.flush_state(force=True)
         if self.runtime_environment_refresh_id:
             try:
                 self.after_cancel(self.runtime_environment_refresh_id)
