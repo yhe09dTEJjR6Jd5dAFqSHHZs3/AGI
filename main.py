@@ -36,7 +36,6 @@ class AgentSpec:
     default_ldplayer_path: str
     default_data_path: str
     default_training_seconds: int
-    default_sleep_seconds: int
     default_still_seconds: float
     default_experience_pool_gb: float
     default_ai_model_limit: int
@@ -47,11 +46,10 @@ AGENT_SPEC = AgentSpec(
     default_ldplayer_path=r"D:\LDPlayer9\dnplayer.exe",
     default_data_path=r"C:\Users\Administrator\Desktop\AAA",
     default_training_seconds=900,
-    default_sleep_seconds=1800,
     default_still_seconds=10.0,
     default_experience_pool_gb=10.0,
     default_ai_model_limit=10,
-    editable_fields=("ldplayer_path", "data_path", "training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit")
+    editable_fields=("ldplayer_path", "data_path", "training_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit")
 )
 
 
@@ -340,27 +338,26 @@ def configuration_failure(area, error):
 
 
 def default_runtime_settings_payload():
-    return {"training_seconds": AGENT_SPEC.default_training_seconds, "sleep_seconds": AGENT_SPEC.default_sleep_seconds, "still_seconds": AGENT_SPEC.default_still_seconds, "experience_pool_gb": AGENT_SPEC.default_experience_pool_gb, "ai_model_limit": AGENT_SPEC.default_ai_model_limit}
+    return {"training_seconds": AGENT_SPEC.default_training_seconds, "still_seconds": AGENT_SPEC.default_still_seconds, "experience_pool_gb": AGENT_SPEC.default_experience_pool_gb, "ai_model_limit": AGENT_SPEC.default_ai_model_limit}
 
 
 DEFAULT_LDPLAYER_PATH = AGENT_SPEC.default_ldplayer_path
 DEFAULT_DATA_PATH = AGENT_SPEC.default_data_path
 DEFAULT_TRAINING_SECONDS = AGENT_SPEC.default_training_seconds
-DEFAULT_SLEEP_SECONDS = AGENT_SPEC.default_sleep_seconds
 DEFAULT_STILL_SECONDS = AGENT_SPEC.default_still_seconds
 DEFAULT_EXPERIENCE_POOL_GB = AGENT_SPEC.default_experience_pool_gb
 DEFAULT_AI_MODEL_LIMIT = AGENT_SPEC.default_ai_model_limit
 MODE_NAMES = {"idle": "空闲", "starting": "准备中", "learning": "学习模式", "training": "训练模式", "sleep": "睡眠模式", "migration": "数据迁移", "stopping": "正在退出"}
 CONFIG_SCHEMA_VERSION = 1
 USER_EDITABLE_STARTUP_FIELDS = ("ldplayer_path", "data_path")
-USER_EDITABLE_RUNTIME_FIELDS = ("training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit")
+USER_EDITABLE_RUNTIME_FIELDS = ("training_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit")
 USER_EDITABLE_FIELDS = AGENT_SPEC.editable_fields
 
 
 class AllowedUserEditPolicy:
     ALLOWED_FIELDS = frozenset(AGENT_SPEC.editable_fields)
     STARTUP_FIELDS = frozenset(("ldplayer_path", "data_path"))
-    RUNTIME_FIELDS = frozenset(("training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit"))
+    RUNTIME_FIELDS = frozenset(("training_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit"))
 
     @classmethod
     def filter(cls, settings, scope=None):
@@ -395,13 +392,12 @@ ALLOWED_TRANSITIONS = {
     ("training", "idle"): {"esc", "still_timeout", "window_invalid", "cursor_outside", "user_stop", "runtime_error", "executor_error"},
     ("training", "sleep"): {"time_limit"},
     ("sleep", "stopping"): {"user_stop", "esc", "runtime_error"},
-    ("sleep", "idle"): {"esc", "time_limit", "poor_optimization", "user_stop", "runtime_error"},
+    ("sleep", "idle"): {"esc", "user_stop", "runtime_error"},
     ("migration", "idle"): {"completed", "migration_error", "user_stop"}
 }
 
 
-TERMINATION_REASONS = ("window_invalid", "cursor_outside", "rect_changed", "empty_action", "executor_error", "time_limit", "esc", "still_timeout", "user_stop", "migration_error", "completed", "poor_optimization")
-POOR_OPTIMIZATION_REASONS = ("no_trainable_records", "repeated_zero_training_batches", "repeated_no_reward_improvement", "repeated_model_loss_worsening", "score_review_failed", "training_errors")
+TERMINATION_REASONS = ("window_invalid", "cursor_outside", "rect_changed", "empty_action", "executor_error", "time_limit", "esc", "still_timeout", "user_stop", "migration_error", "completed")
 HUMAN_FEATURE_NAMES = ("duration", "direct", "bend", "points", "speed_mean", "speed_variance", "acceleration_change", "pauses", "hover_before", "drag_curvature", "double_click_interval")
 
 RUNTIME_NUMBER_RULES = {
@@ -613,7 +609,6 @@ class Config:
     ldplayer_path: Path
     data_path: Path
     training_seconds: int
-    sleep_seconds: int
     still_seconds: float
     experience_pool_gb: float
     ai_model_limit: int
@@ -766,7 +761,7 @@ def run_self_test():
     assert details["reward_sort_key"][0] == details["screen_primary_reward"]
     assert "human_tie_break_reward" in details
     assert 0.0 < details["human_bonus"] < details["screen_score_resolution"]
-    assert set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit"}
+    assert set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "training_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit"}
     assert {"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("learning", "idle")])
     assert {"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("training", "idle")])
     assert "time_limit" not in ALLOWED_TRANSITIONS[("training", "idle")]
@@ -797,7 +792,8 @@ def run_self_test():
     assert not suspended_event.is_set()
     assert ("sleep", "training") not in ALLOWED_TRANSITIONS
     assert ("sleep", "starting") not in ALLOWED_TRANSITIONS
-    assert {"time_limit", "poor_optimization"}.issubset(ALLOWED_TRANSITIONS[("sleep", "idle")])
+    assert "time_limit" not in ALLOWED_TRANSITIONS[("sleep", "idle")]
+    assert "poor_optimization" not in ALLOWED_TRANSITIONS[("sleep", "idle")]
     assert "completed" not in ALLOWED_TRANSITIONS[("sleep", "idle")]
     assert {"completed", "migration_error", "user_stop"}.issubset(ALLOWED_TRANSITIONS[("migration", "idle")])
     pool = ExperiencePool(settings)
@@ -874,7 +870,7 @@ def run_self_test():
         dummy_panel = type("DummyPanel", (), {"store": store})()
         assert ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 200, "target_bytes": 100}) == 0.5
         assert ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 100, "target_bytes": 100}) == 1.0
-        assert ControlPanel.sleep_progress_fields(dummy_panel, time.perf_counter(), 10, 0, 10, 1.0)["compaction"] == 1.0
+        assert ControlPanel.sleep_progress_fields(dummy_panel, 0, 10, 1.0)["compaction"] == 1.0
         assert ControlPanel.sleep_compaction_complete(dummy_panel, {"size_bytes": 100, "target_bytes": 100})
         assert ControlPanel.sleep_restart_blockers(dummy_panel, False, False) == ["经验池压缩未完成", "AI模型清理未完成"]
         assert "AI模型清理未完成" in ControlPanel.sleep_unfinished_summary(dummy_panel, "completed", 3, 3, True, "达到时间上限", False)
@@ -990,7 +986,7 @@ def run_self_test():
         assert ControlPanel.idle_progress_value(dummy_panel, "migration", 91.0) == 0.0
         store.save_settings({"training_seconds": 1, "sleep_seconds": 2, "still_seconds": 3, "experience_pool_gb": 4, "ai_model_limit": 5, "forbidden": 6})
         saved_settings = json.loads(store.settings_file.read_text(encoding="utf-8"))
-        assert "forbidden" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0 and saved_settings["ai_model_limit"] == 5
+        assert "forbidden" not in saved_settings and "sleep_seconds" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0 and saved_settings["ai_model_limit"] == 5
         store.experience_file.write_text("{bad json}\n" + json.dumps({"id": "ok"}) + "\n", encoding="utf-8")
         loaded = store.load_experience()
         assert len(loaded) == 1 and loaded[0]["id"] == "ok"
@@ -2243,7 +2239,7 @@ class DataStore:
 
     def save_settings(self, settings):
         source = AllowedUserEditPolicy.filter(settings, "runtime")
-        payload = {"schema_version": CONFIG_SCHEMA_VERSION, "training_seconds": max(1, safe_int(source.get("training_seconds", AGENT_SPEC.default_training_seconds), AGENT_SPEC.default_training_seconds)), "sleep_seconds": max(1, safe_int(source.get("sleep_seconds", AGENT_SPEC.default_sleep_seconds), AGENT_SPEC.default_sleep_seconds)), "still_seconds": max(0.1, safe_float(source.get("still_seconds", AGENT_SPEC.default_still_seconds), AGENT_SPEC.default_still_seconds)), "experience_pool_gb": max(0.1, safe_float(source.get("experience_pool_gb", AGENT_SPEC.default_experience_pool_gb), AGENT_SPEC.default_experience_pool_gb)), "ai_model_limit": max(1, safe_int(source.get("ai_model_limit", AGENT_SPEC.default_ai_model_limit), AGENT_SPEC.default_ai_model_limit)), "runtime_generated_numbers": RUNTIME_NUMBER_AUDIT}
+        payload = {"schema_version": CONFIG_SCHEMA_VERSION, "training_seconds": max(1, safe_int(source.get("training_seconds", AGENT_SPEC.default_training_seconds), AGENT_SPEC.default_training_seconds)), "still_seconds": max(0.1, safe_float(source.get("still_seconds", AGENT_SPEC.default_still_seconds), AGENT_SPEC.default_still_seconds)), "experience_pool_gb": max(0.1, safe_float(source.get("experience_pool_gb", AGENT_SPEC.default_experience_pool_gb), AGENT_SPEC.default_experience_pool_gb)), "ai_model_limit": max(1, safe_int(source.get("ai_model_limit", AGENT_SPEC.default_ai_model_limit), AGENT_SPEC.default_ai_model_limit)), "runtime_generated_numbers": RUNTIME_NUMBER_AUDIT}
         try:
             with self.lock:
                 temporary = self.settings_file.with_suffix(".tmp")
@@ -4056,7 +4052,6 @@ class ControlPanel(tk.Tk):
         self.ldplayer_var = tk.StringVar(value=DEFAULT_LDPLAYER_PATH)
         self.data_var = tk.StringVar(value=DEFAULT_DATA_PATH)
         self.training_seconds_var = tk.StringVar(value=str(DEFAULT_TRAINING_SECONDS))
-        self.sleep_seconds_var = tk.StringVar(value=str(DEFAULT_SLEEP_SECONDS))
         self.still_seconds_var = tk.StringVar(value=str(DEFAULT_STILL_SECONDS))
         self.experience_pool_gb_var = tk.StringVar(value=str(DEFAULT_EXPERIENCE_POOL_GB))
         self.ai_model_limit_var = tk.StringVar(value=str(DEFAULT_AI_MODEL_LIMIT))
@@ -4081,7 +4076,6 @@ class ControlPanel(tk.Tk):
         self.progress_label_var = tk.StringVar(value="进度")
         self.runtime_value_specs = {
             "training_seconds": ("训练秒数", self.training_seconds_var, DEFAULT_TRAINING_SECONDS, safe_int, 1),
-            "sleep_seconds": ("睡眠秒数", self.sleep_seconds_var, DEFAULT_SLEEP_SECONDS, safe_int, 1),
             "still_seconds": ("静止秒数", self.still_seconds_var, DEFAULT_STILL_SECONDS, safe_float, 0.1),
             "experience_pool_gb": ("经验池 GB", self.experience_pool_gb_var, DEFAULT_EXPERIENCE_POOL_GB, safe_float, 0.1),
             "ai_model_limit": ("AI 模型个数", self.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, 1)
@@ -4155,7 +4149,7 @@ class ControlPanel(tk.Tk):
         time_frame = ttk.Frame(path_frame)
         time_frame.grid(row=2, column=1, columnspan=2, sticky="w", pady=6)
         ttk.Label(path_frame, text="时间设置").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=6)
-        for field, label in (("training_seconds", "训练/秒"), ("sleep_seconds", "睡眠/秒"), ("still_seconds", "静止/秒"), ("experience_pool_gb", "经验池/GB"), ("ai_model_limit", "AI模型/个")):
+        for field, label in (("training_seconds", "训练/秒"), ("still_seconds", "静止/秒"), ("experience_pool_gb", "经验池/GB"), ("ai_model_limit", "AI模型/个")):
             variable = self.runtime_value_specs[field][1]
             item_frame = ttk.Frame(time_frame)
             item_frame.pack(side="left", padx=(0, 12))
@@ -4435,7 +4429,7 @@ class ControlPanel(tk.Tk):
         return True
 
     def format_runtime_value(self, field, value):
-        if field in ("training_seconds", "sleep_seconds", "ai_model_limit"):
+        if field in ("training_seconds", "ai_model_limit"):
             return str(safe_int(value, self.runtime_value_specs[field][2]))
         return str(safe_float(value, self.runtime_value_specs[field][2]))
 
@@ -4490,7 +4484,7 @@ class ControlPanel(tk.Tk):
             return
         self.status_var.set("正在迁移数据")
         self.update_progress(0.0)
-        values = {"ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH, "training_seconds": max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS)), "sleep_seconds": max(1, safe_int(self.sleep_seconds_var.get(), DEFAULT_SLEEP_SECONDS)), "still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))}
+        values = {"ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH, "training_seconds": max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS)), "still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))}
         self.mode_thread = threading.Thread(target=self.migration_service.run, args=(token, old_path, new_path, stop_event, values), daemon=True)
         self.mode_thread.start()
 
@@ -4647,7 +4641,7 @@ class ControlPanel(tk.Tk):
                 if size == 0:
                     self.ui(lambda c=copied, t=total: self.progress_label_var.set(f"数据迁移中｜已迁移 {c}/{t} 字节"))
             if not stop_event.is_set() and self.is_run_active(token, "migration"):
-                DataStore(temp_root).save_settings({"training_seconds": values["training_seconds"], "sleep_seconds": values["sleep_seconds"], "still_seconds": values["still_seconds"], "experience_pool_gb": values["experience_pool_gb"], "ai_model_limit": values["ai_model_limit"]})
+                DataStore(temp_root).save_settings({"training_seconds": values["training_seconds"], "still_seconds": values["still_seconds"], "experience_pool_gb": values["experience_pool_gb"], "ai_model_limit": values["ai_model_limit"]})
                 if new_root.exists():
                     backup_root = new_root.parent / f".backup_{new_root.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                     shutil.copytree(new_root, backup_root)
@@ -4708,9 +4702,8 @@ class ControlPanel(tk.Tk):
         self.data_var.set(str(startup.get("data_path", self.data_var.get())))
         data_settings = DataStore(Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)).load_settings()
         if not data_settings:
-            DataStore(Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)).save_settings({"training_seconds": DEFAULT_TRAINING_SECONDS, "sleep_seconds": DEFAULT_SLEEP_SECONDS, "still_seconds": DEFAULT_STILL_SECONDS, "experience_pool_gb": DEFAULT_EXPERIENCE_POOL_GB, "ai_model_limit": DEFAULT_AI_MODEL_LIMIT})
+            DataStore(Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)).save_settings({"training_seconds": DEFAULT_TRAINING_SECONDS, "still_seconds": DEFAULT_STILL_SECONDS, "experience_pool_gb": DEFAULT_EXPERIENCE_POOL_GB, "ai_model_limit": DEFAULT_AI_MODEL_LIMIT})
         self.training_seconds_var.set(str(max(1, safe_int(data_settings.get("training_seconds", self.training_seconds_var.get()), DEFAULT_TRAINING_SECONDS))))
-        self.sleep_seconds_var.set(str(max(1, safe_int(data_settings.get("sleep_seconds", self.sleep_seconds_var.get()), DEFAULT_SLEEP_SECONDS))))
         self.still_seconds_var.set(str(max(0.1, safe_float(data_settings.get("still_seconds", self.still_seconds_var.get()), DEFAULT_STILL_SECONDS))))
         self.experience_pool_gb_var.set(str(max(0.1, safe_float(data_settings.get("experience_pool_gb", self.experience_pool_gb_var.get()), DEFAULT_EXPERIENCE_POOL_GB))))
         self.ai_model_limit_var.set(str(max(1, safe_int(data_settings.get("ai_model_limit", self.ai_model_limit_var.get()), DEFAULT_AI_MODEL_LIMIT))))
@@ -4719,7 +4712,7 @@ class ControlPanel(tk.Tk):
     def save_persistent_settings(self):
         data_path = Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)
         self.app_config_store.save_settings({"ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH, "data_path": str(data_path)})
-        DataStore(data_path).save_settings({"training_seconds": max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS)), "sleep_seconds": max(1, safe_int(self.sleep_seconds_var.get(), DEFAULT_SLEEP_SECONDS)), "still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))})
+        DataStore(data_path).save_settings({"training_seconds": max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS)), "still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))})
 
     def screen_rect(self):
         width = safe_int(getattr(win32api, "GetSystemMetrics", lambda _: self.winfo_screenwidth())(0), self.winfo_screenwidth())
@@ -4742,14 +4735,12 @@ class ControlPanel(tk.Tk):
         return max(1.0, sum(cost) / len(cost)) if cost else 24.0
 
     def read_config(self):
-        AllowedUserEditPolicy.assert_allowed("ldplayer_path", "data_path", "training_seconds", "sleep_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit")
+        AllowedUserEditPolicy.assert_allowed("ldplayer_path", "data_path", "training_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit")
         training_seconds = max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS))
-        sleep_seconds = max(1, safe_int(self.sleep_seconds_var.get(), DEFAULT_SLEEP_SECONDS))
         still_seconds = max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS))
         experience_pool_gb = max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB))
         ai_model_limit = max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))
         self.training_seconds_var.set(str(training_seconds))
-        self.sleep_seconds_var.set(str(sleep_seconds))
         self.still_seconds_var.set(str(still_seconds))
         self.experience_pool_gb_var.set(str(experience_pool_gb))
         self.ai_model_limit_var.set(str(ai_model_limit))
@@ -4767,7 +4758,7 @@ class ControlPanel(tk.Tk):
         self.settings = settings
         self.escape_monitor.debounce_seconds = settings.key_debounce_seconds
         self.ui(lambda: self.minsize(settings.ui_min_width, settings.ui_min_height))
-        return Config(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH), data_path, training_seconds, sleep_seconds, still_seconds, experience_pool_gb, ai_model_limit, settings)
+        return Config(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH), data_path, training_seconds, still_seconds, experience_pool_gb, ai_model_limit, settings)
 
     def apply_runtime_settings(self, settings):
         self.settings = settings
@@ -5145,21 +5136,20 @@ class ControlPanel(tk.Tk):
         self.mode_thread = threading.Thread(target=self.sleep_loop, args=(token, config, stop_event, restart_training), daemon=True)
         self.mode_thread.start()
 
-    def sleep_progress_fields(self, started_perf, sleep_seconds, completed_steps, target_training_steps, compaction_progress):
-        elapsed_ratio = clamp((time.perf_counter() - started_perf) / max(1.0, safe_float(sleep_seconds, 1.0)), 0.0, 1.0)
+    def sleep_progress_fields(self, completed_steps, target_training_steps, compaction_progress):
         training_ratio = clamp(safe_float(completed_steps, 0.0) / max(1.0, safe_float(target_training_steps, 1.0)), 0.0, 1.0)
         compact_ratio = clamp(compaction_progress, 0.0, 1.0)
         previous_ratio = clamp(getattr(self, "progress_value", 0.0) / 100.0, 0.0, 1.0)
-        review_ratio = 1.0 if completed_steps > 0 or target_training_steps <= 0 else clamp(elapsed_ratio / 0.25, 0.0, 1.0)
+        review_ratio = 1.0 if completed_steps > 0 or target_training_steps <= 0 else 0.0
         model_compaction_ratio = compact_ratio
         pool_compaction_ratio = compact_ratio
         save_ratio = clamp((previous_ratio - 0.92) / 0.08, 0.0, 1.0)
-        prepare_ratio = clamp(elapsed_ratio / 0.05, 0.0, 1.0)
+        prepare_ratio = 1.0 if completed_steps > 0 else 0.0
         stage_ratio = prepare_ratio * 0.05 + review_ratio * 0.25 + training_ratio * 0.40 + model_compaction_ratio * 0.10 + pool_compaction_ratio * 0.12 + save_ratio * 0.08
-        return {"time": elapsed_ratio, "prepare": prepare_ratio, "review": review_ratio, "training": training_ratio, "compaction": compact_ratio, "model_compaction": model_compaction_ratio, "pool_compaction": pool_compaction_ratio, "save": save_ratio, "overall": max(previous_ratio, min(stage_ratio, 0.92 if save_ratio <= 0.0 else 1.0))}
+        return {"prepare": prepare_ratio, "review": review_ratio, "training": training_ratio, "compaction": compact_ratio, "model_compaction": model_compaction_ratio, "pool_compaction": pool_compaction_ratio, "save": save_ratio, "overall": max(previous_ratio, min(stage_ratio, 0.92 if save_ratio <= 0.0 else 1.0))}
 
-    def sleep_progress_percent(self, started_perf, sleep_seconds, completed_steps, target_training_steps, compaction_progress):
-        return clamp(self.sleep_progress_fields(started_perf, sleep_seconds, completed_steps, target_training_steps, compaction_progress)["overall"] * 100.0, 0.0, 100.0)
+    def sleep_progress_percent(self, completed_steps, target_training_steps, compaction_progress):
+        return clamp(self.sleep_progress_fields(completed_steps, target_training_steps, compaction_progress)["overall"] * 100.0, 0.0, 100.0)
 
     def sleep_compaction_progress(self, compact):
         if not isinstance(compact, dict):
@@ -5181,7 +5171,7 @@ class ControlPanel(tk.Tk):
         return review_status in ("completed", "quarantined") and completed >= target_training_steps and improvement_ready and batch_confidence >= confidence_target and compaction_complete and pending_state == 0
 
     def sleep_loop(self, token, config, stop_event, restart_training=False):
-        started = self.events.publish("sleep_started", seconds=config.sleep_seconds, data_path=str(config.data_path))
+        self.events.publish("sleep_started", data_path=str(config.data_path))
         completed = 0
         submitted = 0
         workers = max(1, config.settings.sleep_worker_count)
@@ -5197,18 +5187,7 @@ class ControlPanel(tk.Tk):
         initial_compact = {"changed": False, "size_bytes": self.store.experience_pool_size_bytes() if self.store else 0, "target_bytes": max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))}
         compaction_progress = self.sleep_compaction_progress(initial_compact)
         compaction_complete = self.sleep_compaction_complete(initial_compact)
-        poor_optimization = False
-        poor_optimization_reason = ""
-        zero_training_batches = 0
-        no_reward_batches = 0
-        loss_worsening_batches = 0
-        training_error_batches = 0
-        last_model_loss = None
-        time_limit_reached = False
-        completion_ready = False
-        started_perf = time.perf_counter()
-        sleep_deadline = started_perf + max(1, config.sleep_seconds)
-        run_guard = lambda: should_stop_run(stop_event, sleep_deadline, self.should_stop_by_escape, getattr(self.active_session, "termination_reason", None) or self.termination_reason)
+        run_guard = lambda: should_stop_run(stop_event, None, self.should_stop_by_escape, getattr(self.active_session, "termination_reason", None) or self.termination_reason)
         self.ui(lambda: self.progress_label_var.set("睡眠准备中｜暂停异步写入并刷盘"))
         try:
             self.persistence_paused.set()
@@ -5245,19 +5224,6 @@ class ControlPanel(tk.Tk):
         self.ui(lambda r=recheck_result: self.progress_label_var.set(f"睡眠训练进度｜评分复核 {r.get('checked', 0)} 条｜重评 {r.get('rescored', 0)} 条｜不可恢复 {r.get('unrecoverable', 0)} 条"))
         if self.store and recheck_result.get("unrecoverable", 0):
             self.store.log_error("sleep_score_recheck_unrecoverable", RuntimeError("unrecoverable_screen_records"), recheck_result)
-        with self.experience_pool.lock:
-            trainable_count = sum(1 for record in self.experience_pool.records if self.experience_pool.record_trainable(record)) if self.experience_pool else 0
-        if review_status == "failed":
-            poor_optimization = True
-            poor_optimization_reason = "score_review_failed"
-        elif trainable_count <= 0:
-            poor_optimization = True
-            poor_optimization_reason = "no_trainable_records"
-        if poor_optimization:
-            self.events.publish("sleep_poor_optimization", reason=poor_optimization_reason, review_status=review_status, trainable_count=trainable_count, recheck_result=recheck_result)
-            if self.store:
-                self.store.log_error("sleep_poor_optimization", RuntimeError(poor_optimization_reason), {"reason": poor_optimization_reason, "review_status": review_status, "trainable_count": trainable_count, "recheck_result": recheck_result})
-            self.ui(lambda r=poor_optimization_reason: self.status_var.set("睡眠模式：AI训练效果差：" + r))
         def train_once():
             if run_guard():
                 return {"trained": 0, "best_score": 0.0, "avg_score": 0.0, "avg_confidence": 0.0}
@@ -5271,26 +5237,21 @@ class ControlPanel(tk.Tk):
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             futures = set()
             for _ in range(queue_depth):
-                if not poor_optimization:
-                    submit_next(executor, futures)
-            while not poor_optimization and not stop_event.is_set() and (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
+                submit_next(executor, futures)
+            while not stop_event.is_set() and (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
                 guarded = run_guard()
                 if guarded:
                     with self.state_lock:
                         self.termination_reason = guarded
                         if self.active_session:
                             self.active_session.termination_reason = guarded
-                    if guarded == "time_limit":
-                        time_limit_reached = True
-                        self.events.publish("sleep_time_limit_reached", seconds=config.sleep_seconds, started_sequence=started["sequence"])
                     stop_event.set()
                     break
-                percent = self.sleep_progress_percent(started_perf, config.sleep_seconds, completed, target_training_steps, compaction_progress)
+                percent = self.sleep_progress_percent(completed, target_training_steps, compaction_progress)
                 self.update_progress(percent)
                 if not futures:
                     submit_next(executor, futures)
-                wait_left = max(0.0, sleep_deadline - time.perf_counter())
-                done, futures = concurrent.futures.wait(futures, timeout=min(config.settings.sleep_event_wait, wait_left), return_when=concurrent.futures.FIRST_COMPLETED)
+                done, futures = concurrent.futures.wait(futures, timeout=config.settings.sleep_event_wait, return_when=concurrent.futures.FIRST_COMPLETED)
                 if not done:
                     continue
                 trained = 0
@@ -5302,29 +5263,17 @@ class ControlPanel(tk.Tk):
                         result = future.result()
                     except Exception as exc:
                         self.log_exception("sleep_training", exc, {"submitted": submitted, "completed": completed})
-                        training_error_batches += 1
                         result = {"trained": 0, "best_score": 0.0, "avg_score": 0.0, "avg_confidence": 0.0, "model_loss": None}
                     completed += 1
                     trained += safe_int(result.get("trained", 0), 0)
                     best_score = max(best_score, safe_float(result.get("best_score", 0.0), 0.0))
                     avg_score += safe_float(result.get("avg_score", 0.0), 0.0)
                     avg_confidence += safe_float(result.get("avg_confidence", 0.0), 0.0)
-                    model_loss = result.get("model_loss")
-                    if model_loss is not None:
-                        model_loss = safe_float(model_loss, 0.0)
-                        if last_model_loss is not None and model_loss > last_model_loss:
-                            loss_worsening_batches += 1
-                        else:
-                            loss_worsening_batches = 0
-                        last_model_loss = model_loss
                     submit_next(executor, futures)
                 divisor = max(1, len(done))
                 batch_score = avg_score / divisor
                 batch_confidence = avg_confidence / divisor
-                if trained <= 0:
-                    zero_training_batches += len(done)
-                else:
-                    zero_training_batches = 0
+                if trained > 0:
                     improvement_amount = best_score if best_seen is None else max(0.0, best_score - best_seen)
                     improved = best_seen is None or best_score > best_seen
                     recent_improvements.append(improvement_amount)
@@ -5337,41 +5286,21 @@ class ControlPanel(tk.Tk):
                 compaction_complete = self.sleep_compaction_complete(compact)
                 if self.sleep_completion_reached(completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, compaction_complete, review_status):
                     self.events.publish("sleep_quality_ready_ignored_until_required_exit", completed_batches=completed, target_training_steps=target_training_steps, confidence=batch_confidence, confidence_target=confidence_target)
-                if zero_training_batches >= poor_limit:
-                    poor_optimization_reason = "repeated_zero_training_batches"
-                elif no_reward_batches >= poor_limit or stale_batches >= poor_limit:
-                    poor_optimization_reason = "repeated_no_reward_improvement"
-                elif loss_worsening_batches >= poor_limit:
-                    poor_optimization_reason = "repeated_model_loss_worsening"
-                elif training_error_batches >= poor_limit:
-                    poor_optimization_reason = "training_errors"
-                elif completed >= poor_limit and stale_batches >= poor_limit and batch_confidence <= 1.0 / max(1, batch_size):
-                    poor_optimization_reason = "repeated_no_reward_improvement"
-                poor_optimization = bool(poor_optimization_reason)
-                if poor_optimization:
-                    self.events.publish("sleep_poor_optimization", reason=poor_optimization_reason, completed_batches=completed, trained=trained, zero_training_batches=zero_training_batches, no_reward_batches=no_reward_batches, loss_worsening_batches=loss_worsening_batches, training_error_batches=training_error_batches)
-                    if self.store:
-                        self.store.log_error("sleep_poor_optimization", RuntimeError(poor_optimization_reason), {"reason": poor_optimization_reason, "completed_batches": completed, "trained": trained, "batch_confidence": batch_confidence})
-                    self.ui(lambda r=poor_optimization_reason: self.status_var.set("睡眠模式：AI训练效果差：" + r))
-                    stop_event.set()
                 divisor = max(1, len(done))
                 self.events.publish("sleep_batch_completed", trained=trained, best_score=best_score, confidence=batch_confidence, completed_batches=completed)
                 decision = {"reason": "sleep_prioritized_replay", "confidence": batch_confidence, "candidate_count": trained, "best_score": best_score, "completed_batches": completed, "target_training_steps": target_training_steps, "confidence_target": confidence_target, "workers": workers, "pool_compacted": compact.get("changed", False), "pool_removed": compact.get("removed", 0)}
                 self.update_metrics(0.0, 50.0 + clamp(batch_confidence * 50.0, 0.0, 50.0), 0.0, batch_score, best_score, screen_score_total, decision)
-                remaining_seconds = max(0.0, sleep_deadline - time.perf_counter())
-                self.ui(lambda r=remaining_seconds, c=completed, t=target_training_steps, q=batch_confidence: self.progress_label_var.set(f"睡眠训练进度｜剩余 {r:.1f} 秒｜已训练批次 {c}/{t}｜当前置信度 {q * 100.0:.1f}%"))
-                self.update_progress(self.sleep_progress_percent(started_perf, config.sleep_seconds, completed, target_training_steps, compaction_progress))
-                if poor_optimization:
-                    break
+                self.ui(lambda c=completed, t=target_training_steps, q=batch_confidence: self.progress_label_var.set(f"睡眠训练进度｜已训练批次 {c}/{t}｜当前置信度 {q * 100.0:.1f}%"))
+                self.update_progress(self.sleep_progress_percent(completed, target_training_steps, compaction_progress))
             for future in futures:
                 future.cancel()
         with self.state_lock:
             stopped_reason = self.termination_reason if self.termination_reason in ("esc", "user_stop") else None
-        save_status = "poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached else (stopped_reason or "incomplete"))
-        if save_status in ("time_limit", "poor_optimization") and (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
+        save_status = stopped_reason or "incomplete"
+        if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
             self.update_progress(max(self.progress_value, 92.0), force=True)
             self.ui(lambda: self.progress_label_var.set("睡眠模式保存中｜进度 92%"))
-        saved, save_error, save_report = self.save_sleep_data(config, save_status, run_guard=run_guard, status_detail={"poor_optimization_reason": poor_optimization_reason} if poor_optimization_reason else None)
+        saved, save_error, save_report = self.save_sleep_data(config, save_status, run_guard=run_guard)
         compaction_complete = bool(save_report.get("compaction_complete", compaction_complete)) if isinstance(save_report, dict) else compaction_complete
         models_complete = bool(save_report.get("models_complete", False)) if isinstance(save_report, dict) else False
         if not saved:
@@ -5380,34 +5309,11 @@ class ControlPanel(tk.Tk):
                 self.ui(lambda e=str(save_error): messagebox.showerror("保存失败", e))
             return
         final_reason = None
-        restart_allowed = restart_training and save_status == "time_limit"
-        can_restart = restart_training and save_status == "time_limit" and compaction_complete and models_complete
-        if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and time_limit_reached:
-            final_reason = "time_limit"
-            unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "达到时间上限", models_complete)
-            self.render_sleep_completion_before_idle(f"睡眠模式保存完成 100%｜{unfinished}", 100.0)
-            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=True, reason=final_reason)
-        elif (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and poor_optimization:
-            final_reason = "poor_optimization"
-            unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "AI模型优化效果差：" + (poor_optimization_reason or "poor_optimization"), models_complete)
-            self.render_sleep_completion_before_idle(f"睡眠模式保存完成 100%｜{unfinished}", 100.0)
-            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=True, reason=final_reason)
-        elif (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
+        if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
             final_reason = stopped_reason or "user_stop"
             unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "用户中断", models_complete)
             self.render_sleep_completion_before_idle(f"睡眠模式保存完成 100%｜{unfinished}", 100.0)
             self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=True, reason=final_reason)
-        if restart_allowed and final_reason == "time_limit" and not can_restart:
-            blockers = self.sleep_restart_blockers(compaction_complete, models_complete)
-            message = "自动重启训练失败：" + "，".join(blockers)
-            self.restore_panel()
-            self.ui(lambda m=message: self.status_var.set(m))
-            if self.store:
-                self.store.log_error("sleep_auto_restart_blocked", RuntimeError(message), {"compaction_complete": compaction_complete, "models_complete": models_complete, "save_report": save_report})
-            self.events.publish("auto_restart_training_failed", reason=message, compaction_complete=compaction_complete, models_complete=models_complete)
-        if can_restart and final_reason == "time_limit":
-            self.main_thread_events.put({"type": "restart_training", "reason": final_reason, "config": config, "token": token, "created_at": now_text(), "precheck": {"review_status": review_status, "compaction_complete": compaction_complete, "models_complete": models_complete}})
-            self.ui(self.process_main_thread_events)
 
 
     def sleep_restart_runtime_ready(self):
