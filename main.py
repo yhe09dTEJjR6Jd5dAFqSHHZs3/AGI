@@ -838,6 +838,12 @@ def run_self_test():
         assert ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 100, "target_bytes": 100}) == 1.0
         assert ControlPanel.sleep_progress_fields(dummy_panel, time.perf_counter(), 10, 0, 10, 1.0)["compaction"] == 1.0
         assert ControlPanel.sleep_compaction_complete(dummy_panel, {"size_bytes": 100, "target_bytes": 100})
+        mouse_executor = HumanMouseExecutor.__new__(HumanMouseExecutor)
+        mouse_executor.settings = derive_runtime_settings()
+        edge_rect = (10, 20, 30, 40)
+        edge_points = mouse_executor.smooth_points((10, 20), (29, 39), 1.0, rect=edge_rect)
+        assert edge_points and all(point_inside(edge_rect, x, y) for x, y in edge_points)
+        assert mouse_executor.clamp_point_to_rect((-100, 100), edge_rect) == (10, 39)
         assert ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, deque([0.02, 0.02]), 0.01, 0.9, 0.8, True)
         assert not ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, deque([0.02, 0.02]), 0.01, 0.9, 0.8, True, "failed")
         assert WindowCheck(True, "ok", (0, 0, 10, 10), 9, 9, 0.0).occluded_ratio == 0.0
@@ -3335,7 +3341,13 @@ class HumanMouseExecutor:
             return pynput_mouse.Button.middle
         return pynput_mouse.Button.left
 
-    def smooth_points(self, start, end, duration):
+    def clamp_point_to_rect(self, point, rect):
+        if not rect:
+            return (int(point[0]), int(point[1]))
+        left, top, right, bottom = rect
+        return (max(left, min(right - 1, int(point[0]))), max(top, min(bottom - 1, int(point[1]))))
+
+    def smooth_points(self, start, end, duration, rect=None):
         sx, sy = start
         ex, ey = end
         direct = math.hypot(ex - sx, ey - sy)
@@ -3350,7 +3362,7 @@ class HumanMouseExecutor:
             u = 1.0 - t
             x = u ** 3 * sx + 3.0 * u ** 2 * t * c1[0] + 3.0 * u * t ** 2 * c2[0] + t ** 3 * ex
             y = u ** 3 * sy + 3.0 * u ** 2 * t * c1[1] + 3.0 * u * t ** 2 * c2[1] + t ** 3 * ey
-            points.append((int(round(x)), int(round(y))))
+            points.append(self.clamp_point_to_rect((round(x), round(y)), rect))
         return points
 
     def stoppable_sleep(self, seconds, stop_event, should_stop):
@@ -3362,7 +3374,7 @@ class HumanMouseExecutor:
             stop_event.wait(min(self.settings.generated_sleep_event_wait, max(0.0, deadline - time.perf_counter())))
 
     def move_smooth(self, start, end, duration, stop_event, should_stop, rect=None, previous=None):
-        points = self.smooth_points(start, end, duration)
+        points = self.smooth_points(start, end, duration, rect=rect)
         actual = []
         delay = duration / max(1, len(points) - 1) if duration > 0.0 else 0.0
         last = previous
@@ -3370,6 +3382,12 @@ class HumanMouseExecutor:
             if stop_event.is_set() or should_stop():
                 stop_event.set()
                 break
+            if rect and not point_inside(rect, point[0], point[1]):
+                stop_event.set()
+                return actual
+            if rect and not self.window_manager.window_ok(force=True):
+                stop_event.set()
+                return actual
             self.controller.position = point
             event = build_mouse_event("move", point[0], point[1], rect, previous=last)
             event["source"] = "ai"
@@ -4827,10 +4845,13 @@ class ControlPanel(tk.Tk):
         training_ratio = clamp(safe_float(completed_steps, 0.0) / max(1.0, safe_float(target_training_steps, 1.0)), 0.0, 1.0)
         compact_ratio = clamp(compaction_progress, 0.0, 1.0)
         previous_ratio = clamp(getattr(self, "progress_value", 0.0) / 100.0, 0.0, 1.0)
-        review_ratio = 1.0 if completed_steps > 0 or target_training_steps <= 0 else min(elapsed_ratio, 0.25)
-        save_ratio = 0.0
-        task_ratio = review_ratio * 0.2 + training_ratio * 0.5 + compact_ratio * 0.15 + save_ratio * 0.15
-        return {"time": elapsed_ratio, "review": review_ratio, "training": training_ratio, "compaction": compact_ratio, "save": save_ratio, "overall": max(previous_ratio, task_ratio)}
+        review_ratio = 1.0 if completed_steps > 0 or target_training_steps <= 0 else clamp(elapsed_ratio / 0.25, 0.0, 1.0)
+        model_compaction_ratio = compact_ratio
+        pool_compaction_ratio = compact_ratio
+        save_ratio = clamp((previous_ratio - 0.92) / 0.08, 0.0, 1.0)
+        prepare_ratio = clamp(elapsed_ratio / 0.05, 0.0, 1.0)
+        stage_ratio = prepare_ratio * 0.05 + review_ratio * 0.25 + training_ratio * 0.40 + model_compaction_ratio * 0.10 + pool_compaction_ratio * 0.12 + save_ratio * 0.08
+        return {"time": elapsed_ratio, "prepare": prepare_ratio, "review": review_ratio, "training": training_ratio, "compaction": compact_ratio, "model_compaction": model_compaction_ratio, "pool_compaction": pool_compaction_ratio, "save": save_ratio, "overall": max(previous_ratio, min(stage_ratio, 0.92 if save_ratio <= 0.0 else 1.0))}
 
     def sleep_progress_percent(self, started_perf, sleep_seconds, completed_steps, target_training_steps, compaction_progress):
         return clamp(self.sleep_progress_fields(started_perf, sleep_seconds, completed_steps, target_training_steps, compaction_progress)["overall"] * 100.0, 0.0, 100.0)
@@ -4992,8 +5013,8 @@ class ControlPanel(tk.Tk):
             stopped_reason = self.termination_reason if self.termination_reason in ("esc", "user_stop") else None
         save_status = "completed" if completed_success else ("poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached else (stopped_reason or "incomplete")))
         if save_status in ("completed", "time_limit", "poor_optimization") and (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
-            self.update_progress(max(self.progress_value, 85.0), force=True)
-            self.ui(lambda: self.progress_label_var.set("睡眠模式保存中｜进度 85%"))
+            self.update_progress(max(self.progress_value, 92.0), force=True)
+            self.ui(lambda: self.progress_label_var.set("睡眠模式保存中｜进度 92%"))
         saved, save_error, save_report = self.save_sleep_data(config, save_status, run_guard=run_guard)
         compaction_complete = bool(save_report.get("compaction_complete", compaction_complete)) if isinstance(save_report, dict) else compaction_complete
         models_complete = bool(save_report.get("models_complete", True)) if isinstance(save_report, dict) else True
@@ -5030,7 +5051,8 @@ class ControlPanel(tk.Tk):
         elif (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
             final_reason = stopped_reason or "user_stop"
             unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "用户中断")
-            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", self.progress_value, release=False, reason=final_reason)
+            self.render_sleep_completion_before_idle(f"睡眠模式保存完成 100%｜{unfinished}", 100.0)
+            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=False, reason=final_reason)
         if restart_training and final_reason not in ("esc", "user_stop"):
             self.main_thread_events.put({"type": "restart_training", "reason": final_reason, "config": config, "token": token, "created_at": now_text()})
             self.ui(self.process_main_thread_events)
@@ -5056,20 +5078,20 @@ class ControlPanel(tk.Tk):
             if self.persistence_queue:
                 self.persistence_queue.flush()
             self.store.flush_state(force=True)
-            self.update_progress(max(self.progress_value, 85.0), force=True)
+            self.update_progress(max(self.progress_value, 92.0), force=True)
             with self.experience_pool.lock:
                 recheck_records = copy.deepcopy(self.experience_pool.records)
                 self.store.merge_experience_records_by_id(recheck_records)
                 records = copy.deepcopy(self.experience_pool.records)
                 model = self.experience_pool.model
             self.store.save_ai_model_snapshot(records, config.settings, config.ai_model_limit, status, model, run_guard=persistence_guard)
-            self.update_progress(max(self.progress_value, 90.0), force=True)
+            self.update_progress(max(self.progress_value, 96.0), force=True)
             compact = self.store.compact_experience_pool(config.experience_pool_gb, run_guard=persistence_guard)
             if compact.get("changed"):
                 self.events.publish("experience_pool_compaction_completed", removed=compact.get("removed", 0), size_bytes=compact.get("size_bytes", 0))
                 self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit), self.store.load_latest_model_state(config.settings))
                 self.brain = ActionBrain(self.experience_pool, config.settings)
-            self.update_progress(max(self.progress_value, 95.0), force=True)
+            self.update_progress(max(self.progress_value, 99.0), force=True)
             self.store.flush_state(force=True)
             model_count = len(list(self.store.model_dir.glob("model_*.json")))
             target_bytes = max(1, safe_int(compact.get("target_bytes", 0), 0))
