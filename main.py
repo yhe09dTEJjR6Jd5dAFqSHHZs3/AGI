@@ -1834,6 +1834,7 @@ class PolicyModel:
             self.weights.update({"bias": 0.0, "reward": 0.35, "novelty": 0.25, "human": 0.25, "duration": 0.03, "distance": 0.04, "source": 0.08, "confidence": 0.12, "visits": -0.03})
         self.trained_steps = safe_int(state.get("trained_steps", 0), 0)
         self.loss = safe_float(state.get("loss", 1.0), 1.0)
+        self.visual_model = state.get("visual_model") if isinstance(state.get("visual_model"), dict) else {}
 
     def features(self, record):
         action = record.get("mouse_action") or {}
@@ -1891,7 +1892,7 @@ class PolicyModel:
 
     def snapshot(self):
         with self.lock:
-            return {"type": "online_logistic_policy", "feature_names": list(self.FEATURE_NAMES), "weights": {name: round(value, 8) for name, value in self.weights.items()}, "trained_steps": self.trained_steps, "loss": self.loss}
+            return {"type": "online_logistic_policy", "feature_names": list(self.FEATURE_NAMES), "weights": {name: round(value, 8) for name, value in self.weights.items()}, "trained_steps": self.trained_steps, "loss": self.loss, "visual_model": copy.deepcopy(self.visual_model)}
 
 
 class AppConfigStore:
@@ -2812,6 +2813,7 @@ class ExperiencePool:
         self.global_action_heap = []
         self.nearest_cache = OrderedDict()
         self.metric_tree = BKHashTree()
+        self.visual_model = {}
         self.index_version = 0
         for record in records or []:
             self.add(record)
@@ -2880,6 +2882,29 @@ class ExperiencePool:
                 capacity = max(1, min(self.settings.global_action_heap_limit, self.index_settings.nearest_candidate_limit // max(1, self.settings.ui_metric_columns)))
                 while len(self.nearest_cache) > capacity:
                     self.nearest_cache.popitem(last=False)
+
+
+    def train_local_vision_model(self):
+        with self.lock:
+            vectors = [(parse_semantic_vector(record.get("screen_semantic_vector")), safe_float(record.get("screen_score", record.get("novelty", 0.0)), 0.0), record.get("id")) for record in self.records if self.record_trainable(record)]
+        vectors = [(vector, score, record_id) for vector, score, record_id in vectors if vector]
+        if not vectors:
+            self.visual_model = {"created_at": now_text(), "status": "empty", "clusters": []}
+            self.model.visual_model = copy.deepcopy(self.visual_model)
+            return self.visual_model
+        dimensions = min(len(vector) for vector, _, _ in vectors)
+        ordered = sorted(vectors, key=lambda item: item[1])
+        bucket_count = max(1, min(self.settings.nearest_top_k, int(math.sqrt(len(ordered))) or 1))
+        clusters = []
+        for bucket_index in range(bucket_count):
+            bucket = ordered[bucket_index::bucket_count]
+            if not bucket:
+                continue
+            centroid = [sum(vector[index] for vector, _, _ in bucket) / len(bucket) for index in range(dimensions)]
+            clusters.append({"index": bucket_index, "count": len(bucket), "avg_score": round(sum(score for _, score, _ in bucket) / len(bucket), 6), "centroid": [round(value, 6) for value in centroid]})
+        self.visual_model = {"created_at": now_text(), "status": "trained", "source": "sleep_local_semantic_vectors", "dimensions": dimensions, "records": len(vectors), "clusters": clusters}
+        self.model.visual_model = copy.deepcopy(self.visual_model)
+        return self.visual_model
 
     def count(self):
         with self.lock:
@@ -3658,6 +3683,10 @@ class EscapeMonitor:
         return False
 
 
+class PersistenceFlushError(RuntimeError):
+    pass
+
+
 class AsyncPersistenceQueue:
     def __init__(self, settings_or_maxsize):
         if isinstance(settings_or_maxsize, Settings):
@@ -3670,26 +3699,48 @@ class AsyncPersistenceQueue:
             self.close_seconds = self.settings.persistence_close_seconds
         self.jobs = queue.Queue(maxsize=max(1, safe_int(maxsize, self.settings.async_queue_size)))
         self.image_dropped = 0
+        self.lock = threading.RLock()
+        self.next_sequence = 0
+        self.enqueued_sequences = set()
+        self.confirmed_sequences = set()
+        self.errors = []
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.thread.start()
 
+    def allocate_sequence(self):
+        with self.lock:
+            self.next_sequence += 1
+            return self.next_sequence
+
     def enqueue_image(self, analyzer, image, path, store=None, priority="normal"):
         critical = priority == "critical"
-        return self.enqueue({"type": "image", "analyzer": analyzer, "image": image.copy() if image else None, "path": path, "store": store, "priority": priority}, block_when_full=critical)
+        return self.enqueue({"type": "image", "analyzer": analyzer, "image": image.copy() if image else None, "path": path, "store": store, "priority": priority, "persistence_sequence": self.allocate_sequence()}, block_when_full=critical)
 
     def enqueue_record(self, store, record):
-        return self.enqueue({"type": "record", "store": store, "record": copy.deepcopy(record)}, block_when_full=True)
+        prepared = copy.deepcopy(record)
+        sequence = self.allocate_sequence()
+        prepared["persistence_sequence"] = sequence
+        prepared["persistence_status"] = "queued"
+        return self.enqueue({"type": "record", "store": store, "record": prepared, "persistence_sequence": sequence}, block_when_full=True)
 
     def enqueue(self, job, block_when_full=False):
         if self.stop_event.is_set():
             return False
         try:
             self.jobs.put_nowait(job)
+            sequence = job.get("persistence_sequence") if isinstance(job, dict) else None
+            if sequence is not None:
+                with self.lock:
+                    self.enqueued_sequences.add(sequence)
             return True
         except queue.Full:
             if block_when_full:
                 self.jobs.put(job)
+                sequence = job.get("persistence_sequence") if isinstance(job, dict) else None
+                if sequence is not None:
+                    with self.lock:
+                        self.enqueued_sequences.add(sequence)
                 return True
             store = job.get("store")
             if store:
@@ -3710,13 +3761,24 @@ class AsyncPersistenceQueue:
                     job["analyzer"].save_image(job["image"], job["path"], priority=job.get("priority", "normal"), settings=self.settings)
                 elif job.get("type") == "record":
                     store = job["store"]
-                    store.append_experience(job["record"])
+                    record = job["record"]
+                    record["persistence_status"] = "committed"
+                    record["persistence_committed_at"] = now_text()
+                    store.append_experience(record)
                     store.flush_state(min_interval=self.settings.persistence_close_seconds, max_pending=max(1, self.settings.async_queue_size // max(1, self.settings.global_action_heap_limit // self.settings.local_action_heap_limit)))
+                sequence = job.get("persistence_sequence") if isinstance(job, dict) else None
+                if sequence is not None:
+                    with self.lock:
+                        self.confirmed_sequences.add(sequence)
             except Exception as exc:
                 store = job.get("store") if isinstance(job, dict) else None
+                sequence = job.get("persistence_sequence") if isinstance(job, dict) else None
+                error_payload = {"sequence": sequence, "type": job.get("type") if isinstance(job, dict) else None, "error": repr(exc)}
+                with self.lock:
+                    self.errors.append(error_payload)
                 if store:
                     try:
-                        store.log_error("async_persistence", exc, {"type": job.get("type")})
+                        store.log_error("async_persistence", exc, {"type": job.get("type"), "persistence_sequence": sequence})
                     except Exception:
                         pass
             finally:
@@ -3724,6 +3786,11 @@ class AsyncPersistenceQueue:
 
     def flush(self):
         self.jobs.join()
+        with self.lock:
+            missing = sorted(self.enqueued_sequences - self.confirmed_sequences)
+            errors = list(self.errors)
+        if errors or missing:
+            raise PersistenceFlushError(json.dumps({"errors": errors, "unconfirmed_sequences": missing}, ensure_ascii=False))
 
     def drop_pending_images(self):
         dropped = 0
@@ -4752,6 +4819,16 @@ class ControlPanel(tk.Tk):
             self.update_progress(progress, force=True)
             self.ui_sync(lambda l=label: (self.progress_label_var.set(l), self.update_idletasks()), self.settings.ui_event_coalesce_seconds)
 
+    def handle_save_failure(self, token, error):
+        self.log_exception("mode_data_flush", error)
+        with self.state_lock:
+            mode = self.mode
+        if mode in ("learning", "training", "sleep"):
+            self.transition(mode, "stopping", reason="runtime_error", token=token)
+        detail = str(error)
+        self.update_progress(self.progress_value, force=True)
+        self.ui(lambda d=detail: (self.status_var.set("保存失败，已保持在正在退出状态，禁止直接进入空闲"), messagebox.showerror("保存失败", d)))
+
     def flush_mode_data(self):
         try:
             if self.persistence_queue:
@@ -4760,10 +4837,14 @@ class ControlPanel(tk.Tk):
                 self.store.flush_state(force=True)
             return True, None
         except Exception as exc:
-            self.log_exception("mode_data_flush", exc)
+            token = self.run_token
+            self.handle_save_failure(token, exc)
             return False, exc
 
     def finish_run(self, token, status, progress=0.0, release=True, reason=None):
+        if str(status).startswith("保存失败"):
+            self.ui(lambda s=status: self.status_var.set(s))
+            return False
         mapped_reason = reason or "completed"
         if mapped_reason not in TERMINATION_REASONS and not str(mapped_reason).startswith("window_"):
             mapped_reason = "runtime_error"
@@ -5099,6 +5180,8 @@ class ControlPanel(tk.Tk):
                     self.ui(lambda c=current, t=total: self.progress_label_var.set(f"睡眠评分复核中｜已复核 {c}/{t} 条"))
                 recheck_result = self.experience_pool.recheck_screen_scores(self.store, analyzer, run_guard=run_guard, progress_callback=score_progress)
             self.events.publish("sleep_screen_scores_rechecked", **recheck_result)
+            visual_model = self.experience_pool.train_local_vision_model() if self.experience_pool else {"status": "missing_pool"}
+            self.events.publish("sleep_local_vision_model_trained", status=visual_model.get("status"), records=visual_model.get("records", 0), clusters=len(visual_model.get("clusters", [])))
             self.store.merge_experience_records_by_id(copy.deepcopy(self.experience_pool.records))
             review_status = "quarantined" if recheck_result.get("unrecoverable", 0) else "completed"
         except Exception as exc:
