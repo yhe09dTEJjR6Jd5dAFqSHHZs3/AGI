@@ -386,13 +386,13 @@ ALLOWED_TRANSITIONS = {
     ("idle", "sleep"): {"click_sleep"},
     ("idle", "migration"): {"click_modify_data_path"},
     ("starting", "idle"): {"window_invalid", "user_stop", "runtime_error", "minimize_failed"},
-    ("learning", "stopping"): {"user_stop", "esc", "still_timeout", "window_invalid", "runtime_error"},
-    ("training", "stopping"): {"user_stop", "esc", "still_timeout", "window_invalid", "runtime_error", "executor_error"},
+    ("learning", "stopping"): {"user_stop", "esc", "still_timeout", "window_invalid", "cursor_outside", "runtime_error"},
+    ("training", "stopping"): {"user_stop", "esc", "still_timeout", "window_invalid", "cursor_outside", "runtime_error", "executor_error"},
     ("starting", "stopping"): {"user_stop", "esc"},
     ("migration", "stopping"): {"user_stop", "esc"},
-    ("stopping", "idle"): {"esc", "still_timeout", "window_invalid", "user_stop", "runtime_error", "executor_error", "migration_error", "completed"},
-    ("learning", "idle"): {"esc", "still_timeout", "window_invalid", "user_stop", "runtime_error"},
-    ("training", "idle"): {"esc", "still_timeout", "window_invalid", "user_stop", "runtime_error", "executor_error"},
+    ("stopping", "idle"): {"esc", "still_timeout", "window_invalid", "cursor_outside", "user_stop", "runtime_error", "executor_error", "migration_error", "completed"},
+    ("learning", "idle"): {"esc", "still_timeout", "window_invalid", "cursor_outside", "user_stop", "runtime_error"},
+    ("training", "idle"): {"esc", "still_timeout", "window_invalid", "cursor_outside", "user_stop", "runtime_error", "executor_error"},
     ("training", "sleep"): {"time_limit"},
     ("sleep", "stopping"): {"user_stop", "esc", "runtime_error"},
     ("sleep", "idle"): {"esc", "time_limit", "poor_optimization", "user_stop", "runtime_error"},
@@ -400,7 +400,7 @@ ALLOWED_TRANSITIONS = {
 }
 
 
-TERMINATION_REASONS = ("window_invalid", "rect_changed", "empty_action", "executor_error", "time_limit", "esc", "still_timeout", "user_stop", "migration_error", "completed", "poor_optimization")
+TERMINATION_REASONS = ("window_invalid", "cursor_outside", "rect_changed", "empty_action", "executor_error", "time_limit", "esc", "still_timeout", "user_stop", "migration_error", "completed", "poor_optimization")
 POOR_OPTIMIZATION_REASONS = ("no_trainable_records", "repeated_zero_training_batches", "repeated_no_reward_improvement", "repeated_model_loss_worsening", "score_review_failed", "training_errors")
 HUMAN_FEATURE_NAMES = ("duration", "direct", "bend", "points", "speed_mean", "speed_variance", "acceleration_change", "pauses", "hover_before", "drag_curvature", "double_click_interval")
 
@@ -785,6 +785,10 @@ def run_self_test():
     stop_check_panel.update_progress = lambda value: None
     stop_check_panel.ui = lambda fn: fn()
     stop_check_panel.progress_label_var = type("Label", (), {"set": lambda self, value: None})()
+    stop_check_panel.active_mode_stop_reason = ControlPanel.active_mode_stop_reason.__get__(stop_check_panel, type(stop_check_panel))
+    stop_check_panel.apply_active_stop_reason = ControlPanel.apply_active_stop_reason.__get__(stop_check_panel, type(stop_check_panel))
+    stop_check_panel.settings = settings
+    stop_check_panel.mouse_recorder = None
     stop_config = type("Config", (), {"training_seconds": 1, "still_seconds": 10.0})()
     expired_event = threading.Event()
     assert TrainingService(stop_check_panel).should_stop(time.perf_counter() - 2.0, stop_config, expired_event)
@@ -3340,6 +3344,7 @@ class MouseRecorder:
         self.move_action_id = None
         self.listener = None
         self.wake = threading.Event()
+        self.cursor_outside_event = threading.Event()
 
     def start(self):
         if self.listener or not pynput_mouse:
@@ -3364,6 +3369,7 @@ class MouseRecorder:
             self.move_buffer.clear()
             self.move_action_id = None
             self.wake.clear()
+            self.cursor_outside_event.clear()
 
     def active(self):
         return self.get_mode() == "learning"
@@ -3371,20 +3377,28 @@ class MouseRecorder:
     def capture_event(self, kind, x, y, extra=None, allow_current=False):
         if not self.active():
             return None
-        self.on_activity()
-        self.wake.set()
         rect = self.get_rect()
         if not rect:
             return None
         inside = point_inside(rect, x, y)
         if not inside and not allow_current:
+            self.cursor_outside_event.set()
+            self.wake.set()
             return None
+        self.on_activity()
+        self.wake.set()
         previous = None
         if self.current and self.current.get("path"):
             previous = self.current["path"][-1]
         elif self.move_buffer:
             previous = self.move_buffer[-1]
         return build_mouse_event(kind, x, y, rect, previous=previous, extra=extra)
+
+    def cursor_outside(self):
+        return self.cursor_outside_event.is_set()
+
+    def clear_cursor_outside(self):
+        self.cursor_outside_event.clear()
 
     def push_start_marker(self, action_id, event, action_type):
         self.start_markers.append({"action_id": action_id, "action_type": action_type, "perf_time": event["t"], "created_at": now_text(), "x": event["x"], "y": event["y"]})
@@ -3535,7 +3549,7 @@ class HumanMouseExecutor:
                 break
             stop_event.wait(min(self.settings.generated_sleep_event_wait, max(0.0, deadline - time.perf_counter())))
 
-    def move_smooth(self, start, end, duration, stop_event, should_stop, rect=None, previous=None):
+    def move_smooth(self, start, end, duration, stop_event, should_stop, rect=None, previous=None, on_activity=None):
         points = self.smooth_points(start, end, duration, rect=rect)
         actual = []
         delay = duration / max(1, len(points) - 1) if duration > 0.0 else 0.0
@@ -3551,6 +3565,8 @@ class HumanMouseExecutor:
                 stop_event.set()
                 return actual
             self.controller.position = point
+            if on_activity:
+                on_activity()
             event = build_mouse_event("move", point[0], point[1], rect, previous=last)
             event["source"] = "ai"
             actual.append(event)
@@ -3559,7 +3575,7 @@ class HumanMouseExecutor:
                 self.stoppable_sleep(delay, stop_event, should_stop)
         return actual
 
-    def execute(self, action, rect, stop_event, should_stop):
+    def execute(self, action, rect, stop_event, should_stop, on_activity=None):
         if not action:
             return None
         self.window_manager.topmost()
@@ -3585,7 +3601,9 @@ class HumanMouseExecutor:
         approach_ratio = distance_to_start / max(1.0, distance_to_start + main_distance)
         approach_duration = clamp(duration * approach_ratio, 0.02, duration * 0.85)
         main_duration = clamp(duration - approach_duration, 0.03, duration)
-        actual_path = self.move_smooth(current, start_abs, approach_duration, stop_event, should_stop, rect=rect)
+        if on_activity:
+            on_activity()
+        actual_path = self.move_smooth(current, start_abs, approach_duration, stop_event, should_stop, rect=rect, on_activity=on_activity)
         if stop_event.is_set():
             return None
         started_at = now_text()
@@ -3595,19 +3613,25 @@ class HumanMouseExecutor:
             if action_type == "drag":
                 self.controller.press(button)
                 pressed = True
-                actual_path.extend(self.move_smooth(start_abs, end_abs, main_duration, stop_event, should_stop, rect=rect, previous=actual_path[-1] if actual_path else None))
+                actual_path.extend(self.move_smooth(start_abs, end_abs, main_duration, stop_event, should_stop, rect=rect, previous=actual_path[-1] if actual_path else None, on_activity=on_activity))
             elif action_type == "scroll":
                 scroll = action.get("scroll") or [0, 0]
                 self.controller.scroll(int(scroll[0]), int(scroll[1]))
+                if on_activity:
+                    on_activity()
                 actual_path.append(build_mouse_event("scroll", start_abs[0], start_abs[1], rect, previous=actual_path[-1] if actual_path else None, extra={"source": "ai", "scroll": action.get("scroll") or [0, 0]}))
             else:
                 self.controller.press(button)
                 pressed = True
+                if on_activity:
+                    on_activity()
                 hold_floor = min(self.settings.random_click_duration_min, self.settings.random_click_duration_max)
                 hold_ceiling = max(self.settings.random_click_duration_min, self.settings.random_click_duration_max)
                 hold_duration = clamp(main_duration, hold_floor, hold_ceiling if hold_ceiling > 0.0 else self.settings.generated_click_hold_max)
                 self.stoppable_sleep(clamp(hold_duration, 0.0, self.settings.generated_click_hold_max), stop_event, should_stop)
                 actual_path.append(build_mouse_event("release", end_abs[0], end_abs[1], rect, previous=actual_path[-1] if actual_path else None, extra={"source": "ai", "button": str(button)}))
+                if on_activity:
+                    on_activity()
         except Exception as exc:
             return {"execution_error": str(exc), "error_type": type(exc).__name__, "action_type": action_type, "start_abs": [int(start_abs[0]), int(start_abs[1])], "end_abs": [int(end_abs[0]), int(end_abs[1])]}
         finally:
@@ -3920,30 +3944,14 @@ class TrainingService:
     def should_stop(self, start, config, stop_event, suspend_time_limit=False):
         panel = self.panel
         deadline = None if suspend_time_limit else start + max(1, config.training_seconds)
-        guarded = should_stop_run(stop_event, deadline, panel.should_stop_by_escape, getattr(panel, "termination_reason", None))
+        guarded = panel.active_mode_stop_reason("training", stop_event, config, deadline)
         if guarded:
             panel.termination_reason = guarded
             stop_event.set()
-            return True
-        elapsed = time.perf_counter() - start
-        check = panel.window_manager.check_window(force=True)
-        if not check.ok:
-            panel.termination_reason = "window_invalid"
-            stop_event.set()
-            panel.ui(lambda r=check.reason: panel.status_var.set(f"训练模式结束：雷电模拟器客户区异常：{r}"))
-            return True
-        if not panel.cursor_inside_window():
-            panel.termination_reason = "window_invalid"
-            stop_event.set()
-            panel.ui(lambda: panel.status_var.set("训练模式结束：鼠标位于雷电模拟器客户区外"))
-            return True
-        idle_seconds = panel.learning_idle_seconds()
-        if idle_seconds >= config.still_seconds:
-            panel.termination_reason = "still_timeout"
-            stop_event.set()
-            panel.ui(lambda: panel.status_var.set("训练模式结束：鼠标静止超时"))
+            panel.apply_active_stop_reason("training", guarded, stop_event)
             return True
         panel.update_progress(0.0)
+        elapsed = time.perf_counter() - start
         remaining = max(0.0, config.training_seconds - elapsed)
         panel.ui(lambda r=remaining: panel.progress_label_var.set(f"训练模式进度保持 0%｜剩余 {r:.1f} 秒"))
         return False
@@ -3957,7 +3965,7 @@ class TrainingService:
             panel.write_record("training", session_id, snapshot, None, "ai_mouse_failed", decision=decision, planned_action=action, failed_action=True, window_rect_changed=True, execution_error="window_rect_changed")
             panel.adaptive_policy.observe_execution(success=False)
             return False, {"failure_reason": "window_rect_changed"}
-        actual = panel.executor.execute(action, rect, stop_event, panel.should_stop_by_escape)
+        actual = panel.executor.execute(action, rect, stop_event, panel.should_stop_by_escape, panel.mark_learning_activity)
         panel.events.publish("mouse_action_completed", mode="training", success=bool(actual and not actual.get("execution_error")))
         if not actual:
             panel.log_exception("training.execute", RuntimeError("empty_action_result"))
@@ -4875,6 +4883,35 @@ class ControlPanel(tk.Tk):
     def should_stop_by_escape(self):
         return self.escape_monitor.esc_event_pending()
 
+    def active_mode_stop_reason(self, mode, stop_event, config=None, deadline=None):
+        guarded = should_stop_run(stop_event, deadline, self.should_stop_by_escape, getattr(self, "termination_reason", None))
+        if guarded:
+            return guarded
+        check = self.window_manager.check_window(force=True) if self.window_manager else None
+        if not check or not check.ok:
+            return "window_invalid"
+        if mode == "learning" and self.mouse_recorder and self.mouse_recorder.cursor_outside():
+            return "cursor_outside"
+        if not self.cursor_inside_window():
+            return "cursor_outside"
+        still_seconds = safe_float(getattr(config, "still_seconds", self.settings.generated_action_complete_wait), self.settings.generated_action_complete_wait) if config else self.settings.generated_action_complete_wait
+        if self.learning_idle_seconds() >= still_seconds:
+            return "still_timeout"
+        return None
+
+    def apply_active_stop_reason(self, mode, reason, stop_event):
+        if not reason:
+            return False
+        self.termination_reason = reason
+        stop_event.set()
+        if reason == "window_invalid":
+            self.ui(lambda m=mode: self.status_var.set(f"{MODE_NAMES.get(m, m)}结束：雷电模拟器客户区异常"))
+        elif reason == "cursor_outside":
+            self.ui(lambda m=mode: self.status_var.set(f"{MODE_NAMES.get(m, m)}结束：鼠标位于雷电模拟器客户区外"))
+        elif reason == "still_timeout":
+            self.ui(lambda m=mode: self.status_var.set(f"{MODE_NAMES.get(m, m)}结束：鼠标静止超时"))
+        return True
+
     def cursor_position(self):
         if not win32api:
             return None
@@ -4895,12 +4932,15 @@ class ControlPanel(tk.Tk):
         return pos
 
     def cursor_inside_window(self, tolerance=0):
-        pos = self.observe_cursor_activity()
+        pos = self.cursor_position()
         rect = self.current_rect()
         if pos is None or not rect:
             return False
         left, top, right, bottom = rect
-        return left - tolerance <= pos[0] < right + tolerance and top - tolerance <= pos[1] < bottom + tolerance
+        inside = left - tolerance <= pos[0] < right + tolerance and top - tolerance <= pos[1] < bottom + tolerance
+        if inside:
+            self.observe_cursor_activity()
+        return inside
 
     def ensure_cursor_inside_window(self, rect=None):
         rect = rect or self.current_rect()
@@ -5577,27 +5617,19 @@ class ControlPanel(tk.Tk):
         learning_screens = 0
         termination_reason = "completed"
         self.mark_learning_activity()
+        if self.mouse_recorder:
+            self.mouse_recorder.clear_cursor_outside()
         self.last_learning_event_perf = time.perf_counter()
         self.last_learning_event_hash = None
         with ScreenAnalyzer(config.settings.hash_size) as analyzer:
             self.write_record("learning", session_id, self.capture_snapshot(analyzer, "learning", session_id, start, priority="critical"), None, "mode_start")
             while not stop_event.is_set() and self.is_run_active(token, "learning"):
-                if self.should_stop_by_escape():
-                    termination_reason = "esc"
-                    stop_event.set()
+                reason = self.active_mode_stop_reason("learning", stop_event, config)
+                if reason:
+                    termination_reason = reason
+                    self.apply_active_stop_reason("learning", reason, stop_event)
                     break
                 now_perf = time.perf_counter()
-                check = self.window_manager.check_window(force=True)
-                if not check.ok:
-                    termination_reason = "window_invalid"
-                    stop_event.set()
-                    self.ui(lambda r=check.reason: self.status_var.set(f"学习模式结束：雷电模拟器客户区异常：{r}"))
-                    break
-                if not self.cursor_inside_window():
-                    termination_reason = "window_invalid"
-                    stop_event.set()
-                    self.ui(lambda: self.status_var.set("学习模式结束：鼠标位于雷电模拟器客户区外"))
-                    break
                 idle_seconds = self.learning_idle_seconds()
                 remaining = max(0.0, config.still_seconds - idle_seconds)
                 self.ui(lambda e=learning_events, c=learning_screens, r=remaining: self.progress_label_var.set(f"学习模式进度保持 0%｜静止剩余 {r:.1f} 秒｜学习事件 {e}｜截图 {c}"))
@@ -5628,9 +5660,10 @@ class ControlPanel(tk.Tk):
                         self.write_record("learning", session_id, action_snapshot, action, "user_mouse", action_anchor_perf=action.get("started_perf") or action.get("t0"), after_snapshot=after_snapshot, planned_action=action)
                     if not event_seen:
                         while not stop_event.is_set():
-                            if self.should_stop_by_escape():
-                                termination_reason = "esc"
-                                stop_event.set()
+                            reason = self.active_mode_stop_reason("learning", stop_event, config)
+                            if reason:
+                                termination_reason = reason
+                                self.apply_active_stop_reason("learning", reason, stop_event)
                                 break
                             remaining_wait = max(0.0, config.still_seconds - self.learning_idle_seconds())
                             if remaining_wait <= 0.0:
@@ -5638,9 +5671,10 @@ class ControlPanel(tk.Tk):
                             self.mouse_recorder.wait(min(0.1, remaining_wait))
                 else:
                     while not stop_event.is_set():
-                        if self.should_stop_by_escape():
-                            termination_reason = "esc"
-                            stop_event.set()
+                        reason = self.active_mode_stop_reason("learning", stop_event, config)
+                        if reason:
+                            termination_reason = reason
+                            self.apply_active_stop_reason("learning", reason, stop_event)
                             break
                         remaining_wait = max(0.0, config.still_seconds - self.learning_idle_seconds())
                         if remaining_wait <= 0.0:
@@ -5745,7 +5779,7 @@ class ControlPanel(tk.Tk):
                     try:
                         decision = {"reason": "zero_score_recovery", "zero_score_recovery_stage": stage, "zero_score_factor": 1.0}
                         before_snapshot = snapshot
-                        actual = self.executor.execute(action, rect, stop_event, lambda: bool(run_guard()))
+                        actual = self.executor.execute(action, rect, stop_event, lambda: bool(run_guard()), self.mark_learning_activity)
                         guarded = run_guard()
                         if guarded:
                             self.termination_reason = guarded
@@ -5840,9 +5874,9 @@ class ControlPanel(tk.Tk):
                 delay = safe_float(record["mouse_action"].get("duration", 0.0), 0.0) if record and record.get("mouse_action") else 0.0
                 deadline = time.perf_counter() + max(self.settings.min_action_delay_seconds, delay)
                 while time.perf_counter() < deadline and not stop_event.is_set():
-                    if self.should_stop_by_escape():
-                        self.termination_reason = "esc"
-                        stop_event.set()
+                    reason = self.active_mode_stop_reason("training", stop_event, config)
+                    if reason:
+                        self.apply_active_stop_reason("training", reason, stop_event)
                         break
                     stop_event.wait(min(self.settings.generated_action_complete_wait, deadline - time.perf_counter()))
             self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start, priority="critical"), None, "mode_end")
@@ -5922,6 +5956,14 @@ if __name__ == "__main__":
     if "--self-test" in sys.argv:
         run_self_test()
         sys.exit(0)
-    prepare_startup_environment()
     app = ControlPanel()
+    app.update_idletasks()
+    app.deiconify()
+    app.lift()
+    app.update()
+    def panel_startup_failure(message):
+        messagebox.showerror("启动失败", f"{message}\n\n点击确定后退出。", parent=app)
+        app.destroy()
+        sys.exit(1)
+    prepare_startup_environment(failure_handler=panel_startup_failure)
     app.mainloop()
