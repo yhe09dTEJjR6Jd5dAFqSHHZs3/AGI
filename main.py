@@ -878,6 +878,21 @@ def run_self_test():
         assert ControlPanel.sleep_compaction_complete(dummy_panel, {"size_bytes": 100, "target_bytes": 100})
         assert ControlPanel.sleep_restart_blockers(dummy_panel, False, False) == ["经验池压缩未完成", "AI模型清理未完成"]
         assert "AI模型清理未完成" in ControlPanel.sleep_unfinished_summary(dummy_panel, "completed", 3, 3, True, "达到时间上限", False)
+        class SleepDummyVar:
+            def __init__(self):
+                self.value = None
+            def set(self, value):
+                self.value = value
+        sleep_finish_panel = type("SleepFinishPanel", (), {})()
+        sleep_finish_panel.current_mode = lambda: "sleep"
+        sleep_finish_panel.update_progress = lambda value, force=False: setattr(sleep_finish_panel, "completion_progress", value)
+        sleep_finish_panel.ui_sync = lambda fn, wait=None: fn()
+        sleep_finish_panel.progress_label_var = SleepDummyVar()
+        sleep_finish_panel.update_idletasks = lambda: setattr(sleep_finish_panel, "idled", True)
+        sleep_finish_panel.settings = settings
+        ControlPanel.render_sleep_completion_before_idle(sleep_finish_panel, "睡眠模式保存完成 100%", 100.0)
+        assert sleep_finish_panel.completion_progress == 100.0
+        assert sleep_finish_panel.progress_label_var.value == "睡眠模式保存完成 100%"
         mouse_executor = HumanMouseExecutor.__new__(HumanMouseExecutor)
         mouse_executor.settings = derive_runtime_settings()
         edge_rect = (10, 20, 30, 40)
@@ -5371,7 +5386,7 @@ class ControlPanel(tk.Tk):
             final_reason = "time_limit"
             unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "达到时间上限", models_complete)
             self.render_sleep_completion_before_idle(f"睡眠模式保存完成 100%｜{unfinished}", 100.0)
-            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=not can_restart, reason=final_reason)
+            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=True, reason=final_reason)
         elif (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and poor_optimization:
             final_reason = "poor_optimization"
             unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "AI模型优化效果差：" + (poor_optimization_reason or "poor_optimization"), models_complete)
