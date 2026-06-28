@@ -872,6 +872,8 @@ def run_self_test():
         assert ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 100, "target_bytes": 100}) == 1.0
         assert ControlPanel.sleep_progress_fields(dummy_panel, time.perf_counter(), 10, 0, 10, 1.0)["compaction"] == 1.0
         assert ControlPanel.sleep_compaction_complete(dummy_panel, {"size_bytes": 100, "target_bytes": 100})
+        assert ControlPanel.sleep_restart_blockers(dummy_panel, False, False) == ["经验池压缩未完成", "AI模型清理未完成"]
+        assert "AI模型清理未完成" in ControlPanel.sleep_unfinished_summary(dummy_panel, "completed", 3, 3, True, "达到时间上限", False)
         mouse_executor = HumanMouseExecutor.__new__(HumanMouseExecutor)
         mouse_executor.settings = derive_runtime_settings()
         edge_rect = (10, 20, 30, 40)
@@ -2151,13 +2153,20 @@ class DataStore:
         models = sorted(self.model_dir.glob("model_*.json"), key=self.model_created_key, reverse=True)
         keep = min(len(models), limit)
         removed = 0
+        errors = []
         for path in models[keep:]:
             try:
                 path.unlink()
                 removed += 1
-            except Exception:
-                pass
-        return {"changed": removed > 0, "removed": removed, "limit": limit, "target_count": keep, "model_count": len(models) - removed}
+            except Exception as exc:
+                error = {"path": str(path), "error": str(exc), "error_type": type(exc).__name__}
+                errors.append(error)
+                try:
+                    self.log_error("compact_ai_models.unlink", exc, error)
+                except Exception:
+                    pass
+        remaining = len(list(self.model_dir.glob("model_*.json")))
+        return {"changed": removed > 0, "removed": removed, "limit": limit, "target_count": min(remaining, limit), "model_count": remaining, "complete": remaining <= limit, "errors": errors}
 
 
     def validate_model_state(self, payload, settings=None):
@@ -2403,10 +2412,13 @@ class DataStore:
                 try:
                     if path.exists() and path.is_file():
                         path.unlink()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    try:
+                        self.log_error("compact_experience_pool.unlink", exc, {"path": str(path)})
+                    except Exception:
+                        pass
             current = self.experience_pool_size_bytes([entry["record"] for entry in keep_records])
-        return {"changed": bool(removed_ids), "size_bytes": current, "removed": removed, "target_bytes": target_bytes}
+        return {"changed": bool(removed_ids), "size_bytes": current, "removed": removed, "target_bytes": target_bytes, "complete": current <= target_bytes}
 
     def log_error(self, where, error, context=None):
         payload = {
@@ -5223,6 +5235,7 @@ class ControlPanel(tk.Tk):
             self.ui(lambda: self.progress_label_var.set("睡眠模式保存中｜进度 92%"))
         saved, save_error, save_report = self.save_sleep_data(config, save_status, run_guard=run_guard, status_detail={"poor_optimization_reason": poor_optimization_reason} if poor_optimization_reason else None)
         compaction_complete = bool(save_report.get("compaction_complete", compaction_complete)) if isinstance(save_report, dict) else compaction_complete
+        models_complete = bool(save_report.get("models_complete", False)) if isinstance(save_report, dict) else False
         if not saved:
             if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
                 self.finish_run(token, "保存失败：" + str(save_error), self.progress_value, release=False, reason="runtime_error")
@@ -5230,25 +5243,31 @@ class ControlPanel(tk.Tk):
             return
         final_reason = None
         restart_allowed = restart_training and save_status == "time_limit"
+        can_restart = restart_training and save_status == "time_limit" and compaction_complete and models_complete
         if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and time_limit_reached:
             final_reason = "time_limit"
-            unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "达到时间上限")
+            unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "达到时间上限", models_complete)
             self.render_sleep_completion_before_idle(f"睡眠模式保存完成 100%｜{unfinished}", 100.0)
-            should_restart_training = restart_training and final_reason == "time_limit"
-            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=not should_restart_training, reason=final_reason)
+            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=not can_restart, reason=final_reason)
         elif (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and poor_optimization:
             final_reason = "poor_optimization"
-            unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "AI模型优化效果差：" + (poor_optimization_reason or "poor_optimization"))
+            unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "AI模型优化效果差：" + (poor_optimization_reason or "poor_optimization"), models_complete)
             self.render_sleep_completion_before_idle(f"睡眠模式保存完成 100%｜{unfinished}", 100.0)
-            should_restart_training = restart_training and final_reason == "time_limit"
-            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=not should_restart_training, reason=final_reason)
+            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=True, reason=final_reason)
         elif (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
             final_reason = stopped_reason or "user_stop"
-            unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "用户中断")
+            unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "用户中断", models_complete)
             self.render_sleep_completion_before_idle(f"睡眠模式保存完成 100%｜{unfinished}", 100.0)
-            should_restart_training = restart_training and final_reason == "time_limit"
-            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=not should_restart_training, reason=final_reason)
-        if restart_allowed and final_reason == "time_limit":
+            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=True, reason=final_reason)
+        if restart_allowed and final_reason == "time_limit" and not can_restart:
+            blockers = self.sleep_restart_blockers(compaction_complete, models_complete)
+            message = "自动重启训练失败：" + "，".join(blockers)
+            self.restore_panel()
+            self.ui(lambda m=message: self.status_var.set(m))
+            if self.store:
+                self.store.log_error("sleep_auto_restart_blocked", RuntimeError(message), {"compaction_complete": compaction_complete, "models_complete": models_complete, "save_report": save_report})
+            self.events.publish("auto_restart_training_failed", reason=message, compaction_complete=compaction_complete, models_complete=models_complete)
+        if can_restart and final_reason == "time_limit":
             self.main_thread_events.put({"type": "restart_training", "reason": final_reason, "config": config, "token": token, "created_at": now_text(), "precheck": {"review_status": review_status, "compaction_complete": compaction_complete, "models_complete": models_complete}})
             self.ui(self.process_main_thread_events)
 
@@ -5263,7 +5282,15 @@ class ControlPanel(tk.Tk):
             self.log_exception("sleep_restart_runtime_ready", exc)
             return False
 
-    def sleep_unfinished_summary(self, review_status, completed, target_training_steps, compaction_complete, reason):
+    def sleep_restart_blockers(self, compaction_complete, models_complete):
+        blockers = []
+        if not compaction_complete:
+            blockers.append("经验池压缩未完成")
+        if not models_complete:
+            blockers.append("AI模型清理未完成")
+        return blockers or ["自动重启前置条件未满足"]
+
+    def sleep_unfinished_summary(self, review_status, completed, target_training_steps, compaction_complete, reason, models_complete=True):
         items = []
         if review_status not in ("completed", "quarantined"):
             items.append("评分复核未完成")
@@ -5271,6 +5298,8 @@ class ControlPanel(tk.Tk):
             items.append(f"训练批次 {completed}/{target_training_steps}")
         if not compaction_complete:
             items.append("经验池压缩未完成")
+        if not models_complete:
+            items.append("AI模型清理未完成")
         if not items:
             items.append("后续训练循环尚未确认")
         return f"{reason}；未完成：" + "，".join(items)
