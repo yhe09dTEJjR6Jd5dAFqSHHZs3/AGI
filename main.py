@@ -763,6 +763,21 @@ def run_self_test():
     assert "time_limit" in ALLOWED_TRANSITIONS[("training", "sleep")]
     assert should_stop_run(threading.Event(), time.perf_counter() - 1.0, None) == "time_limit"
     assert should_stop_run(threading.Event(), None, None) is None
+    stop_check_panel = type("StopCheckPanel", (), {})()
+    stop_check_panel.termination_reason = None
+    stop_check_panel.should_stop_by_escape = lambda: False
+    stop_check_panel.window_manager = type("Window", (), {"check_window": lambda self, force=True: type("Check", (), {"ok": True, "reason": "ok"})()})()
+    stop_check_panel.cursor_inside_window = lambda: True
+    stop_check_panel.learning_idle_seconds = lambda: 0.0
+    stop_check_panel.update_progress = lambda value: None
+    stop_check_panel.ui = lambda fn: fn()
+    stop_check_panel.progress_label_var = type("Label", (), {"set": lambda self, value: None})()
+    stop_config = type("Config", (), {"training_seconds": 1, "still_seconds": 10.0})()
+    expired_event = threading.Event()
+    assert TrainingService(stop_check_panel).should_stop(time.perf_counter() - 2.0, stop_config, expired_event)
+    suspended_event = threading.Event()
+    assert not TrainingService(stop_check_panel).should_stop(time.perf_counter() - 2.0, stop_config, suspended_event, suspend_time_limit=True)
+    assert not suspended_event.is_set()
     assert ("sleep", "training") not in ALLOWED_TRANSITIONS
     assert ("sleep", "starting") not in ALLOWED_TRANSITIONS
     assert {"completed", "time_limit", "poor_optimization"}.issubset(ALLOWED_TRANSITIONS[("sleep", "idle")])
@@ -3613,9 +3628,9 @@ class TrainingService:
         screen_score_total = panel.store.screen_score_total if panel.store else 0.0
         return panel.brain.choose(snapshot.hash_value, novelty, batch, screen_score_total, zero_score_factor=zero_score_factor)
 
-    def should_stop(self, start, config, stop_event):
+    def should_stop(self, start, config, stop_event, suspend_time_limit=False):
         panel = self.panel
-        deadline = start + max(1, config.training_seconds)
+        deadline = None if suspend_time_limit else start + max(1, config.training_seconds)
         guarded = should_stop_run(stop_event, deadline, panel.should_stop_by_escape)
         if guarded:
             panel.termination_reason = guarded
@@ -5315,6 +5330,7 @@ class ControlPanel(tk.Tk):
     def training_loop(self, token, stop_event, config):
         session_id = uuid.uuid4().hex
         start = time.perf_counter()
+        training_timer_started_at = start
         consecutive_failures = 0
         consecutive_no_actions = 0
         zero_score_events = 0
@@ -5325,7 +5341,7 @@ class ControlPanel(tk.Tk):
         with ScreenAnalyzer(config.settings.hash_size) as analyzer:
             self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start, priority="critical"), None, "mode_start")
             while not stop_event.is_set() and self.is_run_active(token, "training"):
-                if service.should_stop(start, config, stop_event):
+                if service.should_stop(training_timer_started_at, config, stop_event, suspend_time_limit=zero_score_started_at is not None):
                     break
                 rect = self.current_rect()
                 service.prepare_for_event(rect)
@@ -5376,6 +5392,7 @@ class ControlPanel(tk.Tk):
                     self.events.publish("training_zero_screen_score", streak=zero_score_events, zero_score_elapsed=round(time.perf_counter() - zero_score_started_at, 3) if zero_score_started_at else 0.0, strategy_stage=min(5, 1 + int(clamp(zero_score_events / max(1, self.settings.training_fail_stop_count), 0.0, 1.0) * 5.0)), screen_score=current_screen_score, recovered=bool(recovered))
                     if recovered:
                         zero_score_events = 0
+                        training_timer_started_at = time.perf_counter()
                 else:
                     zero_score_events = 0
                     zero_score_started_at = None
