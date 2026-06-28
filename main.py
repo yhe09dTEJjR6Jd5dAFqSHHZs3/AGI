@@ -821,6 +821,22 @@ def run_self_test():
         assert ControlPanel.sleep_progress_fields(dummy_panel, time.perf_counter(), 10, 0, 10, 1.0)["compaction"] == 1.0
         assert ControlPanel.sleep_compaction_complete(dummy_panel, {"size_bytes": 100, "target_bytes": 100})
         assert ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, deque([0.02, 0.02]), 0.01, 0.9, 0.8, True)
+        assert not ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, deque([0.02, 0.02]), 0.01, 0.9, 0.8, True, "failed")
+        transition_panel = ControlPanel.__new__(ControlPanel)
+        transition_panel.state_lock = threading.RLock()
+        transition_panel.mode = "training"
+        transition_panel.run_token = 7
+        stopped_event = threading.Event()
+        stopped_event.set()
+        transition_panel.stop_event = stopped_event
+        transition_panel.active_session = ModeSession(7, "training", time.perf_counter(), None, stopped_event)
+        transition_panel.termination_reason = None
+        transition_panel.events = type("Events", (), {"publish": lambda self, name=None, **kwargs: {"sequence": 1}})()
+        transition_panel.set_mode_ui = lambda mode: None
+        transition_panel.ui = lambda fn: fn()
+        transition_panel.update_mode_button_states = lambda: None
+        sleep_session = ControlPanel.transition(transition_panel, "training", "sleep", reason="time_limit", token=7, fresh_stop_event=True)
+        assert sleep_session and not sleep_session.stop_event.is_set() and sleep_session.stop_event is not stopped_event
         class DummyVar:
             def __init__(self):
                 self.value = None
@@ -2816,8 +2832,11 @@ class ExperiencePool:
                             file_hash = analyzer.fingerprint(rgb_image)
                             record["image_checksum"] = image_content_checksum(rgb_image)
                     else:
-                        record.update({"score_status": "image_missing", "exclude_from_training": True, "quarantined": True, "quarantine_reason": "image_missing", "score_checked_at": now_text()})
-                        image_missing += 1
+                        if record.get("image_dropped") or record.get("screen_file_expected") is False:
+                            record.update({"score_status": "image_unavailable_hash_scored", "score_checked_at": now_text()})
+                        else:
+                            record.update({"score_status": "image_missing", "exclude_from_training": True, "quarantined": True, "quarantine_reason": "image_missing", "score_checked_at": now_text()})
+                            image_missing += 1
                 except Exception as exc:
                     record["screen_file_error"] = str(exc)
                     record.update({"score_status": "image_corrupt", "exclude_from_training": True, "quarantined": True, "quarantine_reason": "image_corrupt", "score_checked_at": now_text()})
@@ -4422,7 +4441,7 @@ class ControlPanel(tk.Tk):
     def set_mode_ui(self, mode):
         self.ui(lambda m=mode: self.mode_var.set(MODE_NAMES.get(m, m)))
 
-    def transition(self, expected, target, reason=None, token=None, deadline=None):
+    def transition(self, expected, target, reason=None, token=None, deadline=None, fresh_stop_event=False):
         with self.state_lock:
             if token is not None and token != self.run_token:
                 return None
@@ -4443,7 +4462,7 @@ class ControlPanel(tk.Tk):
             else:
                 self.run_token += 1 if token is None else 0
                 session_token = self.run_token if token is None else token
-                stop_event = self.stop_event if token is not None else threading.Event()
+                stop_event = threading.Event() if fresh_stop_event else (self.stop_event if token is not None else threading.Event())
                 self.stop_event = stop_event
                 self.mode = target
                 event = self.events.publish("mode_transition", source=source, target=target, reason=transition_reason, token=session_token)
@@ -4470,10 +4489,21 @@ class ControlPanel(tk.Tk):
     def idle_progress_value(self, source_mode, progress=0.0):
         return 0.0 if source_mode in ("starting", "learning", "training", "sleep", "migration", "idle") else progress
 
-    def render_sleep_completion_before_idle(self, label):
+    def render_sleep_completion_before_idle(self, label, progress=100.0):
         if self.current_mode() == "sleep":
-            self.update_progress(100.0, force=True)
+            self.update_progress(progress, force=True)
             self.ui_sync(lambda l=label: (self.progress_label_var.set(l), self.update_idletasks()), self.settings.ui_event_coalesce_seconds)
+
+    def flush_mode_data(self):
+        try:
+            if self.persistence_queue:
+                self.persistence_queue.flush()
+            if self.store:
+                self.store.flush_state(force=True)
+            return True, None
+        except Exception as exc:
+            self.log_exception("mode_data_flush", exc)
+            return False, exc
 
     def finish_run(self, token, status, progress=0.0, release=True, reason=None):
         mapped_reason = reason or "completed"
@@ -4744,10 +4774,10 @@ class ControlPanel(tk.Tk):
         target_bytes = max(1.0, safe_float(compact.get("target_bytes", 1.0), 1.0))
         return size_bytes <= target_bytes
 
-    def sleep_completion_reached(self, completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, compaction_complete):
+    def sleep_completion_reached(self, completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, compaction_complete, review_status="completed"):
         pending_state = safe_int(getattr(self.store, "pending_state_writes", 0), 0) if self.store else 0
         improvement_ready = bool(recent_improvements) and sum(recent_improvements) >= improvement_threshold * len(recent_improvements)
-        return completed >= target_training_steps and improvement_ready and batch_confidence >= confidence_target and compaction_complete and pending_state == 0
+        return review_status in ("completed", "quarantined") and completed >= target_training_steps and improvement_ready and batch_confidence >= confidence_target and compaction_complete and pending_state == 0
 
     def sleep_loop(self, token, config, stop_event, restart_training=False):
         started = self.events.publish("sleep_started", seconds=config.sleep_seconds, data_path=str(config.data_path))
@@ -4774,6 +4804,10 @@ class ControlPanel(tk.Tk):
         run_guard = lambda: should_stop_run(stop_event, sleep_deadline, self.should_stop_by_escape)
         self.ui(lambda: self.progress_label_var.set("睡眠资源整理中｜正在立即压缩经验池并裁剪模型"))
         try:
+            self.persistence_paused.set()
+            if self.persistence_queue:
+                self.persistence_queue.flush()
+            self.store.flush_state(force=True)
             self.store.compact_ai_models(config.ai_model_limit)
             initial_compact = self.store.compact_experience_pool(config.experience_pool_gb, run_guard=run_guard)
             compaction_progress = self.sleep_compaction_progress(initial_compact)
@@ -4784,15 +4818,20 @@ class ControlPanel(tk.Tk):
                 self.brain = ActionBrain(self.experience_pool, config.settings)
         except Exception as exc:
             self.log_exception("sleep_initial_compaction", exc, initial_compact)
+        finally:
+            self.persistence_paused.clear()
         self.update_progress(15.0)
         self.ui(lambda: self.progress_label_var.set("睡眠评分复核中｜正在检查全部画面评分"))
         recheck_result = {"checked": 0, "rescored": 0, "missing": 0, "errors": 0, "image_missing": 0, "image_corrupt": 0, "hash_missing": 0, "unrecoverable": 0}
+        review_status = "failed"
         try:
             with ScreenAnalyzer(config.settings.hash_size) as analyzer:
                 recheck_result = self.experience_pool.recheck_screen_scores(self.store, analyzer, run_guard=run_guard)
             self.events.publish("sleep_screen_scores_rechecked", **recheck_result)
             self.store.merge_experience_records_by_id(copy.deepcopy(self.experience_pool.records))
+            review_status = "quarantined" if recheck_result.get("unrecoverable", 0) else "completed"
         except Exception as exc:
+            review_status = "failed"
             self.log_exception("sleep_score_recheck", exc, recheck_result)
         self.ui(lambda r=recheck_result: self.progress_label_var.set(f"睡眠训练进度｜评分复核 {r.get('checked', 0)} 条｜重评 {r.get('rescored', 0)} 条｜不可恢复 {r.get('unrecoverable', 0)} 条"))
         if self.store and recheck_result.get("unrecoverable", 0):
@@ -4870,7 +4909,7 @@ class ControlPanel(tk.Tk):
                 remaining_seconds = max(0.0, sleep_deadline - time.perf_counter())
                 self.ui(lambda r=remaining_seconds, c=completed, t=target_training_steps, q=batch_confidence: self.progress_label_var.set(f"睡眠训练进度｜剩余 {r:.1f} 秒｜已训练批次 {c}/{t}｜当前置信度 {q * 100.0:.1f}%"))
                 self.update_progress(self.sleep_progress_percent(started_perf, config.sleep_seconds, completed, target_training_steps, compaction_progress))
-                if self.sleep_completion_reached(completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, compaction_complete):
+                if self.sleep_completion_reached(completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, compaction_complete, review_status):
                     completed_success = True
                     self.events.publish("sleep_completion_reached", completed_batches=completed, target_training_steps=target_training_steps, confidence=batch_confidence, confidence_target=confidence_target)
                     break
@@ -4898,17 +4937,32 @@ class ControlPanel(tk.Tk):
             self.finish_run(token, "睡眠模式任务完成，数据已保存", 100.0, release=False, reason=final_reason)
         elif (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and time_limit_reached:
             final_reason = "time_limit"
-            self.render_sleep_completion_before_idle("睡眠模式进度 100%｜到达时间上限，数据已保存")
-            self.finish_run(token, "睡眠模式到达时间上限，数据已保存", 100.0, release=False, reason=final_reason)
+            unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "达到时间上限")
+            self.render_sleep_completion_before_idle(f"睡眠模式未完成｜{unfinished}", self.progress_value)
+            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", self.progress_value, release=False, reason=final_reason)
         elif (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and poor_optimization:
             final_reason = "poor_optimization"
-            self.finish_run(token, "AI模型优化效果差，已保存数据并退出睡眠模式", self.progress_value, release=False, reason=final_reason)
+            unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "AI模型优化效果差")
+            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", self.progress_value, release=False, reason=final_reason)
         elif (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
             final_reason = stopped_reason or "user_stop"
-            self.finish_run(token, "睡眠模式已终止，数据已保存", 0.0, release=False, reason=final_reason)
+            unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "用户中断")
+            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", self.progress_value, release=False, reason=final_reason)
         if restart_training and final_reason not in ("esc", "user_stop"):
             self.main_thread_events.put({"type": "restart_training", "reason": final_reason, "config": config, "token": token, "created_at": now_text()})
             self.ui(self.process_main_thread_events)
+
+    def sleep_unfinished_summary(self, review_status, completed, target_training_steps, compaction_complete, reason):
+        items = []
+        if review_status not in ("completed", "quarantined"):
+            items.append("评分复核未完成")
+        if completed < target_training_steps:
+            items.append(f"训练批次 {completed}/{target_training_steps}")
+        if not compaction_complete:
+            items.append("经验池压缩未完成")
+        if not items:
+            items.append("后续训练循环尚未确认")
+        return f"{reason}；未完成：" + "，".join(items)
 
     def save_sleep_data(self, config, status, run_guard=None):
         if not self.store or not self.experience_pool:
@@ -5148,7 +5202,11 @@ class ControlPanel(tk.Tk):
                     stop_event.wait(max(0.0, config.still_seconds - idle_seconds))
             self.write_record("learning", session_id, self.capture_snapshot(analyzer, "learning", session_id, start, priority="critical"), None, "mode_end")
         if self.is_run_active(token, "learning") or self.is_run_active(token, "stopping"):
-            self.finish_run(token, "学习模式结束", 0.0, reason=termination_reason if not stop_event.is_set() else (termination_reason or "user_stop"))
+            saved, save_error = self.flush_mode_data()
+            if not saved:
+                self.finish_run(token, "保存失败：" + str(save_error), 0.0, release=False, reason="runtime_error")
+            else:
+                self.finish_run(token, "学习模式结束", 0.0, reason=termination_reason if not stop_event.is_set() else (termination_reason or "user_stop"))
         else:
             self.release_window_and_panel()
 
@@ -5168,6 +5226,18 @@ class ControlPanel(tk.Tk):
             return self.brain.mutate_action(action, 0.8)
         return self.brain.random_action(0.15)
 
+    def recovery_stop_reason(self, stop_event, config):
+        if stop_event.is_set() or self.should_stop_by_escape():
+            return "esc"
+        check = self.window_manager.check_window(force=True)
+        if not check.ok:
+            return "window_invalid"
+        if not self.cursor_inside_window():
+            return "window_invalid"
+        if self.learning_idle_seconds() >= safe_float(getattr(config, "still_seconds", self.settings.generated_action_complete_wait), self.settings.generated_action_complete_wait):
+            return "still_timeout"
+        return None
+
     def recover_zero_screen_score(self, analyzer, session_id, start, stop_event, zero_score_started_at, current_score, config=None):
         stage_names = ("recapture", "verify_window", "refresh_index", "wait_render", "trusted_history", "bounded_random", "rescore")
         still_seconds = safe_float(getattr(config, "still_seconds", self.settings.generated_action_complete_wait), self.settings.generated_action_complete_wait)
@@ -5176,10 +5246,15 @@ class ControlPanel(tk.Tk):
             return current_score, zero_score_started_at, False
         score = current_score
         stage_index = 0
-        run_guard = lambda: should_stop_run(stop_event, None, self.should_stop_by_escape)
+        run_guard = lambda: self.recovery_stop_reason(stop_event, config)
         while score <= 0.0 and not run_guard() and self.is_run_active(self.active_session.token if self.active_session else None, "training"):
             stage = stage_names[min(stage_index, len(stage_names) - 1)]
             self.events.publish("training_zero_score_recovery", stage=stage, elapsed=round(time.perf_counter() - zero_score_started_at, 3), screen_score=score)
+            guarded = run_guard()
+            if guarded:
+                self.termination_reason = guarded
+                stop_event.set()
+                break
             if stage == "verify_window":
                 check = self.window_manager.check_window(force=True)
                 if not check.ok:
@@ -5207,12 +5282,21 @@ class ControlPanel(tk.Tk):
                     action = self.best_zero_score_recovery_action(snapshot.hash_value)
                 else:
                     action = self.brain.random_action(0.35)
+                guarded = run_guard()
+                if guarded:
+                    self.termination_reason = guarded
+                    stop_event.set()
+                    break
                 if action and self.executor and not run_guard():
                     try:
                         decision = {"reason": "zero_score_recovery", "zero_score_recovery_stage": stage, "zero_score_factor": 1.0}
                         before_snapshot = snapshot
                         actual = self.executor.execute(action, rect, stop_event, lambda: bool(run_guard()))
-                        after_snapshot = self.capture_snapshot(analyzer, "training", session_id, start, rect=rect, priority="critical") if not run_guard() else None
+                        guarded = run_guard()
+                        if guarded:
+                            self.termination_reason = guarded
+                            stop_event.set()
+                        after_snapshot = self.capture_snapshot(analyzer, "training", session_id, start, rect=rect, priority="critical") if not guarded else None
                         if actual:
                             record = self.write_record("training", session_id, before_snapshot, actual, "ai_mouse_zero_score_recovery", decision=decision, action_anchor_perf=actual.get("started_perf"), after_snapshot=after_snapshot, planned_action=action, execution_error=actual.get("execution_error"))
                             if record:
@@ -5307,7 +5391,11 @@ class ControlPanel(tk.Tk):
         if self.is_run_active(token, "training") or self.is_run_active(token, "stopping"):
             final_reason = self.termination_reason or ("esc" if self.should_stop_by_escape() else "user_stop")
             if final_reason == "time_limit":
-                session = self.transition("training", "sleep", reason="time_limit", token=token)
+                saved, save_error = self.flush_mode_data()
+                if not saved:
+                    self.finish_run(token, "保存失败：" + str(save_error), 0.0, release=False, reason="runtime_error")
+                    return
+                session = self.transition("training", "sleep", reason="time_limit", token=token, fresh_stop_event=True)
                 if session:
                     self.update_progress(0.0, force=True)
                     self.ui(self.update_mode_button_states)
@@ -5315,7 +5403,11 @@ class ControlPanel(tk.Tk):
                     self.mode_thread = threading.Thread(target=self.sleep_loop, args=(session.token, config, session.stop_event, True), daemon=True)
                     self.mode_thread.start()
             else:
-                self.finish_run(token, "训练模式已终止" if stop_event.is_set() else "训练模式结束", 0.0, reason=final_reason)
+                saved, save_error = self.flush_mode_data()
+                if not saved:
+                    self.finish_run(token, "保存失败：" + str(save_error), 0.0, release=False, reason="runtime_error")
+                else:
+                    self.finish_run(token, "训练模式已终止" if stop_event.is_set() else "训练模式结束", 0.0, reason=final_reason)
         else:
             self.release_window_and_panel()
 
