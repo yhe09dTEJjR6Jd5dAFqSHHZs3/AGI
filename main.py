@@ -912,7 +912,28 @@ def run_self_test():
         assert edge_points and all(point_inside(edge_rect, x, y) for x, y in edge_points)
         assert mouse_executor.clamp_point_to_rect((-100, 100), edge_rect) == (10, 39)
         assert ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, deque([0.02, 0.02]), 0.01, 0.9, 0.8, True)
+        assert ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, deque([0.02, 0.02]), 0.01, 0.9, 0.8, False)
         assert not ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, deque([0.02, 0.02]), 0.01, 0.9, 0.8, True, "failed")
+        task3_store = DataStore(root / "task3")
+        task3_store.model_dir.mkdir(parents=True, exist_ok=True)
+        for name, created in (("model_task3_new.json", "2025-01-03T00:00:00.000"), ("model_task3_old.json", "2025-01-01T00:00:00.000")):
+            (task3_store.model_dir / name).write_text(json.dumps({"created_at": created, "model": {"type": "bad"}}), encoding="utf-8")
+        task3_screen = task3_store.screen_dir / "oversize.png"
+        with task3_screen.open("wb") as file:
+            file.truncate(120 * 1024 * 1024)
+        task3_store.save_experience_records([{"id": "task3_low", "screen_path": "screens/oversize.png", "reward": 0.0}])
+        task3_events = []
+        task3_panel = type("Task3Panel", (), {})()
+        task3_panel.store = task3_store
+        task3_panel.events = type("Events", (), {"publish": lambda self, name, **data: task3_events.append(name)})()
+        task3_panel.progress_label_var = SleepDummyVar()
+        task3_panel.ui = lambda fn: fn()
+        task3_panel.progress_value = 0.0
+        task3_panel.update_progress = lambda value, force=False: setattr(task3_panel, "progress_value", value)
+        task3_config = type("Task3Config", (), {"ai_model_limit": 1, "experience_pool_gb": 0.1})()
+        model_result, pool_result = ControlPanel.run_sleep_task3(task3_panel, task3_config)
+        assert model_result["complete"] and pool_result["complete"]
+        assert task3_events.index("sleep_model_cleanup_completed") < task3_events.index("experience_pool_compaction_completed")
         assert WindowCheck(True, "ok", (0, 0, 10, 10), 9, 9, 0.0).occluded_ratio == 0.0
         for name, created in (("model_new.json", "2025-01-02T00:00:00.000"), ("model_old.json", "2025-01-01T00:00:00.000"), ("model_mid.json", "2025-01-01T12:00:00.000")):
             (store.model_dir / name).write_text(json.dumps({"created_at": created, "model": {"type": "bad"}}), encoding="utf-8")
@@ -5237,7 +5258,7 @@ class ControlPanel(tk.Tk):
 
     def sleep_completion_reached(self, completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, compaction_complete, review_status="completed"):
         pending_state = safe_int(getattr(self.store, "pending_state_writes", 0), 0) if self.store else 0
-        return review_status in ("completed", "quarantined") and completed >= target_training_steps and compaction_complete and pending_state == 0
+        return review_status in ("completed", "quarantined") and completed >= target_training_steps and pending_state == 0
 
     def sleep_loop(self, token, config, stop_event, restart_training=False):
         self.events.publish("sleep_started", data_path=str(config.data_path))
@@ -5390,9 +5411,25 @@ class ControlPanel(tk.Tk):
         if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
             self.update_progress(max(self.progress_value, 92.0), force=True)
             self.ui(lambda: self.progress_label_var.set("睡眠模式保存中｜进度 92%"))
-        saved, save_error, save_report = self.save_sleep_data(config, save_status, run_guard=run_guard)
+        task3_report = None
+        if completed_normally and not stopped_reason:
+            try:
+                model_result, pool_result = self.run_sleep_task3(config, run_guard=run_guard)
+                task3_report = {"model": model_result, "pool": pool_result}
+                compaction_complete = bool(pool_result.get("complete"))
+                models_complete = bool(model_result.get("complete"))
+            except Exception as exc:
+                completed_normally = False
+                compaction_complete = False
+                models_complete = False
+                task3_report = {"error": str(exc), "error_type": type(exc).__name__}
+                self.log_exception("sleep_task3", exc, task3_report)
+                if self.store:
+                    self.store.log_error("sleep_task3_failed", exc, task3_report)
+                save_status = "incomplete"
+        saved, save_error, save_report = self.save_sleep_data(config, save_status, run_guard=run_guard, task3_report=task3_report)
         compaction_complete = bool(save_report.get("compaction_complete", compaction_complete)) if isinstance(save_report, dict) else compaction_complete
-        models_complete = bool(save_report.get("models_complete", False)) if isinstance(save_report, dict) else False
+        models_complete = bool(save_report.get("models_complete", models_complete)) if isinstance(save_report, dict) else models_complete
         if not saved:
             if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
                 self.finish_run(token, "保存失败：" + str(save_error), self.progress_value, release=False, reason="runtime_error")
@@ -5445,7 +5482,26 @@ class ControlPanel(tk.Tk):
             items.append("后续训练循环尚未确认")
         return f"{reason}；未完成：" + "，".join(items)
 
-    def save_sleep_data(self, config, status, run_guard=None, status_detail=None):
+    def run_sleep_task3(self, config, run_guard=None):
+        if not self.store:
+            return {"changed": False, "removed": 0, "model_count": 0, "complete": True}, {"changed": False, "size_bytes": 0, "removed": 0, "target_bytes": 0, "complete": True}
+        self.ui(lambda: self.progress_label_var.set("睡眠任务3｜清理超额AI模型"))
+        model_result = self.store.compact_ai_models(config.ai_model_limit)
+        self.events.publish("sleep_model_cleanup_completed", removed=model_result.get("removed", 0), model_count=model_result.get("model_count", 0), limit=model_result.get("limit", 0), complete=model_result.get("complete", False))
+        if not model_result.get("complete"):
+            raise RuntimeError("睡眠模式任务3未完成：AI模型清理未完成")
+        self.update_progress(max(self.progress_value, 94.0), force=True)
+        if run_guard and run_guard():
+            raise RuntimeError("睡眠模式任务3被中断：经验池压缩未执行")
+        self.ui(lambda: self.progress_label_var.set("睡眠任务3｜压缩经验池至上限50%"))
+        pool_result = self.store.compact_experience_pool(config.experience_pool_gb, run_guard=run_guard)
+        self.events.publish("experience_pool_compaction_completed", removed=pool_result.get("removed", 0), size_bytes=pool_result.get("size_bytes", 0), target_bytes=pool_result.get("target_bytes", 0), complete=pool_result.get("complete", False))
+        if not pool_result.get("complete"):
+            raise RuntimeError("睡眠模式任务3未完成：经验池压缩未完成")
+        self.update_progress(max(self.progress_value, 96.0), force=True)
+        return model_result, pool_result
+
+    def save_sleep_data(self, config, status, run_guard=None, status_detail=None, task3_report=None):
         if not self.store or not self.experience_pool:
             return True, None, {"model_count": 0, "experience_size": 0, "target_bytes": 0, "compaction_complete": True, "models_complete": True}
         try:
@@ -5458,10 +5514,12 @@ class ControlPanel(tk.Tk):
             with self.experience_pool.lock:
                 self.store.merge_experience_records_by_id(copy.deepcopy(self.experience_pool.records))
                 model = self.experience_pool.model
-            self.update_progress(max(self.progress_value, 96.0), force=True)
-            compact = self.store.compact_experience_pool(config.experience_pool_gb, run_guard=persistence_guard)
-            if compact.get("changed"):
-                self.events.publish("experience_pool_compaction_completed", removed=compact.get("removed", 0), size_bytes=compact.get("size_bytes", 0))
+            self.update_progress(max(self.progress_value, 97.0), force=True)
+            compact = (task3_report or {}).get("pool") if isinstance(task3_report, dict) else None
+            if not isinstance(compact, dict):
+                size_bytes = self.store.experience_pool_size_bytes()
+                target_bytes = max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))
+                compact = {"changed": False, "size_bytes": size_bytes, "removed": 0, "target_bytes": target_bytes, "complete": size_bytes <= target_bytes}
             final_records = self.store.load_experience(config.settings.experience_load_limit)
             self.store.save_ai_model_snapshot(final_records, config.settings, config.ai_model_limit, status, model, run_guard=persistence_guard, status_detail=status_detail)
             self.experience_pool = ExperiencePool(config.settings, final_records, self.store.load_latest_model_state(config.settings))
