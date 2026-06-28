@@ -395,7 +395,7 @@ ALLOWED_TRANSITIONS = {
     ("training", "idle"): {"esc", "still_timeout", "window_invalid", "user_stop", "runtime_error", "executor_error"},
     ("training", "sleep"): {"time_limit"},
     ("sleep", "stopping"): {"user_stop", "esc", "runtime_error"},
-    ("sleep", "idle"): {"esc", "time_limit", "poor_optimization", "user_stop", "runtime_error"},
+    ("sleep", "idle"): {"esc", "time_limit", "poor_optimization", "user_stop", "runtime_error", "completed"},
     ("migration", "idle"): {"completed", "migration_error", "user_stop"}
 }
 
@@ -793,8 +793,7 @@ def run_self_test():
     assert not suspended_event.is_set()
     assert ("sleep", "training") not in ALLOWED_TRANSITIONS
     assert ("sleep", "starting") not in ALLOWED_TRANSITIONS
-    assert "completed" not in ALLOWED_TRANSITIONS[("sleep", "idle")]
-    assert {"time_limit", "poor_optimization"}.issubset(ALLOWED_TRANSITIONS[("sleep", "idle")])
+    assert {"time_limit", "poor_optimization", "completed"}.issubset(ALLOWED_TRANSITIONS[("sleep", "idle")])
     assert {"completed", "migration_error", "user_stop"}.issubset(ALLOWED_TRANSITIONS[("migration", "idle")])
     pool = ExperiencePool(settings)
     pool.add({"id": "t1", "mode": "learning", "mouse_action": {"type": "click", "start_rel": [0.5, 0.5]}, "reward": 12, "screen_hash_hex": "f", "screen_hash_bits": 4, "mouse_source": "user"})
@@ -5162,17 +5161,26 @@ class ControlPanel(tk.Tk):
                     best_seen = best_score if best_seen is None else max(best_seen, best_score)
                     stale_batches = 0 if improved else stale_batches + len(done)
                     no_reward_batches = 0 if improvement_amount >= improvement_threshold else no_reward_batches + len(done)
-                if zero_training_batches >= poor_limit:
-                    poor_optimization_reason = "repeated_zero_training_batches"
-                elif no_reward_batches >= poor_limit or stale_batches >= poor_limit:
-                    poor_optimization_reason = "repeated_no_reward_improvement"
-                elif loss_worsening_batches >= poor_limit:
-                    poor_optimization_reason = "repeated_model_loss_worsening"
-                elif training_error_batches >= poor_limit:
-                    poor_optimization_reason = "training_errors"
-                elif completed >= poor_limit and stale_batches >= poor_limit and batch_confidence <= 1.0 / max(1, batch_size):
-                    poor_optimization_reason = "repeated_no_reward_improvement"
-                poor_optimization = bool(poor_optimization_reason)
+                screen_score_total = self.store.state.get("screen_score_total", 0.0) if self.store else 0.0
+                compact = {"changed": False, "size_bytes": self.store.experience_pool_size_bytes() if self.store else 0, "target_bytes": max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))}
+                compaction_progress = self.sleep_compaction_progress(compact)
+                compaction_complete = self.sleep_compaction_complete(compact)
+                if self.sleep_completion_reached(completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, compaction_complete, review_status):
+                    completion_ready = True
+                    self.events.publish("sleep_completion_ready", completed_batches=completed, target_training_steps=target_training_steps, confidence=batch_confidence, confidence_target=confidence_target)
+                    stop_event.set()
+                if not completion_ready:
+                    if zero_training_batches >= poor_limit:
+                        poor_optimization_reason = "repeated_zero_training_batches"
+                    elif no_reward_batches >= poor_limit or stale_batches >= poor_limit:
+                        poor_optimization_reason = "repeated_no_reward_improvement"
+                    elif loss_worsening_batches >= poor_limit:
+                        poor_optimization_reason = "repeated_model_loss_worsening"
+                    elif training_error_batches >= poor_limit:
+                        poor_optimization_reason = "training_errors"
+                    elif completed >= poor_limit and stale_batches >= poor_limit and batch_confidence <= 1.0 / max(1, batch_size):
+                        poor_optimization_reason = "repeated_no_reward_improvement"
+                poor_optimization = bool(poor_optimization_reason) and not completion_ready
                 if poor_optimization:
                     self.events.publish("sleep_poor_optimization", reason=poor_optimization_reason, completed_batches=completed, trained=trained, zero_training_batches=zero_training_batches, no_reward_batches=no_reward_batches, loss_worsening_batches=loss_worsening_batches, training_error_batches=training_error_batches)
                     if self.store:
@@ -5180,26 +5188,19 @@ class ControlPanel(tk.Tk):
                     self.ui(lambda r=poor_optimization_reason: self.status_var.set("睡眠模式：AI训练效果差：" + r))
                     stop_event.set()
                 divisor = max(1, len(done))
-                screen_score_total = self.store.state.get("screen_score_total", 0.0) if self.store else 0.0
-                compact = {"changed": False, "size_bytes": self.store.experience_pool_size_bytes() if self.store else 0, "target_bytes": max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))}
-                compaction_progress = self.sleep_compaction_progress(compact)
-                compaction_complete = self.sleep_compaction_complete(compact)
                 self.events.publish("sleep_batch_completed", trained=trained, best_score=best_score, confidence=batch_confidence, completed_batches=completed)
                 decision = {"reason": "sleep_prioritized_replay", "confidence": batch_confidence, "candidate_count": trained, "best_score": best_score, "completed_batches": completed, "target_training_steps": target_training_steps, "confidence_target": confidence_target, "workers": workers, "pool_compacted": compact.get("changed", False), "pool_removed": compact.get("removed", 0)}
                 self.update_metrics(0.0, 50.0 + clamp(batch_confidence * 50.0, 0.0, 50.0), 0.0, batch_score, best_score, screen_score_total, decision)
                 remaining_seconds = max(0.0, sleep_deadline - time.perf_counter())
                 self.ui(lambda r=remaining_seconds, c=completed, t=target_training_steps, q=batch_confidence: self.progress_label_var.set(f"睡眠训练进度｜剩余 {r:.1f} 秒｜已训练批次 {c}/{t}｜当前置信度 {q * 100.0:.1f}%"))
                 self.update_progress(self.sleep_progress_percent(started_perf, config.sleep_seconds, completed, target_training_steps, compaction_progress))
-                if self.sleep_completion_reached(completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, compaction_complete, review_status):
-                    completion_ready = True
-                    self.events.publish("sleep_completion_ready", completed_batches=completed, target_training_steps=target_training_steps, confidence=batch_confidence, confidence_target=confidence_target)
-                if poor_optimization:
+                if completion_ready or poor_optimization:
                     break
             for future in futures:
                 future.cancel()
         with self.state_lock:
             stopped_reason = self.termination_reason if self.termination_reason in ("esc", "user_stop") else None
-        save_status = "poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached else (stopped_reason or "incomplete"))
+        save_status = "completed" if completion_ready else ("poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached else (stopped_reason or "incomplete")))
         if save_status in ("completed", "time_limit", "poor_optimization") and (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
             self.update_progress(max(self.progress_value, 92.0), force=True)
             self.ui(lambda: self.progress_label_var.set("睡眠模式保存中｜进度 92%"))
@@ -5214,21 +5215,28 @@ class ControlPanel(tk.Tk):
             return
         final_reason = None
         restart_allowed = restart_training and save_status == "time_limit"
-        if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and time_limit_reached:
+        if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and completion_ready:
+            final_reason = "completed"
+            self.render_sleep_completion_before_idle("睡眠模式保存完成 100%｜训练质量条件已达成", 100.0)
+            self.finish_run(token, "睡眠模式完成，数据已安全保存", 100.0, release=True, reason=final_reason)
+        elif (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and time_limit_reached:
             final_reason = "time_limit"
             unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "达到时间上限")
             self.render_sleep_completion_before_idle(f"睡眠模式保存完成 100%｜{unfinished}", 100.0)
-            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=False, reason=final_reason)
+            should_restart_training = restart_training and final_reason == "time_limit"
+            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=not should_restart_training, reason=final_reason)
         elif (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and poor_optimization:
             final_reason = "poor_optimization"
             unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "AI模型优化效果差：" + (poor_optimization_reason or "poor_optimization"))
             self.render_sleep_completion_before_idle(f"睡眠模式保存完成 100%｜{unfinished}", 100.0)
-            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=False, reason=final_reason)
+            should_restart_training = restart_training and final_reason == "time_limit"
+            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=not should_restart_training, reason=final_reason)
         elif (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
             final_reason = stopped_reason or "user_stop"
             unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "用户中断")
             self.render_sleep_completion_before_idle(f"睡眠模式保存完成 100%｜{unfinished}", 100.0)
-            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=False, reason=final_reason)
+            should_restart_training = restart_training and final_reason == "time_limit"
+            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=not should_restart_training, reason=final_reason)
         if restart_allowed and final_reason == "time_limit":
             self.main_thread_events.put({"type": "restart_training", "reason": final_reason, "config": config, "token": token, "created_at": now_text(), "precheck": {"review_status": review_status, "compaction_complete": compaction_complete, "models_complete": models_complete}})
             self.ui(self.process_main_thread_events)
@@ -5496,9 +5504,25 @@ class ControlPanel(tk.Tk):
                         learning_screens += 2
                         self.write_record("learning", session_id, action_snapshot, action, "user_mouse", action_anchor_perf=action.get("started_perf") or action.get("t0"), after_snapshot=after_snapshot, planned_action=action)
                     if not event_seen:
-                        self.mouse_recorder.wait(max(0.0, config.still_seconds - idle_seconds))
+                        while not stop_event.is_set():
+                            if self.should_stop_by_escape():
+                                termination_reason = "esc"
+                                stop_event.set()
+                                break
+                            remaining_wait = max(0.0, config.still_seconds - self.learning_idle_seconds())
+                            if remaining_wait <= 0.0:
+                                break
+                            self.mouse_recorder.wait(min(0.1, remaining_wait))
                 else:
-                    stop_event.wait(max(0.0, config.still_seconds - idle_seconds))
+                    while not stop_event.is_set():
+                        if self.should_stop_by_escape():
+                            termination_reason = "esc"
+                            stop_event.set()
+                            break
+                        remaining_wait = max(0.0, config.still_seconds - self.learning_idle_seconds())
+                        if remaining_wait <= 0.0:
+                            break
+                        stop_event.wait(min(0.1, remaining_wait))
             self.write_record("learning", session_id, self.capture_snapshot(analyzer, "learning", session_id, start, priority="critical"), None, "mode_end")
         if self.is_run_active(token, "learning") or self.is_run_active(token, "stopping"):
             saved, save_error = self.flush_mode_data()
