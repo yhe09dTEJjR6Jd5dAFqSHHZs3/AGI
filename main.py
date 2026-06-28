@@ -387,7 +387,7 @@ ALLOWED_TRANSITIONS = {
     ("training", "idle"): {"esc", "still_timeout", "window_invalid", "user_stop", "runtime_error", "executor_error"},
     ("training", "sleep"): {"time_limit"},
     ("sleep", "stopping"): {"user_stop", "esc", "runtime_error"},
-    ("sleep", "idle"): {"completed", "esc", "time_limit", "poor_optimization", "user_stop", "runtime_error"},
+    ("sleep", "idle"): {"esc", "time_limit", "poor_optimization", "user_stop", "runtime_error"},
     ("migration", "idle"): {"completed", "migration_error", "user_stop"}
 }
 
@@ -783,7 +783,8 @@ def run_self_test():
     assert not suspended_event.is_set()
     assert ("sleep", "training") not in ALLOWED_TRANSITIONS
     assert ("sleep", "starting") not in ALLOWED_TRANSITIONS
-    assert {"completed", "time_limit", "poor_optimization"}.issubset(ALLOWED_TRANSITIONS[("sleep", "idle")])
+    assert "completed" not in ALLOWED_TRANSITIONS[("sleep", "idle")]
+    assert {"time_limit", "poor_optimization"}.issubset(ALLOWED_TRANSITIONS[("sleep", "idle")])
     assert {"completed", "migration_error", "user_stop"}.issubset(ALLOWED_TRANSITIONS[("migration", "idle")])
     pool = ExperiencePool(settings)
     pool.add({"id": "t1", "mode": "learning", "mouse_action": {"type": "click", "start_rel": [0.5, 0.5]}, "reward": 12, "screen_hash_hex": "f", "screen_hash_bits": 4, "mouse_source": "user"})
@@ -2893,7 +2894,7 @@ class ExperiencePool:
             confidence = 0.0
         return round(score, 2), neighbors, confidence
 
-    def recheck_screen_scores(self, store=None, analyzer=None, tolerance=0.01, run_guard=None):
+    def recheck_screen_scores(self, store=None, analyzer=None, tolerance=0.01, run_guard=None, progress_callback=None):
         checked = 0
         rescored = 0
         missing = 0
@@ -2905,7 +2906,10 @@ class ExperiencePool:
         with self.lock:
             snapshot = [(index, copy.deepcopy(record)) for index, record in enumerate(self.records)]
         updates = []
-        for index, record in snapshot:
+        total = len(snapshot)
+        if callable(progress_callback):
+            progress_callback(0, total)
+        for processed, (index, record) in enumerate(snapshot, start=1):
             if run_guard and run_guard():
                 break
             hash_value = parse_hash_value(record)
@@ -2945,6 +2949,8 @@ class ExperiencePool:
                 record["quarantine_reason"] = record.get("quarantine_reason") or "hash_missing"
                 record["score_checked_at"] = now_text()
                 updates.append((index, record, None))
+                if callable(progress_callback):
+                    progress_callback(processed, total)
                 continue
             score, neighbors, confidence = self.compute_screen_score(hash_value, exclude_id=record.get("id"), before_index=index, exact_checksum=record.get("image_checksum"))
             old_score = safe_float(record.get("screen_score", record.get("novelty", record.get("after_novelty", None))), None)
@@ -2961,6 +2967,8 @@ class ExperiencePool:
             record.update({"screen_score": score, "novelty": score, "score_version": 1, "score_status": "rescored" if bool(lacks or wrong) else "scored", "score_basis": "nearest_screen_content_recheck", "score_checked_at": now_text(), "score_neighbors": [{"id": item["record"].get("id"), "similarity": round(item.get("similarity", 0.0), 4)} for item in neighbors], "score_confidence": round(confidence, 4), "score_rechecked": True, "score_recomputed": bool(lacks or wrong), "reward_version": reward_info["reward_version"], "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": reward_info, "reward_sort_key": reward_info["reward_sort_key"], "total_reward": reward_info["total_reward"], "reward": reward_info["total_reward"], "screen_score_delta": max(0.0, reward_info["screen_score_delta"])})
             checked += 1
             updates.append((index, record, hash_value))
+            if callable(progress_callback):
+                progress_callback(processed, total)
         with self.lock:
             for index, record, hash_value in updates:
                 if index < len(self.records):
@@ -2969,6 +2977,8 @@ class ExperiencePool:
             self.rebuild_index_locked()
             self.rebuild_action_heap_locked()
             self.nearest_cache.clear()
+        if callable(progress_callback):
+            progress_callback(total, total)
         return {"checked": checked, "rescored": rescored, "missing": missing, "errors": errors, "image_missing": image_missing, "image_corrupt": image_corrupt, "hash_missing": hash_missing, "unrecoverable": unrecoverable}
 
     def sleep_training_step(self, batch_size, settle_screen_score=None, run_guard=None):
@@ -4284,7 +4294,7 @@ class ControlPanel(tk.Tk):
                 dst.write(chunk)
                 copied += len(chunk)
                 self.events.publish("migration_chunk_completed", source=str(source), target=str(target), copied=copied, total=total)
-                self.update_progress(clamp(copied / max(1, total) * 100.0, 0.0, 99.0))
+                self.ui(lambda c=copied, t=total: self.progress_label_var.set(f"数据迁移中｜已迁移 {c}/{t} 字节"))
         try:
             shutil.copystat(source, target)
         except Exception:
@@ -4401,7 +4411,7 @@ class ControlPanel(tk.Tk):
                     reason = "数据迁移已终止"
                     break
                 if size == 0:
-                    self.update_progress(clamp(copied / total * 100.0, 0.0, 99.0))
+                    self.ui(lambda c=copied, t=total: self.progress_label_var.set(f"数据迁移中｜已迁移 {c}/{t} 字节"))
             if not stop_event.is_set() and self.is_run_active(token, "migration"):
                 DataStore(temp_root).save_settings({"training_seconds": values["training_seconds"], "sleep_seconds": values["sleep_seconds"], "still_seconds": values["still_seconds"], "experience_pool_gb": values["experience_pool_gb"], "ai_model_limit": values["ai_model_limit"]})
                 if new_root.exists():
@@ -4425,10 +4435,10 @@ class ControlPanel(tk.Tk):
                 self.store = DataStore(new_root)
                 self.experience_pool = ExperiencePool(self.settings, self.store.load_experience(self.settings.experience_load_limit), self.store.load_latest_model_state(self.settings))
                 self.brain = ActionBrain(self.experience_pool, self.settings)
-                self.update_progress(100.0)
-                self.finish_run(token, reason, 100.0, release=False, reason="completed")
+                self.update_progress(0.0, force=True)
+                self.finish_run(token, reason, 0.0, release=False, reason="completed")
             elif self.is_run_active(token, "migration"):
-                self.finish_run(token, reason, self.progress_value, release=False, reason="user_stop")
+                self.finish_run(token, reason, 0.0, release=False, reason="user_stop")
         except Exception as exc:
             if backup_root and Path(backup_root).exists():
                 try:
@@ -4894,7 +4904,7 @@ class ControlPanel(tk.Tk):
         compaction_complete = self.sleep_compaction_complete(initial_compact)
         poor_optimization = False
         time_limit_reached = False
-        completed_success = False
+        completion_ready = False
         started_perf = time.perf_counter()
         sleep_deadline = started_perf + max(1, config.sleep_seconds)
         run_guard = lambda: should_stop_run(stop_event, sleep_deadline, self.should_stop_by_escape, getattr(self.active_session, "termination_reason", None) or self.termination_reason)
@@ -4918,7 +4928,11 @@ class ControlPanel(tk.Tk):
         review_status = "failed"
         try:
             with ScreenAnalyzer(config.settings.hash_size) as analyzer:
-                recheck_result = self.experience_pool.recheck_screen_scores(self.store, analyzer, run_guard=run_guard)
+                def score_progress(current, total):
+                    ratio = clamp(safe_float(current, 0.0) / max(1.0, safe_float(total, 1.0)), 0.0, 1.0)
+                    self.update_progress(ratio * 25.0, force=True)
+                    self.ui(lambda c=current, t=total: self.progress_label_var.set(f"睡眠评分复核中｜已复核 {c}/{t} 条"))
+                recheck_result = self.experience_pool.recheck_screen_scores(self.store, analyzer, run_guard=run_guard, progress_callback=score_progress)
             self.events.publish("sleep_screen_scores_rechecked", **recheck_result)
             self.store.merge_experience_records_by_id(copy.deepcopy(self.experience_pool.records))
             review_status = "quarantined" if recheck_result.get("unrecoverable", 0) else "completed"
@@ -5002,43 +5016,30 @@ class ControlPanel(tk.Tk):
                 self.ui(lambda r=remaining_seconds, c=completed, t=target_training_steps, q=batch_confidence: self.progress_label_var.set(f"睡眠训练进度｜剩余 {r:.1f} 秒｜已训练批次 {c}/{t}｜当前置信度 {q * 100.0:.1f}%"))
                 self.update_progress(self.sleep_progress_percent(started_perf, config.sleep_seconds, completed, target_training_steps, compaction_progress))
                 if self.sleep_completion_reached(completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, compaction_complete, review_status):
-                    completed_success = True
-                    self.events.publish("sleep_completion_reached", completed_batches=completed, target_training_steps=target_training_steps, confidence=batch_confidence, confidence_target=confidence_target)
-                    break
+                    completion_ready = True
+                    self.events.publish("sleep_completion_ready", completed_batches=completed, target_training_steps=target_training_steps, confidence=batch_confidence, confidence_target=confidence_target)
                 if poor_optimization:
                     break
             for future in futures:
                 future.cancel()
         with self.state_lock:
             stopped_reason = self.termination_reason if self.termination_reason in ("esc", "user_stop") else None
-        save_status = "completed" if completed_success else ("poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached else (stopped_reason or "incomplete")))
+        save_status = "poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached else (stopped_reason or "incomplete"))
         if save_status in ("completed", "time_limit", "poor_optimization") and (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
             self.update_progress(max(self.progress_value, 92.0), force=True)
             self.ui(lambda: self.progress_label_var.set("睡眠模式保存中｜进度 92%"))
         saved, save_error, save_report = self.save_sleep_data(config, save_status, run_guard=run_guard)
         compaction_complete = bool(save_report.get("compaction_complete", compaction_complete)) if isinstance(save_report, dict) else compaction_complete
         models_complete = bool(save_report.get("models_complete", True)) if isinstance(save_report, dict) else True
-        completed_success = completed_success and compaction_complete and models_complete
-        if completed_success and save_status == "completed":
-            self.events.publish("sleep_completion_saved", model_count=save_report.get("model_count") if isinstance(save_report, dict) else None, experience_size=save_report.get("experience_size") if isinstance(save_report, dict) else None, target_bytes=save_report.get("target_bytes") if isinstance(save_report, dict) else None)
-        elif save_status == "completed":
-            save_status = "incomplete"
+        completion_ready = completion_ready and compaction_complete and models_complete
         if not saved:
             if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
                 self.finish_run(token, "保存失败：" + str(save_error), self.progress_value, release=False, reason="runtime_error")
                 self.ui(lambda e=str(save_error): messagebox.showerror("保存失败", e))
             return
         final_reason = None
-        if restart_training and (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and save_status not in ("esc", "user_stop"):
-            self.render_sleep_completion_before_idle("睡眠模式进度 100%｜保存完成，准备回到空闲", 100.0)
-            self.main_thread_events.put({"type": "restart_training", "reason": save_status, "config": config, "token": token, "created_at": now_text()})
-            self.ui(self.process_main_thread_events)
-            return
-        if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and completed_success:
-            final_reason = "completed"
-            self.render_sleep_completion_before_idle("睡眠模式进度 100%｜任务完成，数据已保存")
-            self.finish_run(token, "睡眠模式任务完成，数据已保存", 100.0, release=False, reason=final_reason)
-        elif (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and time_limit_reached:
+        restart_allowed = restart_training and save_status == "time_limit" and review_status in ("completed", "quarantined") and compaction_complete and models_complete and self.sleep_restart_runtime_ready()
+        if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and time_limit_reached:
             final_reason = "time_limit"
             unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "达到时间上限")
             self.render_sleep_completion_before_idle(f"睡眠模式保存完成 100%｜{unfinished}", 100.0)
@@ -5053,9 +5054,20 @@ class ControlPanel(tk.Tk):
             unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "用户中断")
             self.render_sleep_completion_before_idle(f"睡眠模式保存完成 100%｜{unfinished}", 100.0)
             self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=False, reason=final_reason)
-        if restart_training and final_reason not in ("esc", "user_stop"):
+        if restart_allowed and final_reason == "time_limit":
             self.main_thread_events.put({"type": "restart_training", "reason": final_reason, "config": config, "token": token, "created_at": now_text()})
             self.ui(self.process_main_thread_events)
+
+
+    def sleep_restart_runtime_ready(self):
+        try:
+            if not self.offline_sleep_environment_ready() or not self.window_manager:
+                return False
+            check = self.window_manager.check_window(force=True)
+            return bool(check.ok and self.cursor_inside_window())
+        except Exception as exc:
+            self.log_exception("sleep_restart_runtime_ready", exc)
+            return False
 
     def sleep_unfinished_summary(self, review_status, completed, target_training_steps, compaction_complete, reason):
         items = []
@@ -5080,17 +5092,16 @@ class ControlPanel(tk.Tk):
             self.store.flush_state(force=True)
             self.update_progress(max(self.progress_value, 92.0), force=True)
             with self.experience_pool.lock:
-                recheck_records = copy.deepcopy(self.experience_pool.records)
-                self.store.merge_experience_records_by_id(recheck_records)
-                records = copy.deepcopy(self.experience_pool.records)
+                self.store.merge_experience_records_by_id(copy.deepcopy(self.experience_pool.records))
                 model = self.experience_pool.model
-            self.store.save_ai_model_snapshot(records, config.settings, config.ai_model_limit, status, model, run_guard=persistence_guard)
             self.update_progress(max(self.progress_value, 96.0), force=True)
             compact = self.store.compact_experience_pool(config.experience_pool_gb, run_guard=persistence_guard)
             if compact.get("changed"):
                 self.events.publish("experience_pool_compaction_completed", removed=compact.get("removed", 0), size_bytes=compact.get("size_bytes", 0))
-                self.experience_pool = ExperiencePool(config.settings, self.store.load_experience(config.settings.experience_load_limit), self.store.load_latest_model_state(config.settings))
-                self.brain = ActionBrain(self.experience_pool, config.settings)
+            final_records = self.store.load_experience(config.settings.experience_load_limit)
+            self.store.save_ai_model_snapshot(final_records, config.settings, config.ai_model_limit, status, model, run_guard=persistence_guard)
+            self.experience_pool = ExperiencePool(config.settings, final_records, self.store.load_latest_model_state(config.settings))
+            self.brain = ActionBrain(self.experience_pool, config.settings)
             self.update_progress(max(self.progress_value, 99.0), force=True)
             self.store.flush_state(force=True)
             model_count = len(list(self.store.model_dir.glob("model_*.json")))
