@@ -392,7 +392,7 @@ ALLOWED_TRANSITIONS = {
     ("training", "idle"): {"esc", "still_timeout", "window_invalid", "cursor_outside", "user_stop", "runtime_error", "executor_error"},
     ("training", "sleep"): {"time_limit"},
     ("sleep", "stopping"): {"user_stop", "esc", "runtime_error"},
-    ("sleep", "idle"): {"esc", "user_stop", "runtime_error"},
+    ("sleep", "idle"): {"esc", "user_stop", "runtime_error", "completed"},
     ("migration", "idle"): {"completed", "migration_error", "user_stop"}
 }
 
@@ -794,7 +794,7 @@ def run_self_test():
     assert ("sleep", "starting") not in ALLOWED_TRANSITIONS
     assert "time_limit" not in ALLOWED_TRANSITIONS[("sleep", "idle")]
     assert "poor_optimization" not in ALLOWED_TRANSITIONS[("sleep", "idle")]
-    assert "completed" not in ALLOWED_TRANSITIONS[("sleep", "idle")]
+    assert "completed" in ALLOWED_TRANSITIONS[("sleep", "idle")]
     assert {"completed", "migration_error", "user_stop"}.issubset(ALLOWED_TRANSITIONS[("migration", "idle")])
     pool = ExperiencePool(settings)
     pool.add({"id": "t1", "mode": "learning", "mouse_action": {"type": "click", "start_rel": [0.5, 0.5]}, "reward": 12, "screen_hash_hex": "f", "screen_hash_bits": 4, "mouse_source": "user"})
@@ -5167,8 +5167,7 @@ class ControlPanel(tk.Tk):
 
     def sleep_completion_reached(self, completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, compaction_complete, review_status="completed"):
         pending_state = safe_int(getattr(self.store, "pending_state_writes", 0), 0) if self.store else 0
-        improvement_ready = bool(recent_improvements) and sum(recent_improvements) >= improvement_threshold * len(recent_improvements)
-        return review_status in ("completed", "quarantined") and completed >= target_training_steps and improvement_ready and batch_confidence >= confidence_target and compaction_complete and pending_state == 0
+        return review_status in ("completed", "quarantined") and completed >= target_training_steps and compaction_complete and pending_state == 0
 
     def sleep_loop(self, token, config, stop_event, restart_training=False):
         self.events.publish("sleep_started", data_path=str(config.data_path))
@@ -5187,6 +5186,7 @@ class ControlPanel(tk.Tk):
         initial_compact = {"changed": False, "size_bytes": self.store.experience_pool_size_bytes() if self.store else 0, "target_bytes": max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))}
         compaction_progress = self.sleep_compaction_progress(initial_compact)
         compaction_complete = self.sleep_compaction_complete(initial_compact)
+        completed_normally = False
         run_guard = lambda: should_stop_run(stop_event, None, self.should_stop_by_escape, getattr(self.active_session, "termination_reason", None) or self.termination_reason)
         self.ui(lambda: self.progress_label_var.set("睡眠准备中｜暂停异步写入并刷盘"))
         try:
@@ -5279,13 +5279,14 @@ class ControlPanel(tk.Tk):
                     recent_improvements.append(improvement_amount)
                     best_seen = best_score if best_seen is None else max(best_seen, best_score)
                     stale_batches = 0 if improved else stale_batches + len(done)
-                    no_reward_batches = 0 if improvement_amount >= improvement_threshold else no_reward_batches + len(done)
                 screen_score_total = self.store.state.get("screen_score_total", 0.0) if self.store else 0.0
                 compact = {"changed": False, "size_bytes": self.store.experience_pool_size_bytes() if self.store else 0, "target_bytes": max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))}
                 compaction_progress = self.sleep_compaction_progress(compact)
                 compaction_complete = self.sleep_compaction_complete(compact)
                 if self.sleep_completion_reached(completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, compaction_complete, review_status):
-                    self.events.publish("sleep_quality_ready_ignored_until_required_exit", completed_batches=completed, target_training_steps=target_training_steps, confidence=batch_confidence, confidence_target=confidence_target)
+                    completed_normally = True
+                    self.events.publish("sleep_completion_reached", completed_batches=completed, target_training_steps=target_training_steps, confidence=batch_confidence, confidence_target=confidence_target)
+                    break
                 divisor = max(1, len(done))
                 self.events.publish("sleep_batch_completed", trained=trained, best_score=best_score, confidence=batch_confidence, completed_batches=completed)
                 decision = {"reason": "sleep_prioritized_replay", "confidence": batch_confidence, "candidate_count": trained, "best_score": best_score, "completed_batches": completed, "target_training_steps": target_training_steps, "confidence_target": confidence_target, "workers": workers, "pool_compacted": compact.get("changed", False), "pool_removed": compact.get("removed", 0)}
@@ -5296,7 +5297,7 @@ class ControlPanel(tk.Tk):
                 future.cancel()
         with self.state_lock:
             stopped_reason = self.termination_reason if self.termination_reason in ("esc", "user_stop") else None
-        save_status = stopped_reason or "incomplete"
+        save_status = "completed" if completed_normally and not stopped_reason else stopped_reason or "incomplete"
         if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
             self.update_progress(max(self.progress_value, 92.0), force=True)
             self.ui(lambda: self.progress_label_var.set("睡眠模式保存中｜进度 92%"))
@@ -5310,10 +5311,17 @@ class ControlPanel(tk.Tk):
             return
         final_reason = None
         if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
-            final_reason = stopped_reason or "user_stop"
-            unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "用户中断", models_complete)
-            self.render_sleep_completion_before_idle(f"睡眠模式保存完成 100%｜{unfinished}", 100.0)
-            self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=True, reason=final_reason)
+            if completed_normally and not stopped_reason and compaction_complete and models_complete:
+                final_reason = "completed"
+                self.render_sleep_completion_before_idle("睡眠模式保存完成 100%", 100.0)
+                finished = self.finish_run(token, "睡眠模式完成，数据已安全保存", 100.0, release=not restart_training, reason=final_reason)
+                if finished and restart_training:
+                    self.main_thread_events.put({"type": "restart_training", "token": token, "reason": "completed"})
+            else:
+                final_reason = stopped_reason or "user_stop"
+                unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "用户中断" if stopped_reason else "未完成", models_complete)
+                self.render_sleep_completion_before_idle(f"睡眠模式保存完成 100%｜{unfinished}", 100.0)
+                self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=True, reason=final_reason)
 
 
     def sleep_restart_runtime_ready(self):
@@ -5877,14 +5885,25 @@ if __name__ == "__main__":
     if "--self-test" in sys.argv:
         run_self_test()
         sys.exit(0)
+    startup_panel = tk.Tk()
+    startup_panel.title("AGI 控制面板")
+    startup_status = tk.StringVar(value="正在检查运行环境")
+    ttk.Label(startup_panel, textvariable=startup_status, padding=24).pack(fill="both", expand=True)
+    startup_panel.update_idletasks()
+    startup_panel.deiconify()
+    startup_panel.lift()
+    startup_panel.update()
+    def panel_startup_failure(message):
+        startup_status.set("启动自愈失败")
+        startup_panel.update_idletasks()
+        messagebox.showerror("启动失败", f"{message}\n\n点击确定后退出。", parent=startup_panel)
+        startup_panel.destroy()
+        sys.exit(1)
+    prepare_startup_environment(failure_handler=panel_startup_failure)
+    startup_panel.destroy()
     app = ControlPanel()
     app.update_idletasks()
     app.deiconify()
     app.lift()
     app.update()
-    def panel_startup_failure(message):
-        messagebox.showerror("启动失败", f"{message}\n\n点击确定后退出。", parent=app)
-        app.destroy()
-        sys.exit(1)
-    prepare_startup_environment(failure_handler=panel_startup_failure)
     app.mainloop()
