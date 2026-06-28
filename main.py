@@ -395,7 +395,7 @@ ALLOWED_TRANSITIONS = {
     ("training", "idle"): {"esc", "still_timeout", "window_invalid", "user_stop", "runtime_error", "executor_error"},
     ("training", "sleep"): {"time_limit"},
     ("sleep", "stopping"): {"user_stop", "esc", "runtime_error"},
-    ("sleep", "idle"): {"esc", "time_limit", "poor_optimization", "user_stop", "runtime_error", "completed"},
+    ("sleep", "idle"): {"esc", "time_limit", "poor_optimization", "user_stop", "runtime_error"},
     ("migration", "idle"): {"completed", "migration_error", "user_stop"}
 }
 
@@ -793,7 +793,8 @@ def run_self_test():
     assert not suspended_event.is_set()
     assert ("sleep", "training") not in ALLOWED_TRANSITIONS
     assert ("sleep", "starting") not in ALLOWED_TRANSITIONS
-    assert {"time_limit", "poor_optimization", "completed"}.issubset(ALLOWED_TRANSITIONS[("sleep", "idle")])
+    assert {"time_limit", "poor_optimization"}.issubset(ALLOWED_TRANSITIONS[("sleep", "idle")])
+    assert "completed" not in ALLOWED_TRANSITIONS[("sleep", "idle")]
     assert {"completed", "migration_error", "user_stop"}.issubset(ALLOWED_TRANSITIONS[("migration", "idle")])
     pool = ExperiencePool(settings)
     pool.add({"id": "t1", "mode": "learning", "mouse_action": {"type": "click", "start_rel": [0.5, 0.5]}, "reward": 12, "screen_hash_hex": "f", "screen_hash_bits": 4, "mouse_source": "user"})
@@ -1157,15 +1158,34 @@ def read_hardware_state():
 class RuntimeGeneratedNumbers:
     def __init__(self):
         self.audit = {}
+        self.history = {}
 
     def value(self, name, context, semantic_goal):
-        stable = sum((index + 1) * ord(char) for index, char in enumerate(f"{name}|{semantic_goal}"))
-        context_values = [abs(safe_float(value, 0.0)) for value in context.values() if isinstance(value, (int, float))]
-        condition = sum(context_values) / max(1, len(context_values))
-        spread = math.log1p(condition + stable % max(2, len(str(name)) + len(str(semantic_goal))))
-        normalized = (math.sin(spread + stable) + 1.0) / 2.0
-        value = clamp(normalized, 0.0, 1.0)
-        self.audit[name] = {"source": "RuntimeGeneratedNumbers.value", "reality_conditions": dict(context), "formula": "clamp((sin(log1p(mean(abs(context))+stable_mod)+stable)+1)/2,0,1)", "semantic_goal": semantic_goal, "current_value": value}
+        condition = dict(context)
+        cpu_headroom = 1.0 - clamp(safe_float(condition.get("cpu_load", 0.0), 0.0) / 100.0, 0.0, 1.0)
+        memory_headroom = clamp(safe_float(condition.get("memory_free_ratio", 0.5), 0.5), 0.0, 1.0)
+        success_rate = clamp(safe_float(condition.get("success_rate", 1.0), 1.0), 0.0, 1.0)
+        window_stability = 1.0 - clamp(safe_float(condition.get("window_instability", 0.0), 0.0), 0.0, 1.0)
+        capture_ms = max(1.0, safe_float(condition.get("capture_ms", 24.0), 24.0))
+        execution_ms = max(1.0, safe_float(condition.get("execution_ms", 80.0), 80.0))
+        latency_score = 1.0 - clamp((capture_ms + execution_ms * 0.5) / 360.0, 0.0, 1.0)
+        pool_pressure = clamp(math.log1p(max(0.0, safe_float(condition.get("pool_count", 0.0), 0.0))) / math.log1p(100000.0), 0.0, 1.0)
+        score_pressure = clamp(math.log1p(max(0.0, safe_float(condition.get("screen_score_total", 0.0), 0.0))) / math.log1p(1000000.0), 0.0, 1.0)
+        learning_similarity = clamp(safe_float(condition.get("learning_similarity", 0.97), 0.97), 0.0, 1.0)
+        metrics = {"cpu_headroom": cpu_headroom, "memory_headroom": memory_headroom, "success_rate": success_rate, "window_stability": window_stability, "latency_score": latency_score, "pool_pressure": pool_pressure, "score_pressure": score_pressure, "learning_similarity": learning_similarity}
+        if any(word in name for word in ("worker", "batch", "queue", "async", "heap", "candidate", "load")):
+            weights = {"cpu_headroom": 0.22, "memory_headroom": 0.24, "success_rate": 0.12, "window_stability": 0.1, "latency_score": 0.1, "pool_pressure": 0.16, "score_pressure": 0.06}
+        elif any(word in name for word in ("wait", "duration", "debounce", "event", "close")):
+            weights = {"cpu_headroom": -0.18, "memory_headroom": -0.08, "success_rate": -0.1, "window_stability": -0.12, "latency_score": -0.3, "pool_pressure": 0.08, "score_pressure": 0.02}
+        elif any(word in name for word in ("explore", "random", "jitter", "temperature")):
+            weights = {"cpu_headroom": 0.06, "memory_headroom": 0.04, "success_rate": -0.28, "window_stability": -0.18, "latency_score": 0.06, "pool_pressure": 0.08, "learning_similarity": -0.3}
+        else:
+            weights = {"cpu_headroom": 0.14, "memory_headroom": 0.14, "success_rate": 0.14, "window_stability": 0.14, "latency_score": 0.14, "pool_pressure": 0.15, "score_pressure": 0.08, "learning_similarity": 0.07}
+        baseline = 0.5 + sum(metrics.get(key, 0.0) * weight for key, weight in weights.items())
+        previous = self.history.get(name, baseline)
+        value = clamp(previous * 0.55 + baseline * 0.45, 0.0, 1.0)
+        self.history[name] = value
+        self.audit[name] = {"source": "RuntimeGeneratedNumbers.closed_loop_value", "reality_conditions": condition, "formula": "closed_loop_weighted_metrics_with_history(candidate,current_conditions,result_proxy,benefit_proxy)", "semantic_goal": semantic_goal, "candidate_value": baseline, "result_metrics": metrics, "benefit": value, "current_value": value}
         return value
 
 
@@ -5166,21 +5186,18 @@ class ControlPanel(tk.Tk):
                 compaction_progress = self.sleep_compaction_progress(compact)
                 compaction_complete = self.sleep_compaction_complete(compact)
                 if self.sleep_completion_reached(completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, compaction_complete, review_status):
-                    completion_ready = True
-                    self.events.publish("sleep_completion_ready", completed_batches=completed, target_training_steps=target_training_steps, confidence=batch_confidence, confidence_target=confidence_target)
-                    stop_event.set()
-                if not completion_ready:
-                    if zero_training_batches >= poor_limit:
-                        poor_optimization_reason = "repeated_zero_training_batches"
-                    elif no_reward_batches >= poor_limit or stale_batches >= poor_limit:
-                        poor_optimization_reason = "repeated_no_reward_improvement"
-                    elif loss_worsening_batches >= poor_limit:
-                        poor_optimization_reason = "repeated_model_loss_worsening"
-                    elif training_error_batches >= poor_limit:
-                        poor_optimization_reason = "training_errors"
-                    elif completed >= poor_limit and stale_batches >= poor_limit and batch_confidence <= 1.0 / max(1, batch_size):
-                        poor_optimization_reason = "repeated_no_reward_improvement"
-                poor_optimization = bool(poor_optimization_reason) and not completion_ready
+                    self.events.publish("sleep_quality_ready_ignored_until_required_exit", completed_batches=completed, target_training_steps=target_training_steps, confidence=batch_confidence, confidence_target=confidence_target)
+                if zero_training_batches >= poor_limit:
+                    poor_optimization_reason = "repeated_zero_training_batches"
+                elif no_reward_batches >= poor_limit or stale_batches >= poor_limit:
+                    poor_optimization_reason = "repeated_no_reward_improvement"
+                elif loss_worsening_batches >= poor_limit:
+                    poor_optimization_reason = "repeated_model_loss_worsening"
+                elif training_error_batches >= poor_limit:
+                    poor_optimization_reason = "training_errors"
+                elif completed >= poor_limit and stale_batches >= poor_limit and batch_confidence <= 1.0 / max(1, batch_size):
+                    poor_optimization_reason = "repeated_no_reward_improvement"
+                poor_optimization = bool(poor_optimization_reason)
                 if poor_optimization:
                     self.events.publish("sleep_poor_optimization", reason=poor_optimization_reason, completed_batches=completed, trained=trained, zero_training_batches=zero_training_batches, no_reward_batches=no_reward_batches, loss_worsening_batches=loss_worsening_batches, training_error_batches=training_error_batches)
                     if self.store:
@@ -5194,20 +5211,18 @@ class ControlPanel(tk.Tk):
                 remaining_seconds = max(0.0, sleep_deadline - time.perf_counter())
                 self.ui(lambda r=remaining_seconds, c=completed, t=target_training_steps, q=batch_confidence: self.progress_label_var.set(f"睡眠训练进度｜剩余 {r:.1f} 秒｜已训练批次 {c}/{t}｜当前置信度 {q * 100.0:.1f}%"))
                 self.update_progress(self.sleep_progress_percent(started_perf, config.sleep_seconds, completed, target_training_steps, compaction_progress))
-                if completion_ready or poor_optimization:
+                if poor_optimization:
                     break
             for future in futures:
                 future.cancel()
         with self.state_lock:
             stopped_reason = self.termination_reason if self.termination_reason in ("esc", "user_stop") else None
-        save_status = "completed" if completion_ready else ("poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached else (stopped_reason or "incomplete")))
-        if save_status in ("completed", "time_limit", "poor_optimization") and (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
+        save_status = "poor_optimization" if poor_optimization else ("time_limit" if time_limit_reached else (stopped_reason or "incomplete"))
+        if save_status in ("time_limit", "poor_optimization") and (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
             self.update_progress(max(self.progress_value, 92.0), force=True)
             self.ui(lambda: self.progress_label_var.set("睡眠模式保存中｜进度 92%"))
         saved, save_error, save_report = self.save_sleep_data(config, save_status, run_guard=run_guard, status_detail={"poor_optimization_reason": poor_optimization_reason} if poor_optimization_reason else None)
         compaction_complete = bool(save_report.get("compaction_complete", compaction_complete)) if isinstance(save_report, dict) else compaction_complete
-        models_complete = bool(save_report.get("models_complete", True)) if isinstance(save_report, dict) else True
-        completion_ready = completion_ready and compaction_complete and models_complete
         if not saved:
             if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
                 self.finish_run(token, "保存失败：" + str(save_error), self.progress_value, release=False, reason="runtime_error")
@@ -5215,11 +5230,7 @@ class ControlPanel(tk.Tk):
             return
         final_reason = None
         restart_allowed = restart_training and save_status == "time_limit"
-        if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and completion_ready:
-            final_reason = "completed"
-            self.render_sleep_completion_before_idle("睡眠模式保存完成 100%｜训练质量条件已达成", 100.0)
-            self.finish_run(token, "睡眠模式完成，数据已安全保存", 100.0, release=True, reason=final_reason)
-        elif (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and time_limit_reached:
+        if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")) and time_limit_reached:
             final_reason = "time_limit"
             unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "达到时间上限")
             self.render_sleep_completion_before_idle(f"睡眠模式保存完成 100%｜{unfinished}", 100.0)
