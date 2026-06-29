@@ -230,6 +230,12 @@ def startup_config_paths():
     return Path(str(source.get("ldplayer_path") or AGENT_SPEC.default_ldplayer_path)), Path(str(source.get("data_path") or AGENT_SPEC.default_data_path))
 
 
+def save_startup_config_paths(ldplayer_path=None, data_path=None):
+    current_ldplayer_path, current_data_path = startup_config_paths()
+    store = AppConfigStore()
+    store.save_settings({"ldplayer_path": str(ldplayer_path or current_ldplayer_path), "data_path": str(data_path or current_data_path)})
+
+
 def data_path_write_issue(path, create=False):
     candidate = Path(path)
     try:
@@ -367,6 +373,58 @@ def prepare_startup_environment(check_environment=None, repair_environment=None,
         return True
     failure_handler(startup_failure_detail(list(result.checks), list(result.repair_actions), result.unrecoverable[0] if result.unrecoverable else None, list(result.recheck)))
     return False
+
+
+def interactive_startup_failure_repair(parent, status_var, message):
+    result = {"retry": False, "exit": False}
+    dialog = tk.Toplevel(parent)
+    dialog.title("启动失败修复")
+    dialog.transient(parent)
+    dialog.grab_set()
+    text = tk.Text(dialog, width=96, height=28, wrap="word")
+    text.insert("1.0", message)
+    text.configure(state="disabled")
+    text.pack(fill="both", expand=True, padx=12, pady=(12, 6))
+    actions = ttk.Frame(dialog)
+    actions.pack(fill="x", padx=12, pady=(0, 12))
+    def refresh_status(value):
+        status_var.set(value)
+        parent.update_idletasks()
+    def choose_ldplayer():
+        path = filedialog.askopenfilename(parent=dialog, title="选择 dnplayer.exe", filetypes=[("dnplayer.exe", "dnplayer.exe"), ("可执行文件", "*.exe")])
+        if not path:
+            return
+        ok, reason = validate_ldplayer_executable(Path(path), require_attach=False)
+        if not ok:
+            messagebox.showerror("雷电路径不合法", reason, parent=dialog)
+            return
+        save_startup_config_paths(ldplayer_path=path)
+        refresh_status("已保存雷电模拟器路径，可重试")
+    def choose_data_path():
+        path = filedialog.askdirectory(parent=dialog, title="选择存储目录")
+        if not path:
+            return
+        issue = data_path_write_issue(Path(path), create=True)
+        if issue:
+            messagebox.showerror("存储路径不可用", issue, parent=dialog)
+            return
+        save_startup_config_paths(data_path=path)
+        refresh_status("已保存存储目录，可重试")
+    def show_log():
+        log_path = Path(str(startup_config_paths()[1])) / "startup_install.log"
+        detail = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else "未找到详细日志：" + str(log_path)
+        messagebox.showinfo("详细日志", detail[:12000], parent=dialog)
+    def retry():
+        result["retry"] = True
+        dialog.destroy()
+    def exit_program():
+        result["exit"] = True
+        dialog.destroy()
+    for label, command in (("选择 dnplayer.exe", choose_ldplayer), ("选择存储目录", choose_data_path), ("重试", retry), ("查看详细日志", show_log), ("退出", exit_program)):
+        ttk.Button(actions, text=label, command=command).pack(side="left", padx=4)
+    dialog.protocol("WM_DELETE_WINDOW", exit_program)
+    parent.wait_window(dialog)
+    return result
 
 
 def configuration_failure(area, error):
@@ -5425,7 +5483,7 @@ class ControlPanel(tk.Tk):
                 self.store.log_error("sleep_review_failed_exit", RuntimeError("sleep_review_failed"), failure_detail)
             self.ui(lambda r=recheck_result: self.progress_label_var.set(f"睡眠评分复核失败｜缺失 {r.get('image_missing', 0)}｜损坏 {r.get('image_corrupt', 0)}｜不可恢复 {r.get('unrecoverable', 0)}"))
             self.update_progress(max(self.progress_value, 25.0), force=True)
-            saved, save_error, save_report = self.save_sleep_data(config, "review_failed", run_guard=run_guard, status_detail=failure_detail)
+            saved, save_error, save_report = self.save_after_task1(config, "review_failed", run_guard=run_guard, status_detail=failure_detail)
             if not saved:
                 if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
                     self.finish_run(token, "保存失败：" + str(save_error), self.progress_value, release=False, reason="runtime_error")
@@ -5516,11 +5574,13 @@ class ControlPanel(tk.Tk):
             self.update_progress(max(self.progress_value, 92.0), force=True)
             self.ui(lambda: self.progress_label_var.set("睡眠模式保存中｜进度 92%"))
         task3_report = None
-        saved, save_error, save_report = self.save_sleep_data(config, save_status, run_guard=run_guard, task3_report=None)
+        saved, save_error, save_report = self.save_after_task2(config, save_status, run_guard=run_guard)
         compaction_complete = bool(save_report.get("compaction_complete", compaction_complete)) if isinstance(save_report, dict) else compaction_complete
         models_complete = bool(save_report.get("models_complete", models_complete)) if isinstance(save_report, dict) else models_complete
         if saved and completed_normally and not stopped_reason:
             try:
+                if self.store:
+                    checkpoint = self.store.load_sleep_checkpoint() or checkpoint
                 if self.store:
                     checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task3_model_cleanup", task3_model_cleanup_completed=bool(checkpoint.get("task3_model_cleanup_completed")))
                 model_result, pool_result = self.run_sleep_task3(config, run_guard=run_guard, checkpoint=checkpoint)
@@ -5529,11 +5589,7 @@ class ControlPanel(tk.Tk):
                 task3_report = {"model": model_result, "pool": pool_result}
                 compaction_complete = bool(pool_result.get("complete"))
                 models_complete = bool(model_result.get("complete"))
-                if self.store:
-                    self.store.flush_state(force=True)
-                    final_records = self.store.load_experience(config.settings.experience_load_limit)
-                    self.experience_pool = ExperiencePool(config.settings, final_records, self.store.load_latest_model_state(config.settings))
-                    self.brain = ActionBrain(self.experience_pool, config.settings)
+                saved, save_error, save_report = self.save_after_task3(config, save_status, task3_report=task3_report)
             except Exception as exc:
                 completed_normally = False
                 compaction_complete = False
@@ -5601,6 +5657,9 @@ class ControlPanel(tk.Tk):
     def run_sleep_task3(self, config, run_guard=None, checkpoint=None):
         if not self.store:
             return {"changed": False, "removed": 0, "model_count": 0, "complete": True}, {"changed": False, "size_bytes": 0, "removed": 0, "target_bytes": 0, "complete": True}
+        if checkpoint:
+            if not checkpoint.get("task1_completed") or not checkpoint.get("task2_completed") or not checkpoint.get("task2_saved"):
+                raise RuntimeError("睡眠模式任务3前置不变量失败：任务1、任务2与任务2保存必须全部完成")
         if checkpoint and checkpoint.get("task3_model_cleanup_completed"):
             model_result = {"changed": False, "removed": 0, "limit": config.ai_model_limit, "model_count": len(list(self.store.model_dir.glob("model_*.json"))), "complete": True, "resumed": True}
         else:
@@ -5625,7 +5684,16 @@ class ControlPanel(tk.Tk):
         self.update_progress(max(self.progress_value, 96.0), force=True)
         return model_result, pool_result
 
-    def save_sleep_data(self, config, status, run_guard=None, status_detail=None, task3_report=None):
+    def save_after_task1(self, config, status, run_guard=None, status_detail=None):
+        return self.save_sleep_data(config, status, run_guard=run_guard, status_detail=status_detail, save_model=False, checkpoint_stage="task1_failure_saved")
+
+    def save_after_task2(self, config, status, run_guard=None, status_detail=None):
+        return self.save_sleep_data(config, status, run_guard=run_guard, status_detail=status_detail, save_model=True, checkpoint_stage="task2_saved", allow_cleanup=False)
+
+    def save_after_task3(self, config, status, task3_report=None, status_detail=None):
+        return self.save_sleep_data(config, status, run_guard=None, status_detail=status_detail, task3_report=task3_report, save_model=False, checkpoint_stage="task3_final_saved", allow_cleanup=False)
+
+    def save_sleep_data(self, config, status, run_guard=None, status_detail=None, task3_report=None, save_model=True, checkpoint_stage=None, allow_cleanup=False):
         if not self.store or not self.experience_pool:
             return True, None, {"model_count": 0, "experience_size": 0, "target_bytes": 0, "compaction_complete": True, "models_complete": True}
         try:
@@ -5645,8 +5713,9 @@ class ControlPanel(tk.Tk):
                 target_bytes = max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))
                 compact = {"changed": False, "size_bytes": size_bytes, "removed": 0, "target_bytes": target_bytes, "complete": size_bytes <= target_bytes}
             final_records = self.store.load_experience(config.settings.experience_load_limit)
-            self.store.save_ai_model_snapshot(final_records, config.settings, config.ai_model_limit, status, model, run_guard=persistence_guard, status_detail=status_detail)
-            model_compact = self.store.compact_ai_models(config.ai_model_limit)
+            if save_model:
+                self.store.save_ai_model_snapshot(final_records, config.settings, config.ai_model_limit, status, model, run_guard=persistence_guard, status_detail=status_detail)
+            model_compact = self.store.compact_ai_models(config.ai_model_limit) if allow_cleanup else {"changed": False, "removed": 0, "limit": config.ai_model_limit, "model_count": len(list(self.store.model_dir.glob("model_*.json"))), "complete": True, "deferred_to_task3": True}
             self.experience_pool = ExperiencePool(config.settings, final_records, self.store.load_latest_model_state(config.settings))
             self.brain = ActionBrain(self.experience_pool, config.settings)
             self.update_progress(max(self.progress_value, 99.0), force=True)
@@ -5655,6 +5724,12 @@ class ControlPanel(tk.Tk):
             target_bytes = max(1, safe_int(compact.get("target_bytes", 0), 0))
             experience_size = max(0, safe_int(compact.get("size_bytes", 0), 0))
             report = {"model_count": model_count, "experience_size": experience_size, "target_bytes": target_bytes, "compaction_complete": experience_size <= target_bytes, "models_complete": model_count <= max(1, safe_int(config.ai_model_limit, AGENT_SPEC.default_ai_model_limit)), "compact": compact, "model_compact": model_compact}
+            if checkpoint_stage:
+                checkpoint = self.store.load_sleep_checkpoint() or {}
+                checkpoint_payload = {"current_task": checkpoint_stage, "input_record_version": checkpoint.get("input_record_version", 0), "output_record_version": now_text(), "flushed": True, "model_count": model_count, "experience_pool_size": experience_size, "allowed_next_task": checkpoint_stage in ("task2_saved", "task3_final_saved")}
+                if checkpoint_stage == "task2_saved":
+                    checkpoint_payload.update({"task1_completed": True, "task2_completed": True, "task2_saved": True})
+                self.store.save_sleep_checkpoint(checkpoint, stage=checkpoint_stage, **checkpoint_payload)
             self.events.publish("save_completed", kind="sleep_data", status=status, **report)
             self.ui(lambda c=self.experience_pool.count(): self.pool_var.set(str(c)))
             return True, None, report
@@ -6173,10 +6248,14 @@ if __name__ == "__main__":
     def panel_startup_failure(message):
         startup_status.set("启动自愈失败")
         startup_panel.update_idletasks()
-        messagebox.showerror("启动失败", f"{message}\n\n点击确定后退出。", parent=startup_panel)
+        action = interactive_startup_failure_repair(startup_panel, startup_status, message)
+        if action.get("retry"):
+            return
         startup_panel.destroy()
         sys.exit(1)
-    prepare_startup_environment(failure_handler=panel_startup_failure)
+    while not prepare_startup_environment(failure_handler=panel_startup_failure):
+        startup_status.set("正在重新检查运行环境")
+        startup_panel.update()
     startup_panel.destroy()
     app = ControlPanel()
     app.update_idletasks()
