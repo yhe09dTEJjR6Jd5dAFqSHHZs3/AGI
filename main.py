@@ -91,6 +91,17 @@ class EnvironmentEnsureResult:
         sections = [f"阶段：{self.stage}", "检查项：", *[f"- {item}" for item in self.checks], "", "修复动作：", *[f"- {item}" for item in self.repair_actions], "", "复检结果：", *[f"- {item}" for item in self.recheck], "", "不可修复原因：", *[f"- {item}" for item in self.unrecoverable]]
         return "\n".join(sections)
 
+    def startup_popup_message(self):
+        initial = self.checks or ("无异常",)
+        repairs = self.repair_actions or ("未执行自愈",)
+        recheck = self.recheck or ("复检通过",)
+        if self.ok:
+            advice = ("运行环境符合要求，程序可进入空闲。",)
+        else:
+            advice = ("点击“浏览”选择 dnplayer.exe 路径。", "点击“重试”再次自愈并复检。", "确认环境可用时点击“忽略”进入空闲。", "无法处理时点击“退出”终止程序。")
+        sections = ["初检结果：", *[f"- {item}" for item in initial], "", "初检后进行的自愈尝试：", *[f"- {item}" for item in repairs], "", "复检结果：", *[f"- {item}" for item in recheck], "", "下一步建议：", *[f"- {item}" for item in advice]]
+        return "\n".join(sections)
+
 
 def write_startup_install_log(command, result=None, error=None):
     try:
@@ -371,17 +382,21 @@ def ensure_environment(stage, allow_repair=True, check_environment=None, repair_
     return EnvironmentEnsureResult(not remaining_issues, stage, initial_issues, tuple(repair_actions), remaining_issues, unrecoverable)
 
 
+def ensure_startup_environment_result(check_environment=None, repair_environment=None):
+    return ensure_environment("startup", True, check_environment, repair_environment)
+
+
 def prepare_startup_environment(check_environment=None, repair_environment=None, failure_handler=None):
     failure_handler = failure_handler or fail_and_exit
-    result = ensure_environment("startup", True, check_environment, repair_environment)
+    result = ensure_startup_environment_result(check_environment, repair_environment)
     if result.ok:
         return True
-    failure_handler(startup_failure_detail(list(result.checks), list(result.repair_actions), result.unrecoverable[0] if result.unrecoverable else None, list(result.recheck)))
+    failure_handler(result.startup_popup_message())
     return False
 
 
 def interactive_startup_failure_repair(parent, status_var, message):
-    result = {"retry": False, "exit": False}
+    result = {"retry": False, "exit": False, "ignore": False}
     dialog = tk.Toplevel(parent)
     dialog.title("启动失败修复")
     dialog.transient(parent)
@@ -417,15 +432,19 @@ def interactive_startup_failure_repair(parent, status_var, message):
         refresh_status("已保存存储目录，可重试")
     def show_log():
         log_path = Path(str(startup_config_paths()[1])) / "startup_install.log"
-        detail = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else "未找到详细日志：" + str(log_path)
+        log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else "未找到详细日志：" + str(log_path)
+        detail = message + "\n\n详细日志：\n" + log_text
         messagebox.showinfo("详细日志", detail[:12000], parent=dialog)
     def retry():
         result["retry"] = True
         dialog.destroy()
+    def ignore():
+        result["ignore"] = True
+        dialog.destroy()
     def exit_program():
         result["exit"] = True
         dialog.destroy()
-    for label, command in (("选择 dnplayer.exe", choose_ldplayer), ("选择存储目录", choose_data_path), ("重试", retry), ("查看详细日志", show_log), ("退出", exit_program)):
+    for label, command in (("浏览", choose_ldplayer), ("更多", show_log), ("重试", retry), ("忽略", ignore), ("退出", exit_program)):
         ttk.Button(actions, text=label, command=command).pack(side="left", padx=4)
     dialog.protocol("WM_DELETE_WINDOW", exit_program)
     parent.wait_window(dialog)
@@ -821,7 +840,7 @@ def run_self_test():
     startup_checks = deque([["桌面异常"], ["桌面异常"]])
     startup_events = []
     assert not prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: actions.append("无法自动修复"), startup_events.append)
-    assert len(startup_events) == 1 and "初次检查" in startup_events[0] and "无法自动修复的原因" in startup_events[0] and "下一步操作" in startup_events[0]
+    assert len(startup_events) == 1 and "初检结果" in startup_events[0] and "初检后进行的自愈尝试" in startup_events[0] and "复检结果" in startup_events[0] and "下一步建议" in startup_events[0]
     settings = derive_runtime_settings()
     assert len(settings.human_feature_weights) == len(HUMAN_FEATURE_NAMES)
     assert sum(settings.human_feature_weights) > 0.0
@@ -1135,6 +1154,9 @@ def run_self_test():
         store.save_experience_records([{"id": "m1", "mouse_action": {"type": "click"}, "reward": 1.0, "sleep_confidence": 0.5, "screen_path": store.relative_path(screen_path)}])
         model_path = store.save_ai_model_snapshot(store.load_experience(), settings, 1, "completed")
         assert model_path.exists() and len(list(store.model_dir.glob("model_*.json"))) == 1
+        model_payload = json.loads(model_path.read_text(encoding="utf-8"))
+        assert len(model_payload["model_group"]["models"]) == 6
+        assert [item["key"] for item in model_payload["model_group"]["models"]] == [item["key"] for item in AI_MODEL_GROUP_SPECS]
         model_path.write_bytes(model_path.read_bytes() + (b"m" * 2048))
         assert store.storage_size_bytes() > store.experience_pool_size_bytes()
         compact = store.compact_experience_pool(0.1)
@@ -1935,6 +1957,34 @@ def strict_reward_target(screen_score, human_similarity):
     return clamp((screen / 100.0 + human / 100.0 * tie_cap) / (1.0 + tie_cap), 0.0, 1.0)
 
 
+AI_MODEL_GROUP_SPECS = (
+    {"key": "screen_novelty_scorer", "name": "画面新颖程度评分模型", "goal": "一个画面与经验池中最相似历史画面的相似度越高，评分越低"},
+    {"key": "mouse_humanlikeness_scorer", "name": "鼠标拟人程度评分模型", "goal": "AI鼠标操作与学习模式用户鼠标操作相似度越高，评分越高"},
+    {"key": "operation_policy", "name": "实操模型", "goal": "训练模式非自救期间在雷电模拟器客户区内输出鼠标操作"},
+    {"key": "rescue_policy", "name": "自救模型", "goal": "画面评分持续为0时输出自救操作，直到画面评分不再为0"},
+    {"key": "reward_model", "name": "奖励模型", "goal": "画面评分优先，画面评分相同时鼠标评分越高奖励越高"},
+    {"key": "runtime_value_model", "name": "数值变化模型", "goal": "依据现实条件确定未指定变量初始值，并让变量跟随现实条件变化"},
+)
+
+
+def ai_model_group_snapshot(policy_payload, settings, records):
+    policy_payload = policy_payload if isinstance(policy_payload, dict) else {}
+    records = records or []
+    novelty_values = [safe_float(record.get("sleep_novelty", record.get("novelty", record.get("screen_score", 0.0))), 0.0) for record in records if isinstance(record, dict)]
+    human_values = [safe_float(record.get("sleep_human_score", record.get("human_score", 50.0)), 50.0) for record in records if isinstance(record, dict)]
+    reward_values = [safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0) for record in records if isinstance(record, dict)]
+    action_count = sum(1 for record in records if isinstance(record, dict) and record.get("mouse_action"))
+    avg = lambda values, default=0.0: round(sum(values) / len(values), 4) if values else default
+    return {"group_version": 1, "models": [
+        {"key": AI_MODEL_GROUP_SPECS[0]["key"], "name": AI_MODEL_GROUP_SPECS[0]["name"], "goal": AI_MODEL_GROUP_SPECS[0]["goal"], "type": "nearest_history_inverse_similarity", "average_score": avg(novelty_values), "sample_count": len(novelty_values)},
+        {"key": AI_MODEL_GROUP_SPECS[1]["key"], "name": AI_MODEL_GROUP_SPECS[1]["name"], "goal": AI_MODEL_GROUP_SPECS[1]["goal"], "type": "human_profile_similarity", "average_score": avg(human_values, 50.0), "sample_count": len(human_values)},
+        {"key": AI_MODEL_GROUP_SPECS[2]["key"], "name": AI_MODEL_GROUP_SPECS[2]["name"], "goal": AI_MODEL_GROUP_SPECS[2]["goal"], "type": policy_payload.get("type", "online_logistic_policy"), "policy": policy_payload, "action_count": action_count},
+        {"key": AI_MODEL_GROUP_SPECS[3]["key"], "name": AI_MODEL_GROUP_SPECS[3]["name"], "goal": AI_MODEL_GROUP_SPECS[3]["goal"], "type": "zero_score_rescue_policy", "trigger": "continuous_zero_screen_score", "action_count": action_count},
+        {"key": AI_MODEL_GROUP_SPECS[4]["key"], "name": AI_MODEL_GROUP_SPECS[4]["name"], "goal": AI_MODEL_GROUP_SPECS[4]["goal"], "type": "screen_first_human_tiebreak_reward", "average_reward": avg(reward_values), "sample_count": len(reward_values)},
+        {"key": AI_MODEL_GROUP_SPECS[5]["key"], "name": AI_MODEL_GROUP_SPECS[5]["name"], "goal": AI_MODEL_GROUP_SPECS[5]["goal"], "type": "resource_adaptive_runtime_numbers", "runtime_rules": RUNTIME_NUMBER_RULES, "settings": {name: getattr(settings, name) for name in RUNTIME_NUMBER_RULES if hasattr(settings, name)}}
+    ]}
+
+
 def record_screen_human(record):
     screen = record.get("sleep_novelty", record.get("screen_primary_reward", record.get("novelty", record.get("screen_score", 0.0))))
     human = record.get("sleep_human_score", record.get("human_tie_break_reward", record.get("human_score", 50.0)))
@@ -2446,9 +2496,10 @@ class DataStore:
             ranked = sorted([record for record in records or [] if record.get("mouse_action")], key=lambda record: (safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), safe_float(record.get("sleep_confidence", 0.0), 0.0)), reverse=True)
             limit = max(1, min(len(ranked) or 1, safe_int(getattr(settings, "global_action_heap_limit", 1), 1)))
             model_payload = model.snapshot() if model else None
+            model_group = ai_model_group_snapshot(model_payload, settings, ranked)
             identity = hashlib.sha256(str(self.root.resolve()).encode("utf-8", "replace")).hexdigest()
             training_digest = hashlib.sha256(json.dumps([record.get("id") for record in ranked[:limit]], ensure_ascii=False).encode("utf-8")).hexdigest()
-            payload = {"schema_version": CONFIG_SCHEMA_VERSION, "model_version": 1, "training_data_version": 1, "data_path_id": identity, "checksum": training_digest, "created_at": now_text(), "status": status, "status_detail": status_detail or {}, "screen_score_total": self.screen_score_total, "experience_count": len(records or []), "model": model_payload, "policy": [{"id": record.get("id"), "mode": record.get("mode"), "mouse_action": record.get("mouse_action"), "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_model_confidence": safe_float(record.get("sleep_model_confidence", record.get("model_prediction", 0.0)), 0.0), "model_prediction": safe_float(record.get("model_prediction", 0.0), 0.0), "model_target": safe_float(record.get("model_target", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
+            payload = {"schema_version": CONFIG_SCHEMA_VERSION, "model_version": 2, "training_data_version": 1, "data_path_id": identity, "checksum": training_digest, "created_at": now_text(), "status": status, "status_detail": status_detail or {}, "screen_score_total": self.screen_score_total, "experience_count": len(records or []), "model_group": model_group, "model": model_payload, "policy": [{"id": record.get("id"), "mode": record.get("mode"), "mouse_action": record.get("mouse_action"), "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_model_confidence": safe_float(record.get("sleep_model_confidence", record.get("model_prediction", 0.0)), 0.0), "model_prediction": safe_float(record.get("model_prediction", 0.0), 0.0), "model_target": safe_float(record.get("model_target", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
             path = self.model_dir / f"model_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex}.json"
             temporary = path.with_suffix(".tmp")
             with temporary.open("w", encoding="utf-8") as file:
@@ -6520,15 +6571,20 @@ if __name__ == "__main__":
     startup_panel.deiconify()
     startup_panel.lift()
     startup_panel.update()
+    startup_action = {"value": None}
     def panel_startup_failure(message):
         startup_status.set("启动自愈失败")
         startup_panel.update_idletasks()
         action = interactive_startup_failure_repair(startup_panel, startup_status, message)
-        if action.get("retry"):
+        startup_action["value"] = "ignore" if action.get("ignore") else "retry" if action.get("retry") else "exit"
+        if action.get("retry") or action.get("ignore"):
             return
         startup_panel.destroy()
         sys.exit(1)
     while not prepare_startup_environment(failure_handler=panel_startup_failure):
+        if startup_action.get("value") == "ignore":
+            break
+        startup_action["value"] = None
         startup_status.set("正在重新检查运行环境")
         startup_panel.update()
     startup_panel.destroy()
