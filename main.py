@@ -257,7 +257,7 @@ def data_path_write_issue(path, create=False):
 def startup_ldplayer_window_issue(path):
     if sys.platform != "win32":
         return None
-    ok, reason = validate_ldplayer_executable(path, require_attach=False)
+    ok, reason = validate_ldplayer_executable(path, require_attach=True)
     if not ok:
         return reason
     report = windows_runtime_report(path)
@@ -304,6 +304,10 @@ def startup_environment_issues():
     valid_path, path_reason = validate_ldplayer_executable(ldplayer_path, require_attach=False)
     if not valid_path:
         issues.append(f"雷电模拟器启动路径无效 {ldplayer_path}：{path_reason}")
+    elif sys.platform == "win32":
+        runtime_ok, runtime_reason = validate_ldplayer_executable(ldplayer_path, require_attach=True)
+        if not runtime_ok:
+            issues.append(f"雷电模拟器客户区不可用 {ldplayer_path}：{runtime_reason}")
     storage_issue = data_path_write_issue(data_path)
     if storage_issue:
         issues.append(f"存储路径无效 {data_path}：{storage_issue}")
@@ -321,7 +325,8 @@ def attempt_startup_environment_repair(actions=None):
     actions.append("已创建并验证存储路径可写" if not storage_issue else f"无法修复存储路径：{storage_issue}")
     valid_path, path_reason = validate_ldplayer_executable(ldplayer_path, require_attach=False)
     if valid_path and sys.platform == "win32" and not missing:
-        actions.append("启动检查已跳过雷电模拟器客户区状态")
+        runtime_ok, runtime_reason = validate_ldplayer_executable(ldplayer_path, require_attach=True)
+        actions.append("已启动或附着雷电模拟器并复检客户区可用" if runtime_ok else f"无法修复雷电模拟器客户区：{runtime_reason}")
     elif not valid_path:
         discovered = discover_ldplayer_candidates()
         actions.append("已自动发现雷电模拟器候选路径：" + "、".join(discovered) if discovered else "未在常见目录或已运行进程中发现雷电模拟器")
@@ -1580,6 +1585,33 @@ def rect_area(rect):
     return max(0, int(rect[2] - rect[0])) * max(0, int(rect[3] - rect[1])) if rect else 0
 
 
+def rect_union_area(rects):
+    normalized = [tuple(map(int, rect)) for rect in rects if rect and rect[2] > rect[0] and rect[3] > rect[1]]
+    if not normalized:
+        return 0
+    xs = sorted({value for rect in normalized for value in (rect[0], rect[2])})
+    total = 0
+    for left, right in zip(xs, xs[1:]):
+        if right <= left:
+            continue
+        intervals = sorted((rect[1], rect[3]) for rect in normalized if rect[0] < right and rect[2] > left)
+        merged = 0
+        current_top = None
+        current_bottom = None
+        for top, bottom in intervals:
+            if current_top is None:
+                current_top, current_bottom = top, bottom
+            elif top <= current_bottom:
+                current_bottom = max(current_bottom, bottom)
+            else:
+                merged += current_bottom - current_top
+                current_top, current_bottom = top, bottom
+        if current_top is not None:
+            merged += current_bottom - current_top
+        total += (right - left) * merged
+    return total
+
+
 def point_inside(rect, x, y):
     left, top, right, bottom = rect
     return left <= x < right and top <= y < bottom
@@ -2544,6 +2576,51 @@ class DataStore:
                 pass
         return total
 
+    def screen_file_paths(self):
+        paths = set()
+        if not self.screen_dir.exists():
+            return paths
+        for file_root, _, filenames in os.walk(self.screen_dir):
+            for filename in filenames:
+                path = Path(file_root) / filename
+                if path.is_file():
+                    paths.add(path.resolve())
+        return paths
+
+    def experience_pool_size_report(self, records=None):
+        if records is None:
+            records = self.load_experience()
+        logical = self.experience_pool_size_bytes(records)
+        referenced = self.experience_record_paths(records)
+        orphans = self.screen_file_paths() - referenced
+        orphan_size = 0
+        for path in orphans:
+            try:
+                orphan_size += path.stat().st_size
+            except Exception:
+                pass
+        return {"logical_pool_size_bytes": logical, "physical_pool_size_bytes": logical + orphan_size, "orphan_screen_size_bytes": orphan_size, "orphan_screen_count": len(orphans), "orphan_screen_paths": [str(path) for path in sorted(orphans)]}
+
+    def cleanup_orphan_screens(self, records=None):
+        report = self.experience_pool_size_report(records)
+        failed = []
+        attempted = len(report.get("orphan_screen_paths", []))
+        for text in report.get("orphan_screen_paths", []):
+            path = Path(text)
+            try:
+                if path.exists() and path.is_file():
+                    path.unlink()
+            except Exception as exc:
+                failed.append(text)
+                try:
+                    self.log_error("cleanup_orphan_screens.unlink", exc, {"path": text})
+                except Exception:
+                    pass
+        refreshed = self.experience_pool_size_report(records)
+        refreshed["orphan_cleanup_failed_paths"] = failed
+        refreshed["orphan_cleanup_attempted"] = attempted
+        return refreshed
+
     def compact_experience_pool(self, limit_gb, run_guard=None):
         limit_bytes = max(1, int(max(0.1, safe_float(limit_gb, DEFAULT_EXPERIENCE_POOL_GB)) * 1024 * 1024 * 1024))
         records = self.load_experience()
@@ -2560,8 +2637,12 @@ class DataStore:
             except Exception:
                 pass
         current = experience_file_size + sum(path_sizes.values())
+        size_report = self.cleanup_orphan_screens(records)
         if current <= limit_bytes:
-            return {"changed": False, "size_bytes": current, "removed": 0, "target_bytes": limit_bytes, "complete": True}
+            complete = current <= limit_bytes and size_report.get("orphan_screen_size_bytes", 0) == 0
+            result = {"changed": bool(size_report.get("orphan_cleanup_attempted", 0)), "size_bytes": current, "removed": 0, "target_bytes": limit_bytes, "complete": complete}
+            result.update(size_report)
+            return result
         target_bytes = max(1, limit_bytes // 2)
         records = []
         if self.experience_file.exists():
@@ -2627,7 +2708,14 @@ class DataStore:
                     except Exception:
                         pass
             current = self.experience_pool_size_bytes([entry["record"] for entry in keep_records])
-        return {"changed": bool(removed_ids), "size_bytes": current, "removed": removed, "target_bytes": target_bytes, "complete": current <= target_bytes}
+            size_report = self.cleanup_orphan_screens([entry["record"] for entry in keep_records])
+            current = size_report.get("logical_pool_size_bytes", current)
+        else:
+            size_report = self.cleanup_orphan_screens(records)
+        complete = current <= target_bytes and size_report.get("orphan_screen_size_bytes", 0) == 0
+        result = {"changed": bool(removed_ids) or bool(size_report.get("orphan_cleanup_attempted", 0)), "size_bytes": current, "removed": removed, "target_bytes": target_bytes, "complete": complete}
+        result.update(size_report)
+        return result
 
     def log_error(self, where, error, context=None):
         payload = {
@@ -2797,7 +2885,7 @@ class WindowManager:
             ordered.append(current)
             current = win32gui.GetWindow(current, win32con.GW_HWNDNEXT)
         front_hwnds = set(ordered)
-        covered = sum(rect_area(inter) for other, inter in front if other in front_hwnds)
+        covered = rect_union_area([inter for other, inter in front if other in front_hwnds])
         return clamp(covered / target_area, 0.0, 1.0)
 
     def check_window(self, force=False):
@@ -5567,6 +5655,12 @@ class ControlPanel(tk.Tk):
                 self.finish_run(token, "睡眠模式已退出：评分复核失败，需人工处理或明确降级策略", 100.0, release=True, reason="runtime_error")
                 self.ui(lambda d=json.dumps(failure_detail, ensure_ascii=False, indent=2): messagebox.showerror("评分复核失败", d))
             return
+        saved, save_error, save_report = self.save_after_task1(config, "task1_completed", run_guard=run_guard, status_detail=recheck_result)
+        if not saved:
+            if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
+                self.finish_run(token, "保存失败：" + str(save_error), self.progress_value, release=False, reason="runtime_error")
+                self.ui(lambda e=str(save_error): messagebox.showerror("保存失败", e))
+            return
         def train_once():
             if run_guard():
                 return {"trained": 0, "best_score": 0.0, "avg_score": 0.0, "avg_confidence": 0.0}
@@ -5733,32 +5827,31 @@ class ControlPanel(tk.Tk):
         if checkpoint:
             if not checkpoint.get("task1_completed") or not checkpoint.get("task2_completed") or not checkpoint.get("task2_saved"):
                 raise RuntimeError("睡眠模式任务3前置不变量失败：任务1、任务2与任务2保存必须全部完成")
+        self.ui(lambda: self.progress_label_var.set("睡眠任务3｜清理超额AI模型"))
+        model_result = self.store.compact_ai_models(config.ai_model_limit)
         if checkpoint and checkpoint.get("task3_model_cleanup_completed"):
-            model_result = {"changed": False, "removed": 0, "limit": config.ai_model_limit, "model_count": len(list(self.store.model_dir.glob("model_*.json"))), "complete": True, "resumed": True}
-        else:
-            self.ui(lambda: self.progress_label_var.set("睡眠任务3｜清理超额AI模型"))
-            model_result = self.store.compact_ai_models(config.ai_model_limit)
-            self.events.publish("sleep_model_cleanup_completed", removed=model_result.get("removed", 0), model_count=model_result.get("model_count", 0), limit=model_result.get("limit", 0), complete=model_result.get("complete", False))
-            checkpoint = self.store.save_sleep_checkpoint(checkpoint or {}, stage="task3_model_cleanup_saved", task3_model_cleanup_completed=bool(model_result.get("complete")))
+            model_result["resumed_rechecked"] = True
+        self.events.publish("sleep_model_cleanup_completed", removed=model_result.get("removed", 0), model_count=model_result.get("model_count", 0), limit=model_result.get("limit", 0), complete=model_result.get("complete", False))
+        checkpoint = self.store.save_sleep_checkpoint(checkpoint or {}, stage="task3_model_cleanup_saved", task3_model_cleanup_completed=bool(model_result.get("complete")))
         if not model_result.get("complete"):
             raise RuntimeError("睡眠模式任务3未完成：AI模型清理未完成")
         self.update_progress(max(self.progress_value, 94.0), force=True)
         if run_guard and run_guard():
             raise RuntimeError("睡眠模式任务3被中断：经验池压缩未执行")
+        self.ui(lambda: self.progress_label_var.set("睡眠任务3｜压缩经验池至上限50%"))
+        pool_result = self.store.compact_experience_pool(config.experience_pool_gb, run_guard=run_guard)
         if checkpoint and checkpoint.get("task3_pool_compaction_completed"):
-            pool_result = {"changed": False, "size_bytes": self.store.experience_pool_size_bytes(), "removed": 0, "target_bytes": max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024)), "complete": True, "resumed": True}
-        else:
-            self.ui(lambda: self.progress_label_var.set("睡眠任务3｜压缩经验池至上限50%"))
-            pool_result = self.store.compact_experience_pool(config.experience_pool_gb, run_guard=run_guard)
-            self.events.publish("experience_pool_compaction_completed", removed=pool_result.get("removed", 0), size_bytes=pool_result.get("size_bytes", 0), target_bytes=pool_result.get("target_bytes", 0), complete=pool_result.get("complete", False))
-            self.store.save_sleep_checkpoint(checkpoint or {}, stage="task3_pool_compaction_saved", task3_pool_compaction_completed=bool(pool_result.get("complete")))
+            pool_result["resumed_rechecked"] = True
+        self.events.publish("experience_pool_compaction_completed", removed=pool_result.get("removed", 0), size_bytes=pool_result.get("size_bytes", 0), target_bytes=pool_result.get("target_bytes", 0), complete=pool_result.get("complete", False))
+        self.store.save_sleep_checkpoint(checkpoint or {}, stage="task3_pool_compaction_saved", task3_pool_compaction_completed=bool(pool_result.get("complete")))
         if not pool_result.get("complete"):
             raise RuntimeError("睡眠模式任务3未完成：经验池压缩未完成")
         self.update_progress(max(self.progress_value, 96.0), force=True)
         return model_result, pool_result
 
     def save_after_task1(self, config, status, run_guard=None, status_detail=None):
-        return self.save_sleep_data(config, status, run_guard=run_guard, status_detail=status_detail, save_model=False, checkpoint_stage="task1_failure_saved")
+        stage = "task1_completed" if status == "task1_completed" else "task1_failure_saved"
+        return self.save_sleep_data(config, status, run_guard=run_guard, status_detail=status_detail, save_model=False, checkpoint_stage=stage)
 
     def save_after_task2(self, config, status, run_guard=None, status_detail=None):
         return self.save_sleep_data(config, status, run_guard=run_guard, status_detail=status_detail, save_model=True, checkpoint_stage="task2_saved", allow_cleanup=False)
@@ -5796,10 +5889,12 @@ class ControlPanel(tk.Tk):
             model_count = len(list(self.store.model_dir.glob("model_*.json")))
             target_bytes = max(1, safe_int(compact.get("target_bytes", 0), 0))
             experience_size = max(0, safe_int(compact.get("size_bytes", 0), 0))
-            report = {"model_count": model_count, "experience_size": experience_size, "target_bytes": target_bytes, "compaction_complete": experience_size <= target_bytes, "models_complete": model_count <= max(1, safe_int(config.ai_model_limit, AGENT_SPEC.default_ai_model_limit)), "compact": compact, "model_compact": model_compact}
+            report = {"model_count": model_count, "experience_size": experience_size, "target_bytes": target_bytes, "compaction_complete": bool(compact.get("complete", experience_size <= target_bytes)), "models_complete": model_count <= max(1, safe_int(config.ai_model_limit, AGENT_SPEC.default_ai_model_limit)), "compact": compact, "model_compact": model_compact}
             if checkpoint_stage:
                 checkpoint = self.store.load_sleep_checkpoint() or {}
                 checkpoint_payload = {"current_task": checkpoint_stage, "input_record_version": checkpoint.get("input_record_version", 0), "output_record_version": now_text(), "flushed": True, "model_count": model_count, "experience_pool_size": experience_size, "allowed_next_task": checkpoint_stage in ("task2_saved", "task3_final_saved")}
+                if checkpoint_stage == "task1_completed":
+                    checkpoint_payload.update({"task1_completed": True, "task1_result": status_detail if isinstance(status_detail, dict) else {"status_detail": status_detail}, "allowed_next_task": True})
                 if checkpoint_stage == "task2_saved":
                     checkpoint_payload.update({"task1_completed": True, "task2_completed": True, "task2_saved": True})
                 self.store.save_sleep_checkpoint(checkpoint, stage=checkpoint_stage, **checkpoint_payload)
@@ -6070,7 +6165,7 @@ class ControlPanel(tk.Tk):
         if not check.ok:
             return "window_invalid"
         if not self.cursor_inside_window():
-            return "window_invalid"
+            return "cursor_outside"
         if self.learning_idle_seconds() >= safe_float(getattr(config, "still_seconds", self.settings.generated_action_complete_wait), self.settings.generated_action_complete_wait):
             return "still_timeout"
         return None
