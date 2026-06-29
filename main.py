@@ -504,16 +504,16 @@ ALLOWED_TRANSITIONS = {
     ("idle", "sleep"): {"click_sleep"},
     ("idle", "migration"): {"click_modify_data_path"},
     ("learning", "stopping"): {"user_stop", "esc", "still_timeout", "window_invalid", "cursor_outside", "runtime_error"},
-    ("training", "stopping"): {"user_stop", "esc", "still_timeout", "window_invalid", "cursor_outside", "runtime_error", "executor_error"},
+    ("training", "stopping"): {"user_stop", "esc", "still_timeout", "window_invalid", "cursor_outside", "runtime_error", "executor_error", "zero_score_unrecoverable"},
     ("starting", "stopping"): {"user_stop", "esc", "runtime_error", "minimize_failed", "window_invalid", "completed"},
     ("migration", "stopping"): {"user_stop", "esc", "runtime_error", "migration_error", "completed"},
-    ("stopping", "idle"): {"esc", "still_timeout", "window_invalid", "cursor_outside", "user_stop", "runtime_error", "executor_error", "migration_error", "completed"},
+    ("stopping", "idle"): {"esc", "still_timeout", "window_invalid", "cursor_outside", "user_stop", "runtime_error", "executor_error", "zero_score_unrecoverable", "migration_error", "completed"},
     ("training", "sleep"): {"time_limit"},
     ("sleep", "stopping"): {"user_stop", "esc", "runtime_error", "completed"}
 }
 
 
-TERMINATION_REASONS = ("window_invalid", "cursor_outside", "rect_changed", "empty_action", "executor_error", "time_limit", "esc", "still_timeout", "user_stop", "migration_error", "completed")
+TERMINATION_REASONS = ("window_invalid", "cursor_outside", "rect_changed", "empty_action", "executor_error", "zero_score_unrecoverable", "time_limit", "esc", "still_timeout", "user_stop", "migration_error", "completed")
 HUMAN_FEATURE_NAMES = ("duration", "direct", "bend", "points", "speed_mean", "speed_variance", "acceleration_change", "pauses", "hover_before", "drag_curvature", "double_click_interval")
 
 RUNTIME_NUMBER_RULES = {
@@ -941,6 +941,9 @@ def run_self_test():
     runtime_pool = ExperiencePool(changed, pool.records, {"model_group": group})
     runtime = runtime_pool.model_runtime
     assert runtime.screen_novelty([1.0]) == 0.0
+    changed_for_topk = replace(changed, nearest_top_k=3)
+    topk_model = ScreenNoveltyScorerModel(changed_for_topk)
+    assert topk_model.predict({"similarities": [1.0, 0.8, 0.8]}) == 14.67
     assert runtime.mouse_humanlikeness({"type": "click", "start_rel": [0.5, 0.5]}, 55.0) == 55.0
     assert 0.0 <= runtime.operation_policy_score(pool.records[0], 0.9) <= 1.0
     assert runtime.models["rescue_policy"].predict({"zero_score": 0.0}) is not None
@@ -2016,7 +2019,7 @@ def strict_reward_target(screen_score, human_similarity):
 
 
 AI_MODEL_GROUP_SPECS = (
-    {"key": "screen_novelty_scorer", "name": "画面新颖程度评分模型", "goal": "一个画面与经验池中最相似历史画面的相似度越高，评分越低"},
+    {"key": "screen_novelty_scorer", "name": "画面新颖程度评分模型", "goal": "一个画面与经验池中最相似的一批历史画面批量聚合相似度越高，评分越低"},
     {"key": "mouse_humanlikeness_scorer", "name": "鼠标拟人程度评分模型", "goal": "AI鼠标操作与学习模式用户鼠标操作相似度越高，评分越高"},
     {"key": "operation_policy", "name": "实操模型", "goal": "训练模式非自救期间在雷电模拟器客户区内输出鼠标操作"},
     {"key": "rescue_policy", "name": "自救模型", "goal": "画面评分持续为0时输出自救操作，直到画面评分不再为0"},
@@ -2092,8 +2095,14 @@ class ScreenNoveltyScorerModel(TrainableModel):
 
     def predict(self, features):
         similarities = features.get("similarities", []) if isinstance(features, dict) else []
-        sims = [clamp(safe_float(item, 0.0), 0.0, 1.0) for item in similarities]
-        return round(clamp((1.0 - max(sims or [1.0])) * 100.0, 0.0, 100.0), 2)
+        sims = sorted([clamp(safe_float(item, 0.0), 0.0, 1.0) for item in similarities], reverse=True)
+        if not sims:
+            return 100.0
+        top = sims[:max(1, min(safe_int(getattr(self.settings, "nearest_top_k", getattr(self, "nearest_top_k", 1)), getattr(self, "nearest_top_k", 1)), len(sims)))]
+        mean_similarity = sum(top) / len(top)
+        density = sum(1 for item in top if item >= 0.95) / len(top)
+        similarity = top[0] * 0.5 + mean_similarity * 0.35 + density * 0.15
+        return round(clamp((1.0 - similarity) * 100.0, 0.0, 100.0), 2)
 
     def probe_input(self):
         return {"similarities": [0.5]}
@@ -2286,7 +2295,7 @@ class ModelGroupRuntime:
         model = self.models.get("screen_novelty_scorer")
         if model:
             return model.predict({"similarities": similarities})
-        sims = [clamp(safe_float(item, 0.0), 0.0, 1.0) for item in similarities]
+        sims = sorted([clamp(safe_float(item, 0.0), 0.0, 1.0) for item in similarities], reverse=True)
         if not sims:
             return 100.0
         top = sims[:max(1, min(safe_int(getattr(self.settings, "nearest_top_k", 1), 1), len(sims)))]
@@ -6816,7 +6825,12 @@ class ControlPanel(tk.Tk):
         score = current_score
         stage_index = 0
         run_guard = lambda: self.recovery_stop_reason(stop_event, config)
+        max_attempts = len(stage_names) + max(1, self.settings.training_fail_stop_count)
         while score <= 0.0 and not run_guard() and self.is_run_active(self.active_session.token if self.active_session else None, "training"):
+            if stage_index >= max_attempts:
+                self.termination_reason = "zero_score_unrecoverable"
+                stop_event.set()
+                break
             stage = stage_names[min(stage_index, len(stage_names) - 1)]
             self.events.publish("training_zero_score_recovery", stage=stage, elapsed=round(time.perf_counter() - zero_score_started_at, 3), screen_score=score)
             guarded = run_guard()
