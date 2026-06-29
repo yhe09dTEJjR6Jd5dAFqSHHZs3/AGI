@@ -260,6 +260,22 @@ def startup_ldplayer_window_issue(path):
     return None
 
 
+def discover_ldplayer_candidates():
+    candidates = []
+    for text in (AGENT_SPEC.default_ldplayer_path, r"C:\Program Files\LDPlayer\LDPlayer9\dnplayer.exe", r"C:\Program Files\LDPlayer\LDPlayer4\dnplayer.exe", r"D:\LDPlayer\LDPlayer9\dnplayer.exe"):
+        path = Path(text)
+        if path.exists():
+            candidates.append(str(path))
+    if sys.platform == "win32" and psutil:
+        try:
+            for proc in psutil.process_iter(["name", "exe"]):
+                if str((proc.info or {}).get("name", "")).lower() == "dnplayer.exe" and (proc.info or {}).get("exe"):
+                    candidates.append(str(proc.info["exe"]))
+        except Exception:
+            pass
+    return list(dict.fromkeys(candidates))
+
+
 def startup_environment_issues():
     issues = []
     ldplayer_path, data_path = startup_config_paths()
@@ -301,6 +317,8 @@ def attempt_startup_environment_repair(actions=None):
     if valid_path and sys.platform == "win32" and not missing:
         actions.append("启动检查已跳过雷电模拟器客户区状态")
     elif not valid_path:
+        discovered = discover_ldplayer_candidates()
+        actions.append("已自动发现雷电模拟器候选路径：" + "、".join(discovered) if discovered else "未在常见目录或已运行进程中发现雷电模拟器")
         actions.append(f"雷电模拟器路径无法自动修复：{path_reason}")
     if sys.version_info < MIN_PYTHON_VERSION:
         actions.append("Python 运行时版本无法由程序自动升级")
@@ -314,11 +332,11 @@ def attempt_startup_environment_repair(actions=None):
 
 
 def startup_failure_detail(initial_issues, repair_actions, repair_error, remaining_issues):
-    sections = ["初次检查：", *[f"- {item}" for item in initial_issues], "", "修复过程："]
+    sections = ["已尝试的修复动作、无法自动修复的原因与下一步操作", "", "初次检查：", *[f"- {item}" for item in initial_issues], "", "已尝试的修复动作："]
     sections.extend(f"- {item}" for item in repair_actions)
     if repair_error:
         sections.append(f"- 修复失败：{repair_error}")
-    sections.extend(["", "修复后复检：", *[f"- {item}" for item in remaining_issues]])
+    sections.extend(["", "无法自动修复的原因：", *[f"- {item}" for item in remaining_issues], "", "下一步操作：", "- 确认正在 Windows 桌面会话中运行且 Python 版本满足要求。", "- 安装雷电模拟器或通过控制面板修改 dnplayer.exe 路径。", "- 按上方依赖或存储路径错误手动修复后重新启动。"])
     return "\n".join(sections)
 
 
@@ -734,7 +752,7 @@ def run_self_test():
     startup_checks = deque([["桌面异常"], ["桌面异常"]])
     startup_events = []
     assert not prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: actions.append("无法自动修复"), startup_events.append)
-    assert len(startup_events) == 1 and "初次检查" in startup_events[0] and "修复后复检" in startup_events[0]
+    assert len(startup_events) == 1 and "初次检查" in startup_events[0] and "无法自动修复的原因" in startup_events[0] and "下一步操作" in startup_events[0]
     settings = derive_runtime_settings()
     assert len(settings.human_feature_weights) == len(HUMAN_FEATURE_NAMES)
     assert sum(settings.human_feature_weights) > 0.0
@@ -855,6 +873,12 @@ def run_self_test():
         reopened.load()
         assert reopened.format == "PNG"
         assert image_content_checksum(reopened) == image_content_checksum(image)
+        checkpoint = store.save_sleep_checkpoint({"run_id": "self-test", "stage": "task2_training"}, task1_completed=True)
+        assert store.load_sleep_checkpoint()["task1_completed"] is True
+        store.clear_sleep_checkpoint()
+        assert store.load_sleep_checkpoint() is None
+        store.append_runtime_parameter_audit({"a": 1}, {"a": 2}, {"a": {"reality_conditions": {"cpu_load": 0.5}, "semantic_goal": "self test"}})
+        assert store.runtime_audit_file.exists()
         queued_path = root / "queued.png"
         persistence = AsyncPersistenceQueue(settings)
         try:
@@ -2001,6 +2025,8 @@ class DataStore:
         self.experience_file = self.root / "experience.jsonl"
         self.state_file = self.root / "state.json"
         self.settings_file = self.root / "settings.json"
+        self.sleep_checkpoint_file = self.root / "sleep_checkpoint.json"
+        self.runtime_audit_file = self.root / "runtime_parameters_audit.jsonl"
         self.error_file = self.root / "errors.jsonl"
         self.lock = threading.RLock()
         try:
@@ -2069,6 +2095,49 @@ class DataStore:
             with temporary.open("w", encoding="utf-8") as file:
                 json.dump(self.state, file, ensure_ascii=False, indent=2)
             temporary.replace(self.state_file)
+
+    def write_json_atomic(self, path, payload):
+        with self.lock:
+            temporary = Path(path).with_suffix(Path(path).suffix + ".tmp")
+            with temporary.open("w", encoding="utf-8") as file:
+                json.dump(payload, file, ensure_ascii=False, indent=2)
+            temporary.replace(path)
+
+    def load_sleep_checkpoint(self):
+        try:
+            if not self.sleep_checkpoint_file.exists():
+                return None
+            with self.sleep_checkpoint_file.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+            return payload if isinstance(payload, dict) else None
+        except Exception as exc:
+            self.log_error("load_sleep_checkpoint", exc, {"path": str(self.sleep_checkpoint_file)})
+            return None
+
+    def save_sleep_checkpoint(self, checkpoint, **updates):
+        payload = dict(checkpoint or {})
+        payload.update(updates)
+        payload["updated_at"] = now_text()
+        self.write_json_atomic(self.sleep_checkpoint_file, payload)
+        return payload
+
+    def clear_sleep_checkpoint(self):
+        with self.lock:
+            try:
+                self.sleep_checkpoint_file.unlink(missing_ok=True)
+            except Exception as exc:
+                self.log_error("clear_sleep_checkpoint", exc, {"path": str(self.sleep_checkpoint_file)})
+
+    def append_runtime_parameter_audit(self, previous_values, current_values, audit):
+        payload = {"schema_version": CONFIG_SCHEMA_VERSION, "audit_version": 1, "created_at": now_text(), "previous_values": previous_values or {}, "current_values": current_values or {}, "changes": [], "runtime_generated_numbers": audit or {}}
+        for key, value in sorted((current_values or {}).items()):
+            previous = (previous_values or {}).get(key)
+            if previous != value:
+                item_audit = (audit or {}).get(key, {})
+                payload["changes"].append({"name": key, "before": previous, "after": value, "trigger_conditions": item_audit.get("reality_conditions", {}), "reason": item_audit.get("semantic_goal", key), "effect_metrics": {"pending_observation": True}})
+        with self.lock:
+            with self.runtime_audit_file.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     def add_screen_score_total(self, value):
         with self.lock:
@@ -3098,8 +3167,6 @@ class ExperiencePool:
             top = sims[:max(1, min(self.settings.nearest_top_k, len(sims)))]
             density = sum(1 for item in top if item >= 0.95) / len(top)
             score = clamp((1.0 - (top[0] * 0.5 + sum(top) / len(top) * 0.35 + density * 0.15)) * 100.0, 0.0, 100.0)
-            if score <= 0.0 and exact_checksum:
-                score = 0.01
             confidence = clamp(top[0] * 0.65 + (1.0 - density) * 0.35, 0.0, 1.0)
         else:
             score = 100.0
@@ -3127,6 +3194,7 @@ class ExperiencePool:
             hash_value = parse_hash_value(record)
             file_hash = None
             screen_path = record.get("screen_path")
+            needs_checksum = not bool(record.get("image_checksum"))
             if store and analyzer and screen_path:
                 path = (store.root / str(screen_path)).resolve()
                 try:
@@ -3146,6 +3214,9 @@ class ExperiencePool:
                     record["screen_file_error"] = str(exc)
                     record.update({"score_status": "image_corrupt", "exclude_from_training": True, "quarantined": True, "quarantine_reason": "image_corrupt", "score_checked_at": now_text()})
                     image_corrupt += 1
+            elif needs_checksum:
+                record.update({"score_status": "image_missing", "exclude_from_training": True, "quarantined": True, "quarantine_reason": "image_checksum_missing_without_recoverable_image", "score_checked_at": now_text()})
+                image_missing += 1
             if file_hash and (not hash_value or file_hash.hex != hash_value.hex or file_hash.bits != hash_value.bits):
                 hash_value = file_hash
                 record["screen_hash"] = file_hash.hex
@@ -3162,6 +3233,12 @@ class ExperiencePool:
                 record["quarantine_reason"] = record.get("quarantine_reason") or "hash_missing"
                 record["score_checked_at"] = now_text()
                 updates.append((index, record, None))
+                if callable(progress_callback):
+                    progress_callback(processed, total)
+                continue
+            if record.get("quarantined") and record.get("quarantine_reason") in ("image_missing", "image_corrupt", "image_checksum_missing_without_recoverable_image"):
+                unrecoverable += 1
+                updates.append((index, record, hash_value))
                 if callable(progress_callback):
                     progress_callback(processed, total)
                 continue
@@ -4231,7 +4308,7 @@ class ControlPanel(tk.Tk):
             self.metric_items.append(self.create_metric(self.metrics_frame, title, variable))
         self.reflow_metrics()
         ttk.Label(status_frame, text="快捷键", style="CardTitle.TLabel").grid(row=1, column=0, sticky="w", pady=(18, 6), padx=(0, 12))
-        hint = "学习模式期间，全局鼠标静止超时会自动结束。雷电模拟器客户区外的新动作不会记录为学习动作，但会重置静止倒计时。ESC 终止当前学习、训练或睡眠。截图与坐标均使用雷电模拟器客户区。"
+        hint = "学习模式期间，全局鼠标静止超时会自动结束。鼠标离开雷电模拟器客户区将立即结束当前学习或训练模式；客户区外动作不会作为学习数据保存。ESC 终止当前学习、训练或睡眠。截图与坐标均使用雷电模拟器客户区。"
         self.hint_label = ttk.Label(status_frame, text=hint, wraplength=max(320, self.settings.ui_width - 120), style="Hint.TLabel")
         self.hint_label.grid(row=2, column=0, sticky="ew", pady=6)
         progress_frame = ttk.LabelFrame(container, text=self.progress_label_var.get(), padding=self.settings.ui_section_padding)
@@ -4802,13 +4879,19 @@ class ControlPanel(tk.Tk):
         if capture_ms <= 0.0:
             capture_ms = self.measure_capture_latency()
         screen_score_total_value = self.store.screen_score_total if self.store else 0.0
+        previous_settings = {item.name: getattr(self.settings, item.name) for item in fields(Settings)} if self.settings else {}
         settings = derive_runtime_settings(base_settings=self.settings, rect=self.current_rect() or self.screen_rect(), pool_count=self.experience_pool.count() if self.experience_pool else 0, capture_ms=capture_ms, cpu_load=cpu_load, execution_ms=self.adaptive_policy._avg(self.adaptive_policy.execution_latency_ms, 0.0), window_instability=self.adaptive_policy._avg(self.adaptive_policy.window_change_flags, 0.0), recent_success=self.adaptive_policy._avg(self.adaptive_policy.outcome_flags, 1.0), screen_score_total=screen_score_total_value, learning_similarity=self.adaptive_policy._avg(self.adaptive_policy.learning_similarity, 0.97), hardware=self.hardware_state)
+        if self.store:
+            self.store.append_runtime_parameter_audit(previous_settings, {item.name: getattr(settings, item.name) for item in fields(Settings)}, copy.deepcopy(RUNTIME_NUMBER_AUDIT))
         self.settings = settings
         self.escape_monitor.debounce_seconds = settings.key_debounce_seconds
         self.ui(lambda: self.minsize(settings.ui_min_width, settings.ui_min_height))
         return Config(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH), data_path, training_seconds, still_seconds, experience_pool_gb, ai_model_limit, settings)
 
     def apply_runtime_settings(self, settings):
+        previous_settings = {item.name: getattr(self.settings, item.name) for item in fields(Settings)} if self.settings else {}
+        if self.store:
+            self.store.append_runtime_parameter_audit(previous_settings, {item.name: getattr(settings, item.name) for item in fields(Settings)}, copy.deepcopy(RUNTIME_NUMBER_AUDIT))
         self.settings = settings
         if self.experience_pool:
             self.experience_pool.apply_settings(settings)
@@ -5285,9 +5368,14 @@ class ControlPanel(tk.Tk):
         compaction_complete = self.sleep_compaction_complete(initial_compact)
         completed_normally = False
         models_complete = False
+        checkpoint = self.store.load_sleep_checkpoint() if self.store else None
+        if not checkpoint or checkpoint.get("completed"):
+            checkpoint = {"run_id": uuid.uuid4().hex, "stage": "prepare", "task1_completed": False, "task2_completed": False, "task3_model_cleanup_completed": False, "task3_pool_compaction_completed": False, "created_at": now_text()}
         run_guard = lambda: should_stop_run(stop_event, None, self.should_stop_by_escape, getattr(self.active_session, "termination_reason", None) or self.termination_reason)
         self.ui(lambda: self.progress_label_var.set("睡眠准备中｜暂停异步写入并刷盘"))
         try:
+            if self.store:
+                checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="prepare")
             self.persistence_paused.set()
             if self.persistence_queue:
                 self.persistence_queue.flush()
@@ -5305,16 +5393,22 @@ class ControlPanel(tk.Tk):
         recheck_result = {"checked": 0, "rescored": 0, "missing": 0, "errors": 0, "image_missing": 0, "image_corrupt": 0, "hash_missing": 0, "unrecoverable": 0}
         review_status = "failed"
         try:
-            with ScreenAnalyzer(config.settings.hash_size) as analyzer:
-                def score_progress(current, total):
-                    ratio = clamp(safe_float(current, 0.0) / max(1.0, safe_float(total, 1.0)), 0.0, 1.0)
-                    self.update_progress(ratio * 25.0, force=True)
-                    self.ui(lambda c=current, t=total: self.progress_label_var.set(f"睡眠评分复核中｜已复核 {c}/{t} 条"))
-                recheck_result = self.experience_pool.recheck_screen_scores(self.store, analyzer, run_guard=run_guard, progress_callback=score_progress)
-            self.events.publish("sleep_screen_scores_rechecked", **recheck_result)
-            visual_model = self.experience_pool.train_local_vision_model() if self.experience_pool else {"status": "missing_pool"}
-            self.events.publish("sleep_local_vision_model_trained", status=visual_model.get("status"), records=visual_model.get("records", 0), clusters=len(visual_model.get("clusters", [])))
-            self.store.merge_experience_records_by_id(copy.deepcopy(self.experience_pool.records))
+            if self.store and not checkpoint.get("task1_completed"):
+                checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task1_recheck", task1_completed=False)
+            if checkpoint.get("task1_completed"):
+                recheck_result = checkpoint.get("task1_result", recheck_result)
+            else:
+                with ScreenAnalyzer(config.settings.hash_size) as analyzer:
+                    def score_progress(current, total):
+                        ratio = clamp(safe_float(current, 0.0) / max(1.0, safe_float(total, 1.0)), 0.0, 1.0)
+                        self.update_progress(ratio * 25.0, force=True)
+                        self.ui(lambda c=current, t=total: self.progress_label_var.set(f"睡眠评分复核中｜已复核 {c}/{t} 条"))
+                    recheck_result = self.experience_pool.recheck_screen_scores(self.store, analyzer, run_guard=run_guard, progress_callback=score_progress)
+                self.events.publish("sleep_screen_scores_rechecked", **recheck_result)
+                visual_model = self.experience_pool.train_local_vision_model() if self.experience_pool else {"status": "missing_pool"}
+                self.events.publish("sleep_local_vision_model_trained", status=visual_model.get("status"), records=visual_model.get("records", 0), clusters=len(visual_model.get("clusters", [])))
+                self.store.merge_experience_records_by_id(copy.deepcopy(self.experience_pool.records))
+                checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task1_saved", task1_completed=True, task1_result=recheck_result)
             blocking_records = sum(safe_int(recheck_result.get(name, 0), 0) for name in ("unrecoverable", "image_missing", "image_corrupt"))
             trainable_records = safe_int(recheck_result.get("trainable", 0), 0)
             review_status = "quarantined" if blocking_records and trainable_records > 0 else ("completed" if not blocking_records else "failed")
@@ -5352,61 +5446,69 @@ class ControlPanel(tk.Tk):
                 return
             futures.add(executor.submit(train_once))
             submitted += 1
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = set()
-            for _ in range(queue_depth):
-                submit_next(executor, futures)
-            while not stop_event.is_set() and (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
-                guarded = run_guard()
-                if guarded:
-                    with self.state_lock:
-                        self.termination_reason = guarded
-                        if self.active_session:
-                            self.active_session.termination_reason = guarded
-                    stop_event.set()
-                    break
-                percent = self.sleep_progress_percent(completed, target_training_steps, compaction_progress)
-                self.update_progress(percent)
-                if not futures:
+        if self.store and not checkpoint.get("task2_completed"):
+            checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task2_training", task2_completed=False)
+        if checkpoint.get("task2_completed"):
+            completed = target_training_steps
+            completed_normally = True
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = set()
+                for _ in range(queue_depth):
                     submit_next(executor, futures)
-                done, futures = concurrent.futures.wait(futures, timeout=config.settings.sleep_event_wait, return_when=concurrent.futures.FIRST_COMPLETED)
-                if not done:
-                    continue
-                trained = 0
-                best_score = 0.0
-                avg_score = 0.0
-                avg_confidence = 0.0
-                for future in done:
-                    try:
-                        result = future.result()
-                    except Exception as exc:
-                        self.log_exception("sleep_training", exc, {"submitted": submitted, "completed": completed})
-                        result = {"trained": 0, "best_score": 0.0, "avg_score": 0.0, "avg_confidence": 0.0, "model_loss": None}
-                    completed += 1
-                    trained += safe_int(result.get("trained", 0), 0)
-                    best_score = max(best_score, safe_float(result.get("best_score", 0.0), 0.0))
-                    avg_score += safe_float(result.get("avg_score", 0.0), 0.0)
-                    avg_confidence += safe_float(result.get("avg_confidence", 0.0), 0.0)
-                    submit_next(executor, futures)
-                divisor = max(1, len(done))
-                batch_score = avg_score / divisor
-                batch_confidence = avg_confidence / divisor
-                screen_score_total = self.store.state.get("screen_score_total", 0.0) if self.store else 0.0
-                compact = {"changed": False, "size_bytes": self.store.experience_pool_size_bytes() if self.store else 0, "target_bytes": max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))}
-                compaction_progress = self.sleep_compaction_progress(compact)
-                compaction_complete = self.sleep_compaction_complete(compact)
-                if self.sleep_completion_reached(completed, target_training_steps, review_status):
-                    completed_normally = True
-                    self.events.publish("sleep_completion_reached", completed_batches=completed, target_training_steps=target_training_steps, confidence=batch_confidence)
-                    break
-                divisor = max(1, len(done))
-                self.events.publish("sleep_batch_completed", trained=trained, best_score=best_score, confidence=batch_confidence, completed_batches=completed)
-                decision = {"reason": "sleep_prioritized_replay", "confidence": batch_confidence, "candidate_count": trained, "best_score": best_score, "completed_batches": completed, "target_training_steps": target_training_steps, "workers": workers, "pool_compacted": compact.get("changed", False), "pool_removed": compact.get("removed", 0)}
-                self.update_metrics(0.0, 50.0 + clamp(batch_confidence * 50.0, 0.0, 50.0), 0.0, batch_score, best_score, screen_score_total, decision)
-                self.ui(lambda c=completed, t=target_training_steps, q=batch_confidence: self.progress_label_var.set(f"睡眠训练进度｜已训练批次 {c}/{t}｜当前置信度 {q * 100.0:.1f}%"))
-                self.update_progress(self.sleep_progress_percent(completed, target_training_steps, compaction_progress))
-            for future in futures:
-                future.cancel()
+                while not stop_event.is_set() and (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
+                    guarded = run_guard()
+                    if guarded:
+                        with self.state_lock:
+                            self.termination_reason = guarded
+                            if self.active_session:
+                                self.active_session.termination_reason = guarded
+                        stop_event.set()
+                        break
+                    percent = self.sleep_progress_percent(completed, target_training_steps, compaction_progress)
+                    self.update_progress(percent)
+                    if not futures:
+                        submit_next(executor, futures)
+                    done, futures = concurrent.futures.wait(futures, timeout=config.settings.sleep_event_wait, return_when=concurrent.futures.FIRST_COMPLETED)
+                    if not done:
+                        continue
+                    trained = 0
+                    best_score = 0.0
+                    avg_score = 0.0
+                    avg_confidence = 0.0
+                    for future in done:
+                        try:
+                            result = future.result()
+                        except Exception as exc:
+                            self.log_exception("sleep_training", exc, {"submitted": submitted, "completed": completed})
+                            result = {"trained": 0, "best_score": 0.0, "avg_score": 0.0, "avg_confidence": 0.0, "model_loss": None}
+                        completed += 1
+                        trained += safe_int(result.get("trained", 0), 0)
+                        best_score = max(best_score, safe_float(result.get("best_score", 0.0), 0.0))
+                        avg_score += safe_float(result.get("avg_score", 0.0), 0.0)
+                        avg_confidence += safe_float(result.get("avg_confidence", 0.0), 0.0)
+                        submit_next(executor, futures)
+                    divisor = max(1, len(done))
+                    batch_score = avg_score / divisor
+                    batch_confidence = avg_confidence / divisor
+                    screen_score_total = self.store.state.get("screen_score_total", 0.0) if self.store else 0.0
+                    compact = {"changed": False, "size_bytes": self.store.experience_pool_size_bytes() if self.store else 0, "target_bytes": max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))}
+                    compaction_progress = self.sleep_compaction_progress(compact)
+                    compaction_complete = self.sleep_compaction_complete(compact)
+                    if self.sleep_completion_reached(completed, target_training_steps, review_status):
+                        completed_normally = True
+                        self.events.publish("sleep_completion_reached", completed_batches=completed, target_training_steps=target_training_steps, confidence=batch_confidence)
+                        break
+                    divisor = max(1, len(done))
+                    self.events.publish("sleep_batch_completed", trained=trained, best_score=best_score, confidence=batch_confidence, completed_batches=completed)
+                    decision = {"reason": "sleep_prioritized_replay", "confidence": batch_confidence, "candidate_count": trained, "best_score": best_score, "completed_batches": completed, "target_training_steps": target_training_steps, "workers": workers, "pool_compacted": compact.get("changed", False), "pool_removed": compact.get("removed", 0)}
+                    self.update_metrics(0.0, 50.0 + clamp(batch_confidence * 50.0, 0.0, 50.0), 0.0, batch_score, best_score, screen_score_total, decision)
+                    self.ui(lambda c=completed, t=target_training_steps, q=batch_confidence: self.progress_label_var.set(f"睡眠训练进度｜已训练批次 {c}/{t}｜当前置信度 {q * 100.0:.1f}%"))
+                    self.update_progress(self.sleep_progress_percent(completed, target_training_steps, compaction_progress))
+                for future in futures:
+                    future.cancel()
+                if completed_normally and not stop_event.is_set() and self.store:
+                    checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task2_saved", task2_completed=True, completed_batches=completed, target_training_steps=target_training_steps)
         with self.state_lock:
             stopped_reason = self.termination_reason if self.termination_reason in ("esc", "user_stop") else None
         save_status = "completed" if completed_normally and not stopped_reason else stopped_reason or "incomplete"
@@ -5419,7 +5521,11 @@ class ControlPanel(tk.Tk):
         models_complete = bool(save_report.get("models_complete", models_complete)) if isinstance(save_report, dict) else models_complete
         if saved and completed_normally and not stopped_reason:
             try:
-                model_result, pool_result = self.run_sleep_task3(config, run_guard=run_guard)
+                if self.store:
+                    checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task3_model_cleanup", task3_model_cleanup_completed=bool(checkpoint.get("task3_model_cleanup_completed")))
+                model_result, pool_result = self.run_sleep_task3(config, run_guard=run_guard, checkpoint=checkpoint)
+                if self.store:
+                    checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task3_saved", task3_model_cleanup_completed=bool(model_result.get("complete")), task3_pool_compaction_completed=bool(pool_result.get("complete")))
                 task3_report = {"model": model_result, "pool": pool_result}
                 compaction_complete = bool(pool_result.get("complete"))
                 models_complete = bool(model_result.get("complete"))
@@ -5446,6 +5552,9 @@ class ControlPanel(tk.Tk):
         if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
             if completed_normally and not stopped_reason and compaction_complete and models_complete:
                 final_reason = "completed"
+                if self.store:
+                    self.store.save_sleep_checkpoint(checkpoint, stage="completed", completed=True)
+                    self.store.clear_sleep_checkpoint()
                 self.render_sleep_completion_before_idle("睡眠模式保存完成 100%", 100.0)
                 finished = self.finish_run(token, "睡眠模式完成，数据已安全保存", 100.0, release=not restart_training, reason=final_reason)
                 if finished and restart_training:
@@ -5489,20 +5598,28 @@ class ControlPanel(tk.Tk):
             items.append("后续训练循环尚未确认")
         return f"{reason}；未完成：" + "，".join(items)
 
-    def run_sleep_task3(self, config, run_guard=None):
+    def run_sleep_task3(self, config, run_guard=None, checkpoint=None):
         if not self.store:
             return {"changed": False, "removed": 0, "model_count": 0, "complete": True}, {"changed": False, "size_bytes": 0, "removed": 0, "target_bytes": 0, "complete": True}
-        self.ui(lambda: self.progress_label_var.set("睡眠任务3｜清理超额AI模型"))
-        model_result = self.store.compact_ai_models(config.ai_model_limit)
-        self.events.publish("sleep_model_cleanup_completed", removed=model_result.get("removed", 0), model_count=model_result.get("model_count", 0), limit=model_result.get("limit", 0), complete=model_result.get("complete", False))
+        if checkpoint and checkpoint.get("task3_model_cleanup_completed"):
+            model_result = {"changed": False, "removed": 0, "limit": config.ai_model_limit, "model_count": len(list(self.store.model_dir.glob("model_*.json"))), "complete": True, "resumed": True}
+        else:
+            self.ui(lambda: self.progress_label_var.set("睡眠任务3｜清理超额AI模型"))
+            model_result = self.store.compact_ai_models(config.ai_model_limit)
+            self.events.publish("sleep_model_cleanup_completed", removed=model_result.get("removed", 0), model_count=model_result.get("model_count", 0), limit=model_result.get("limit", 0), complete=model_result.get("complete", False))
+            checkpoint = self.store.save_sleep_checkpoint(checkpoint or {}, stage="task3_model_cleanup_saved", task3_model_cleanup_completed=bool(model_result.get("complete")))
         if not model_result.get("complete"):
             raise RuntimeError("睡眠模式任务3未完成：AI模型清理未完成")
         self.update_progress(max(self.progress_value, 94.0), force=True)
         if run_guard and run_guard():
             raise RuntimeError("睡眠模式任务3被中断：经验池压缩未执行")
-        self.ui(lambda: self.progress_label_var.set("睡眠任务3｜压缩经验池至上限50%"))
-        pool_result = self.store.compact_experience_pool(config.experience_pool_gb, run_guard=run_guard)
-        self.events.publish("experience_pool_compaction_completed", removed=pool_result.get("removed", 0), size_bytes=pool_result.get("size_bytes", 0), target_bytes=pool_result.get("target_bytes", 0), complete=pool_result.get("complete", False))
+        if checkpoint and checkpoint.get("task3_pool_compaction_completed"):
+            pool_result = {"changed": False, "size_bytes": self.store.experience_pool_size_bytes(), "removed": 0, "target_bytes": max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024)), "complete": True, "resumed": True}
+        else:
+            self.ui(lambda: self.progress_label_var.set("睡眠任务3｜压缩经验池至上限50%"))
+            pool_result = self.store.compact_experience_pool(config.experience_pool_gb, run_guard=run_guard)
+            self.events.publish("experience_pool_compaction_completed", removed=pool_result.get("removed", 0), size_bytes=pool_result.get("size_bytes", 0), target_bytes=pool_result.get("target_bytes", 0), complete=pool_result.get("complete", False))
+            self.store.save_sleep_checkpoint(checkpoint or {}, stage="task3_pool_compaction_saved", task3_pool_compaction_completed=bool(pool_result.get("complete")))
         if not pool_result.get("complete"):
             raise RuntimeError("睡眠模式任务3未完成：经验池压缩未完成")
         self.update_progress(max(self.progress_value, 96.0), force=True)
