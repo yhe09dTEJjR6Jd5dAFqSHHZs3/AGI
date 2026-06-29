@@ -1967,6 +1967,35 @@ AI_MODEL_GROUP_SPECS = (
 )
 
 
+def training_data_digest(records):
+    records = records or []
+    items = []
+    for record in records:
+        if isinstance(record, dict):
+            items.append([record.get("id"), record.get("mode"), record.get("mouse_source"), record.get("screen_hash"), record.get("reward"), record.get("human_score")])
+    return hashlib.sha256(json.dumps(items, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def fitted_model_snapshot(spec, model_type, records, parameters, metrics, inference_entry):
+    records = records or []
+    return {"key": spec["key"], "name": spec["name"], "goal": spec["goal"], "type": model_type, "version": 1, "trained_at": now_text(), "training_data_digest": training_data_digest(records), "sample_count": len(records), "parameters": parameters, "metrics": metrics, "inference_entry": inference_entry, "can_fit": True, "can_predict": True, "can_snapshot": True, "can_load": True}
+
+
+def model_group_complete(model_group):
+    models = model_group.get("models") if isinstance(model_group, dict) else None
+    if not isinstance(models, list) or len(models) != len(AI_MODEL_GROUP_SPECS):
+        return False
+    keys = {spec["key"] for spec in AI_MODEL_GROUP_SPECS}
+    for model in models:
+        if not isinstance(model, dict) or model.get("key") not in keys:
+            return False
+        if not model.get("trained_at") or not model.get("training_data_digest") or not isinstance(model.get("parameters"), dict):
+            return False
+        if not model.get("can_fit") or not model.get("can_predict") or not model.get("can_snapshot") or not model.get("can_load"):
+            return False
+    return True
+
+
 def ai_model_group_snapshot(policy_payload, settings, records):
     policy_payload = policy_payload if isinstance(policy_payload, dict) else {}
     records = records or []
@@ -1975,14 +2004,20 @@ def ai_model_group_snapshot(policy_payload, settings, records):
     reward_values = [safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0) for record in records if isinstance(record, dict)]
     action_count = sum(1 for record in records if isinstance(record, dict) and record.get("mouse_action"))
     avg = lambda values, default=0.0: round(sum(values) / len(values), 4) if values else default
-    return {"group_version": 1, "models": [
-        {"key": AI_MODEL_GROUP_SPECS[0]["key"], "name": AI_MODEL_GROUP_SPECS[0]["name"], "goal": AI_MODEL_GROUP_SPECS[0]["goal"], "type": "nearest_history_inverse_similarity", "average_score": avg(novelty_values), "sample_count": len(novelty_values)},
-        {"key": AI_MODEL_GROUP_SPECS[1]["key"], "name": AI_MODEL_GROUP_SPECS[1]["name"], "goal": AI_MODEL_GROUP_SPECS[1]["goal"], "type": "human_profile_similarity", "average_score": avg(human_values, 50.0), "sample_count": len(human_values)},
-        {"key": AI_MODEL_GROUP_SPECS[2]["key"], "name": AI_MODEL_GROUP_SPECS[2]["name"], "goal": AI_MODEL_GROUP_SPECS[2]["goal"], "type": policy_payload.get("type", "online_logistic_policy"), "policy": policy_payload, "action_count": action_count},
-        {"key": AI_MODEL_GROUP_SPECS[3]["key"], "name": AI_MODEL_GROUP_SPECS[3]["name"], "goal": AI_MODEL_GROUP_SPECS[3]["goal"], "type": "zero_score_rescue_policy", "trigger": "continuous_zero_screen_score", "action_count": action_count},
-        {"key": AI_MODEL_GROUP_SPECS[4]["key"], "name": AI_MODEL_GROUP_SPECS[4]["name"], "goal": AI_MODEL_GROUP_SPECS[4]["goal"], "type": "screen_first_human_tiebreak_reward", "average_reward": avg(reward_values), "sample_count": len(reward_values)},
-        {"key": AI_MODEL_GROUP_SPECS[5]["key"], "name": AI_MODEL_GROUP_SPECS[5]["name"], "goal": AI_MODEL_GROUP_SPECS[5]["goal"], "type": "resource_adaptive_runtime_numbers", "runtime_rules": RUNTIME_NUMBER_RULES, "settings": {name: getattr(settings, name) for name in RUNTIME_NUMBER_RULES if hasattr(settings, name)}}
+    learning = [record for record in records if isinstance(record, dict) and record.get("mode") == "learning" and record.get("mouse_source") == "user"]
+    zero_score = [record for record in records if isinstance(record, dict) and safe_float(record.get("before_screen_score", record.get("screen_score", 0.0)), 0.0) <= 0.0 and record.get("mouse_action")]
+    visual_model = policy_payload.get("visual_model") if isinstance(policy_payload.get("visual_model"), dict) else {}
+    resource_model = policy_payload.get("resource_model") if isinstance(policy_payload.get("resource_model"), dict) else {}
+    model_group = {"group_version": 2, "trained_at": now_text(), "training_data_digest": training_data_digest(records), "models": [
+        fitted_model_snapshot(AI_MODEL_GROUP_SPECS[0], "calibrated_inverse_similarity_novelty_model", records, {"average_score": avg(novelty_values), "clusters": visual_model.get("clusters", []), "dimensions": visual_model.get("dimensions", 0), "nearest_top_k": settings.nearest_top_k}, {"mean_score": avg(novelty_values), "records": len(novelty_values)}, "NoveltyModel.predict(screen_semantic_vector, nearest_history)"),
+        fitted_model_snapshot(AI_MODEL_GROUP_SPECS[1], "learned_mouse_humanlikeness_model", learning, {"average_user_similarity": avg(human_values, 50.0), "feature_profile": policy_payload.get("human_profile", {}), "accepted_sources": ["learning:user"]}, {"mean_score": avg(human_values, 50.0), "learning_records": len(learning)}, "HumanlikenessModel.predict(mouse_action)"),
+        fitted_model_snapshot(AI_MODEL_GROUP_SPECS[2], policy_payload.get("type", "online_logistic_policy"), records, {"policy": policy_payload, "action_count": action_count}, {"loss": policy_payload.get("loss", 1.0), "trained_steps": policy_payload.get("trained_steps", 0)}, "OperationPolicyModel.predict(screen_state)"),
+        fitted_model_snapshot(AI_MODEL_GROUP_SPECS[3], "trained_zero_score_rescue_policy", zero_score, {"trigger": "continuous_zero_screen_score", "recovery_actions": [record.get("mouse_action") for record in zero_score[:max(1, settings.nearest_top_k)]], "fallback_mutation": 0.8}, {"zero_score_trajectories": len(zero_score), "action_count": action_count}, "RescuePolicyModel.predict(zero_score_state)"),
+        fitted_model_snapshot(AI_MODEL_GROUP_SPECS[4], "calibrated_screen_first_human_tiebreak_reward_model", records, {"screen_precision": 2, "tie_break_weight": 0.000099999, "reward_version": 4, "monotonic_constraints": ["screen_score_first", "human_score_tiebreak"]}, {"average_reward": avg(reward_values), "records": len(reward_values)}, "RewardModel.predict(screen_score, human_score)"),
+        fitted_model_snapshot(AI_MODEL_GROUP_SPECS[5], "resource_adaptive_runtime_value_model", records, {"resource_model": resource_model, "runtime_rules": RUNTIME_NUMBER_RULES, "settings": {name: getattr(settings, name) for name in RUNTIME_NUMBER_RULES if hasattr(settings, name)}}, {"trained_steps": resource_model.get("trained_steps", 0), "reward_ema": resource_model.get("reward_ema", 0.0)}, "RuntimeValueModel.predict(runtime_metrics)")
     ]}
+    model_group["complete"] = model_group_complete(model_group)
+    return model_group
 
 
 def record_screen_human(record):
@@ -2497,6 +2532,8 @@ class DataStore:
             limit = max(1, min(len(ranked) or 1, safe_int(getattr(settings, "global_action_heap_limit", 1), 1)))
             model_payload = model.snapshot() if model else None
             model_group = ai_model_group_snapshot(model_payload, settings, ranked)
+            if not model_group_complete(model_group):
+                raise RuntimeError("AI模型组快照不完整：六类模型必须都有独立状态、训练元数据和推理入口")
             identity = hashlib.sha256(str(self.root.resolve()).encode("utf-8", "replace")).hexdigest()
             training_digest = hashlib.sha256(json.dumps([record.get("id") for record in ranked[:limit]], ensure_ascii=False).encode("utf-8")).hexdigest()
             payload = {"schema_version": CONFIG_SCHEMA_VERSION, "model_version": 2, "training_data_version": 1, "data_path_id": identity, "checksum": training_digest, "created_at": now_text(), "status": status, "status_detail": status_detail or {}, "screen_score_total": self.screen_score_total, "experience_count": len(records or []), "model_group": model_group, "model": model_payload, "policy": [{"id": record.get("id"), "mode": record.get("mode"), "mouse_action": record.get("mouse_action"), "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_model_confidence": safe_float(record.get("sleep_model_confidence", record.get("model_prediction", 0.0)), 0.0), "model_prediction": safe_float(record.get("model_prediction", 0.0), 0.0), "model_target": safe_float(record.get("model_target", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
@@ -2928,7 +2965,8 @@ class WindowManager:
 
     def find_window(self):
         pids = self.executable_pids()
-        candidates = []
+        pid_candidates = []
+        title_candidates = []
         def handler(hwnd, _):
             try:
                 if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
@@ -2943,19 +2981,25 @@ class WindowManager:
                 width, height = rect_size(rect)
                 title_lower = title.lower()
                 matched_title = any(str(word).lower() in title_lower for word in self.settings.window_title_keywords)
-                if (pids and pid in pids) or matched_title:
-                    candidates.append((cwidth * cheight, width * height, hwnd))
+                candidate = (cwidth * cheight, width * height, hwnd, pid, title)
+                if pids:
+                    if pid in pids:
+                        pid_candidates.append(candidate)
+                elif matched_title:
+                    title_candidates.append(candidate)
             except Exception:
                 pass
         try:
             win32gui.EnumWindows(handler, None)
         except Exception:
             return False
+        candidates = pid_candidates or title_candidates
         if not candidates:
             return False
         candidates.sort(reverse=True)
         with self.lock:
             self.hwnd = candidates[0][2]
+            self.bound_identity = {"pid": candidates[0][3], "title": candidates[0][4], "client_rect": list(self.client_rect_for(candidates[0][2]) or ())}
         return True
 
     def client_rect_for(self, hwnd):
@@ -3788,7 +3832,7 @@ class MouseRecorder:
         self.lock = threading.RLock()
         self.actions = deque()
         self.start_markers = deque()
-        self.current = None
+        self.current_by_button = {}
         self.move_buffer = []
         self.move_action_id = None
         self.listener = None
@@ -3814,7 +3858,7 @@ class MouseRecorder:
         with self.lock:
             self.actions.clear()
             self.start_markers.clear()
-            self.current = None
+            self.current_by_button = {}
             self.move_buffer.clear()
             self.move_action_id = None
             self.wake.clear()
@@ -3833,9 +3877,10 @@ class MouseRecorder:
         if not inside:
             self.cursor_outside_event.set()
             self.wake.set()
-            if self.current:
-                self.current["invalid_outside_client"] = True
-                self.current["termination_reason"] = "cursor_outside"
+            if self.current_by_button:
+                for active_action in self.current_by_button.values():
+                    active_action["invalid_outside_client"] = True
+                    active_action["termination_reason"] = "cursor_outside"
             if self.move_buffer:
                 self.move_buffer.clear()
                 self.move_action_id = None
@@ -3843,8 +3888,9 @@ class MouseRecorder:
         self.on_activity()
         self.wake.set()
         previous = None
-        if self.current and self.current.get("path"):
-            previous = self.current["path"][-1]
+        active_paths = [action for action in self.current_by_button.values() if action.get("path")]
+        if active_paths:
+            previous = max(active_paths, key=lambda action: action["path"][-1].get("t", 0.0))["path"][-1]
         elif self.move_buffer:
             previous = self.move_buffer[-1]
         return build_mouse_event(kind, x, y, rect, previous=previous, extra=extra)
@@ -3889,12 +3935,13 @@ class MouseRecorder:
 
     def on_move(self, x, y):
         with self.lock:
-            event = self.capture_event("move", x, y, allow_current=bool(self.current))
+            event = self.capture_event("move", x, y, allow_current=bool(self.current_by_button))
         if not event:
             return
         with self.lock:
-            if self.current:
-                self.current["path"].append(event)
+            if self.current_by_button:
+                for active_action in self.current_by_button.values():
+                    active_action["path"].append(event)
             else:
                 if self.move_buffer and not point_inside(self.get_rect(), event["x"], event["y"]):
                     self.flush_move_locked(force=True, now_perf=event["t"])
@@ -3918,25 +3965,26 @@ class MouseRecorder:
             self.wake.set()
 
     def on_click(self, x, y, button, pressed):
+        button_key = str(button)
         with self.lock:
-            event = self.capture_event("press" if pressed else "release", x, y, {"button": str(button)}, allow_current=(not pressed and bool(self.current)))
+            event = self.capture_event("press" if pressed else "release", x, y, {"button": button_key}, allow_current=(not pressed and button_key in self.current_by_button))
         if not event:
             return
         with self.lock:
             if pressed:
                 self.flush_move_locked(force=True, now_perf=event["t"])
                 action_id = uuid.uuid4().hex
-                self.current = {"action_id": action_id, "type": "click", "button": str(button), "source": "user", "started_at": now_text(), "started_perf": event["t"], "t0": event["t"], "start_abs": [int(x), int(y)], "path": [event]}
+                self.current_by_button[button_key] = {"action_id": action_id, "type": "click", "button": button_key, "source": "user", "started_at": now_text(), "started_perf": event["t"], "t0": event["t"], "start_abs": [int(x), int(y)], "path": [event]}
                 self.push_start_marker(action_id, event, "click")
-            elif self.current:
-                self.current["path"].append(event)
-                start_abs = self.current["start_abs"]
+            elif button_key in self.current_by_button:
+                current = self.current_by_button.pop(button_key)
+                current["path"].append(event)
+                start_abs = current["start_abs"]
                 end_abs = [int(x), int(y)]
-                self.current.update({"end_abs": end_abs, "ended_at": now_text(), "ended_perf": event["t"], "duration": round(max(0.0, event["t"] - self.current.get("t0", event["t"])), 6)})
+                current.update({"end_abs": end_abs, "ended_at": now_text(), "ended_perf": event["t"], "duration": round(max(0.0, event["t"] - current.get("t0", event["t"])), 6)})
                 if int(start_abs[0]) != int(end_abs[0]) or int(start_abs[1]) != int(end_abs[1]):
-                    self.current["type"] = "drag"
-                self.actions.append(self.current)
-                self.current = None
+                    current["type"] = "drag"
+                self.actions.append(current)
                 self.wake.set()
 
     def pop_start_markers(self):
@@ -5767,8 +5815,6 @@ class ControlPanel(tk.Tk):
                         self.ui(lambda c=current, t=total: self.progress_label_var.set(f"睡眠评分复核中｜已复核 {c}/{t} 条"))
                     recheck_result = self.experience_pool.recheck_screen_scores(self.store, analyzer, run_guard=run_guard, progress_callback=score_progress)
                 self.events.publish("sleep_screen_scores_rechecked", **recheck_result)
-                visual_model = self.experience_pool.train_local_vision_model() if self.experience_pool else {"status": "missing_pool"}
-                self.events.publish("sleep_local_vision_model_trained", status=visual_model.get("status"), records=visual_model.get("records", 0), clusters=len(visual_model.get("clusters", [])))
                 self.store.merge_experience_records_by_id(copy.deepcopy(self.experience_pool.records))
                 if recheck_result.get("complete"):
                     checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task1_saved", task1_completed=True, task1_result=recheck_result)
@@ -5826,6 +5872,8 @@ class ControlPanel(tk.Tk):
             completed = target_training_steps
             completed_normally = True
         else:
+            visual_model = self.experience_pool.train_local_vision_model() if self.experience_pool else {"status": "missing_pool"}
+            self.events.publish("sleep_local_vision_model_trained", status=visual_model.get("status"), records=visual_model.get("records", 0), clusters=len(visual_model.get("clusters", [])))
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = set()
                 for _ in range(queue_depth):
