@@ -1976,22 +1976,255 @@ def training_data_digest(records):
     return hashlib.sha256(json.dumps(items, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
-def fitted_model_snapshot(spec, model_type, records, parameters, metrics, inference_entry):
-    records = records or []
-    return {"key": spec["key"], "name": spec["name"], "goal": spec["goal"], "type": model_type, "version": 1, "trained_at": now_text(), "training_data_digest": training_data_digest(records), "sample_count": len(records), "parameters": parameters, "metrics": metrics, "inference_entry": inference_entry, "can_fit": True, "can_predict": True, "can_snapshot": True, "can_load": True}
+class TrainableModel:
+    key = ""
+    model_type = "trainable_model"
+    version = 1
+
+    def __init__(self, settings=None, state=None):
+        self.settings = settings
+        self.state = state if isinstance(state, dict) else {}
+        self.metrics = self.state.get("metrics") if isinstance(self.state.get("metrics"), dict) else {}
+        self.sample_count = safe_int(self.state.get("sample_count", 0), 0)
+        self.trained_at = self.state.get("trained_at") or now_text()
+        self.training_data_digest = self.state.get("training_data_digest") or ""
+
+    def fit(self, records):
+        self.sample_count = len(records or [])
+        self.trained_at = now_text()
+        self.training_data_digest = training_data_digest(records)
+        return self.metrics
+
+    def predict(self, features):
+        raise NotImplementedError
+
+    def parameters(self):
+        return {}
+
+    def snapshot(self):
+        payload = {"key": self.key, "type": self.model_type, "version": self.version, "trained_at": self.trained_at, "training_data_digest": self.training_data_digest, "sample_count": self.sample_count, "parameters": self.parameters(), "metrics": self.metrics, "class": self.__class__.__name__}
+        self.restore(payload, self.settings).predict(self.probe_input())
+        payload.update({"can_fit": True, "can_predict": True, "can_snapshot": True, "can_load": True, "probe_prediction": self.predict(self.probe_input())})
+        return payload
+
+    @classmethod
+    def restore(cls, payload, settings=None):
+        return cls(settings, payload)
+
+    def probe_input(self):
+        return {}
 
 
-def model_group_complete(model_group):
+class ScreenNoveltyScorerModel(TrainableModel):
+    key = "screen_novelty_scorer"
+    model_type = "calibrated_inverse_similarity_novelty_model"
+
+    def fit(self, records):
+        super().fit(records)
+        values = [safe_float(record.get("sleep_novelty", record.get("novelty", record.get("screen_score", 0.0))), 0.0) for record in records or [] if isinstance(record, dict)]
+        self.average_score = round(sum(values) / len(values), 4) if values else 0.0
+        self.clusters = []
+        self.dimensions = 0
+        self.nearest_top_k = safe_int(getattr(self.settings, "nearest_top_k", 1), 1)
+        self.metrics = {"mean_score": self.average_score, "records": len(values)}
+        return self.metrics
+
+    def parameters(self):
+        return {"average_score": self.average_score, "clusters": self.clusters, "dimensions": self.dimensions, "nearest_top_k": self.nearest_top_k}
+
+    def predict(self, features):
+        similarities = features.get("similarities", []) if isinstance(features, dict) else []
+        sims = [clamp(safe_float(item, 0.0), 0.0, 1.0) for item in similarities]
+        return round(clamp((1.0 - max(sims or [1.0])) * 100.0, 0.0, 100.0), 2)
+
+    def probe_input(self):
+        return {"similarities": [0.5]}
+
+    @classmethod
+    def restore(cls, payload, settings=None):
+        obj = cls(settings, payload)
+        params = payload.get("parameters") if isinstance(payload, dict) else {}
+        obj.average_score = safe_float(params.get("average_score", 0.0), 0.0)
+        obj.clusters = params.get("clusters") if isinstance(params.get("clusters"), list) else []
+        obj.dimensions = safe_int(params.get("dimensions", 0), 0)
+        obj.nearest_top_k = safe_int(params.get("nearest_top_k", getattr(settings, "nearest_top_k", 1)), 1)
+        return obj
+
+
+class MouseHumanlikenessScorerModel(TrainableModel):
+    key = "mouse_humanlikeness_scorer"
+    model_type = "learned_mouse_humanlikeness_model"
+
+    def fit(self, records):
+        learning = [record for record in records or [] if isinstance(record, dict) and record.get("mode") == "learning" and record.get("mouse_source") == "user"]
+        super().fit(learning)
+        values = [safe_float(record.get("sleep_human_score", record.get("human_score", 50.0)), 50.0) for record in learning]
+        self.average_user_similarity = round(sum(values) / len(values), 4) if values else 50.0
+        self.feature_profile = {}
+        self.metrics = {"mean_score": self.average_user_similarity, "learning_records": len(learning)}
+        return self.metrics
+
+    def parameters(self):
+        return {"average_user_similarity": self.average_user_similarity, "feature_profile": self.feature_profile, "accepted_sources": ["learning:user"]}
+
+    def predict(self, features):
+        return round(clamp(safe_float((features or {}).get("human_score", self.average_user_similarity), self.average_user_similarity), 0.0, 100.0), 2)
+
+    def probe_input(self):
+        return {"human_score": 50.0}
+
+    @classmethod
+    def restore(cls, payload, settings=None):
+        obj = cls(settings, payload)
+        params = payload.get("parameters") if isinstance(payload, dict) else {}
+        obj.average_user_similarity = safe_float(params.get("average_user_similarity", 50.0), 50.0)
+        obj.feature_profile = params.get("feature_profile") if isinstance(params.get("feature_profile"), dict) else {}
+        return obj
+
+
+class OperationPolicyModel(TrainableModel):
+    key = "operation_policy"
+    model_type = "online_logistic_policy"
+
+    def fit(self, records):
+        super().fit(records)
+        self.policy = self.state.get("policy") if isinstance(self.state.get("policy"), dict) else {}
+        self.action_count = sum(1 for record in records or [] if isinstance(record, dict) and record.get("mouse_action"))
+        self.metrics = {"loss": safe_float(self.policy.get("loss", 1.0), 1.0), "trained_steps": safe_int(self.policy.get("trained_steps", 0), 0)}
+        return self.metrics
+
+    def parameters(self):
+        return {"policy": self.policy, "action_count": self.action_count}
+
+    def predict(self, features):
+        weights = self.policy.get("weights") if isinstance(self.policy.get("weights"), dict) else {}
+        names = self.policy.get("feature_names") or PolicyModel.FEATURE_NAMES
+        z = sum(safe_float(weights.get(name, 0.0), 0.0) * safe_float((features or {}).get(name, 0.0), 0.0) for name in names)
+        return 1.0 / (1.0 + math.exp(-clamp(z, -60.0, 60.0)))
+
+    def probe_input(self):
+        return {name: 0.0 for name in PolicyModel.FEATURE_NAMES}
+
+    @classmethod
+    def restore(cls, payload, settings=None):
+        obj = cls(settings, payload)
+        params = payload.get("parameters") if isinstance(payload, dict) else {}
+        obj.policy = params.get("policy") if isinstance(params.get("policy"), dict) else {}
+        obj.action_count = safe_int(params.get("action_count", 0), 0)
+        return obj
+
+
+class RescuePolicyModel(TrainableModel):
+    key = "rescue_policy"
+    model_type = "trained_zero_score_rescue_policy"
+
+    def fit(self, records):
+        zero_score = [record for record in records or [] if isinstance(record, dict) and safe_float(record.get("before_screen_score", record.get("screen_score", 0.0)), 0.0) <= 0.0 and record.get("mouse_action")]
+        super().fit(zero_score)
+        self.recovery_actions = [copy.deepcopy(record.get("mouse_action")) for record in zero_score[:max(1, safe_int(getattr(self.settings, "nearest_top_k", 1), 1))]]
+        self.fallback_mutation = 0.8
+        self.metrics = {"zero_score_trajectories": len(zero_score), "action_count": sum(1 for record in records or [] if isinstance(record, dict) and record.get("mouse_action"))}
+        return self.metrics
+
+    def parameters(self):
+        return {"trigger": "continuous_zero_screen_score", "recovery_actions": self.recovery_actions, "fallback_mutation": self.fallback_mutation}
+
+    def predict(self, features):
+        actions = self.recovery_actions or []
+        return copy.deepcopy(actions[0]) if actions else None
+
+    def probe_input(self):
+        return {"zero_score": 0.0}
+
+    @classmethod
+    def restore(cls, payload, settings=None):
+        obj = cls(settings, payload)
+        params = payload.get("parameters") if isinstance(payload, dict) else {}
+        obj.recovery_actions = params.get("recovery_actions") if isinstance(params.get("recovery_actions"), list) else []
+        obj.fallback_mutation = safe_float(params.get("fallback_mutation", 0.8), 0.8)
+        return obj
+
+
+class RewardModel(TrainableModel):
+    key = "reward_model"
+    model_type = "calibrated_screen_first_human_tiebreak_reward_model"
+
+    def fit(self, records):
+        super().fit(records)
+        values = [safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0) for record in records or [] if isinstance(record, dict)]
+        self.metrics = {"average_reward": round(sum(values) / len(values), 4) if values else 0.0, "records": len(values)}
+        return self.metrics
+
+    def parameters(self):
+        return {"screen_precision": 2, "tie_break_weight": 0.000099999, "reward_version": 4, "monotonic_constraints": ["screen_score_first", "human_score_tiebreak"]}
+
+    def predict(self, features):
+        return strict_reward_value((features or {}).get("screen_score", 0.0), (features or {}).get("human_score", 50.0))
+
+    def probe_input(self):
+        return {"screen_score": 1.0, "human_score": 50.0}
+
+
+class RuntimeValueModel(TrainableModel):
+    key = "runtime_value_model"
+    model_type = "resource_adaptive_runtime_value_model"
+
+    def fit(self, records):
+        super().fit(records)
+        self.resource_model = self.state.get("resource_model") if isinstance(self.state.get("resource_model"), dict) else {}
+        self.runtime_rules = RUNTIME_NUMBER_RULES
+        self.saved_settings = {name: getattr(self.settings, name) for name in RUNTIME_NUMBER_RULES if hasattr(self.settings, name)} if self.settings else {}
+        self.metrics = {"trained_steps": safe_int(self.resource_model.get("trained_steps", 0), 0), "reward_ema": safe_float(self.resource_model.get("reward_ema", 0.0), 0.0)}
+        return self.metrics
+
+    def parameters(self):
+        return {"resource_model": self.resource_model, "runtime_rules": self.runtime_rules, "settings": self.saved_settings}
+
+    def predict(self, features):
+        return ResourceAdaptiveRLModel(self.resource_model).multipliers(features or {})
+
+    def probe_input(self):
+        return {"cpu_load": 0.0, "memory_free_ratio": 0.5}
+
+    @classmethod
+    def restore(cls, payload, settings=None):
+        obj = cls(settings, payload)
+        params = payload.get("parameters") if isinstance(payload, dict) else {}
+        obj.resource_model = params.get("resource_model") if isinstance(params.get("resource_model"), dict) else {}
+        obj.runtime_rules = params.get("runtime_rules") if isinstance(params.get("runtime_rules"), dict) else RUNTIME_NUMBER_RULES
+        obj.saved_settings = params.get("settings") if isinstance(params.get("settings"), dict) else {}
+        return obj
+
+
+TRAINABLE_MODEL_CLASSES = {cls.key: cls for cls in (ScreenNoveltyScorerModel, MouseHumanlikenessScorerModel, OperationPolicyModel, RescuePolicyModel, RewardModel, RuntimeValueModel)}
+
+
+def restore_trainable_model(payload, settings=None):
+    if not isinstance(payload, dict):
+        raise ValueError("模型载荷必须是对象")
+    key = payload.get("key")
+    cls = TRAINABLE_MODEL_CLASSES.get(key)
+    if not cls:
+        raise ValueError("未知模型 " + str(key))
+    model = cls.restore(payload, settings)
+    model.predict(model.probe_input())
+    return model
+
+
+def model_group_complete(model_group, settings=None):
     models = model_group.get("models") if isinstance(model_group, dict) else None
     if not isinstance(models, list) or len(models) != len(AI_MODEL_GROUP_SPECS):
         return False
-    keys = {spec["key"] for spec in AI_MODEL_GROUP_SPECS}
-    for model in models:
-        if not isinstance(model, dict) or model.get("key") not in keys:
-            return False
-        if not model.get("trained_at") or not model.get("training_data_digest") or not isinstance(model.get("parameters"), dict):
-            return False
-        if not model.get("can_fit") or not model.get("can_predict") or not model.get("can_snapshot") or not model.get("can_load"):
+    expected = [spec["key"] for spec in AI_MODEL_GROUP_SPECS]
+    if [model.get("key") for model in models if isinstance(model, dict)] != expected:
+        return False
+    for model_payload in models:
+        try:
+            model = restore_trainable_model(model_payload, settings)
+            snapshot = model.snapshot()
+            if not all(snapshot.get(name) for name in ("can_fit", "can_predict", "can_snapshot", "can_load")):
+                return False
+        except Exception:
             return False
     return True
 
@@ -1999,26 +2232,25 @@ def model_group_complete(model_group):
 def ai_model_group_snapshot(policy_payload, settings, records):
     policy_payload = policy_payload if isinstance(policy_payload, dict) else {}
     records = records or []
-    novelty_values = [safe_float(record.get("sleep_novelty", record.get("novelty", record.get("screen_score", 0.0))), 0.0) for record in records if isinstance(record, dict)]
-    human_values = [safe_float(record.get("sleep_human_score", record.get("human_score", 50.0)), 50.0) for record in records if isinstance(record, dict)]
-    reward_values = [safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0) for record in records if isinstance(record, dict)]
-    action_count = sum(1 for record in records if isinstance(record, dict) and record.get("mouse_action"))
-    avg = lambda values, default=0.0: round(sum(values) / len(values), 4) if values else default
-    learning = [record for record in records if isinstance(record, dict) and record.get("mode") == "learning" and record.get("mouse_source") == "user"]
-    zero_score = [record for record in records if isinstance(record, dict) and safe_float(record.get("before_screen_score", record.get("screen_score", 0.0)), 0.0) <= 0.0 and record.get("mouse_action")]
-    visual_model = policy_payload.get("visual_model") if isinstance(policy_payload.get("visual_model"), dict) else {}
-    resource_model = policy_payload.get("resource_model") if isinstance(policy_payload.get("resource_model"), dict) else {}
-    model_group = {"group_version": 2, "trained_at": now_text(), "training_data_digest": training_data_digest(records), "models": [
-        fitted_model_snapshot(AI_MODEL_GROUP_SPECS[0], "calibrated_inverse_similarity_novelty_model", records, {"average_score": avg(novelty_values), "clusters": visual_model.get("clusters", []), "dimensions": visual_model.get("dimensions", 0), "nearest_top_k": settings.nearest_top_k}, {"mean_score": avg(novelty_values), "records": len(novelty_values)}, "NoveltyModel.predict(screen_semantic_vector, nearest_history)"),
-        fitted_model_snapshot(AI_MODEL_GROUP_SPECS[1], "learned_mouse_humanlikeness_model", learning, {"average_user_similarity": avg(human_values, 50.0), "feature_profile": policy_payload.get("human_profile", {}), "accepted_sources": ["learning:user"]}, {"mean_score": avg(human_values, 50.0), "learning_records": len(learning)}, "HumanlikenessModel.predict(mouse_action)"),
-        fitted_model_snapshot(AI_MODEL_GROUP_SPECS[2], policy_payload.get("type", "online_logistic_policy"), records, {"policy": policy_payload, "action_count": action_count}, {"loss": policy_payload.get("loss", 1.0), "trained_steps": policy_payload.get("trained_steps", 0)}, "OperationPolicyModel.predict(screen_state)"),
-        fitted_model_snapshot(AI_MODEL_GROUP_SPECS[3], "trained_zero_score_rescue_policy", zero_score, {"trigger": "continuous_zero_screen_score", "recovery_actions": [record.get("mouse_action") for record in zero_score[:max(1, settings.nearest_top_k)]], "fallback_mutation": 0.8}, {"zero_score_trajectories": len(zero_score), "action_count": action_count}, "RescuePolicyModel.predict(zero_score_state)"),
-        fitted_model_snapshot(AI_MODEL_GROUP_SPECS[4], "calibrated_screen_first_human_tiebreak_reward_model", records, {"screen_precision": 2, "tie_break_weight": 0.000099999, "reward_version": 4, "monotonic_constraints": ["screen_score_first", "human_score_tiebreak"]}, {"average_reward": avg(reward_values), "records": len(reward_values)}, "RewardModel.predict(screen_score, human_score)"),
-        fitted_model_snapshot(AI_MODEL_GROUP_SPECS[5], "resource_adaptive_runtime_value_model", records, {"resource_model": resource_model, "runtime_rules": RUNTIME_NUMBER_RULES, "settings": {name: getattr(settings, name) for name in RUNTIME_NUMBER_RULES if hasattr(settings, name)}}, {"trained_steps": resource_model.get("trained_steps", 0), "reward_ema": resource_model.get("reward_ema", 0.0)}, "RuntimeValueModel.predict(runtime_metrics)")
-    ]}
-    model_group["complete"] = model_group_complete(model_group)
+    states = {
+        "screen_novelty_scorer": {},
+        "mouse_humanlikeness_scorer": {},
+        "operation_policy": {"policy": policy_payload},
+        "rescue_policy": {},
+        "reward_model": {},
+        "runtime_value_model": {"resource_model": policy_payload.get("resource_model") if isinstance(policy_payload.get("resource_model"), dict) else {}}
+    }
+    models = []
+    for spec in AI_MODEL_GROUP_SPECS:
+        cls = TRAINABLE_MODEL_CLASSES[spec["key"]]
+        model = cls(settings, states.get(spec["key"], {}))
+        model.fit(records)
+        payload = model.snapshot()
+        payload.update({"name": spec["name"], "goal": spec["goal"]})
+        models.append(payload)
+    model_group = {"group_version": 3, "trained_at": now_text(), "training_data_digest": training_data_digest(records), "models": models}
+    model_group["complete"] = model_group_complete(model_group, settings)
     return model_group
-
 
 def record_screen_human(record):
     screen = record.get("sleep_novelty", record.get("screen_primary_reward", record.get("novelty", record.get("screen_score", 0.0))))
@@ -2532,8 +2764,8 @@ class DataStore:
             limit = max(1, min(len(ranked) or 1, safe_int(getattr(settings, "global_action_heap_limit", 1), 1)))
             model_payload = model.snapshot() if model else None
             model_group = ai_model_group_snapshot(model_payload, settings, ranked)
-            if not model_group_complete(model_group):
-                raise RuntimeError("AI模型组快照不完整：六类模型必须都有独立状态、训练元数据和推理入口")
+            if not model_group_complete(model_group, settings):
+                raise RuntimeError("AI模型组快照不完整：六类模型必须都能独立加载并完成探针推理")
             identity = hashlib.sha256(str(self.root.resolve()).encode("utf-8", "replace")).hexdigest()
             training_digest = hashlib.sha256(json.dumps([record.get("id") for record in ranked[:limit]], ensure_ascii=False).encode("utf-8")).hexdigest()
             payload = {"schema_version": CONFIG_SCHEMA_VERSION, "model_version": 2, "training_data_version": 1, "data_path_id": identity, "checksum": training_digest, "created_at": now_text(), "status": status, "status_detail": status_detail or {}, "screen_score_total": self.screen_score_total, "experience_count": len(records or []), "model_group": model_group, "model": model_payload, "policy": [{"id": record.get("id"), "mode": record.get("mode"), "mouse_action": record.get("mouse_action"), "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_model_confidence": safe_float(record.get("sleep_model_confidence", record.get("model_prediction", 0.0)), 0.0), "model_prediction": safe_float(record.get("model_prediction", 0.0), 0.0), "model_target": safe_float(record.get("model_target", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
@@ -2609,7 +2841,11 @@ class DataStore:
                 raise ValueError("资源自适应模型状态特征不匹配")
             if tuple(resource_model.get("action_names") or ()) != ResourceAdaptiveRLModel.ACTION_NAMES:
                 raise ValueError("资源自适应模型动作空间不匹配")
-        return {"weights": clean, "trained_steps": trained_steps, "loss": loss, "resource_model": resource_model}
+        model_group = payload.get("model_group") if isinstance(payload.get("model_group"), dict) else None
+        if not model_group_complete(model_group, settings):
+            raise ValueError("六模型组无法逐个恢复并推理")
+        restored_models = {item.get("key"): item for item in model_group.get("models", [])}
+        return {"weights": clean, "trained_steps": trained_steps, "loss": loss, "resource_model": resource_model, "model_group": model_group, "restored_models": restored_models}
 
     def load_latest_model_state(self, settings=None):
         candidates = sorted(self.model_dir.glob("model_*.json"), key=self.model_created_key, reverse=True)
@@ -3287,6 +3523,10 @@ class ExperiencePool:
         self.sorted_prefixes = []
         self.profile = HumanProfile(settings)
         self.model = PolicyModel(settings, model_state)
+        group_payload = (model_state or {}).get("model_group") if isinstance(model_state, dict) else None
+        self.model_group_models = {}
+        if isinstance(group_payload, dict) and model_group_complete(group_payload, settings):
+            self.model_group_models = {item.get("key"): restore_trainable_model(item, settings) for item in group_payload.get("models", [])}
         self.lock = threading.RLock()
         self.action_cache = []
         self.prefix_neighbor_cache = OrderedDict()
@@ -6338,7 +6578,13 @@ class ControlPanel(tk.Tk):
 
 
     def best_zero_score_recovery_action(self, hash_value):
+        rescue_model = None
+        if self.experience_pool and getattr(self.experience_pool, "model_group_models", None):
+            rescue_model = self.experience_pool.model_group_models.get("rescue_policy")
         batch = self.experience_pool.nearest(hash_value, limit=max(1, self.settings.nearest_top_k)) if self.experience_pool else []
+        model_action = rescue_model.predict({"hash": getattr(hash_value, "hex", ""), "neighbors": batch}) if rescue_model else None
+        if model_action:
+            return self.brain.mutate_action(model_action, safe_float(getattr(rescue_model, "fallback_mutation", 0.8), 0.8))
         weighted = []
         for item in batch:
             record = item.get("record", {})
