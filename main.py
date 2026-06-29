@@ -879,9 +879,19 @@ def run_self_test():
             {"id": "middle", "screen_path": "screens/unique.png", "reward_sort_key": [2.0, 2.0], "reward": 2.0},
             {"id": "high", "screen_path": "screens/shared.png", "reward_sort_key": [3.0, 3.0], "reward": 3.0}
         ])
+        empty_pool_store = DataStore(root / "empty_pool")
+        empty_pool_result = empty_pool_store.compact_experience_pool(0.1)
+        assert empty_pool_result["complete"] is True and not empty_pool_result["changed"] and empty_pool_result["removed"] == 0
+        under_limit_store = DataStore(root / "under_limit_pool")
+        under_limit_screen = under_limit_store.screen_dir / "small.png"
+        with under_limit_screen.open("wb") as file:
+            file.truncate(1024)
+        under_limit_store.save_experience_records([{"id": "under", "screen_path": "screens/small.png", "reward": 1.0}])
+        under_limit_result = under_limit_store.compact_experience_pool(0.1)
+        assert under_limit_result["complete"] is True and not under_limit_result["changed"] and under_limit_result["removed"] == 0
         compacted = store.compact_experience_pool(0.1)
         retained = store.load_experience()
-        assert compacted["changed"] and shared.exists() and not unique.exists()
+        assert compacted["complete"] is True and compacted["changed"] and shared.exists() and not unique.exists()
         assert [record["id"] for record in retained] == ["high"]
         dummy_panel = type("DummyPanel", (), {"store": store})()
         assert ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 200, "target_bytes": 100}) == 0.5
@@ -2405,7 +2415,7 @@ class DataStore:
                 pass
         current = experience_file_size + sum(path_sizes.values())
         if current <= limit_bytes:
-            return {"changed": False, "size_bytes": current, "removed": 0, "target_bytes": limit_bytes}
+            return {"changed": False, "size_bytes": current, "removed": 0, "target_bytes": limit_bytes, "complete": True}
         target_bytes = max(1, limit_bytes // 2)
         records = []
         if self.experience_file.exists():
