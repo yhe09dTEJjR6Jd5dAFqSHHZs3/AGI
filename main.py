@@ -63,6 +63,35 @@ def should_stop_run(stop_event, deadline, escape_check, termination_reason=None)
     return None
 
 
+class PausableTrainingClock:
+    def __init__(self, seconds):
+        self.remaining = float(max(1, seconds))
+        self.last_tick = time.perf_counter()
+        self.paused = False
+
+    def pause(self):
+        if not self.paused:
+            self.remaining -= time.perf_counter() - self.last_tick
+            self.paused = True
+
+    def resume(self):
+        if self.paused:
+            self.last_tick = time.perf_counter()
+            self.paused = False
+
+    def expired(self):
+        if not self.paused:
+            now = time.perf_counter()
+            self.remaining -= now - self.last_tick
+            self.last_tick = now
+        return self.remaining <= 0
+
+    def deadline(self):
+        if self.paused:
+            return None
+        return time.perf_counter() + max(0.0, self.remaining)
+
+
 def fail_and_exit(message):
     try:
         root = tk.Tk()
@@ -338,10 +367,29 @@ def attempt_startup_environment_repair(actions=None):
     if valid_path and sys.platform == "win32" and not missing:
         runtime_ok, runtime_reason = validate_ldplayer_executable(ldplayer_path, require_attach=True)
         actions.append("已启动或附着雷电模拟器并复检客户区可用" if runtime_ok else f"无法修复雷电模拟器客户区：{runtime_reason}")
+        if not runtime_ok:
+            discovered = discover_ldplayer_candidates()
+            for candidate in discovered:
+                candidate_ok, candidate_reason = validate_ldplayer_executable(candidate, require_attach=True)
+                actions.append(f"验证雷电候选路径 {candidate}：" + ("可用" if candidate_ok else candidate_reason))
+                if candidate_ok:
+                    save_startup_config_paths(ldplayer_path=candidate, data_path=data_path)
+                    actions.append(f"已自动切换并保存雷电模拟器路径：{candidate}")
+                    break
     elif not valid_path:
         discovered = discover_ldplayer_candidates()
         actions.append("已自动发现雷电模拟器候选路径：" + "、".join(discovered) if discovered else "未在常见目录或已运行进程中发现雷电模拟器")
-        actions.append(f"雷电模拟器路径无法自动修复：{path_reason}")
+        adopted = False
+        for candidate in discovered:
+            candidate_ok, candidate_reason = validate_ldplayer_executable(candidate, require_attach=True)
+            actions.append(f"验证雷电候选路径 {candidate}：" + ("可用" if candidate_ok else candidate_reason))
+            if candidate_ok:
+                save_startup_config_paths(ldplayer_path=candidate, data_path=data_path)
+                actions.append(f"已自动切换并保存雷电模拟器路径：{candidate}")
+                adopted = True
+                break
+        if not adopted:
+            actions.append(f"雷电模拟器路径无法自动修复：{path_reason}")
     if sys.version_info < MIN_PYTHON_VERSION:
         actions.append("Python 运行时版本无法由程序自动升级")
     if sys.platform != "win32":
@@ -1036,9 +1084,17 @@ def run_self_test():
         sleep_finish_panel.progress_label_var = SleepDummyVar()
         sleep_finish_panel.update_idletasks = lambda: setattr(sleep_finish_panel, "idled", True)
         sleep_finish_panel.settings = settings
-        ControlPanel.render_sleep_completion_before_idle(sleep_finish_panel, "睡眠模式保存完成 100%", 100.0)
-        assert sleep_finish_panel.completion_progress == 100.0
-        assert sleep_finish_panel.progress_label_var.value == "睡眠模式保存完成 100%"
+        ControlPanel.render_sleep_completion_before_idle(sleep_finish_panel, "睡眠模式已中断：任务完成 43.2%，数据已安全保存", 43.2)
+        assert sleep_finish_panel.completion_progress == 43.2
+        assert sleep_finish_panel.progress_label_var.value == "睡眠模式已中断：任务完成 43.2%，数据已安全保存"
+        clock = PausableTrainingClock(900)
+        clock.remaining = 200.0
+        clock.pause()
+        paused_remaining = clock.remaining
+        time.sleep(0.01)
+        assert abs(clock.remaining - paused_remaining) < 0.001
+        clock.resume()
+        assert 0.0 < clock.remaining <= 200.0
         mouse_executor = HumanMouseExecutor.__new__(HumanMouseExecutor)
         mouse_executor.settings = derive_runtime_settings()
         edge_rect = (10, 20, 30, 40)
@@ -2087,11 +2143,45 @@ class ScreenNoveltyScorerModel(TrainableModel):
         self.clusters = []
         self.dimensions = 0
         self.nearest_top_k = safe_int(getattr(self.settings, "nearest_top_k", 1), 1)
-        self.metrics = {"mean_score": self.average_score, "records": len(values)}
+        self.similarity_weights = self.learn_similarity_weights(records or [])
+        self.metrics = {"mean_score": self.average_score, "records": len(values), "validation_mae": self.validation_mae(records or [])}
         return self.metrics
 
+    def learn_similarity_weights(self, records):
+        pairs = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            neighbors = record.get("score_neighbors") or record.get("nearest") or []
+            sims = [clamp(safe_float(item.get("similarity", 0.0), 0.0), 0.0, 1.0) for item in neighbors if isinstance(item, dict)]
+            if sims:
+                pairs.append((sims, clamp(1.0 - safe_float(record.get("sleep_novelty", record.get("novelty", record.get("screen_score", 0.0))), 0.0) / 100.0, 0.0, 1.0)))
+        if not pairs:
+            return {"max": 0.5, "mean": 0.35, "density": 0.15}
+        best = (999.0, {"max": 0.5, "mean": 0.35, "density": 0.15})
+        for max_w in (0.35, 0.5, 0.65):
+            for mean_w in (0.2, 0.35, 0.5):
+                density_w = max(0.0, 1.0 - max_w - mean_w)
+                error = 0.0
+                for sims, target in pairs:
+                    top = sorted(sims, reverse=True)[:max(1, min(self.nearest_top_k, len(sims)))]
+                    predicted = top[0] * max_w + (sum(top) / len(top)) * mean_w + (sum(1 for item in top if item >= 0.95) / len(top)) * density_w
+                    error += abs(predicted - target)
+                if error < best[0]:
+                    best = (error, {"max": max_w, "mean": mean_w, "density": density_w})
+        return best[1]
+
+    def validation_mae(self, records):
+        errors = []
+        for record in records:
+            if isinstance(record, dict) and (record.get("score_neighbors") or record.get("nearest")):
+                predicted = self.predict({"similarities": [item.get("similarity", 0.0) for item in (record.get("score_neighbors") or record.get("nearest") or []) if isinstance(item, dict)]})
+                actual = safe_float(record.get("sleep_novelty", record.get("novelty", record.get("screen_score", predicted))), predicted)
+                errors.append(abs(predicted - actual))
+        return round(sum(errors) / len(errors), 4) if errors else 0.0
+
     def parameters(self):
-        return {"average_score": self.average_score, "clusters": self.clusters, "dimensions": self.dimensions, "nearest_top_k": self.nearest_top_k}
+        return {"average_score": self.average_score, "clusters": self.clusters, "dimensions": self.dimensions, "nearest_top_k": self.nearest_top_k, "similarity_weights": self.similarity_weights, "degradation_threshold": 25.0}
 
     def predict(self, features):
         similarities = features.get("similarities", []) if isinstance(features, dict) else []
@@ -2101,7 +2191,8 @@ class ScreenNoveltyScorerModel(TrainableModel):
         top = sims[:max(1, min(safe_int(getattr(self.settings, "nearest_top_k", getattr(self, "nearest_top_k", 1)), getattr(self, "nearest_top_k", 1)), len(sims)))]
         mean_similarity = sum(top) / len(top)
         density = sum(1 for item in top if item >= 0.95) / len(top)
-        similarity = top[0] * 0.5 + mean_similarity * 0.35 + density * 0.15
+        weights = getattr(self, "similarity_weights", {"max": 0.5, "mean": 0.35, "density": 0.15})
+        similarity = top[0] * safe_float(weights.get("max", 0.5), 0.5) + mean_similarity * safe_float(weights.get("mean", 0.35), 0.35) + density * safe_float(weights.get("density", 0.15), 0.15)
         return round(clamp((1.0 - similarity) * 100.0, 0.0, 100.0), 2)
 
     def probe_input(self):
@@ -2115,6 +2206,7 @@ class ScreenNoveltyScorerModel(TrainableModel):
         obj.clusters = params.get("clusters") if isinstance(params.get("clusters"), list) else []
         obj.dimensions = safe_int(params.get("dimensions", 0), 0)
         obj.nearest_top_k = safe_int(params.get("nearest_top_k", getattr(settings, "nearest_top_k", 1)), 1)
+        obj.similarity_weights = params.get("similarity_weights") if isinstance(params.get("similarity_weights"), dict) else {"max": 0.5, "mean": 0.35, "density": 0.15}
         return obj
 
 
@@ -2127,14 +2219,28 @@ class MouseHumanlikenessScorerModel(TrainableModel):
         super().fit(learning)
         values = [safe_float(record.get("sleep_human_score", record.get("human_score", 50.0)), 50.0) for record in learning]
         self.average_user_similarity = round(sum(values) / len(values), 4) if values else 50.0
-        self.feature_profile = {}
-        self.metrics = {"mean_score": self.average_user_similarity, "learning_records": len(learning)}
+        features = [action_features(record.get("mouse_action")) for record in learning if record.get("mouse_action")]
+        names = sorted({name for item in features for name in item})
+        means = {name: round(sum(safe_float(item.get(name, 0.0), 0.0) for item in features) / len(features), 6) for name in names} if features else {}
+        variances = {name: round(sum((safe_float(item.get(name, 0.0), 0.0) - means[name]) ** 2 for item in features) / len(features), 6) for name in names} if features else {}
+        self.feature_profile = {"means": means, "variances": variances, "density": len(features)}
+        self.metrics = {"mean_score": self.average_user_similarity, "learning_records": len(learning), "feature_dimensions": len(names), "validation_mae": 0.0, "degradation_threshold": 30.0}
         return self.metrics
 
     def parameters(self):
         return {"average_user_similarity": self.average_user_similarity, "feature_profile": self.feature_profile, "accepted_sources": ["learning:user"]}
 
     def predict(self, features):
+        if isinstance(features, dict) and isinstance(features.get("mouse_action"), dict) and getattr(self, "feature_profile", None):
+            feature_values = action_features(features.get("mouse_action"))
+            means = self.feature_profile.get("means", {})
+            variances = self.feature_profile.get("variances", {})
+            if means:
+                distance = 0.0
+                for name, mean in means.items():
+                    variance = max(0.0001, safe_float(variances.get(name, 1.0), 1.0))
+                    distance += ((safe_float(feature_values.get(name, 0.0), 0.0) - safe_float(mean, 0.0)) ** 2) / variance
+                return round(clamp(100.0 / (1.0 + math.sqrt(distance / max(1, len(means)))), 0.0, 100.0), 2)
         return round(clamp(safe_float((features or {}).get("human_score", self.average_user_similarity), self.average_user_similarity), 0.0, 100.0), 2)
 
     def probe_input(self):
@@ -2219,11 +2325,15 @@ class RewardModel(TrainableModel):
     def fit(self, records):
         super().fit(records)
         values = [safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0) for record in records or [] if isinstance(record, dict)]
-        self.metrics = {"average_reward": round(sum(values) / len(values), 4) if values else 0.0, "records": len(values)}
+        screen_values = [safe_float(record.get("screen_score", record.get("novelty", 0.0)), 0.0) for record in records or [] if isinstance(record, dict)]
+        human_values = [safe_float(record.get("human_score", 50.0), 50.0) for record in records or [] if isinstance(record, dict)]
+        self.screen_scale = round(max(1.0, (max(screen_values) - min(screen_values)) if screen_values else 100.0), 6)
+        self.human_tie_break_weight = round(min(0.000099999, 0.000099999 * (sum(human_values) / max(1, len(human_values))) / 100.0), 9) if human_values else 0.00005
+        self.metrics = {"average_reward": round(sum(values) / len(values), 4) if values else 0.0, "records": len(values), "calibrated_screen_scale": self.screen_scale, "calibrated_tie_break_weight": self.human_tie_break_weight, "degradation_threshold": 0.0}
         return self.metrics
 
     def parameters(self):
-        return {"screen_precision": 2, "tie_break_weight": 0.000099999, "reward_version": 4, "monotonic_constraints": ["screen_score_first", "human_score_tiebreak"]}
+        return {"screen_precision": 2, "tie_break_weight": getattr(self, "human_tie_break_weight", 0.000099999), "screen_scale": getattr(self, "screen_scale", 100.0), "reward_version": 4, "monotonic_constraints": ["screen_score_first", "human_score_tiebreak"]}
 
     def predict(self, features):
         return strict_reward_value((features or {}).get("screen_score", 0.0), (features or {}).get("human_score", 50.0))
@@ -4822,9 +4932,16 @@ class TrainingService:
         screen_score_total = panel.store.screen_score_total if panel.store else 0.0
         return panel.brain.choose(snapshot.hash_value, novelty, batch, screen_score_total, zero_score_factor=zero_score_factor)
 
-    def should_stop(self, start, config, stop_event, suspend_time_limit=False):
+    def should_stop(self, clock, config, stop_event, suspend_time_limit=False):
         panel = self.panel
-        deadline = None if suspend_time_limit else start + max(1, config.training_seconds)
+        if isinstance(clock, PausableTrainingClock):
+            if suspend_time_limit:
+                clock.pause()
+            else:
+                clock.resume()
+            deadline = None if suspend_time_limit else clock.deadline()
+        else:
+            deadline = None if suspend_time_limit else clock + max(1, config.training_seconds)
         guarded = panel.active_mode_stop_reason("training", stop_event, config, deadline)
         if guarded:
             panel.termination_reason = guarded
@@ -4832,8 +4949,11 @@ class TrainingService:
             panel.apply_active_stop_reason("training", guarded, stop_event)
             return True
         panel.update_progress(0.0)
-        elapsed = time.perf_counter() - start
-        remaining = max(0.0, config.training_seconds - elapsed)
+        if isinstance(clock, PausableTrainingClock):
+            remaining = max(0.0, clock.remaining)
+        else:
+            elapsed = time.perf_counter() - clock
+            remaining = max(0.0, config.training_seconds - elapsed)
         panel.ui(lambda r=remaining: panel.progress_label_var.set(f"训练模式进度保持 0%｜剩余 {r:.1f} 秒"))
         return False
 
@@ -5192,10 +5312,13 @@ class ControlPanel(tk.Tk):
         self.event_journal.append(event)
 
     def ui(self, func):
-        try:
-            self.after(0, func)
-        except Exception as exc:
-            self.log_exception("ui.dispatch", exc)
+        if threading.current_thread() is threading.main_thread():
+            try:
+                func()
+            except Exception as exc:
+                self.log_exception("ui.dispatch", exc)
+            return
+        self.main_thread_events.put({"type": "ui_call", "func": func})
 
     def ui_sync(self, func, timeout=None):
         if threading.current_thread() is threading.main_thread():
@@ -5213,11 +5336,7 @@ class ControlPanel(tk.Tk):
                 result["error"] = exc
             finally:
                 done.set()
-        try:
-            self.after(0, apply)
-        except Exception as exc:
-            self.log_exception("ui.sync.dispatch", exc)
-            return None
+        self.main_thread_events.put({"type": "ui_sync_call", "func": apply})
         wait_seconds = timeout if timeout is not None else max(self.settings.window_event_wait, self.settings.key_debounce_seconds)
         done.wait(wait_seconds)
         if "error" in result:
@@ -5313,7 +5432,11 @@ class ControlPanel(tk.Tk):
             except queue.Empty:
                 break
             try:
-                if event.get("type") == "restart_training":
+                if event.get("type") in ("ui_call", "ui_sync_call"):
+                    func = event.get("func")
+                    if callable(func):
+                        func()
+                elif event.get("type") == "restart_training":
                     self.status_var.set("睡眠模式已保存，正在自动调度训练模式")
                     old_token = event.get("token")
                     reason = event.get("reason") or "time_limit"
@@ -5426,7 +5549,7 @@ class ControlPanel(tk.Tk):
     def migration_items(self, old_path):
         root = Path(old_path)
         items = []
-        for name in ("screens", "models", "experience.jsonl", "state.json", "settings.json", "errors.jsonl"):
+        for name in ("screens", "models", "experience.jsonl", "state.json", "settings.json", "errors.jsonl", "sleep_checkpoint.json", "runtime_parameters_audit.jsonl", "startup_install.log"):
             source = root / name
             if source.is_dir():
                 for file_root, _, filenames in os.walk(source):
@@ -5465,7 +5588,7 @@ class ControlPanel(tk.Tk):
         return copied, True
 
     def migration_known_names(self):
-        return {"screens", "models", "experience.jsonl", "state.json", "settings.json", "errors.jsonl"}
+        return {"screens", "models", "experience.jsonl", "state.json", "settings.json", "errors.jsonl", "sleep_checkpoint.json", "runtime_parameters_audit.jsonl", "startup_install.log"}
 
     def migration_target_conflicts(self, target):
         path = Path(target)
@@ -5487,6 +5610,7 @@ class ControlPanel(tk.Tk):
             for _, _, filenames in os.walk(models):
                 model_count += len([name for name in filenames if name.lower().startswith("model_")])
         lines = 0
+        audit_lines = 0
         experience = root / "experience.jsonl"
         if experience.exists():
             try:
@@ -5495,7 +5619,32 @@ class ControlPanel(tk.Tk):
                         lines += 1
             except Exception:
                 pass
-        return {"screens": screen_count, "models": model_count, "experience_lines": lines, "settings": (root / "settings.json").exists(), "state": (root / "state.json").exists()}
+        runtime_audit = root / "runtime_parameters_audit.jsonl"
+        if runtime_audit.exists():
+            try:
+                with runtime_audit.open("r", encoding="utf-8") as file:
+                    for _ in file:
+                        audit_lines += 1
+            except Exception:
+                pass
+        checkpoint = root / "sleep_checkpoint.json"
+        checkpoint_stage = None
+        if checkpoint.exists():
+            try:
+                with checkpoint.open("r", encoding="utf-8") as file:
+                    loaded = json.load(file)
+                checkpoint_stage = loaded.get("stage") if isinstance(loaded, dict) else None
+            except Exception:
+                checkpoint_stage = "invalid"
+        sizes = {}
+        for name in self.migration_known_names():
+            path = root / name
+            if path.is_file():
+                try:
+                    sizes[name] = path.stat().st_size
+                except Exception:
+                    sizes[name] = 0
+        return {"screens": screen_count, "models": model_count, "experience_lines": lines, "runtime_audit_lines": audit_lines, "sleep_checkpoint": checkpoint.exists(), "sleep_checkpoint_stage": checkpoint_stage, "file_sizes": sizes, "settings": (root / "settings.json").exists(), "state": (root / "state.json").exists()}
 
     def migration_sample_files(self, root):
         root = Path(root)
@@ -5537,6 +5686,15 @@ class ControlPanel(tk.Tk):
             raise ValueError("迁移校验失败：settings.json 缺失")
         if source_counts["state"] and not target_counts["state"]:
             raise ValueError("迁移校验失败：state.json 缺失")
+        if target_counts.get("runtime_audit_lines", 0) < source_counts.get("runtime_audit_lines", 0):
+            raise ValueError("迁移校验失败：runtime_parameters_audit.jsonl 行数少于源目录")
+        if source_counts.get("sleep_checkpoint") and not target_counts.get("sleep_checkpoint"):
+            raise ValueError("迁移校验失败：sleep_checkpoint.json 缺失")
+        if source_counts.get("sleep_checkpoint_stage") != target_counts.get("sleep_checkpoint_stage"):
+            raise ValueError("迁移校验失败：sleep_checkpoint.json 断点状态不一致")
+        for name, size in source_counts.get("file_sizes", {}).items():
+            if target_counts.get("file_sizes", {}).get(name, 0) < size:
+                raise ValueError("迁移校验失败：文件大小不一致 " + name)
         for source_file in self.migration_sample_files(source):
             relative = source_file.relative_to(Path(source))
             target_file = Path(target) / relative
@@ -6287,8 +6445,9 @@ class ControlPanel(tk.Tk):
                     self.ui(lambda e=str(save_error): messagebox.showerror("保存失败", e))
                 return
             if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
-                self.render_sleep_completion_before_idle("睡眠评分复核失败，已保存失败上下文 100%", 100.0)
-                self.finish_run(token, "睡眠模式已退出：评分复核失败，需人工处理或明确降级策略", 100.0, release=True, reason="runtime_error")
+                saved_progress = max(self.progress_value, 25.0)
+                self.render_sleep_completion_before_idle(f"睡眠评分复核失败：任务完成 {saved_progress:.1f}%，失败上下文已安全保存", saved_progress)
+                self.finish_run(token, "睡眠模式已退出：评分复核失败，需人工处理或明确降级策略", saved_progress, release=True, reason="runtime_error")
                 self.ui(lambda d=json.dumps(failure_detail, ensure_ascii=False, indent=2): messagebox.showerror("评分复核失败", d))
             return
         saved, save_error, save_report = self.save_after_task1(config, "task1_completed", run_guard=run_guard, status_detail=recheck_result)
@@ -6423,8 +6582,9 @@ class ControlPanel(tk.Tk):
             else:
                 final_reason = stopped_reason or "user_stop"
                 unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "用户中断" if stopped_reason else "未完成", models_complete)
-                self.render_sleep_completion_before_idle(f"睡眠模式保存完成 100%｜{unfinished}", 100.0)
-                self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", 100.0, release=True, reason=final_reason)
+                interrupted_progress = self.sleep_progress_percent(completed, target_training_steps, compaction_progress)
+                self.render_sleep_completion_before_idle(f"睡眠模式已中断：任务完成 {interrupted_progress:.1f}%，数据已安全保存｜{unfinished}", interrupted_progress)
+                self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", interrupted_progress, release=True, reason=final_reason)
 
 
     def sleep_restart_runtime_ready(self):
@@ -6900,7 +7060,7 @@ class ControlPanel(tk.Tk):
     def training_loop(self, token, stop_event, config):
         session_id = uuid.uuid4().hex
         start = time.perf_counter()
-        training_timer_started_at = start
+        training_clock = PausableTrainingClock(config.training_seconds)
         consecutive_failures = 0
         consecutive_no_actions = 0
         zero_score_events = 0
@@ -6912,7 +7072,7 @@ class ControlPanel(tk.Tk):
         with ScreenAnalyzer(config.settings.hash_size) as analyzer:
             self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start, priority="critical"), None, "mode_start")
             while not stop_event.is_set() and self.is_run_active(token, "training"):
-                if service.should_stop(training_timer_started_at, config, stop_event, suspend_time_limit=zero_score_started_at is not None or rescue_started_at is not None):
+                if service.should_stop(training_clock, config, stop_event, suspend_time_limit=zero_score_started_at is not None or rescue_started_at is not None):
                     break
                 rect = self.current_rect()
                 service.prepare_for_event(rect)
@@ -6934,8 +7094,9 @@ class ControlPanel(tk.Tk):
                     self.events.publish("training_zero_screen_score", streak=zero_score_events, zero_score_elapsed=round(time.perf_counter() - zero_score_started_at, 3) if zero_score_started_at else 0.0, strategy_stage=min(5, 1 + int(clamp(zero_score_events / max(1, self.settings.training_fail_stop_count), 0.0, 1.0) * 5.0)), screen_score=current_screen_score, recovered=bool(recovered))
                     if recovered:
                         zero_score_events = 0
+                        zero_score_started_at = None
                         rescue_started_at = None
-                        training_timer_started_at = time.perf_counter()
+                        training_clock.resume()
                 else:
                     zero_score_events = 0
                     zero_score_started_at = None
