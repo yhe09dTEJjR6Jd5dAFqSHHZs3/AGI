@@ -1345,6 +1345,88 @@ class RuntimeGeneratedNumbers:
         return value
 
 
+class ResourceAdaptiveRLModel:
+    STATE_NAMES = ("cpu_headroom", "memory_free_ratio", "frame_speed", "execution_speed", "window_stability", "success_rate", "pool_maturity")
+    ACTION_NAMES = ("sleep_batch_size", "sleep_worker_count", "training_event_wait", "nearest_candidate_limit", "explore_max_rate", "generated_sleep_event_wait")
+
+    def __init__(self, state=None):
+        state = state if isinstance(state, dict) else {}
+        weights = state.get("weights") if isinstance(state.get("weights"), dict) else {}
+        self.weights = {action: {name: safe_float((weights.get(action) or {}).get(name, 0.0), 0.0) for name in self.STATE_NAMES} for action in self.ACTION_NAMES}
+        bias = state.get("bias") if isinstance(state.get("bias"), dict) else {}
+        self.bias = {action: safe_float(bias.get(action, 0.0), 0.0) for action in self.ACTION_NAMES}
+        self.trained_steps = safe_int(state.get("trained_steps", 0), 0)
+        self.reward_ema = safe_float(state.get("reward_ema", 0.0), 0.0)
+        self.last_reward = safe_float(state.get("last_reward", 0.0), 0.0)
+
+    def state_vector(self, metrics):
+        capture_ms = max(1.0, safe_float(metrics.get("capture_ms", metrics.get("frame_ms", 24.0)), 24.0))
+        execution_ms = max(1.0, safe_float(metrics.get("execution_ms", 120.0), 120.0))
+        pool_count = max(0.0, safe_float(metrics.get("pool_count", 0.0), 0.0))
+        return {
+            "cpu_headroom": 1.0 - clamp(safe_float(metrics.get("cpu_load", 0.0), 0.0) / 100.0, 0.0, 1.0),
+            "memory_free_ratio": clamp(safe_float(metrics.get("memory_free_ratio", 0.5), 0.5), 0.0, 1.0),
+            "frame_speed": 1.0 - clamp(capture_ms / 240.0, 0.0, 1.0),
+            "execution_speed": 1.0 - clamp(execution_ms / 900.0, 0.0, 1.0),
+            "window_stability": 1.0 - clamp(safe_float(metrics.get("window_instability", metrics.get("window_exception_rate", 0.0)), 0.0), 0.0, 1.0),
+            "success_rate": clamp(safe_float(metrics.get("success_rate", metrics.get("recent_success", 1.0)), 1.0), 0.0, 1.0),
+            "pool_maturity": clamp(math.log1p(pool_count) / math.log1p(100000.0), 0.0, 1.0)
+        }
+
+    def score(self, action, state_vector):
+        return self.bias.get(action, 0.0) + sum(self.weights.get(action, {}).get(name, 0.0) * state_vector.get(name, 0.0) for name in self.STATE_NAMES)
+
+    def multipliers(self, metrics):
+        state_vector = self.state_vector(metrics)
+        learned = self.trained_steps > 0
+        result = {}
+        for action in self.ACTION_NAMES:
+            raw = math.tanh(self.score(action, state_vector))
+            span = 0.55 if learned else 0.18
+            if action in ("training_event_wait", "generated_sleep_event_wait"):
+                raw = -raw
+            result[action] = clamp(1.0 + raw * span, 0.35, 1.85)
+        return result
+
+    def apply_settings(self, settings, metrics):
+        factors = self.multipliers(metrics)
+        values = {item.name: getattr(settings, item.name) for item in fields(Settings)}
+        count_bounds = {"sleep_batch_size": (8, 4096), "sleep_worker_count": (1, 64), "nearest_candidate_limit": (256, 20000)}
+        ratio_bounds = {"explore_max_rate": (0.2, 0.95)}
+        seconds_bounds = {"training_event_wait": (0.01, 0.9), "generated_sleep_event_wait": (0.02, 1.2)}
+        for name, (low, high) in count_bounds.items():
+            values[name] = int(clamp(safe_float(values.get(name, low), low) * factors.get(name, 1.0), low, high))
+        for name, (low, high) in ratio_bounds.items():
+            values[name] = clamp(safe_float(values.get(name, low), low) * factors.get(name, 1.0), low, high)
+        for name, (low, high) in seconds_bounds.items():
+            values[name] = round(clamp(safe_float(values.get(name, low), low) * factors.get(name, 1.0), low, high), 4)
+        values["explore_min_rate"] = min(values["explore_min_rate"], max(0.01, values["explore_max_rate"] * 0.45))
+        return normalize_settings(Settings(**values))
+
+    def train_from_metrics(self, metrics):
+        state_vector = self.state_vector(metrics)
+        throughput = clamp(safe_float(metrics.get("throughput", 0.0), 0.0) / max(1.0, safe_float(metrics.get("batch_size", 1.0), 1.0)), 0.0, 1.0)
+        save_success = clamp(safe_float(metrics.get("save_success_rate", metrics.get("success_rate", 1.0)), 1.0), 0.0, 1.0)
+        stability = state_vector["window_stability"]
+        gain = clamp(safe_float(metrics.get("training_gain", 0.0), 0.0), 0.0, 1.0)
+        resource_penalty = clamp((1.0 - state_vector["cpu_headroom"]) * 0.35 + (1.0 - state_vector["memory_free_ratio"]) * 0.35 + (1.0 - state_vector["frame_speed"]) * 0.15 + (1.0 - state_vector["execution_speed"]) * 0.15, 0.0, 1.0)
+        reward = clamp(throughput * 0.28 + save_success * 0.24 + stability * 0.18 + gain * 0.22 - resource_penalty * 0.22, -1.0, 1.0)
+        lr = clamp(1.0 / math.sqrt(self.trained_steps + 4.0), 0.01, 0.18)
+        for action in self.ACTION_NAMES:
+            direction = -1.0 if action in ("training_event_wait", "generated_sleep_event_wait") else 1.0
+            error = reward - self.score(action, state_vector)
+            self.bias[action] = clamp(self.bias.get(action, 0.0) + lr * error * direction, -4.0, 4.0)
+            for name in self.STATE_NAMES:
+                self.weights[action][name] = clamp(self.weights[action].get(name, 0.0) + lr * error * state_vector[name] * direction, -4.0, 4.0)
+        self.trained_steps += 1
+        self.last_reward = round(reward, 6)
+        self.reward_ema = round(self.reward_ema * 0.85 + reward * 0.15, 6)
+        return {"resource_policy_reward": self.last_reward, "resource_policy_ema": self.reward_ema, "resource_policy_steps": self.trained_steps}
+
+    def snapshot(self):
+        return {"type": "resource_adaptive_actor_critic", "state_names": list(self.STATE_NAMES), "action_names": list(self.ACTION_NAMES), "weights": {action: {name: round(value, 8) for name, value in weights.items()} for action, weights in self.weights.items()}, "bias": {action: round(value, 8) for action, value in self.bias.items()}, "trained_steps": self.trained_steps, "reward_ema": self.reward_ema, "last_reward": self.last_reward}
+
+
 class RuntimeNumberFactory:
     def __init__(self, hardware, screen, pool_count, capture_ms, execution_ms, latency, success_rate, window_instability, learning_similarity, screen_score_total):
         width, height = screen
@@ -2030,6 +2112,7 @@ class PolicyModel:
         self.trained_steps = safe_int(state.get("trained_steps", 0), 0)
         self.loss = safe_float(state.get("loss", 1.0), 1.0)
         self.visual_model = state.get("visual_model") if isinstance(state.get("visual_model"), dict) else {}
+        self.resource_model = ResourceAdaptiveRLModel(state.get("resource_model") if isinstance(state.get("resource_model"), dict) else None)
 
     def features(self, record):
         action = record.get("mouse_action") or {}
@@ -2087,7 +2170,7 @@ class PolicyModel:
 
     def snapshot(self):
         with self.lock:
-            return {"type": "online_logistic_policy", "feature_names": list(self.FEATURE_NAMES), "weights": {name: round(value, 8) for name, value in self.weights.items()}, "trained_steps": self.trained_steps, "loss": self.loss, "visual_model": copy.deepcopy(self.visual_model)}
+            return {"type": "online_logistic_policy", "feature_names": list(self.FEATURE_NAMES), "weights": {name: round(value, 8) for name, value in self.weights.items()}, "trained_steps": self.trained_steps, "loss": self.loss, "visual_model": copy.deepcopy(self.visual_model), "resource_model": self.resource_model.snapshot()}
 
 
 class AppConfigStore:
@@ -2432,7 +2515,13 @@ class DataStore:
         loss = safe_float(model.get("loss", 1.0), 1.0)
         if trained_steps < 0 or not math.isfinite(loss) or loss < 0.0:
             raise ValueError("模型训练状态无效")
-        return {"weights": clean, "trained_steps": trained_steps, "loss": loss}
+        resource_model = model.get("resource_model") if isinstance(model.get("resource_model"), dict) else {}
+        if resource_model:
+            if tuple(resource_model.get("state_names") or ()) != ResourceAdaptiveRLModel.STATE_NAMES:
+                raise ValueError("资源自适应模型状态特征不匹配")
+            if tuple(resource_model.get("action_names") or ()) != ResourceAdaptiveRLModel.ACTION_NAMES:
+                raise ValueError("资源自适应模型动作空间不匹配")
+        return {"weights": clean, "trained_steps": trained_steps, "loss": loss, "resource_model": resource_model}
 
     def load_latest_model_state(self, settings=None):
         candidates = sorted(self.model_dir.glob("model_*.json"), key=self.model_created_key, reverse=True)
@@ -3507,7 +3596,9 @@ class ExperiencePool:
         count = len(updates)
         model_confidence = safe_float(model_result.get("confidence", 0.0), 0.0)
         avg_confidence = (sum(item[3] for item in updates) / count if count else 0.0)
-        return {"trained": count, "model_trained": safe_int(model_result.get("trained", 0), 0), "model_loss": safe_float(model_result.get("loss", 0.0), 0.0), "best_score": round(best_score or 0.0, 4), "avg_score": round(total_score / count if count else 0.0, 4), "avg_confidence": round(clamp(avg_confidence * 0.6 + model_confidence * 0.4, 0.0, 1.0), 4)}
+        hardware = read_hardware_state()
+        resource_result = self.model.resource_model.train_from_metrics({"cpu_load": safe_float(hardware.get("cpu_load", 0.0), 0.0), "memory_free_ratio": safe_float(hardware.get("memory_free_ratio", 0.5), 0.5), "capture_ms": safe_float(getattr(self.settings, "training_event_wait", 0.05), 0.05) * 1000.0, "execution_ms": safe_float(getattr(self.settings, "generated_sleep_event_wait", 0.1), 0.1) * 1000.0, "window_instability": 1.0 - avg_confidence, "success_rate": model_confidence, "pool_count": len(self.records), "throughput": count, "batch_size": max(1, safe_int(getattr(self.settings, "sleep_batch_size", 1), 1)), "save_success_rate": 1.0, "training_gain": clamp((best_score or 0.0) / max(1.0, abs(self.settings.reward_total_max)), 0.0, 1.0)})
+        return {"trained": count, "model_trained": safe_int(model_result.get("trained", 0), 0), "model_loss": safe_float(model_result.get("loss", 0.0), 0.0), "best_score": round(best_score or 0.0, 4), "avg_score": round(total_score / count if count else 0.0, 4), "avg_confidence": round(clamp(avg_confidence * 0.6 + model_confidence * 0.4, 0.0, 1.0), 4), **resource_result}
 
     def rebuild_action_heap_locked(self):
         heap = []
@@ -4242,6 +4333,8 @@ class TrainingService:
         screen_score_total_value = panel.store.screen_score_total if panel.store else 0.0
         panel.hardware_state = panel.refresh_hardware_state()
         settings = panel.adaptive_policy.build(panel.settings, rect, pool_count, screen_score_total_value, hardware=panel.hardware_state)
+        if panel.experience_pool and getattr(panel.experience_pool.model, "resource_model", None):
+            settings = panel.experience_pool.model.resource_model.apply_settings(settings, {"cpu_load": panel.hardware_state.get("cpu_load", 0.0), "memory_free_ratio": panel.hardware_state.get("memory_free_ratio", 0.5), "capture_ms": panel.adaptive_policy._avg(panel.adaptive_policy.capture_latency_ms, 24.0), "execution_ms": panel.adaptive_policy._avg(panel.adaptive_policy.execution_latency_ms, 140.0), "window_instability": panel.adaptive_policy._avg(panel.adaptive_policy.window_change_flags, 0.0), "success_rate": panel.adaptive_policy._avg(panel.adaptive_policy.outcome_flags, 1.0), "pool_count": pool_count})
         panel.apply_runtime_settings(settings)
         return settings
 
@@ -5569,6 +5662,11 @@ class ControlPanel(tk.Tk):
 
     def sleep_loop(self, token, config, stop_event, restart_training=False):
         self.events.publish("sleep_started", data_path=str(config.data_path))
+        if self.experience_pool and getattr(self.experience_pool.model, "resource_model", None):
+            self.hardware_state = self.refresh_hardware_state()
+            learned_settings = self.experience_pool.model.resource_model.apply_settings(config.settings, {"cpu_load": self.hardware_state.get("cpu_load", 0.0), "memory_free_ratio": self.hardware_state.get("memory_free_ratio", 0.5), "capture_ms": self.adaptive_policy._avg(self.adaptive_policy.capture_latency_ms, 24.0), "execution_ms": self.adaptive_policy._avg(self.adaptive_policy.execution_latency_ms, 140.0), "window_instability": self.adaptive_policy._avg(self.adaptive_policy.window_change_flags, 0.0), "success_rate": self.adaptive_policy._avg(self.adaptive_policy.outcome_flags, 1.0), "pool_count": self.experience_pool.count()})
+            config = replace(config, settings=learned_settings)
+            self.apply_runtime_settings(learned_settings)
         completed = 0
         submitted = 0
         workers = max(1, config.settings.sleep_worker_count)
