@@ -809,7 +809,6 @@ def run_self_test():
     assert ("sleep", "training") not in ALLOWED_TRANSITIONS
     assert ("sleep", "starting") not in ALLOWED_TRANSITIONS
     assert ("sleep", "idle") not in ALLOWED_TRANSITIONS
-    assert "poor_optimization" not in ALLOWED_TRANSITIONS[("sleep", "stopping")]
     assert "completed" in ALLOWED_TRANSITIONS[("sleep", "stopping")]
     assert {"completed", "migration_error", "user_stop"}.issubset(ALLOWED_TRANSITIONS[("migration", "stopping")])
     pool = ExperiencePool(settings)
@@ -921,9 +920,9 @@ def run_self_test():
         edge_points = mouse_executor.smooth_points((10, 20), (29, 39), 1.0, rect=edge_rect)
         assert edge_points and all(point_inside(edge_rect, x, y) for x, y in edge_points)
         assert mouse_executor.clamp_point_to_rect((-100, 100), edge_rect) == (10, 39)
-        assert ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, deque([0.02, 0.02]), 0.01, 0.9, 0.8, True)
-        assert ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, deque([0.02, 0.02]), 0.01, 0.9, 0.8, False)
-        assert not ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, deque([0.02, 0.02]), 0.01, 0.9, 0.8, True, "failed")
+        assert ControlPanel.sleep_completion_reached(dummy_panel, 3, 3)
+        assert ControlPanel.sleep_completion_reached(dummy_panel, 3, 3)
+        assert not ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, "failed")
         task3_store = DataStore(root / "task3")
         task3_store.model_dir.mkdir(parents=True, exist_ok=True)
         for name, created in (("model_task3_new.json", "2025-01-03T00:00:00.000"), ("model_task3_old.json", "2025-01-01T00:00:00.000")):
@@ -1031,9 +1030,9 @@ def run_self_test():
         assert dummy_panel.progress_value == 0.0 and dummy_panel.progress_var.value == 0.0
         assert ControlPanel.idle_progress_value(dummy_panel, "training", 91.0) == 0.0
         assert ControlPanel.idle_progress_value(dummy_panel, "migration", 91.0) == 0.0
-        store.save_settings({"training_seconds": 1, "sleep_seconds": 2, "still_seconds": 3, "experience_pool_gb": 4, "ai_model_limit": 5, "forbidden": 6})
+        store.save_settings({"training_seconds": 1, "still_seconds": 3, "experience_pool_gb": 4, "ai_model_limit": 5, "forbidden": 6})
         saved_settings = json.loads(store.settings_file.read_text(encoding="utf-8"))
-        assert "forbidden" not in saved_settings and "sleep_seconds" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0 and saved_settings["ai_model_limit"] == 5
+        assert "forbidden" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0 and saved_settings["ai_model_limit"] == 5
         store.experience_file.write_text("{bad json}\n" + json.dumps({"id": "ok"}) + "\n", encoding="utf-8")
         loaded = store.load_experience()
         assert len(loaded) == 1 and loaded[0]["id"] == "ok"
@@ -5266,7 +5265,7 @@ class ControlPanel(tk.Tk):
         target_bytes = max(1.0, safe_float(compact.get("target_bytes", 1.0), 1.0))
         return size_bytes <= target_bytes
 
-    def sleep_completion_reached(self, completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, compaction_complete, review_status="completed"):
+    def sleep_completion_reached(self, completed, target_training_steps, review_status="completed"):
         pending_state = safe_int(getattr(self.store, "pending_state_writes", 0), 0) if self.store else 0
         return review_status in ("completed", "quarantined") and completed >= target_training_steps and pending_state == 0
 
@@ -5277,17 +5276,13 @@ class ControlPanel(tk.Tk):
         workers = max(1, config.settings.sleep_worker_count)
         queue_depth = max(workers, config.settings.sleep_queue_depth)
         batch_size = max(1, config.settings.sleep_batch_size)
-        best_seen = None
-        recent_improvements = deque(maxlen=max(1, min(max(workers, queue_depth), max(1, self.experience_pool.count() // batch_size if self.experience_pool else 1))))
-        stale_batches = 0
-        poor_limit = max(workers, queue_depth)
-        target_training_steps = max(poor_limit, math.ceil(max(1, self.experience_pool.count() if self.experience_pool else 1) / batch_size), workers * max(1, config.settings.ui_metric_columns))
-        improvement_threshold = 1.0 / max(100.0, target_training_steps * batch_size)
-        confidence_target = clamp(1.0 - 1.0 / max(2.0, config.settings.nearest_top_k + batch_size), 0.5, 0.98)
+        minimum_training_batches = max(workers, queue_depth)
+        target_training_steps = max(minimum_training_batches, math.ceil(max(1, self.experience_pool.count() if self.experience_pool else 1) / batch_size), workers * max(1, config.settings.ui_metric_columns))
         initial_compact = {"changed": False, "size_bytes": self.store.experience_pool_size_bytes() if self.store else 0, "target_bytes": max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))}
         compaction_progress = self.sleep_compaction_progress(initial_compact)
         compaction_complete = self.sleep_compaction_complete(initial_compact)
         completed_normally = False
+        models_complete = False
         run_guard = lambda: should_stop_run(stop_event, None, self.should_stop_by_escape, getattr(self.active_session, "termination_reason", None) or self.termination_reason)
         self.ui(lambda: self.progress_label_var.set("睡眠准备中｜暂停异步写入并刷盘"))
         try:
@@ -5393,23 +5388,17 @@ class ControlPanel(tk.Tk):
                 divisor = max(1, len(done))
                 batch_score = avg_score / divisor
                 batch_confidence = avg_confidence / divisor
-                if trained > 0:
-                    improvement_amount = best_score if best_seen is None else max(0.0, best_score - best_seen)
-                    improved = best_seen is None or best_score > best_seen
-                    recent_improvements.append(improvement_amount)
-                    best_seen = best_score if best_seen is None else max(best_seen, best_score)
-                    stale_batches = 0 if improved else stale_batches + len(done)
                 screen_score_total = self.store.state.get("screen_score_total", 0.0) if self.store else 0.0
                 compact = {"changed": False, "size_bytes": self.store.experience_pool_size_bytes() if self.store else 0, "target_bytes": max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))}
                 compaction_progress = self.sleep_compaction_progress(compact)
                 compaction_complete = self.sleep_compaction_complete(compact)
-                if self.sleep_completion_reached(completed, target_training_steps, recent_improvements, improvement_threshold, batch_confidence, confidence_target, compaction_complete, review_status):
+                if self.sleep_completion_reached(completed, target_training_steps, review_status):
                     completed_normally = True
-                    self.events.publish("sleep_completion_reached", completed_batches=completed, target_training_steps=target_training_steps, confidence=batch_confidence, confidence_target=confidence_target)
+                    self.events.publish("sleep_completion_reached", completed_batches=completed, target_training_steps=target_training_steps, confidence=batch_confidence)
                     break
                 divisor = max(1, len(done))
                 self.events.publish("sleep_batch_completed", trained=trained, best_score=best_score, confidence=batch_confidence, completed_batches=completed)
-                decision = {"reason": "sleep_prioritized_replay", "confidence": batch_confidence, "candidate_count": trained, "best_score": best_score, "completed_batches": completed, "target_training_steps": target_training_steps, "confidence_target": confidence_target, "workers": workers, "pool_compacted": compact.get("changed", False), "pool_removed": compact.get("removed", 0)}
+                decision = {"reason": "sleep_prioritized_replay", "confidence": batch_confidence, "candidate_count": trained, "best_score": best_score, "completed_batches": completed, "target_training_steps": target_training_steps, "workers": workers, "pool_compacted": compact.get("changed", False), "pool_removed": compact.get("removed", 0)}
                 self.update_metrics(0.0, 50.0 + clamp(batch_confidence * 50.0, 0.0, 50.0), 0.0, batch_score, best_score, screen_score_total, decision)
                 self.ui(lambda c=completed, t=target_training_steps, q=batch_confidence: self.progress_label_var.set(f"睡眠训练进度｜已训练批次 {c}/{t}｜当前置信度 {q * 100.0:.1f}%"))
                 self.update_progress(self.sleep_progress_percent(completed, target_training_steps, compaction_progress))
