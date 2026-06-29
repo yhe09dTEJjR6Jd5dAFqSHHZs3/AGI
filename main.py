@@ -500,6 +500,9 @@ RUNTIME_NUMBER_RULES = {
     "mouse_activity_wait": ("capture_ms", "cpu_load"),
     "training_event_wait": ("capture_ms", "execution_ms", "cpu_load", "gpu_factor", "window_instability"),
     "sleep_event_wait": ("cpu_load", "cpu_count", "memory_free_ratio"),
+    "min_action_delay_seconds": ("capture_ms", "execution_ms", "cpu_load", "recent_success"),
+    "generated_sleep_event_wait": ("capture_ms", "execution_ms", "cpu_load", "window_instability", "recent_success"),
+    "generated_action_complete_wait": ("capture_ms", "execution_ms", "cpu_load", "window_instability", "recent_success"),
     "sleep_worker_count": ("cpu_count", "gpu_count", "memory_free_ratio", "cpu_load"),
     "sleep_batch_size": ("pool_count", "cpu_count", "memory_free_ratio", "screen_score_total"),
     "sleep_queue_depth": ("cpu_count", "gpu_count", "memory_free_ratio"),
@@ -523,6 +526,9 @@ RUNTIME_NUMBER_RULES = {
     "ui_metric_min_column_width": ("screen_width", "ui_metric_columns"),
     "reward_total_min": ("screen_score_total", "recent_success"),
     "reward_total_max": ("screen_score_total", "recent_success"),
+    "score_default": ("screen_score_total", "learning_similarity", "pool_count"),
+    "scroll_score_default": ("screen_score_total", "recent_success", "pool_count"),
+    "fallback_score_base": ("screen_score_total", "learning_similarity", "recent_success"),
     "experience_load_limit": ("pool_count", "memory_free_ratio", "cpu_count"),
     "global_action_probability": ("pool_count", "recent_success"),
     "random_action_min": ("window_instability", "recent_success"),
@@ -1386,6 +1392,9 @@ class RuntimeNumberFactory:
             "mouse_activity_wait": self.capture_factor * g("capture_fraction", "wait tracks capture arrival latency", 0.0, 0.08),
             "training_event_wait": self.capture_factor * self.cpu_factor * self.timing_factor * g("event_gap", "next screenshot follows action result and hardware readiness", 0.0, 0.12) / self.gpu_factor,
             "sleep_event_wait": self.cpu_factor / self.core_factor * g("batch_event_gap", "sleep advances on batch completion events", 0.0, 0.18),
+            "min_action_delay_seconds": (self.capture_ms + self.execution_ms * g("action_gap_share", "minimum delay follows action completion and system pressure", 0.0, 0.45)) / g("action_gap_divisor", "convert action gap milliseconds to seconds", 600.0, 2400.0) * self.cpu_factor,
+            "generated_sleep_event_wait": (self.capture_ms + self.execution_ms * g("sleep_wait_share", "offline sleep wakeups slow down under load and unstable windows", 0.1, 0.9)) / g("sleep_wait_divisor", "convert sleep event wait milliseconds to seconds", 180.0, 900.0) * self.cpu_factor * (1.0 + self.window_instability) / max(0.2, self.success_rate),
+            "generated_action_complete_wait": (self.capture_ms + self.execution_ms * g("action_complete_share", "action completion polling tracks actual execution latency", 0.05, 0.7)) / g("action_complete_divisor", "convert action completion wait milliseconds to seconds", 220.0, 1100.0) * self.cpu_factor * (1.0 + self.window_instability) / max(0.2, self.success_rate),
             "sleep_worker_count": self.cpu_count * clamp(self.memory_free_ratio * g("worker_memory", "parallelism respects free memory and cpu load", 0.2, 1.6), 0.0, max(1.0, self.cpu_count)) + self.gpu_count,
             "sleep_batch_size": (self.record_factor + self.core_factor + self.memory_free_ratio + math.log1p(self.screen_score_total)) * g("batch_scale", "batch size grows with experience pool and hardware", 1.0, 64.0),
             "sleep_queue_depth": (self.cpu_count + max(1, self.gpu_count) + self.memory_free_ratio) * g("queue_scale", "queue absorbs worker completion events", 0.5, 4.0),
@@ -1443,6 +1452,9 @@ class RuntimeNumberFactory:
             "softmax_temperature": self.record_factor * g("temperature", "softmax action diversity", 1.0, 6.0),
             "reward_total_min": -max(self.screen_score_total, g("reward_min", "minimum auditable reward", 1000.0, 20000.0)),
             "reward_total_max": max(self.screen_score_total, g("reward_max", "maximum auditable reward", 1000.0, 20000.0)),
+            "score_default": 100.0 * clamp(g("score_default", "default screen score follows pool maturity and learned similarity", 0.25, 0.75) * (0.7 + min(1.0, self.record_factor / 12.0) * 0.3) * (0.85 + (1.0 - self.learning_similarity) * 0.3), 0.0, 1.0),
+            "scroll_score_default": 100.0 * clamp(g("scroll_score", "scroll default score follows successful human-like outcomes", 0.25, 0.75) * (0.8 + self.success_rate * 0.2), 0.0, 1.0),
+            "fallback_score_base": 100.0 * clamp(g("fallback_score", "fallback score remains conservative under uncertain reality", 0.2, 0.65) * (0.75 + self.success_rate * 0.25) * (0.9 + (1.0 - self.learning_similarity) * 0.2), 0.0, 1.0),
             "motion_steps_per_second": (self.width / g("motion_divisor", "mouse interpolation density", 12.0, 42.0)) / max(0.1, self.cpu_factor),
             "learning_screen_change_capacity": clamp(self.core_factor * self.gpu_factor, 0.1, 4.0) / max(0.001, self.capture_ms / g("capacity_ms", "screen-change event capacity", 700.0, 1400.0))
         }
@@ -1488,6 +1500,9 @@ def derive_runtime_settings(base_settings=None, rect=None, pool_count=0, capture
         "key_debounce_seconds": round(factory.seconds("key_debounce_seconds", 0.05, 1.0), 3),
         "window_attach_seconds": round(factory.seconds("window_attach_seconds", 5.0, 120.0), 2),
         "window_event_wait": round(factory.seconds("window_event_wait", 0.05, 1.0), 3),
+        "min_action_delay_seconds": round(factory.seconds("min_action_delay_seconds", 0.01, 0.8), 4),
+        "generated_sleep_event_wait": round(factory.seconds("generated_sleep_event_wait", 0.02, 1.2), 4),
+        "generated_action_complete_wait": round(factory.seconds("generated_action_complete_wait", 0.02, 1.0), 4),
         "explore_max_rate": factory.ratio("explore_max_rate", 0.2, 0.95),
         "explore_min_rate": factory.ratio("explore_min_rate", 0.01, 0.2),
         "action_jitter": factory.ratio("action_jitter", 0.005, 0.08),
@@ -1505,6 +1520,9 @@ def derive_runtime_settings(base_settings=None, rect=None, pool_count=0, capture
         "ui_metric_min_column_width": factory.count("ui_metric_min_column_width", 150, 320),
         "reward_total_min": factory.scalar("reward_total_min", -1000000000.0, 0.0),
         "reward_total_max": factory.scalar("reward_total_max", 0.0, 1000000000.0),
+        "score_default": round(factory.scalar("score_default", 5.0, 95.0), 3),
+        "scroll_score_default": round(factory.scalar("scroll_score_default", 5.0, 95.0), 3),
+        "fallback_score_base": round(factory.scalar("fallback_score_base", 5.0, 95.0), 3),
         "experience_load_limit": factory.count("experience_load_limit", 8000, 90000),
         "global_action_probability": factory.ratio("global_action_probability", 0.2, 0.75),
         "random_action_min": factory.ratio("random_action_min", 0.0, 0.12),
@@ -1655,6 +1673,8 @@ def normalize_motion_events(rect, path, start_abs):
 
 def normalize_mouse_action(action, rect):
     if not action:
+        return None
+    if action.get("invalid_outside_client") or any(not event.get("inside", True) for event in action.get("path", [])):
         return None
     if "start_rel" in action and "end_rel" in action:
         result = copy.deepcopy(action)
@@ -3233,6 +3253,8 @@ class ExperiencePool:
 
     def recheck_screen_scores(self, store=None, analyzer=None, tolerance=0.01, run_guard=None, progress_callback=None):
         checked = 0
+        processed_count = 0
+        interrupted = False
         rescored = 0
         missing = 0
         errors = 0
@@ -3247,7 +3269,10 @@ class ExperiencePool:
         if callable(progress_callback):
             progress_callback(0, total)
         for processed, (index, record) in enumerate(snapshot, start=1):
+            processed_count = processed
             if run_guard and run_guard():
+                interrupted = True
+                processed_count = processed - 1
                 break
             hash_value = parse_hash_value(record)
             file_hash = None
@@ -3326,10 +3351,10 @@ class ExperiencePool:
             self.rebuild_action_heap_locked()
             self.nearest_cache.clear()
         if callable(progress_callback):
-            progress_callback(total, total)
+            progress_callback(processed_count if interrupted else total, total)
         trainable = sum(1 for record in self.records if self.training_eligible(record))
         degraded = sum(1 for record in self.records if isinstance(record, dict) and record.get("score_status") == "image_unavailable_hash_scored")
-        return {"checked": checked, "rescored": rescored, "missing": missing, "errors": errors, "image_missing": image_missing, "image_corrupt": image_corrupt, "hash_missing": hash_missing, "unrecoverable": unrecoverable, "degraded": degraded, "quarantined": image_missing + image_corrupt + unrecoverable, "trainable": trainable}
+        return {"checked": checked, "processed": processed_count if interrupted else total, "total": total, "complete": not interrupted, "interrupted": interrupted, "rescored": rescored, "missing": missing, "errors": errors, "image_missing": image_missing, "image_corrupt": image_corrupt, "hash_missing": hash_missing, "unrecoverable": unrecoverable, "degraded": degraded, "quarantined": image_missing + image_corrupt + unrecoverable, "trainable": trainable}
 
     def sleep_training_step(self, batch_size, settle_screen_score=None, run_guard=None):
         indices = self.sleep_training_batch_indices(batch_size)
@@ -3575,9 +3600,15 @@ class MouseRecorder:
         if not rect:
             return None
         inside = point_inside(rect, x, y)
-        if not inside and not allow_current:
+        if not inside:
             self.cursor_outside_event.set()
             self.wake.set()
+            if self.current:
+                self.current["invalid_outside_client"] = True
+                self.current["termination_reason"] = "cursor_outside"
+            if self.move_buffer:
+                self.move_buffer.clear()
+                self.move_action_id = None
             return None
         self.on_activity()
         self.wake.set()
@@ -3687,7 +3718,7 @@ class MouseRecorder:
     def pop_actions(self):
         with self.lock:
             self.flush_move_locked(force=self.move_flush_due())
-            items = list(self.actions)
+            items = [item for item in self.actions if not item.get("invalid_outside_client") and all(event.get("inside", True) for event in item.get("path", []))]
             self.actions.clear()
             if not self.start_markers and not self.move_buffer:
                 self.wake.clear()
@@ -5221,6 +5252,42 @@ class ControlPanel(tk.Tk):
             actions.append("当前操作系统无法由程序自动转换为 Windows 桌面环境")
         return actions
 
+
+    def offline_data_environment_issues_for_config(self, config):
+        issues = []
+        if sys.version_info < MIN_PYTHON_VERSION:
+            issues.append(f"Python 版本过低：需要 {MIN_PYTHON_VERSION[0]}.{MIN_PYTHON_VERSION[1]} 或更高版本")
+        for name in REQUIRED_MODULES:
+            if name in IMPORT_ERRORS:
+                issues.append(f"依赖无法导入 {name}：{IMPORT_ERRORS[name]}")
+        storage_issue = data_path_write_issue(config.data_path)
+        if storage_issue:
+            issues.append(f"存储路径无效 {config.data_path}：{storage_issue}")
+        return issues
+
+    def repair_offline_data_environment_for_config(self, config, actions=None):
+        actions = actions if actions is not None else []
+        missing = [name for name in REQUIRED_MODULES if name in IMPORT_ERRORS]
+        if missing:
+            actions.append("自动安装缺失或异常依赖：" + "、".join(missing))
+            bootstrap_dependencies()
+        storage_issue = data_path_write_issue(config.data_path, create=True)
+        actions.append("已创建并验证存储路径可写" if not storage_issue else f"无法修复存储路径：{storage_issue}")
+        return actions
+
+    def ensure_offline_data_environment(self, config=None, allow_repair=True, show_error=True):
+        config = config or self.read_config()
+        result = ensure_environment("sleep_data", allow_repair, lambda: self.offline_data_environment_issues_for_config(config), lambda actions: self.repair_offline_data_environment_for_config(config, actions))
+        if not result.ok:
+            self.runtime_environment_issue = "；".join(result.unrecoverable) or "睡眠模式数据环境不符合要求"
+            self.log_exception("sleep.environment", RuntimeError("offline_data_environment_not_ready"), {"result": result.detail()})
+            if show_error:
+                self.ui(lambda r=result: messagebox.showerror("睡眠模式数据环境不符合要求", r.detail()))
+            return result
+        self.runtime_environment_issue = ""
+        self.ensure_storage_runtime(config)
+        return result
+
     def ensure_environment(self, stage, config=None, allow_repair=True, require_attach=False, show_error=True):
         config = config or self.read_config()
         result = ensure_environment(stage, allow_repair, lambda: self.runtime_environment_issues_for_config(config), lambda actions: self.repair_runtime_environment_for_config(config, actions))
@@ -5366,7 +5433,7 @@ class ControlPanel(tk.Tk):
             return
         config = self.read_config()
         try:
-            env_result = self.ensure_environment("sleep", config, allow_repair=True, require_attach=False)
+            env_result = self.ensure_offline_data_environment(config, allow_repair=True)
             if not env_result.ok:
                 raise RuntimeError(env_result.detail())
         except Exception as exc:
@@ -5466,10 +5533,16 @@ class ControlPanel(tk.Tk):
                 visual_model = self.experience_pool.train_local_vision_model() if self.experience_pool else {"status": "missing_pool"}
                 self.events.publish("sleep_local_vision_model_trained", status=visual_model.get("status"), records=visual_model.get("records", 0), clusters=len(visual_model.get("clusters", [])))
                 self.store.merge_experience_records_by_id(copy.deepcopy(self.experience_pool.records))
-                checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task1_saved", task1_completed=True, task1_result=recheck_result)
+                if recheck_result.get("complete"):
+                    checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task1_saved", task1_completed=True, task1_result=recheck_result)
+                else:
+                    checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task1_interrupted", task1_completed=False, task1_result=recheck_result)
+                    review_status = "interrupted"
+                    stop_event.set()
             blocking_records = sum(safe_int(recheck_result.get(name, 0), 0) for name in ("unrecoverable", "image_missing", "image_corrupt"))
             trainable_records = safe_int(recheck_result.get("trainable", 0), 0)
-            review_status = "quarantined" if blocking_records and trainable_records > 0 else ("completed" if not blocking_records else "failed")
+            if review_status != "interrupted":
+                review_status = "quarantined" if blocking_records and trainable_records > 0 else ("completed" if not blocking_records else "failed")
         except Exception as exc:
             review_status = "failed"
             self.log_exception("sleep_score_recheck", exc, recheck_result)
@@ -5477,7 +5550,7 @@ class ControlPanel(tk.Tk):
         blocking_records = sum(safe_int(recheck_result.get(name, 0), 0) for name in ("unrecoverable", "image_missing", "image_corrupt"))
         if self.store and blocking_records:
             self.store.log_error("sleep_score_recheck_unrecoverable", RuntimeError("unrecoverable_or_invalid_screen_records"), recheck_result)
-        if review_status == "failed":
+        if review_status in ("failed", "interrupted"):
             failure_detail = {"stage": "评分复核", "review_status": review_status, "result": recheck_result, "auto_restart_allowed": False}
             if self.store:
                 self.store.log_error("sleep_review_failed_exit", RuntimeError("sleep_review_failed"), failure_detail)
@@ -6192,9 +6265,16 @@ class ControlPanel(tk.Tk):
             self.request_stop("user_stop")
             if mode_thread and mode_thread.is_alive():
                 mode_thread.join(timeout=max(self.settings.persistence_close_seconds, self.settings.persistence_close_seconds * 3.0))
+        still_running = bool(mode_thread and mode_thread.is_alive())
+        if still_running and self.store:
+            try:
+                checkpoint = self.store.load_sleep_checkpoint() or {"run_id": uuid.uuid4().hex, "created_at": now_text()}
+                self.store.save_sleep_checkpoint(checkpoint, stage="close_interrupted", close_interrupted=True, safe_to_resume=True)
+            except Exception as exc:
+                self.log_exception("close.checkpoint", exc, {"active_mode": active_mode})
         with self.state_lock:
             self.stop_event.set()
-            if self.mode not in ("idle",):
+            if self.mode not in ("idle",) and not still_running:
                 self.run_token += 1
                 self.mode = "idle"
         if self.persistence_queue:
@@ -6217,6 +6297,8 @@ class ControlPanel(tk.Tk):
         mode_thread = self.mode_thread
         if mode_thread and mode_thread.is_alive():
             mode_thread.join(timeout=self.settings.persistence_close_seconds)
+        if mode_thread and mode_thread.is_alive():
+            self.log_exception("close.force_exit_risk", RuntimeError("background_task_not_safely_finished"), {"mode": active_mode})
         try:
             self.destroy()
         except Exception:
