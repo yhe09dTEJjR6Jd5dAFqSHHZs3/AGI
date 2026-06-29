@@ -937,7 +937,17 @@ def run_self_test():
     sleep_result = pool.sleep_training_step(changed.sleep_batch_size)
     assert sleep_result["trained"] >= 1
     assert pool.records[0].get("sleep_visits", 0) >= 1
-    brain = ActionBrain(pool, changed)
+    group = ai_model_group_snapshot(pool.model.snapshot(), changed, pool.records)
+    runtime_pool = ExperiencePool(changed, pool.records, {"model_group": group})
+    runtime = runtime_pool.model_runtime
+    assert runtime.screen_novelty([1.0]) == 0.0
+    assert runtime.mouse_humanlikeness({"type": "click", "start_rel": [0.5, 0.5]}, 55.0) == 55.0
+    assert 0.0 <= runtime.operation_policy_score(pool.records[0], 0.9) <= 1.0
+    assert runtime.models["rescue_policy"].predict({"zero_score": 0.0}) is not None
+    assert runtime.reward(70.0, 100.0) > runtime.reward(70.0, 0.0)
+    assert runtime.reward(71.0, 0.0) > runtime.reward(70.0, 100.0)
+    assert isinstance(runtime.models["runtime_value_model"].predict({"cpu_load": 0.0, "memory_free_ratio": 0.5}), dict)
+    brain = ActionBrain(runtime_pool, changed)
     _, decision = brain.choose(a, novelty, batch, 0.0)
     assert isinstance(decision, dict)
     random_action, random_decision = brain.choose(a, novelty, [], 0.0, zero_score_factor=1.0)
@@ -1152,8 +1162,21 @@ def run_self_test():
         screen_path = store.screen_dir / "sample.png"
         screen_path.write_bytes(b"screen")
         store.save_experience_records([{"id": "m1", "mouse_action": {"type": "click"}, "reward": 1.0, "sleep_confidence": 0.5, "screen_path": store.relative_path(screen_path)}])
+        before_snapshot_count = len(list(store.model_dir.glob("model_*.json")))
         model_path = store.save_ai_model_snapshot(store.load_experience(), settings, 1, "completed")
-        assert model_path.exists() and len(list(store.model_dir.glob("model_*.json"))) == 1
+        model_path_extra = store.save_ai_model_snapshot(store.load_experience(), settings, 1, "completed")
+        assert model_path.exists() and model_path_extra.exists() and len(list(store.model_dir.glob("model_*.json"))) == before_snapshot_count + 2
+        sleep_task3_panel = type("SnapshotTask3Panel", (), {})()
+        sleep_task3_panel.store = store
+        sleep_task3_panel.events = type("Events", (), {"publish": lambda self, name, **data: None})()
+        sleep_task3_panel.progress_label_var = SleepDummyVar()
+        sleep_task3_panel.progress_value = 0.0
+        sleep_task3_panel.ui = lambda fn: fn()
+        sleep_task3_panel.update_progress = lambda value, force=False: None
+        sleep_task3_config = type("SnapshotTask3Config", (), {"ai_model_limit": 1, "experience_pool_gb": 0.1})()
+        ControlPanel.run_sleep_task3(sleep_task3_panel, sleep_task3_config)
+        assert len(list(store.model_dir.glob("model_*.json"))) == 1
+        model_path = max(store.model_dir.glob("model_*.json"), key=store.model_created_key)
         model_payload = json.loads(model_path.read_text(encoding="utf-8"))
         assert len(model_payload["model_group"]["models"]) == 6
         assert [item["key"] for item in model_payload["model_group"]["models"]] == [item["key"] for item in AI_MODEL_GROUP_SPECS]
@@ -2211,6 +2234,71 @@ def restore_trainable_model(payload, settings=None):
     return model
 
 
+class ModelGroupRuntime:
+    def __init__(self, models=None, settings=None):
+        self.models = models if isinstance(models, dict) else {}
+        self.settings = settings
+
+    def apply_settings(self, settings):
+        self.settings = settings
+        for model in self.models.values():
+            try:
+                model.settings = settings
+            except Exception:
+                pass
+
+    def screen_novelty(self, similarities):
+        model = self.models.get("screen_novelty_scorer")
+        if model:
+            return model.predict({"similarities": similarities})
+        sims = [clamp(safe_float(item, 0.0), 0.0, 1.0) for item in similarities]
+        if not sims:
+            return 100.0
+        top = sims[:max(1, min(safe_int(getattr(self.settings, "nearest_top_k", 1), 1), len(sims)))]
+        density = sum(1 for item in top if item >= 0.95) / len(top)
+        return clamp((1.0 - (top[0] * 0.5 + sum(top) / len(top) * 0.35 + density * 0.15)) * 100.0, 0.0, 100.0)
+
+    def mouse_humanlikeness(self, action, fallback_score):
+        model = self.models.get("mouse_humanlikeness_scorer")
+        if model:
+            return model.predict({"human_score": fallback_score, "action_features": action_features(action)})
+        return fallback_score
+
+    def operation_policy_score(self, record, similarity):
+        model = self.models.get("operation_policy")
+        if model:
+            features = PolicyModel(self.settings).features(record)
+            features["confidence"] = clamp(similarity, 0.0, 1.0)
+            return model.predict(features)
+        return 0.0
+
+    def reward(self, screen_score, human_score):
+        model = self.models.get("reward_model")
+        if model:
+            return model.predict({"screen_score": screen_score, "human_score": human_score})
+        return strict_reward_value(screen_score, human_score)
+
+    def reward_breakdown(self, screen_score, human_score):
+        parts = reward_breakdown(screen_score, human_score, self.settings)
+        parts["total_reward"] = self.reward(screen_score, human_score)
+        parts["reward_sort_key"] = list(strict_reward_key(screen_score, human_score))
+        parts["basis"] = list(parts.get("basis", [])) + ["model_group_runtime_reward_model"]
+        return parts
+
+    def apply_runtime_values(self, settings, features, fallback_model=None):
+        model = self.models.get("runtime_value_model")
+        if model:
+            factors = model.predict(features)
+            values = {item.name: getattr(settings, item.name) for item in fields(Settings)}
+            for name, low, high, integer in (("sleep_batch_size", 8, 4096, True), ("sleep_worker_count", 1, 64, True), ("nearest_candidate_limit", 256, 20000, True), ("explore_max_rate", 0.2, 0.95, False), ("training_event_wait", 0.01, 0.9, False), ("generated_sleep_event_wait", 0.02, 1.2, False)):
+                value = clamp(safe_float(values.get(name, low), low) * safe_float(factors.get(name, 1.0), 1.0), low, high)
+                values[name] = int(value) if integer else value
+            return Settings(**values)
+        if fallback_model:
+            return fallback_model.apply_settings(settings, features)
+        return settings
+
+
 def model_group_complete(model_group, settings=None):
     models = model_group.get("models") if isinstance(model_group, dict) else None
     if not isinstance(models, list) or len(models) != len(AI_MODEL_GROUP_SPECS):
@@ -2780,7 +2868,6 @@ class DataStore:
                     pass
                 return None
             temporary.replace(path)
-            self.compact_ai_models(max_models)
             return path
 
     def model_created_key(self, path):
@@ -3375,7 +3462,8 @@ class ScreenAnalyzer:
     def __init__(self, hash_size):
         self.hash_size = int(hash_size)
         self.sct = None
-        self.resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+        resampling = getattr(Image, "Resampling", Image) if Image else None
+        self.resample = getattr(resampling, "LANCZOS", 1)
 
     def __enter__(self):
         self.sct = mss.mss()
@@ -3527,6 +3615,7 @@ class ExperiencePool:
         self.model_group_models = {}
         if isinstance(group_payload, dict) and model_group_complete(group_payload, settings):
             self.model_group_models = {item.get("key"): restore_trainable_model(item, settings) for item in group_payload.get("models", [])}
+        self.model_runtime = ModelGroupRuntime(self.model_group_models, settings)
         self.lock = threading.RLock()
         self.action_cache = []
         self.prefix_neighbor_cache = OrderedDict()
@@ -3551,6 +3640,7 @@ class ExperiencePool:
             self.settings = settings
             self.profile.settings = settings
             self.model.settings = settings
+            self.model_runtime.apply_settings(settings)
             if rebuild:
                 self.index_settings = settings
                 self.rebuild_index_locked()
@@ -3756,10 +3846,10 @@ class ExperiencePool:
         if sims:
             top = sims[:max(1, min(self.settings.nearest_top_k, len(sims)))]
             density = sum(1 for item in top if item >= 0.95) / len(top)
-            score = clamp((1.0 - (top[0] * 0.5 + sum(top) / len(top) * 0.35 + density * 0.15)) * 100.0, 0.0, 100.0)
+            score = self.model_runtime.screen_novelty(sims)
             confidence = clamp(top[0] * 0.65 + (1.0 - density) * 0.35, 0.0, 1.0)
         else:
-            score = 100.0
+            score = self.model_runtime.screen_novelty([])
             confidence = 0.0
         return round(score, 2), neighbors, confidence
 
@@ -3951,7 +4041,7 @@ class ExperiencePool:
         self.global_action_heap = heap
 
     def human_score(self, action):
-        return self.profile.score(action)
+        return self.model_runtime.mouse_humanlikeness(action, self.profile.score(action))
 
 
 class ActionBrain:
@@ -3973,7 +4063,7 @@ class ActionBrain:
         record = item["record"]
         similarity = clamp(item.get("similarity", 0.0), 0.0, 1.0)
         screen, human_score = record_screen_human(record)
-        reward = strict_reward_value(screen, human_score)
+        reward = self.pool.model_runtime.reward(screen, human_score)
         source_bonus = 0.0000000001 if record.get("mode") == "learning" else 0.0
         sleep_confidence = clamp(record.get("sleep_confidence", 0.0), 0.0, 1.0)
         return reward + similarity * 0.00000001 + sleep_confidence * 0.000000001 + source_bonus
@@ -4049,7 +4139,8 @@ class ActionBrain:
             if not action or safe_float(item["record"].get("reward", 0.0), 0.0) < -60.0:
                 continue
             score = self.score_candidate(item)
-            usable.append((math.exp(clamp(score, self.settings.reward_total_min, self.settings.reward_total_max) / self.settings.softmax_temperature), {"item": item, "score": score, "action": action}))
+            policy_score = self.pool.model_runtime.operation_policy_score(item["record"], item.get("similarity", 0.0))
+            usable.append((math.exp(clamp(score + policy_score * 0.000001, self.settings.reward_total_min, self.settings.reward_total_max) / self.settings.softmax_temperature), {"item": item, "score": score, "policy_score": policy_score, "action": action}))
         if random.random() < rate or not usable:
             action, reason = self.fallback_action(zero_score_factor)
             decision = {"reason": reason, "exploration_rate": rate, "zero_score_factor": round(clamp(zero_score_factor, 0.0, 1.0), 4), "candidate_count": len(usable), "confidence": 0.0, "nearest_similarity": round(batch[0]["similarity"], 4) if batch else 0.0}
@@ -4673,7 +4764,8 @@ class TrainingService:
         panel.hardware_state = panel.refresh_hardware_state()
         settings = panel.adaptive_policy.build(panel.settings, rect, pool_count, screen_score_total_value, hardware=panel.hardware_state)
         if panel.experience_pool and getattr(panel.experience_pool.model, "resource_model", None):
-            settings = panel.experience_pool.model.resource_model.apply_settings(settings, {"cpu_load": panel.hardware_state.get("cpu_load", 0.0), "memory_free_ratio": panel.hardware_state.get("memory_free_ratio", 0.5), "capture_ms": panel.adaptive_policy._avg(panel.adaptive_policy.capture_latency_ms, 24.0), "execution_ms": panel.adaptive_policy._avg(panel.adaptive_policy.execution_latency_ms, 140.0), "window_instability": panel.adaptive_policy._avg(panel.adaptive_policy.window_change_flags, 0.0), "success_rate": panel.adaptive_policy._avg(panel.adaptive_policy.outcome_flags, 1.0), "pool_count": pool_count})
+            features = {"cpu_load": panel.hardware_state.get("cpu_load", 0.0), "memory_free_ratio": panel.hardware_state.get("memory_free_ratio", 0.5), "capture_ms": panel.adaptive_policy._avg(panel.adaptive_policy.capture_latency_ms, 24.0), "execution_ms": panel.adaptive_policy._avg(panel.adaptive_policy.execution_latency_ms, 140.0), "window_instability": panel.adaptive_policy._avg(panel.adaptive_policy.window_change_flags, 0.0), "success_rate": panel.adaptive_policy._avg(panel.adaptive_policy.outcome_flags, 1.0), "pool_count": pool_count}
+            settings = panel.experience_pool.model_runtime.apply_runtime_values(settings, features, panel.experience_pool.model.resource_model)
         panel.apply_runtime_settings(settings)
         return settings
 
@@ -4834,8 +4926,34 @@ class ControlPanel(tk.Tk):
         self.escape_monitor.start()
         if not pynput_keyboard:
             self.status_var.set("全局键盘监听不可用，已启用 Windows ESC 轮询兜底")
+        self.create_control_menu()
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh_runtime_environment_state()
+
+    def create_control_menu(self):
+        menu = tk.Menu(self)
+        run_menu = tk.Menu(menu, tearoff=0)
+        run_menu.add_command(label="终止当前模式", command=self.stop_current_mode)
+        run_menu.add_separator()
+        run_menu.add_command(label="退出", command=self.close)
+        menu.add_cascade(label="程序", menu=run_menu)
+        self.config(menu=menu)
+
+    def modify_settings_dialog(self):
+        if self.current_mode() != "idle":
+            self.status_var.set("只能在空闲状态点击修改")
+            return
+        ldplayer = filedialog.askopenfilename(title="选择雷电模拟器 dnplayer.exe", initialdir=str(Path(self.ldplayer_var.get() or DEFAULT_LDPLAYER_PATH).parent), filetypes=[("dnplayer.exe", "dnplayer.exe"), ("可执行文件", "*.exe"), ("所有文件", "*.*")], parent=self)
+        if ldplayer:
+            self.ldplayer_var.set(ldplayer)
+        data_path = filedialog.askdirectory(title="选择数据存储路径", initialdir=self.data_var.get() or DEFAULT_DATA_PATH, parent=self)
+        if data_path:
+            self.data_var.set(data_path)
+        for field in ("experience_pool_gb", "ai_model_limit", "still_seconds", "training_seconds"):
+            self.modify_runtime_value(field)
+        self.save_user_settings()
+        self.refresh_runtime_environment_state()
+        self.status_var.set("修改已保存")
 
     def build_ui(self):
         style = ttk.Style(self)
@@ -4872,14 +4990,10 @@ class ControlPanel(tk.Tk):
         path_frame.columnconfigure(1, weight=1)
         ttk.Label(path_frame, text="雷电模拟器").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=6)
         ttk.Entry(path_frame, textvariable=self.ldplayer_var, justify="right", state="readonly").grid(row=0, column=1, sticky="ew", pady=6)
-        ldplayer_modify = ttk.Button(path_frame, text="修改", command=self.choose_ldplayer)
-        ldplayer_modify.grid(row=0, column=2, padx=(8, 0), pady=6)
-        self.modify_buttons.append(ldplayer_modify)
+        path_frame.columnconfigure(2, weight=0)
         ttk.Label(path_frame, text="数据存储").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=6)
         ttk.Entry(path_frame, textvariable=self.data_var, justify="right", state="readonly").grid(row=1, column=1, sticky="ew", pady=6)
-        data_modify = ttk.Button(path_frame, text="修改", command=self.choose_data)
-        data_modify.grid(row=1, column=2, padx=(8, 0), pady=6)
-        self.modify_buttons.append(data_modify)
+        ttk.Label(path_frame, text="").grid(row=1, column=2, padx=(8, 0), pady=6)
         time_frame = ttk.Frame(path_frame)
         time_frame.grid(row=2, column=1, columnspan=2, sticky="w", pady=6)
         ttk.Label(path_frame, text="时间设置").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=6)
@@ -4889,23 +5003,17 @@ class ControlPanel(tk.Tk):
             item_frame.pack(side="left", padx=(0, 12))
             ttk.Label(item_frame, text=label).pack(side="left")
             ttk.Entry(item_frame, textvariable=variable, width=10, state="readonly", justify="right").pack(side="left", padx=(6, 4))
-            button = ttk.Button(item_frame, text="修改", command=lambda name=field: self.modify_runtime_value(name))
-            button.pack(side="left")
-            self.modify_buttons.append(button)
+            ttk.Label(item_frame, text="").pack(side="left")
         button_frame = ttk.Frame(container)
         button_frame.pack(fill="x", pady=(4, 12))
         self.button_frame = button_frame
+        self.modify_button = ttk.Button(button_frame, text="修改", command=self.modify_settings_dialog)
         self.learning_button = ttk.Button(button_frame, text="学习模式", command=self.learning_mode)
         self.training_button = ttk.Button(button_frame, text="训练模式", command=self.training_mode)
         self.sleep_button = ttk.Button(button_frame, text="睡眠模式", command=self.sleep_mode)
         self.mode_buttons = [self.learning_button, self.training_button, self.sleep_button]
-        self.control_buttons = [
-            self.learning_button,
-            self.training_button,
-            self.sleep_button,
-            ttk.Button(button_frame, text="终止当前模式", command=self.stop_current_mode),
-            ttk.Button(button_frame, text="退出", command=self.close)
-        ]
+        self.modify_buttons.append(self.modify_button)
+        self.control_buttons = [self.modify_button, self.learning_button, self.training_button, self.sleep_button]
         self.reflow_buttons()
         status_frame = ttk.LabelFrame(container, text="状态", padding=self.settings.ui_section_padding)
         status_frame.pack(fill="both", expand=True)
@@ -6442,7 +6550,7 @@ class ControlPanel(tk.Tk):
         after_novelty = self.experience_pool.compute_screen_score(after_snapshot.hash_value, exact_checksum=getattr(after_snapshot, "image_checksum", ""), semantic_vector=getattr(after_snapshot, "semantic_vector", ()))[0] if after_snapshot else before_novelty
         transition_reward = round(after_novelty - before_novelty, 2)
         scoring_novelty = after_novelty if normalized and after_snapshot else before_novelty
-        reward_info = reward_breakdown(scoring_novelty, human_score if normalized else self.settings.score_default, self.settings)
+        reward_info = self.experience_pool.model_runtime.reward_breakdown(scoring_novelty, human_score if normalized else self.settings.score_default)
         novelty_reward = reward_info["screen_primary_reward"]
         human_delta = reward_info["mouse_action_delta"]
         reward = reward_info["total_reward"]
