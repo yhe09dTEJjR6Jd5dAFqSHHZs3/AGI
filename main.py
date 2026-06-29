@@ -3192,7 +3192,9 @@ class ExperiencePool:
             self.nearest_cache.clear()
         if callable(progress_callback):
             progress_callback(total, total)
-        return {"checked": checked, "rescored": rescored, "missing": missing, "errors": errors, "image_missing": image_missing, "image_corrupt": image_corrupt, "hash_missing": hash_missing, "unrecoverable": unrecoverable}
+        trainable = sum(1 for record in self.records if self.training_eligible(record))
+        degraded = sum(1 for record in self.records if isinstance(record, dict) and record.get("score_status") == "image_unavailable_hash_scored")
+        return {"checked": checked, "rescored": rescored, "missing": missing, "errors": errors, "image_missing": image_missing, "image_corrupt": image_corrupt, "hash_missing": hash_missing, "unrecoverable": unrecoverable, "degraded": degraded, "quarantined": image_missing + image_corrupt + unrecoverable, "trainable": trainable}
 
     def sleep_training_step(self, batch_size, settle_screen_score=None, run_guard=None):
         indices = self.sleep_training_batch_indices(batch_size)
@@ -5314,7 +5316,8 @@ class ControlPanel(tk.Tk):
             self.events.publish("sleep_local_vision_model_trained", status=visual_model.get("status"), records=visual_model.get("records", 0), clusters=len(visual_model.get("clusters", [])))
             self.store.merge_experience_records_by_id(copy.deepcopy(self.experience_pool.records))
             blocking_records = sum(safe_int(recheck_result.get(name, 0), 0) for name in ("unrecoverable", "image_missing", "image_corrupt"))
-            review_status = "failed" if blocking_records else "completed"
+            trainable_records = safe_int(recheck_result.get("trainable", 0), 0)
+            review_status = "quarantined" if blocking_records and trainable_records > 0 else ("completed" if not blocking_records else "failed")
         except Exception as exc:
             review_status = "failed"
             self.log_exception("sleep_score_recheck", exc, recheck_result)
@@ -5411,12 +5414,20 @@ class ControlPanel(tk.Tk):
             self.update_progress(max(self.progress_value, 92.0), force=True)
             self.ui(lambda: self.progress_label_var.set("睡眠模式保存中｜进度 92%"))
         task3_report = None
-        if completed_normally and not stopped_reason:
+        saved, save_error, save_report = self.save_sleep_data(config, save_status, run_guard=run_guard, task3_report=None)
+        compaction_complete = bool(save_report.get("compaction_complete", compaction_complete)) if isinstance(save_report, dict) else compaction_complete
+        models_complete = bool(save_report.get("models_complete", models_complete)) if isinstance(save_report, dict) else models_complete
+        if saved and completed_normally and not stopped_reason:
             try:
                 model_result, pool_result = self.run_sleep_task3(config, run_guard=run_guard)
                 task3_report = {"model": model_result, "pool": pool_result}
                 compaction_complete = bool(pool_result.get("complete"))
                 models_complete = bool(model_result.get("complete"))
+                if self.store:
+                    self.store.flush_state(force=True)
+                    final_records = self.store.load_experience(config.settings.experience_load_limit)
+                    self.experience_pool = ExperiencePool(config.settings, final_records, self.store.load_latest_model_state(config.settings))
+                    self.brain = ActionBrain(self.experience_pool, config.settings)
             except Exception as exc:
                 completed_normally = False
                 compaction_complete = False
@@ -5426,9 +5437,6 @@ class ControlPanel(tk.Tk):
                 if self.store:
                     self.store.log_error("sleep_task3_failed", exc, task3_report)
                 save_status = "incomplete"
-        saved, save_error, save_report = self.save_sleep_data(config, save_status, run_guard=run_guard, task3_report=task3_report)
-        compaction_complete = bool(save_report.get("compaction_complete", compaction_complete)) if isinstance(save_report, dict) else compaction_complete
-        models_complete = bool(save_report.get("models_complete", models_complete)) if isinstance(save_report, dict) else models_complete
         if not saved:
             if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
                 self.finish_run(token, "保存失败：" + str(save_error), self.progress_value, release=False, reason="runtime_error")
@@ -5521,6 +5529,7 @@ class ControlPanel(tk.Tk):
                 compact = {"changed": False, "size_bytes": size_bytes, "removed": 0, "target_bytes": target_bytes, "complete": size_bytes <= target_bytes}
             final_records = self.store.load_experience(config.settings.experience_load_limit)
             self.store.save_ai_model_snapshot(final_records, config.settings, config.ai_model_limit, status, model, run_guard=persistence_guard, status_detail=status_detail)
+            model_compact = self.store.compact_ai_models(config.ai_model_limit)
             self.experience_pool = ExperiencePool(config.settings, final_records, self.store.load_latest_model_state(config.settings))
             self.brain = ActionBrain(self.experience_pool, config.settings)
             self.update_progress(max(self.progress_value, 99.0), force=True)
@@ -5528,7 +5537,7 @@ class ControlPanel(tk.Tk):
             model_count = len(list(self.store.model_dir.glob("model_*.json")))
             target_bytes = max(1, safe_int(compact.get("target_bytes", 0), 0))
             experience_size = max(0, safe_int(compact.get("size_bytes", 0), 0))
-            report = {"model_count": model_count, "experience_size": experience_size, "target_bytes": target_bytes, "compaction_complete": experience_size <= target_bytes, "models_complete": model_count <= max(1, safe_int(config.ai_model_limit, AGENT_SPEC.default_ai_model_limit)), "compact": compact}
+            report = {"model_count": model_count, "experience_size": experience_size, "target_bytes": target_bytes, "compaction_complete": experience_size <= target_bytes, "models_complete": model_count <= max(1, safe_int(config.ai_model_limit, AGENT_SPEC.default_ai_model_limit)), "compact": compact, "model_compact": model_compact}
             self.events.publish("save_completed", kind="sleep_data", status=status, **report)
             self.ui(lambda c=self.experience_pool.count(): self.pool_var.set(str(c)))
             return True, None, report
@@ -5801,12 +5810,14 @@ class ControlPanel(tk.Tk):
             return "still_timeout"
         return None
 
-    def recover_zero_screen_score(self, analyzer, session_id, start, stop_event, zero_score_started_at, current_score, config=None):
+    def recover_zero_screen_score(self, analyzer, session_id, start, stop_event, zero_score_started_at, rescue_started_at, current_score, config=None):
         stage_names = ("recapture", "verify_window", "refresh_index", "wait_render", "trusted_history", "bounded_random", "rescore")
         still_seconds = safe_float(getattr(config, "still_seconds", self.settings.generated_action_complete_wait), self.settings.generated_action_complete_wait)
         threshold = max(self.settings.training_event_wait, min(still_seconds, self.settings.generated_action_complete_wait * max(1, self.settings.training_fail_stop_count)))
         if not zero_score_started_at or time.perf_counter() - zero_score_started_at < threshold:
-            return current_score, zero_score_started_at, False
+            return current_score, zero_score_started_at, rescue_started_at, False
+        if rescue_started_at is None:
+            rescue_started_at = time.perf_counter()
         score = current_score
         stage_index = 0
         run_guard = lambda: self.recovery_stop_reason(stop_event, config)
@@ -5838,7 +5849,7 @@ class ControlPanel(tk.Tk):
             score = self.experience_pool.score_snapshot(snapshot)[0]
             self.events.publish("training_zero_score_recovery_recheck", stage=stage, screen_score=score)
             if score > 0.0:
-                return score, None, True
+                return score, None, None, True
             if stage in ("trusted_history", "bounded_random"):
                 rect = snapshot.rect
                 if stage == "trusted_history":
@@ -5875,7 +5886,7 @@ class ControlPanel(tk.Tk):
             if guarded:
                 self.termination_reason = guarded
                 stop_event.set()
-        return score, zero_score_started_at, score > 0.0
+        return score, zero_score_started_at, rescue_started_at, score > 0.0
 
     def training_loop(self, token, stop_event, config):
         session_id = uuid.uuid4().hex
@@ -5885,13 +5896,14 @@ class ControlPanel(tk.Tk):
         consecutive_no_actions = 0
         zero_score_events = 0
         zero_score_started_at = None
+        rescue_started_at = None
         last_training_error = None
         self.termination_reason = "completed"
         service = self.training_service
         with ScreenAnalyzer(config.settings.hash_size) as analyzer:
             self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start, priority="critical"), None, "mode_start")
             while not stop_event.is_set() and self.is_run_active(token, "training"):
-                if service.should_stop(training_timer_started_at, config, stop_event, suspend_time_limit=zero_score_started_at is not None):
+                if service.should_stop(training_timer_started_at, config, stop_event, suspend_time_limit=rescue_started_at is not None):
                     break
                 rect = self.current_rect()
                 service.prepare_for_event(rect)
@@ -5909,14 +5921,16 @@ class ControlPanel(tk.Tk):
                     zero_score_events += 1
                     if zero_score_started_at is None:
                         zero_score_started_at = time.perf_counter()
-                    current_screen_score, zero_score_started_at, recovered = self.recover_zero_screen_score(analyzer, session_id, start, stop_event, zero_score_started_at, current_screen_score, config)
+                    current_screen_score, zero_score_started_at, rescue_started_at, recovered = self.recover_zero_screen_score(analyzer, session_id, start, stop_event, zero_score_started_at, rescue_started_at, current_screen_score, config)
                     self.events.publish("training_zero_screen_score", streak=zero_score_events, zero_score_elapsed=round(time.perf_counter() - zero_score_started_at, 3) if zero_score_started_at else 0.0, strategy_stage=min(5, 1 + int(clamp(zero_score_events / max(1, self.settings.training_fail_stop_count), 0.0, 1.0) * 5.0)), screen_score=current_screen_score, recovered=bool(recovered))
                     if recovered:
                         zero_score_events = 0
+                        rescue_started_at = None
                         training_timer_started_at = time.perf_counter()
                 else:
                     zero_score_events = 0
                     zero_score_started_at = None
+                    rescue_started_at = None
                 zero_score_factor = clamp(zero_score_events / max(1, self.settings.training_fail_stop_count), 0.0, 1.0)
                 action, decision = service.decide_action(snapshot, zero_score_factor=zero_score_factor)
                 if decision is not None:
