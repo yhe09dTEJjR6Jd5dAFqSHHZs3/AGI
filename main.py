@@ -1141,6 +1141,41 @@ def run_self_test():
                 self.value = None
             def set(self, value):
                 self.value = value
+            def get(self):
+                return self.value
+        modify_panel = ControlPanel.__new__(ControlPanel)
+        modify_panel.ldplayer_var = DummyVar()
+        modify_panel.data_var = DummyVar()
+        modify_panel.training_seconds_var = DummyVar()
+        modify_panel.still_seconds_var = DummyVar()
+        modify_panel.experience_pool_gb_var = DummyVar()
+        modify_panel.ai_model_limit_var = DummyVar()
+        modify_panel.status_var = DummyVar()
+        modify_panel.ldplayer_var.set(str(executable))
+        modify_panel.data_var.set(str(store.root))
+        modify_panel.training_seconds_var.set("1")
+        modify_panel.still_seconds_var.set("3")
+        modify_panel.experience_pool_gb_var.set("4")
+        modify_panel.ai_model_limit_var.set("5")
+        modify_panel.settings = settings
+        modify_panel.runtime_value_specs = {"training_seconds": ("训练秒数", modify_panel.training_seconds_var, DEFAULT_TRAINING_SECONDS, safe_int, 1), "still_seconds": ("静止秒数", modify_panel.still_seconds_var, DEFAULT_STILL_SECONDS, safe_float, 0.1), "experience_pool_gb": ("经验池 GB", modify_panel.experience_pool_gb_var, DEFAULT_EXPERIENCE_POOL_GB, safe_float, 0.1), "ai_model_limit": ("AI 模型个数", modify_panel.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, 1)}
+        modify_panel.update_mode_button_states = lambda: setattr(modify_panel, "updated", True)
+        modify_panel.refresh_runtime_environment_state = lambda: setattr(modify_panel, "refreshed", True)
+        modify_panel.save_persistent_settings = lambda: setattr(modify_panel, "saved", True)
+        modify_panel.start_data_migration = lambda new_path, values=None: setattr(modify_panel, "migration_request", (Path(new_path), values)) or True
+        original_showerror = messagebox.showerror
+        messagebox.showerror = lambda *args, **kwargs: None
+        try:
+            assert not hasattr(ControlPanel, "save_user_settings")
+            assert ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(root / "missing.exe"), "data_path": str(store.root), "training_seconds": 2, "still_seconds": 4, "experience_pool_gb": 6, "ai_model_limit": 7}) is False
+        finally:
+            messagebox.showerror = original_showerror
+        assert modify_panel.ldplayer_var.value == str(executable)
+        assert ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(executable), "data_path": str(store.root), "training_seconds": 2, "still_seconds": 4, "experience_pool_gb": 6, "ai_model_limit": 7}) is True
+        assert modify_panel.saved and modify_panel.training_seconds_var.value == "2" and modify_panel.ai_model_limit_var.value == "7"
+        target_data_path = root / "submit_new_data"
+        assert ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(executable), "data_path": str(target_data_path), "training_seconds": 8, "still_seconds": 9, "experience_pool_gb": 1, "ai_model_limit": 2}) is True
+        assert modify_panel.migration_request[0] == target_data_path and modify_panel.data_var.value == str(store.root)
         dummy_panel.progress_value = 0.4
         dummy_panel.last_progress_update_perf = 0.0
         dummy_panel.progress_var = DummyVar()
@@ -4943,17 +4978,57 @@ class ControlPanel(tk.Tk):
         if self.current_mode() != "idle":
             self.status_var.set("只能在空闲状态点击修改")
             return
-        ldplayer = filedialog.askopenfilename(title="选择雷电模拟器 dnplayer.exe", initialdir=str(Path(self.ldplayer_var.get() or DEFAULT_LDPLAYER_PATH).parent), filetypes=[("dnplayer.exe", "dnplayer.exe"), ("可执行文件", "*.exe"), ("所有文件", "*.*")], parent=self)
+        values = self.pending_user_settings()
+        ldplayer = filedialog.askopenfilename(title="选择雷电模拟器 dnplayer.exe", initialdir=str(Path(values["ldplayer_path"] or DEFAULT_LDPLAYER_PATH).parent), filetypes=[("dnplayer.exe", "dnplayer.exe"), ("可执行文件", "*.exe"), ("所有文件", "*.*")], parent=self)
         if ldplayer:
-            self.ldplayer_var.set(ldplayer)
-        data_path = filedialog.askdirectory(title="选择数据存储路径", initialdir=self.data_var.get() or DEFAULT_DATA_PATH, parent=self)
+            values["ldplayer_path"] = ldplayer
+        data_path = filedialog.askdirectory(title="选择数据存储路径", initialdir=values["data_path"] or DEFAULT_DATA_PATH, parent=self)
         if data_path:
-            self.data_var.set(data_path)
+            values["data_path"] = data_path
         for field in ("experience_pool_gb", "ai_model_limit", "still_seconds", "training_seconds"):
-            self.modify_runtime_value(field)
-        self.save_user_settings()
+            changed = self.ask_runtime_value(field, values[field])
+            if changed is not None:
+                values[field] = changed
+        self.submit_user_settings(values)
+
+    def pending_user_settings(self):
+        return {"ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH, "data_path": self.data_var.get().strip() or DEFAULT_DATA_PATH, "training_seconds": max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS)), "still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))}
+
+    def ask_runtime_value(self, field, current_value):
+        AllowedUserEditPolicy.assert_allowed(field)
+        title, _, default, parser, minimum = self.runtime_value_specs[field]
+        answer = simpledialog.askstring("修改" + title, "请输入" + title, initialvalue=self.format_runtime_value(field, current_value), parent=self)
+        if answer is None:
+            return None
+        return max(minimum, parser(answer, default))
+
+    def apply_runtime_value_vars(self, values):
+        self.training_seconds_var.set(self.format_runtime_value("training_seconds", values["training_seconds"]))
+        self.still_seconds_var.set(self.format_runtime_value("still_seconds", values["still_seconds"]))
+        self.experience_pool_gb_var.set(self.format_runtime_value("experience_pool_gb", values["experience_pool_gb"]))
+        self.ai_model_limit_var.set(self.format_runtime_value("ai_model_limit", values["ai_model_limit"]))
+
+    def submit_user_settings(self, values):
+        old_values = self.pending_user_settings()
+        new_ldplayer = str(values.get("ldplayer_path") or DEFAULT_LDPLAYER_PATH)
+        new_data_path = Path(str(values.get("data_path") or DEFAULT_DATA_PATH))
+        if new_ldplayer != old_values["ldplayer_path"]:
+            ok, reason = validate_ldplayer_executable(new_ldplayer, self.settings, require_attach=True)
+            if not ok:
+                messagebox.showerror("雷电路径不合法", reason)
+                self.status_var.set("雷电路径校验失败，未保存")
+                self.update_mode_button_states()
+                return False
+        normalized = {"ldplayer_path": new_ldplayer, "data_path": str(new_data_path), "training_seconds": max(1, safe_int(values.get("training_seconds"), DEFAULT_TRAINING_SECONDS)), "still_seconds": max(0.1, safe_float(values.get("still_seconds"), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(values.get("experience_pool_gb"), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(values.get("ai_model_limit"), DEFAULT_AI_MODEL_LIMIT))}
+        if Path(old_values["data_path"]) != new_data_path:
+            return self.start_data_migration(new_data_path, normalized)
+        self.ldplayer_var.set(new_ldplayer)
+        self.data_var.set(str(new_data_path))
+        self.apply_runtime_value_vars(normalized)
+        self.save_persistent_settings()
         self.refresh_runtime_environment_state()
         self.status_var.set("修改已保存")
+        return True
 
     def build_ui(self):
         style = ttk.Style(self)
@@ -5313,22 +5388,31 @@ class ControlPanel(tk.Tk):
         path = filedialog.askdirectory(title="选择数据存储目录")
         if not path:
             return
+        self.start_data_migration(Path(path), self.pending_user_settings())
+
+    def start_data_migration(self, new_path, values=None):
         old_path = Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)
-        new_path = Path(path)
+        new_path = Path(new_path)
         if old_path == new_path:
+            if values:
+                self.ldplayer_var.set(str(values.get("ldplayer_path") or DEFAULT_LDPLAYER_PATH))
+                self.apply_runtime_value_vars(values)
             self.data_var.set(str(new_path))
             self.save_persistent_settings()
             self.update_mode_button_states()
-            return
+            self.status_var.set("修改已保存")
+            return True
         token, stop_event = self.begin_run("migration", reason="click_modify_data_path")
         if not token:
             self.status_var.set("请先终止当前模式，或等待当前模式结束")
-            return
+            return False
         self.status_var.set("正在迁移数据")
         self.update_progress(0.0)
-        values = {"ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH, "training_seconds": max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS)), "still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))}
-        self.mode_thread = threading.Thread(target=self.migration_service.run, args=(token, old_path, new_path, stop_event, values), daemon=True)
+        values = values or self.pending_user_settings()
+        migration_values = {"ldplayer_path": str(values.get("ldplayer_path") or DEFAULT_LDPLAYER_PATH), "training_seconds": max(1, safe_int(values.get("training_seconds"), DEFAULT_TRAINING_SECONDS)), "still_seconds": max(0.1, safe_float(values.get("still_seconds"), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(values.get("experience_pool_gb"), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(values.get("ai_model_limit"), DEFAULT_AI_MODEL_LIMIT))}
+        self.mode_thread = threading.Thread(target=self.migration_service.run, args=(token, old_path, new_path, stop_event, migration_values), daemon=True)
         self.mode_thread.start()
+        return True
 
     def migration_items(self, old_path):
         root = Path(old_path)
@@ -5500,7 +5584,7 @@ class ControlPanel(tk.Tk):
                     temp_root.replace(new_root)
                     temp_root = None
                 self.verify_migration(old_root, new_root)
-                self.ui(lambda path=str(new_root): self.data_var.set(path))
+                self.ui(lambda path=str(new_root), v=dict(values): (self.ldplayer_var.set(v["ldplayer_path"]), self.data_var.set(path), self.apply_runtime_value_vars(v)))
                 self.app_config_store.save_settings({"ldplayer_path": values["ldplayer_path"], "data_path": str(new_root)})
                 self.store = DataStore(new_root)
                 self.experience_pool = ExperiencePool(self.settings, self.store.load_experience(self.settings.experience_load_limit), self.store.load_latest_model_state(self.settings))
@@ -6814,7 +6898,7 @@ class ControlPanel(tk.Tk):
         with ScreenAnalyzer(config.settings.hash_size) as analyzer:
             self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start, priority="critical"), None, "mode_start")
             while not stop_event.is_set() and self.is_run_active(token, "training"):
-                if service.should_stop(training_timer_started_at, config, stop_event, suspend_time_limit=rescue_started_at is not None):
+                if service.should_stop(training_timer_started_at, config, stop_event, suspend_time_limit=zero_score_started_at is not None or rescue_started_at is not None):
                     break
                 rect = self.current_rect()
                 service.prepare_for_event(rect)
