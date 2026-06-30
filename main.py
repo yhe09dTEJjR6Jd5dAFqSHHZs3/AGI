@@ -344,20 +344,22 @@ def startup_environment_issues():
     valid_path, path_reason = validate_ldplayer_executable(ldplayer_path, require_attach=False)
     if not valid_path:
         issues.append(f"雷电模拟器启动路径无效 {ldplayer_path}：{path_reason}")
-    elif sys.platform == "win32":
-        runtime_ok, runtime_reason = validate_ldplayer_executable(ldplayer_path, require_attach=True)
+    elif sys.platform == "win32" and "WindowManager" in globals():
+        runtime_ok, runtime_reason = attach_and_probe_ldplayer(ldplayer_path)
         if not runtime_ok:
-            issues.append(f"雷电模拟器客户区不可用 {ldplayer_path}：{runtime_reason}")
-        elif "WindowManager" in globals():
-            settings = derive_runtime_settings() if "derive_runtime_settings" in globals() else None
-            probe_ok, probe_reason = runtime_capability_probe(WindowManager(ldplayer_path, settings))
-            if not probe_ok:
-                issues.append(f"雷电运行能力不可用 {ldplayer_path}：{probe_reason}")
+            issues.append(f"雷电运行能力不可用 {ldplayer_path}：{runtime_reason}")
     storage_issue = data_path_write_issue(data_path)
     if storage_issue:
         issues.append(f"存储路径无效 {data_path}：{storage_issue}")
     return issues
 
+
+def attach_and_probe_ldplayer(ldplayer_path, settings=None):
+    effective_settings = settings or (derive_runtime_settings() if "derive_runtime_settings" in globals() else None)
+    manager = WindowManager(ldplayer_path, effective_settings)
+    if not manager.launch_or_attach():
+        return False, "无法启动或附着雷电模拟器客户区"
+    return runtime_capability_probe(manager)
 
 
 def runtime_capability_probe(window_manager):
@@ -953,6 +955,33 @@ def run_self_test():
     assert not prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: actions.append("无法自动修复"), startup_events.append)
     assert len(startup_events) == 1 and "初检结果" in startup_events[0] and "初检后进行的自愈尝试" in startup_events[0] and "复检结果" in startup_events[0] and "下一步建议" in startup_events[0]
     assert STARTUP_FAILURE_BUTTON_LABELS == ("选择雷电路径", "选择数据目录", "更多", "重试", "忽略", "退出")
+    original_window_manager = globals().get("WindowManager")
+    original_probe = globals().get("runtime_capability_probe")
+    attach_events = []
+    class FakeStartupWindowManager:
+        def __init__(self, path, settings=None):
+            self.path = path
+            self.settings = settings
+            self.hwnd = None
+        def launch_or_attach(self):
+            self.hwnd = 100
+            attach_events.append(("attach", str(self.path)))
+            return True
+    def fake_runtime_capability_probe(manager):
+        attach_events.append(("probe", getattr(manager, "hwnd", None)))
+        return getattr(manager, "hwnd", None) == 100, "invalid_handle"
+    globals()["WindowManager"] = FakeStartupWindowManager
+    globals()["runtime_capability_probe"] = fake_runtime_capability_probe
+    try:
+        probe_ok, probe_reason = attach_and_probe_ldplayer(Path("D:/LDPlayer9/dnplayer.exe"), settings=None)
+        assert probe_ok, probe_reason
+        assert attach_events == [("attach", "D:/LDPlayer9/dnplayer.exe"), ("probe", 100)]
+    finally:
+        if original_window_manager is None:
+            globals().pop("WindowManager", None)
+        else:
+            globals()["WindowManager"] = original_window_manager
+        globals()["runtime_capability_probe"] = original_probe
     settings = derive_runtime_settings()
     assert len(settings.human_feature_weights) == len(HUMAN_FEATURE_NAMES)
     assert sum(settings.human_feature_weights) > 0.0
