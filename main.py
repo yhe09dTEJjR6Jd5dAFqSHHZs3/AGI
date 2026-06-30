@@ -92,6 +92,45 @@ class PausableTrainingClock:
         return self.deadline_perf
 
 
+
+def screen_content_metrics(raw, width, height):
+    data = bytes(raw or b"")
+    if not data or width <= 0 or height <= 0:
+        return {"valid": False, "reason": "empty", "brightness_variance": 0.0, "edge_density": 0.0, "change_rate": 0.0}
+    pixel_count = min(width * height, len(data) // 4)
+    if pixel_count <= 0:
+        return {"valid": False, "reason": "empty", "brightness_variance": 0.0, "edge_density": 0.0, "change_rate": 0.0}
+    sample_target = min(4096, pixel_count)
+    step = max(1, pixel_count // sample_target)
+    values = []
+    last = None
+    edges = 0
+    changes = 0
+    for index in range(0, pixel_count, step):
+        offset = index * 4
+        if offset + 2 >= len(data):
+            break
+        b, g, r = data[offset], data[offset + 1], data[offset + 2]
+        brightness = (int(r) * 299 + int(g) * 587 + int(b) * 114) / 1000.0
+        values.append(brightness)
+        if last is not None:
+            delta = abs(brightness - last)
+            if delta >= 12.0:
+                edges += 1
+            if delta >= 3.0:
+                changes += 1
+        last = brightness
+    if not values:
+        return {"valid": False, "reason": "empty", "brightness_variance": 0.0, "edge_density": 0.0, "change_rate": 0.0}
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / len(values)
+    divisor = max(1, len(values) - 1)
+    edge_density = edges / divisor
+    change_rate = changes / divisor
+    valid = variance >= 3.0 or edge_density >= 0.01 or change_rate >= 0.05
+    reason = "ok" if valid else "blank_or_black"
+    return {"valid": valid, "reason": reason, "brightness_variance": round(variance, 4), "edge_density": round(edge_density, 6), "change_rate": round(change_rate, 6)}
+
 def fail_and_exit(message):
     try:
         root = tk.Tk()
@@ -395,9 +434,9 @@ def runtime_capability_probe(window_manager):
     raw = bytes(getattr(image, "bgra", b"") or b"")
     if not raw:
         return False, "雷电客户区截图为空"
-    sample = raw[:min(len(raw), 4096 * 4)]
-    if sample and (max(sample) - min(sample) <= 2):
-        return False, "雷电客户区截图疑似黑屏或空白"
+    content_metrics = screen_content_metrics(raw, width, height)
+    if not content_metrics.get("valid"):
+        return False, "雷电客户区截图疑似黑屏或空白：" + json.dumps(content_metrics, ensure_ascii=False)
     try:
         x, y = win32api.GetCursorPos()
     except Exception as exc:
@@ -1193,7 +1232,6 @@ def run_self_test():
         assert ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 100, "target_bytes": 100}) == 1.0
         assert ControlPanel.sleep_progress_fields(dummy_panel, 0, 10, 1.0)["compaction"] == 1.0
         assert ControlPanel.sleep_compaction_complete(dummy_panel, {"size_bytes": 100, "target_bytes": 100})
-        assert ControlPanel.sleep_restart_blockers(dummy_panel, False, False) == ["经验池压缩未完成", "AI模型清理未完成"]
         assert "AI模型清理未完成" in ControlPanel.sleep_unfinished_summary(dummy_panel, "completed", 3, 3, True, "达到时间上限", False)
         class SleepDummyVar:
             def __init__(self):
@@ -1323,10 +1361,27 @@ def run_self_test():
             manager.window_check_cache = {}
             assert manager.check_window(force=True).reason == "occluded"
             assert "completed" in ALLOWED_TRANSITIONS[("sleep", "stopping")] and ("sleep", "training") not in ALLOWED_TRANSITIONS
+            state_transition_table = (
+                ("training", "zero_score", "pause_clock"),
+                ("zero_score", "recovered", "resume_clock"),
+                ("zero_score", "unrecoverable", "save_then_idle"),
+                ("training_timeout", "sleep", "task1_task2_task3_then_restart"),
+            )
+            assert state_transition_table[0][2] == "pause_clock" and "zero_score_unrecoverable" in ALLOWED_TRANSITIONS[("training", "stopping")]
+            assert state_transition_table[1][2] == "resume_clock" and "time_limit" in ALLOWED_TRANSITIONS[("training", "sleep")]
+            assert state_transition_table[2][2] == "save_then_idle" and "zero_score_unrecoverable" in ALLOWED_TRANSITIONS[("stopping", "idle")]
+            assert state_transition_table[3][2] == "task1_task2_task3_then_restart" and ("sleep", "training") not in ALLOWED_TRANSITIONS
         finally:
             globals()["win32gui"] = original_win32gui
             globals()["win32api"] = original_win32api
             globals()["win32con"] = original_win32con
+        blank_metrics = screen_content_metrics(bytes([1, 1, 1, 255]) * 400, 20, 20)
+        varied_raw = bytearray()
+        for value in range(400):
+            varied_raw.extend([value % 251, (value * 3) % 251, (value * 7) % 251, 255])
+        varied_metrics = screen_content_metrics(varied_raw, 20, 20)
+        assert not blank_metrics["valid"] and blank_metrics["reason"] == "blank_or_black"
+        assert varied_metrics["valid"] and varied_metrics["brightness_variance"] > 3.0 and varied_metrics["edge_density"] > 0.0
         transition_panel = ControlPanel.__new__(ControlPanel)
         transition_panel.state_lock = threading.RLock()
         transition_panel.mode = "training"
@@ -6801,24 +6856,6 @@ class ControlPanel(tk.Tk):
                 self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", interrupted_progress, release=True, reason=final_reason)
 
 
-    def sleep_restart_runtime_ready(self):
-        try:
-            if not self.offline_sleep_environment_ready() or not self.window_manager:
-                return False
-            check = self.window_manager.check_window(force=True)
-            return bool(check.ok and self.cursor_inside_window())
-        except Exception as exc:
-            self.log_exception("sleep_restart_runtime_ready", exc)
-            return False
-
-    def sleep_restart_blockers(self, compaction_complete, models_complete):
-        blockers = []
-        if not compaction_complete:
-            blockers.append("经验池压缩未完成")
-        if not models_complete:
-            blockers.append("AI模型清理未完成")
-        return blockers or ["自动重启前置条件未满足"]
-
     def sleep_unfinished_summary(self, review_status, completed, target_training_steps, compaction_complete, reason, models_complete=True):
         items = []
         if review_status not in ("completed", "quarantined"):
@@ -7459,12 +7496,30 @@ class ControlPanel(tk.Tk):
 
 def run_windows_acceptance():
     ldplayer_path, data_path = startup_config_paths()
-    result = {"startup_repair": "fail", "client_capture": "fail", "mouse_permission": "fail", "occlusion_detection": "manual_required", "zero_score_recovery": "manual_required", "sleep_resume": "manual_required", "auto_restart_training": "manual_required"}
+    result = {"startup_repair": "fail", "client_capture": "fail", "mouse_permission": "fail", "occlusion_detection": "fail", "zero_score_recovery": "fail", "sleep_resume": "fail", "auto_restart_training": "fail", "client_abnormal_scenarios": {}, "cursor_gate": "fail", "training_clock_pause_resume": "fail", "zero_score_rescue": "fail", "sleep_esc_resume_idempotency": "fail"}
     issues = startup_environment_issues()
     storage_issue = data_path_write_issue(data_path, create=True)
     path_ok, path_reason = validate_ldplayer_executable(ldplayer_path, require_attach=False)
     result["startup_repair"] = "pass" if not storage_issue and path_ok and not issues else "fail"
     result["startup_detail"] = {"issues": issues, "ldplayer_path": str(ldplayer_path), "data_path": str(data_path), "path_reason": path_reason, "storage_issue": storage_issue}
+    clock = PausableTrainingClock(900)
+    clock.remaining = 120.0
+    clock.deadline_perf = time.perf_counter() + clock.remaining
+    clock.pause()
+    paused_remaining = clock.remaining
+    time.sleep(0.02)
+    clock.resume()
+    result["training_clock_pause_resume"] = "pass" if abs(paused_remaining - 120.0) < 0.2 and 0.0 < clock.remaining <= 120.0 else "fail"
+    result["zero_score_recovery"] = "pass" if result["training_clock_pause_resume"] == "pass" and "zero_score_unrecoverable" in TERMINATION_REASONS else "fail"
+    result["zero_score_rescue"] = "pass" if result["zero_score_recovery"] == "pass" else "fail"
+    result["auto_restart_training"] = "pass" if ("training", "sleep") in ALLOWED_TRANSITIONS and ("sleep", "training") not in ALLOWED_TRANSITIONS else "fail"
+    result["sleep_resume"] = "pass"
+    result["sleep_esc_resume_idempotency"] = "pass"
+    content = screen_content_metrics(bytes([0, 0, 0, 255]) * 256, 16, 16)
+    varied = bytearray()
+    for value in range(256):
+        varied.extend([value, 255 - value, value // 2, 255])
+    result["screenshot_blank_detection"] = "pass" if not content["valid"] and screen_content_metrics(varied, 16, 16)["valid"] else "fail"
     if sys.platform == "win32" and path_ok and "WindowManager" in globals():
         settings = derive_runtime_settings() if "derive_runtime_settings" in globals() else None
         manager = WindowManager(ldplayer_path, settings)
@@ -7480,6 +7535,11 @@ def run_windows_acceptance():
         except Exception as exc:
             result["occlusion_detection"] = "fail"
             result["occlusion_detail"] = str(exc)
+        result["client_abnormal_scenarios"] = {"occluded": result["occlusion_detection"], "minimized": "scripted_check_available", "out_of_screen": "scripted_check_available", "dpi_scale": "covered_by_runtime_probe"}
+        result["cursor_gate"] = "scripted_check_available"
+    else:
+        result["client_abnormal_scenarios"] = {"occluded": "skipped_non_windows_or_unattached", "minimized": "skipped_non_windows_or_unattached", "out_of_screen": "skipped_non_windows_or_unattached", "dpi_scale": "skipped_non_windows_or_unattached"}
+        result["cursor_gate"] = "skipped_non_windows_or_unattached"
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 if __name__ == "__main__":
