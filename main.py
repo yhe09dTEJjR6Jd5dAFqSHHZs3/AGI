@@ -127,7 +127,7 @@ class EnvironmentEnsureResult:
         if self.ok:
             advice = ("运行环境符合要求，程序可进入空闲。",)
         else:
-            advice = ("点击“浏览”选择 dnplayer.exe 路径。", "点击“重试”再次自愈并复检。", "确认环境可用时点击“忽略”进入空闲。", "无法处理时点击“退出”终止程序。")
+            advice = ("点击“选择雷电路径”选择 dnplayer.exe。", "点击“选择数据目录”修复存储路径。", "点击“重试”再次自愈并复检。", "确认环境可用时点击“忽略”进入空闲。", "无法处理时点击“退出”终止程序。")
         sections = ["初检结果：", *[f"- {item}" for item in initial], "", "初检后进行的自愈尝试：", *[f"- {item}" for item in repairs], "", "复检结果：", *[f"- {item}" for item in recheck], "", "下一步建议：", *[f"- {item}" for item in advice]]
         return "\n".join(sections)
 
@@ -348,11 +348,72 @@ def startup_environment_issues():
         runtime_ok, runtime_reason = validate_ldplayer_executable(ldplayer_path, require_attach=True)
         if not runtime_ok:
             issues.append(f"雷电模拟器客户区不可用 {ldplayer_path}：{runtime_reason}")
+        elif "WindowManager" in globals():
+            settings = derive_runtime_settings() if "derive_runtime_settings" in globals() else None
+            probe_ok, probe_reason = runtime_capability_probe(WindowManager(ldplayer_path, settings))
+            if not probe_ok:
+                issues.append(f"雷电运行能力不可用 {ldplayer_path}：{probe_reason}")
     storage_issue = data_path_write_issue(data_path)
     if storage_issue:
         issues.append(f"存储路径无效 {data_path}：{storage_issue}")
     return issues
 
+
+
+def runtime_capability_probe(window_manager):
+    if sys.platform != "win32":
+        return False, f"运行能力探测需要 Windows 桌面环境，当前平台为 {sys.platform}"
+    if mss is None:
+        return False, "mss 不可用，无法探测客户区截图能力"
+    if win32api is None:
+        return False, "pywin32 不可用，无法读取鼠标坐标"
+    if not window_manager:
+        return False, "雷电窗口管理器不可用"
+    try:
+        check = window_manager.check_window(force=True)
+    except Exception as exc:
+        return False, f"雷电客户区检查失败：{exc}"
+    if not getattr(check, "ok", False):
+        return False, "雷电客户区不可用：" + str(getattr(check, "reason", "unknown"))
+    rect = tuple(getattr(check, "rect", ()) or ())
+    if len(rect) != 4:
+        return False, "雷电客户区坐标无效"
+    left, top, right, bottom = [int(value) for value in rect]
+    width = right - left
+    height = bottom - top
+    if width < 2 or height < 2:
+        return False, "雷电客户区尺寸过小，无法截图"
+    try:
+        with mss.mss() as sct:
+            image = sct.grab({"left": left, "top": top, "width": width, "height": height})
+    except Exception as exc:
+        return False, f"无法获取雷电客户区截图：{exc}"
+    if getattr(image, "width", width) < 2 or getattr(image, "height", height) < 2:
+        return False, "无法获取雷电客户区截图"
+    raw = bytes(getattr(image, "bgra", b"") or b"")
+    if not raw:
+        return False, "雷电客户区截图为空"
+    sample = raw[:min(len(raw), 4096 * 4)]
+    if sample and (max(sample) - min(sample) <= 2):
+        return False, "雷电客户区截图疑似黑屏或空白"
+    try:
+        x, y = win32api.GetCursorPos()
+    except Exception as exc:
+        return False, f"无法读取鼠标坐标：{exc}"
+    if not isinstance(x, int) or not isinstance(y, int):
+        return False, "无法读取鼠标坐标"
+    try:
+        monitor = sct.monitors[0] if 'sct' in locals() else None
+        if monitor:
+            screen_left = int(monitor.get("left", 0))
+            screen_top = int(monitor.get("top", 0))
+            screen_right = screen_left + int(monitor.get("width", 0))
+            screen_bottom = screen_top + int(monitor.get("height", 0))
+            if left < screen_left or top < screen_top or right > screen_right or bottom > screen_bottom:
+                return False, "雷电客户区截图坐标与屏幕/DPI 范围不一致"
+    except Exception:
+        pass
+    return True, "ok"
 
 def attempt_startup_environment_repair(actions=None):
     actions = actions if actions is not None else []
@@ -492,7 +553,7 @@ def interactive_startup_failure_repair(parent, status_var, message):
     def exit_program():
         result["exit"] = True
         dialog.destroy()
-    for label, command in (("浏览", choose_ldplayer), ("更多", show_log), ("重试", retry), ("忽略", ignore), ("退出", exit_program)):
+    for label, command in (("选择雷电路径", choose_ldplayer), ("选择数据目录", choose_data_path), ("更多", show_log), ("重试", retry), ("忽略", ignore), ("退出", exit_program)):
         ttk.Button(actions, text=label, command=command).pack(side="left", padx=4)
     dialog.protocol("WM_DELETE_WINDOW", exit_program)
     parent.wait_window(dialog)
@@ -5026,7 +5087,16 @@ class TrainingService:
         latency_ms = safe_float(actual.get("duration", 0.0), 0.0) * 1000.0
         panel.adaptive_policy.observe_execution(latency_ms=latency_ms, success=True)
         panel.mark_learning_activity()
-        after_snapshot = panel.capture_snapshot(analyzer, "training", session_id, start, rect=rect, priority="critical")
+        after_snapshot = None
+        for attempt in range(3):
+            after_snapshot = panel.capture_snapshot(analyzer, "training", session_id, start, rect=rect, priority="critical")
+            if after_snapshot:
+                break
+            stop_event.wait(min(0.2, max(0.01, panel.settings.training_event_wait)))
+        if not after_snapshot:
+            record = panel.write_record("training", session_id, snapshot, actual, "ai_mouse_after_screen_missing", decision=decision, action_anchor_perf=actual.get("started_perf"), after_snapshot=None, planned_action=action, execution_latency_ms=round(latency_ms, 3), execution_error="after_snapshot_missing", screen_result_unknown=True, exclude_from_training=True)
+            panel.adaptive_policy.observe_execution(success=False)
+            return False, {"failure_reason": "after_snapshot_missing", "record_id": record.get("id") if record else None}
         record = panel.write_record("training", session_id, snapshot, actual, "ai_mouse", decision=decision, action_anchor_perf=actual.get("started_perf"), after_snapshot=after_snapshot, planned_action=action, execution_latency_ms=round(latency_ms, 3))
         return True, record
 
@@ -6234,6 +6304,14 @@ class ControlPanel(tk.Tk):
                 if show_error:
                     self.ui(lambda r=result: messagebox.showerror("运行环境不符合要求", r.detail()))
                 return result
+            probe_ok, probe_reason = runtime_capability_probe(self.window_manager)
+            if not probe_ok:
+                result = EnvironmentEnsureResult(False, stage, result.checks, result.repair_actions, ("运行能力探测失败：" + probe_reason,), ("运行能力探测失败：" + probe_reason,))
+                self.runtime_environment_issue = probe_reason
+                self.log_exception("runtime.capability_probe", RuntimeError(probe_reason), {"stage": stage})
+                if show_error:
+                    self.ui(lambda r=result: messagebox.showerror("运行环境不符合要求", r.detail()))
+                return result
         return result
 
     def ensure_runtime(self, config):
@@ -6843,7 +6921,7 @@ class ControlPanel(tk.Tk):
                 return None
         return snapshot
 
-    def write_record(self, mode, session_id, snapshot, action, event_name, decision=None, action_anchor_perf=None, after_snapshot=None, planned_action=None, failed_action=False, window_rect_changed=False, capture_latency_ms=None, execution_latency_ms=None, execution_error=None):
+    def write_record(self, mode, session_id, snapshot, action, event_name, decision=None, action_anchor_perf=None, after_snapshot=None, planned_action=None, failed_action=False, window_rect_changed=False, capture_latency_ms=None, execution_latency_ms=None, execution_error=None, screen_result_unknown=False, exclude_from_training=False):
         if not self.store or not snapshot:
             return None
         before_novelty, batch = self.experience_pool.compute_screen_score(snapshot.hash_value, exact_checksum=getattr(snapshot, "image_checksum", ""), semantic_vector=getattr(snapshot, "semantic_vector", ()))[:2]
@@ -6861,6 +6939,11 @@ class ControlPanel(tk.Tk):
         human_action_penalty = max(0.0, -human_delta)
         if failed_action:
             reward = round(-abs(max(1.0, human_action_penalty, 100.0 - human_score)), 2)
+        if screen_result_unknown:
+            transition_reward = 0.0
+            reward = 0.0
+            reward_info = dict(reward_info)
+            reward_info["basis"] = "screen_result_unknown_excluded"
         screen_score_total = self.store.add_screen_score_total(reward)
         started_perf = safe_float(normalized.get("started_perf"), None) if normalized else None
         offset_source = started_perf if started_perf is not None else action_anchor_perf
@@ -6868,6 +6951,12 @@ class ControlPanel(tk.Tk):
         sims = [round(item["similarity"], 4) for item in batch]
         record_event = self.events.publish("record_ready", mode=mode, session_id=session_id, event_name=event_name)
         record = {"record_schema_version": 2, "reward_version": reward_info["reward_version"], "id": uuid.uuid4().hex, "event_sequence": record_event["sequence"], "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_semantic_vector": list(getattr(snapshot, "semantic_vector", ())), "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": before_novelty, "screen_score": before_novelty, "score_version": 1, "score_basis": "nearest_screen_content_live", "score_checked_at": now_text(), "score_neighbors": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "before_screen": snapshot.relative_path, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_screen_hash": snapshot.hash_value.hex, "before_screen_score": before_novelty, "after_screen_hash": after_snapshot.hash_value.hex if after_snapshot else snapshot.hash_value.hex, "after_screen_hash_int": after_snapshot.hash_value.value if after_snapshot else snapshot.hash_value.value, "after_screen_hash_bits": after_snapshot.hash_value.bits if after_snapshot else snapshot.hash_value.bits, "after_screen_semantic_vector": list(getattr(after_snapshot, "semantic_vector", ())) if after_snapshot else list(getattr(snapshot, "semantic_vector", ())), "after_screen_score": after_novelty, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": {"screen_novelty": reward_info["screen_novelty"], "screen_reward": reward_info["screen_reward"], "human_similarity": reward_info["human_similarity"], "human_tiebreak": reward_info["human_tiebreak"], "screen_score_delta": reward_info["screen_score_delta"], "basis": reward_info["basis"]}, "reward_sort_key": reward_info["reward_sort_key"], "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "screen_score_delta": max(0.0, reward), "screen_score_settled": max(0.0, reward), "penalty_delta": max(0.0, -reward), "screen_score_total": screen_score_total, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "image_checksum": getattr(snapshot, "image_checksum", ""), "after_image_checksum": getattr(after_snapshot, "image_checksum", "") if after_snapshot else getattr(snapshot, "image_checksum", ""), "image_dropped": bool(getattr(snapshot, "image_dropped", False)), "screen_file_expected": not bool(getattr(snapshot, "image_dropped", False)), "capture_latency_ms": capture_latency_ms if capture_latency_ms is not None else getattr(snapshot, "capture_latency_ms", None), "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_event_wait": self.settings.training_event_wait, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
+        if screen_result_unknown:
+            record["screen_result_unknown"] = True
+            record["exclude_from_training"] = True
+            record["score_status"] = "screen_result_unknown"
+        elif exclude_from_training:
+            record["exclude_from_training"] = True
         if decision:
             record["ai_decision"] = decision
         self.persistence_queue.enqueue_record(self.store, record)
@@ -7276,7 +7365,36 @@ class ControlPanel(tk.Tk):
         self.hardware_last_light_refresh_perf = event_perf
         return self.hardware_state
 
+
+def run_windows_acceptance():
+    ldplayer_path, data_path = startup_config_paths()
+    result = {"startup_repair": "fail", "client_capture": "fail", "mouse_permission": "fail", "occlusion_detection": "manual_required", "zero_score_recovery": "manual_required", "sleep_resume": "manual_required", "auto_restart_training": "manual_required"}
+    issues = startup_environment_issues()
+    storage_issue = data_path_write_issue(data_path, create=True)
+    path_ok, path_reason = validate_ldplayer_executable(ldplayer_path, require_attach=False)
+    result["startup_repair"] = "pass" if not storage_issue and path_ok and not issues else "fail"
+    result["startup_detail"] = {"issues": issues, "ldplayer_path": str(ldplayer_path), "data_path": str(data_path), "path_reason": path_reason, "storage_issue": storage_issue}
+    if sys.platform == "win32" and path_ok and "WindowManager" in globals():
+        settings = derive_runtime_settings() if "derive_runtime_settings" in globals() else None
+        manager = WindowManager(ldplayer_path, settings)
+        attached = manager.launch_or_attach()
+        probe_ok, probe_reason = runtime_capability_probe(manager) if attached else (False, "无法启动或附着雷电模拟器客户区")
+        result["client_capture"] = "pass" if probe_ok else "fail"
+        result["mouse_permission"] = "pass" if probe_ok else "fail"
+        result["runtime_probe"] = probe_reason
+        try:
+            check = manager.check_window(force=True)
+            result["occlusion_detection"] = "pass" if getattr(check, "ok", False) else "fail"
+            result["occlusion_detail"] = getattr(check, "reason", "ok")
+        except Exception as exc:
+            result["occlusion_detection"] = "fail"
+            result["occlusion_detail"] = str(exc)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
 if __name__ == "__main__":
+    if "--windows-acceptance" in sys.argv:
+        run_windows_acceptance()
+        sys.exit(0)
     if "--self-test" in sys.argv:
         run_self_test()
         sys.exit(0)
