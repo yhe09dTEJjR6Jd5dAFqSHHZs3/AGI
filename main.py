@@ -1151,6 +1151,11 @@ def run_self_test():
     assert semantic_similarity((1.0, 0.0), (1.0, 0.0)) == 1.0
     pool.add({"id": "t3", "mode": "learning", "mouse_action": {"type": "click", "start_rel": [0.1, 0.1]}, "reward": 1, "screen_hash_hex": "0", "screen_hash_bits": 4, "mouse_source": "user", "image_checksum": "exact-a", "screen_semantic_vector": [1.0, 0.0]})
     assert pool.compute_screen_score(a, exact_checksum="exact-a", semantic_vector=[0.0, 1.0])[0] == 0.0
+    recheck_pool = ExperiencePool(settings, [{"id": "record-1", "screen_hash_hex": "f", "screen_hash_bits": 4, "image_checksum": "known"}])
+    recheck_result = recheck_pool.recheck_screen_scores()
+    assert recheck_result["total"] == 1 and recheck_result["trainable"] == 1
+    action_pool = ExperiencePool(settings, [{"id": "bad-action", "mouse_action": {"type": "click", "start_rel": [0.1, 0.1]}, "reward": 999, "screen_hash_hex": "f", "screen_hash_bits": 4, "image_checksum": "bad", "quarantined": True}, {"id": "good-action", "mouse_action": {"type": "click", "start_rel": [0.2, 0.2]}, "reward": 1, "screen_hash_hex": "e", "screen_hash_bits": 4, "image_checksum": "good"}])
+    assert action_pool.best_global_action()["start_rel"] == [0.2, 0.2]
     sleep_result = pool.sleep_training_step(changed.sleep_batch_size)
     assert sleep_result["trained"] >= 1
     assert pool.records[0].get("sleep_visits", 0) >= 1
@@ -4093,8 +4098,11 @@ class ExperiencePool:
                 bucket.append(index)
                 self.metric_tree.add(hash_value, index)
 
+    def is_training_eligible(self, record):
+        return isinstance(record, dict) and not bool(record.get("quarantined") or record.get("exclude_from_training") or record.get("score_status") in ("image_missing", "image_corrupt", "unrecoverable"))
+
     def record_trainable(self, record):
-        return not bool(record.get("quarantined") or record.get("exclude_from_training") or record.get("score_status") in ("image_missing", "image_corrupt", "unrecoverable"))
+        return self.is_training_eligible(record)
 
     def add(self, record):
         with self.lock:
@@ -4110,9 +4118,9 @@ class ExperiencePool:
                     self.index_version += 1
                 bucket.append(index)
                 self.metric_tree.add(hash_value, index)
-            if self.record_trainable(record) and record.get("mouse_action") and record.get("mode") == "learning" and record.get("mouse_source") == "user":
+            if self.is_training_eligible(record) and record.get("mouse_action") and record.get("mode") == "learning" and record.get("mouse_source") == "user":
                 self.profile.observe(record["mouse_action"])
-            if self.record_trainable(record) and record.get("mouse_action"):
+            if self.is_training_eligible(record) and record.get("mouse_action"):
                 self.action_cache.append(record)
                 reward = safe_float(record.get("reward", 0.0), 0.0)
                 item = (reward, index)
@@ -4128,7 +4136,7 @@ class ExperiencePool:
 
     def train_local_vision_model(self):
         with self.lock:
-            vectors = [(parse_semantic_vector(record.get("screen_semantic_vector")), safe_float(record.get("screen_score", record.get("novelty", 0.0)), 0.0), record.get("id")) for record in self.records if self.record_trainable(record)]
+            vectors = [(parse_semantic_vector(record.get("screen_semantic_vector")), safe_float(record.get("screen_score", record.get("novelty", 0.0)), 0.0), record.get("id")) for record in self.records if self.is_training_eligible(record)]
         vectors = [(vector, score, record_id) for vector, score, record_id in vectors if vector]
         if not vectors:
             self.visual_model = {"created_at": now_text(), "status": "empty", "clusters": []}
@@ -4207,7 +4215,7 @@ class ExperiencePool:
             if len(self.records) > self.index_settings.nearest_candidate_limit:
                 recent_limit = min(len(self.records), max(top_k, self.index_settings.nearest_candidate_limit // 4))
                 candidate_indexes = list(dict.fromkeys(candidate_indexes + list(range(len(self.records) - recent_limit, len(self.records))) + [index for _, index in heapq.nlargest(min(len(self.global_action_heap), top_k), self.global_action_heap)]))
-            snapshot = [(index, self.hashes[index], self.records[index]) for index in candidate_indexes if self.hashes[index] and self.record_trainable(self.records[index]) and (before_index is None or index < before_index) and (exclude_id is None or self.records[index].get("id") != exclude_id)]
+            snapshot = [(index, self.hashes[index], self.records[index]) for index in candidate_indexes if self.hashes[index] and self.is_training_eligible(self.records[index]) and (before_index is None or index < before_index) and (exclude_id is None or self.records[index].get("id") != exclude_id)]
         scored = []
         for index, other, record in snapshot:
             if other:
@@ -4246,6 +4254,8 @@ class ExperiencePool:
                 if index < 0 or index >= len(self.records):
                     continue
                 record = self.records[index]
+                if not self.is_training_eligible(record):
+                    continue
                 action = record.get("mouse_action")
                 reward = safe_float(record.get("reward", 0.0), 0.0)
                 human_score = clamp(record.get("human_score", 50.0), 0.0, 100.0)
@@ -4257,7 +4267,7 @@ class ExperiencePool:
 
     def sleep_training_batch_indices(self, batch_size):
         with self.lock:
-            action_indices = [index for index, record in enumerate(self.records) if index not in self.inflight_indices and record.get("mouse_action") and self.record_trainable(record)]
+            action_indices = [index for index, record in enumerate(self.records) if index not in self.inflight_indices and record.get("mouse_action") and self.is_training_eligible(record)]
             if not action_indices:
                 return []
             target = max(1, min(safe_int(batch_size, 1), len(action_indices)))
@@ -4274,7 +4284,7 @@ class ExperiencePool:
         if exact_checksum:
             with self.lock:
                 for index, record in enumerate(self.records):
-                    if (before_index is None or index < before_index) and (exclude_id is None or record.get("id") != exclude_id) and self.record_trainable(record) and exact_checksum == record.get("image_checksum"):
+                    if (before_index is None or index < before_index) and (exclude_id is None or record.get("id") != exclude_id) and self.is_training_eligible(record) and exact_checksum == record.get("image_checksum"):
                         return 0.0, [{"similarity": 1.0, "hash_similarity": 1.0, "semantic_similarity": 1.0, "record": record}], 1.0
         neighbors = self.nearest(hash_value, exclude_id=exclude_id, limit=self.settings.nearest_top_k, before_index=before_index, semantic_vector=semantic_vector)
         sims = [clamp(item.get("similarity", 0.0), 0.0, 1.0) for item in neighbors]
@@ -4295,10 +4305,11 @@ class ExperiencePool:
         rescored = 0
         missing = 0
         errors = 0
-        image_missing = 0
-        image_corrupt = 0
-        hash_missing = 0
-        unrecoverable = 0
+        image_missing_ids = set()
+        image_corrupt_ids = set()
+        hash_missing_ids = set()
+        unrecoverable_ids = set()
+        quarantined_ids = set()
         with self.lock:
             snapshot = [(index, dict(record)) for index, record in enumerate(self.records)]
         updates = []
@@ -4308,6 +4319,7 @@ class ExperiencePool:
             progress_callback(0, total)
         for processed, (index, record) in enumerate(snapshot, start=1):
             processed_count = processed
+            record_key = record.get("id") or index
             if run_guard and run_guard():
                 interrupted = True
                 processed_count = processed - 1
@@ -4330,14 +4342,17 @@ class ExperiencePool:
                             record.update({"score_status": "image_unavailable_hash_scored", "score_checked_at": now_text()})
                         else:
                             record.update({"score_status": "image_missing", "exclude_from_training": True, "quarantined": True, "quarantine_reason": "image_missing", "score_checked_at": now_text()})
-                            image_missing += 1
+                            image_missing_ids.add(record_key)
+                            quarantined_ids.add(record_key)
                 except Exception as exc:
                     record["screen_file_error"] = str(exc)
                     record.update({"score_status": "image_corrupt", "exclude_from_training": True, "quarantined": True, "quarantine_reason": "image_corrupt", "score_checked_at": now_text()})
-                    image_corrupt += 1
+                    image_corrupt_ids.add(record_key)
+                    quarantined_ids.add(record_key)
             elif needs_checksum:
                 record.update({"score_status": "image_missing", "exclude_from_training": True, "quarantined": True, "quarantine_reason": "image_checksum_missing_without_recoverable_image", "score_checked_at": now_text()})
-                image_missing += 1
+                image_missing_ids.add(record_key)
+                quarantined_ids.add(record_key)
             if file_hash and (not hash_value or file_hash.hex != hash_value.hex or file_hash.bits != hash_value.bits):
                 hash_value = file_hash
                 record["screen_hash"] = file_hash.hex
@@ -4346,8 +4361,9 @@ class ExperiencePool:
                 record["screen_hash_bits"] = file_hash.bits
                 errors += 1
             if not hash_value:
-                hash_missing += 1
-                unrecoverable += 1
+                hash_missing_ids.add(record_key)
+                unrecoverable_ids.add(record_key)
+                quarantined_ids.add(record_key)
                 record["score_status"] = "unrecoverable"
                 record["exclude_from_training"] = True
                 record["quarantined"] = True
@@ -4359,7 +4375,8 @@ class ExperiencePool:
                     progress_callback(processed, total)
                 continue
             if record.get("quarantined") and record.get("quarantine_reason") in ("image_missing", "image_corrupt", "image_checksum_missing_without_recoverable_image"):
-                unrecoverable += 1
+                unrecoverable_ids.add(record_key)
+                quarantined_ids.add(record_key)
                 updates.append((index, record, hash_value))
                 changed_records.append(record)
                 if callable(progress_callback):
@@ -4389,13 +4406,18 @@ class ExperiencePool:
                     self.records[index] = record
                     self.hashes[index] = hash_value
             self.rebuild_index_locked()
-            self.rebuild_action_heap_locked()
+            self.rebuild_derived_state_locked()
             self.nearest_cache.clear()
         if callable(progress_callback):
             progress_callback(processed_count if interrupted else total, total)
-        trainable = sum(1 for record in self.records if self.training_eligible(record))
+        trainable = sum(1 for record in self.records if self.is_training_eligible(record))
         degraded = sum(1 for record in self.records if isinstance(record, dict) and record.get("score_status") == "image_unavailable_hash_scored")
-        return {"checked": checked, "processed": processed_count if interrupted else total, "total": total, "complete": not interrupted, "interrupted": interrupted, "rescored": rescored, "missing": missing, "errors": errors, "image_missing": image_missing, "image_corrupt": image_corrupt, "hash_missing": hash_missing, "unrecoverable": unrecoverable, "degraded": degraded, "quarantined": image_missing + image_corrupt + unrecoverable, "trainable": trainable, "changed_records": changed_records, "changed_ids": [record.get("id") for record in changed_records if isinstance(record, dict) and record.get("id")]}
+        image_missing = len(image_missing_ids)
+        image_corrupt = len(image_corrupt_ids)
+        hash_missing = len(hash_missing_ids)
+        unrecoverable = len(unrecoverable_ids)
+        unique_quarantined = len(quarantined_ids)
+        return {"checked": checked, "processed": processed_count if interrupted else total, "total": total, "complete": not interrupted, "interrupted": interrupted, "rescored": rescored, "missing": missing, "errors": errors, "image_missing": image_missing, "image_corrupt": image_corrupt, "hash_missing": hash_missing, "unrecoverable": unrecoverable, "degraded": degraded, "quarantined": unique_quarantined, "unique_quarantined": unique_quarantined, "trainable": trainable, "changed_records": changed_records, "changed_ids": [record.get("id") for record in changed_records if isinstance(record, dict) and record.get("id")]}
 
     def sleep_training_step(self, batch_size, settle_screen_score=None, run_guard=None):
         indices = self.sleep_training_batch_indices(batch_size)
@@ -4470,11 +4492,16 @@ class ExperiencePool:
                 for index in indices:
                     self.inflight_indices.discard(index)
 
-    def rebuild_action_heap_locked(self):
+    def rebuild_derived_state_locked(self):
+        self.action_cache = []
         heap = []
         for index, record in enumerate(self.records):
-            if not record.get("mouse_action"):
+            if not self.is_training_eligible(record):
                 continue
+            action = record.get("mouse_action")
+            if not action:
+                continue
+            self.action_cache.append(record)
             screen, human = record_screen_human(record)
             reward = strict_reward_value(screen, human)
             confidence = clamp(record.get("sleep_confidence", 0.0), 0.0, 1.0)
@@ -4484,6 +4511,9 @@ class ExperiencePool:
             elif item[0] > heap[0][0]:
                 heapq.heapreplace(heap, item)
         self.global_action_heap = heap
+
+    def rebuild_action_heap_locked(self):
+        self.rebuild_derived_state_locked()
 
     def human_score(self, action):
         return self.model_runtime.mouse_humanlikeness(action, self.profile.score(action))
@@ -6974,6 +7004,11 @@ class ControlPanel(tk.Tk):
         self.store.save_sleep_checkpoint(checkpoint or {}, stage="task3_pool_compaction_saved", task3_pool_compaction_completed=bool(pool_result.get("complete")))
         if not pool_result.get("complete"):
             raise RuntimeError("睡眠模式任务3未完成：经验池压缩未完成")
+        settings = getattr(config, "settings", getattr(self, "settings", derive_runtime_settings()))
+        records = self.store.load_experience(settings.experience_load_limit)
+        model_state = self.store.load_latest_model_state(settings)
+        self.experience_pool = ExperiencePool(settings, records, model_state)
+        self.brain = ActionBrain(self.experience_pool, settings)
         self.update_progress(95.0, force=True)
         return model_result, pool_result
 
@@ -6998,8 +7033,10 @@ class ControlPanel(tk.Tk):
                 self.persistence_queue.flush()
             self.store.flush_state(force=True)
             self.update_progress(self.sleep_stage_progress(progress_start, progress_end, 0.15), force=True)
+            task3_compacted = isinstance(task3_report, dict) and isinstance(task3_report.get("pool"), dict) and bool(task3_report["pool"].get("complete"))
             with self.experience_pool.lock:
-                self.store.merge_experience_records_by_id(copy.deepcopy(self.experience_pool.records))
+                if not task3_compacted:
+                    self.store.merge_experience_records_by_id(copy.deepcopy(self.experience_pool.records))
                 model = self.experience_pool.model
             self.update_progress(self.sleep_stage_progress(progress_start, progress_end, 0.55), force=True)
             compact = (task3_report or {}).get("pool") if isinstance(task3_report, dict) else None
