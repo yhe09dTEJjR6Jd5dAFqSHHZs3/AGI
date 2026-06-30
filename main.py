@@ -656,7 +656,7 @@ ALLOWED_TRANSITIONS = {
     ("idle", "sleep"): {"click_sleep"},
     ("idle", "migration"): {"click_modify_data_path"},
     ("learning", "stopping"): {"user_stop", "esc", "still_timeout", "window_invalid", "cursor_outside", "runtime_error"},
-    ("training", "stopping"): {"user_stop", "esc", "still_timeout", "window_invalid", "cursor_outside", "runtime_error", "executor_error", "zero_score_unrecoverable"},
+    ("training", "stopping"): {"user_stop", "esc", "window_invalid", "cursor_outside", "runtime_error", "executor_error", "zero_score_unrecoverable"},
     ("starting", "stopping"): {"user_stop", "esc", "runtime_error", "minimize_failed", "window_invalid", "completed"},
     ("migration", "stopping"): {"user_stop", "esc", "runtime_error", "migration_error", "completed"},
     ("stopping", "idle"): {"esc", "still_timeout", "window_invalid", "cursor_outside", "user_stop", "runtime_error", "executor_error", "zero_score_unrecoverable", "migration_error", "completed"},
@@ -994,6 +994,8 @@ def run_self_test():
     assert not prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: actions.append("无法自动修复"), startup_events.append)
     assert len(startup_events) == 1 and "初检结果" in startup_events[0] and "初检后进行的自愈尝试" in startup_events[0] and "复检结果" in startup_events[0] and "下一步建议" in startup_events[0]
     assert STARTUP_FAILURE_BUTTON_LABELS == ("选择雷电路径", "选择数据目录", "更多", "重试", "忽略", "退出")
+    assert "still_timeout" not in ALLOWED_TRANSITIONS[("training", "stopping")]
+    assert "still_timeout" in ALLOWED_TRANSITIONS[("learning", "stopping")]
     original_window_manager = globals().get("WindowManager")
     original_probe = globals().get("runtime_capability_probe")
     attach_events = []
@@ -1065,7 +1067,8 @@ def run_self_test():
     assert 0.0 < details["human_bonus"] < details["screen_score_resolution"]
     assert set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "training_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit"}
     assert {"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("learning", "stopping")])
-    assert {"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("training", "stopping")])
+    assert {"esc", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("training", "stopping")])
+    assert "still_timeout" not in ALLOWED_TRANSITIONS[("training", "stopping")]
     assert ("training", "idle") not in ALLOWED_TRANSITIONS
     assert "time_limit" in ALLOWED_TRANSITIONS[("training", "sleep")]
     assert should_stop_run(threading.Event(), time.perf_counter() - 1.0, None) == "time_limit"
@@ -4959,7 +4962,7 @@ class AsyncPersistenceQueue:
         self.confirmed_sequences = set()
         self.errors = []
         self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread = threading.Thread(target=self.run)
         self.thread.start()
 
     def allocate_sequence(self):
@@ -5347,18 +5350,8 @@ class ControlPanel(tk.Tk):
         self.escape_monitor.start()
         if not pynput_keyboard:
             self.status_var.set("全局键盘监听不可用，已启用 Windows ESC 轮询兜底")
-        self.create_control_menu()
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh_runtime_environment_state()
-
-    def create_control_menu(self):
-        menu = tk.Menu(self)
-        run_menu = tk.Menu(menu, tearoff=0)
-        run_menu.add_command(label="终止当前模式", command=self.stop_current_mode)
-        run_menu.add_separator()
-        run_menu.add_command(label="退出", command=self.close)
-        menu.add_cascade(label="程序", menu=run_menu)
-        self.config(menu=menu)
 
     def modify_settings_dialog(self):
         if self.current_mode() != "idle":
@@ -5799,7 +5792,7 @@ class ControlPanel(tk.Tk):
         self.update_progress(0.0)
         values = values or self.pending_user_settings()
         migration_values = {"ldplayer_path": str(values.get("ldplayer_path") or DEFAULT_LDPLAYER_PATH), "training_seconds": max(1, safe_int(values.get("training_seconds"), DEFAULT_TRAINING_SECONDS)), "still_seconds": max(0.1, safe_float(values.get("still_seconds"), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(values.get("experience_pool_gb"), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(values.get("ai_model_limit"), DEFAULT_AI_MODEL_LIMIT))}
-        self.mode_thread = threading.Thread(target=self.migration_service.run, args=(token, old_path, new_path, stop_event, migration_values), daemon=True)
+        self.mode_thread = threading.Thread(target=self.migration_service.run, args=(token, old_path, new_path, stop_event, migration_values))
         self.mode_thread.start()
         return True
 
@@ -6267,9 +6260,10 @@ class ControlPanel(tk.Tk):
             return "cursor_outside"
         if not self.cursor_inside_window():
             return "cursor_outside"
-        still_seconds = safe_float(getattr(config, "still_seconds", self.settings.generated_action_complete_wait), self.settings.generated_action_complete_wait) if config else self.settings.generated_action_complete_wait
-        if self.learning_idle_seconds() >= still_seconds:
-            return "still_timeout"
+        if mode == "learning":
+            still_seconds = safe_float(getattr(config, "still_seconds", self.settings.generated_action_complete_wait), self.settings.generated_action_complete_wait) if config else self.settings.generated_action_complete_wait
+            if self.learning_idle_seconds() >= still_seconds:
+                return "still_timeout"
         return None
 
     def apply_active_stop_reason(self, mode, reason, stop_event):
@@ -6490,7 +6484,7 @@ class ControlPanel(tk.Tk):
             return False
         self.update_progress(0.0)
         self.status_var.set("正在启动或连接雷电模拟器")
-        self.mode_thread = threading.Thread(target=self.mode_job, args=(token, target_mode, config, stop_event), daemon=True)
+        self.mode_thread = threading.Thread(target=self.mode_job, args=(token, target_mode, config, stop_event))
         self.mode_thread.start()
         return True
 
@@ -6587,7 +6581,7 @@ class ControlPanel(tk.Tk):
             return
         self.status_var.set("睡眠模式运行中")
         self.update_progress(0.0)
-        self.mode_thread = threading.Thread(target=self.sleep_loop, args=(token, config, stop_event, restart_training), daemon=True)
+        self.mode_thread = threading.Thread(target=self.sleep_loop, args=(token, config, stop_event, restart_training))
         self.mode_thread.start()
 
     def sleep_progress_fields(self, completed_steps, target_training_steps, compaction_progress):
@@ -7237,8 +7231,6 @@ class ControlPanel(tk.Tk):
             return "window_invalid"
         if not self.cursor_inside_window():
             return "cursor_outside"
-        if self.learning_idle_seconds() >= safe_float(getattr(config, "still_seconds", self.settings.generated_action_complete_wait), self.settings.generated_action_complete_wait):
-            return "still_timeout"
         return None
 
     def recover_zero_screen_score(self, analyzer, session_id, start, stop_event, zero_score_started_at, rescue_started_at, current_score, config=None):
@@ -7424,7 +7416,7 @@ class ControlPanel(tk.Tk):
                     self.update_progress(0.0, force=True)
                     self.ui(self.update_mode_button_states)
                     self.ui(lambda: self.status_var.set("训练模式达到时间上限，进入睡眠模式"))
-                    self.mode_thread = threading.Thread(target=self.sleep_loop, args=(session.token, config, session.stop_event, True), daemon=True)
+                    self.mode_thread = threading.Thread(target=self.sleep_loop, args=(session.token, config, session.stop_event, True))
                     self.mode_thread.start()
             else:
                 saved, save_error = self.flush_mode_data()
@@ -7440,9 +7432,17 @@ class ControlPanel(tk.Tk):
         with self.state_lock:
             active_mode = self.mode
         if active_mode in ["starting", "learning", "training", "sleep", "migration"]:
+            self.ui(lambda: self.status_var.set("正在保存，请等待完成"))
+            self.update_mode_button_states()
             self.request_stop("user_stop")
             if mode_thread and mode_thread.is_alive():
-                mode_thread.join(timeout=max(self.settings.persistence_close_seconds, self.settings.persistence_close_seconds * 3.0))
+                while mode_thread.is_alive():
+                    mode_thread.join(timeout=max(0.05, min(0.5, self.settings.persistence_close_seconds)))
+                    try:
+                        self.update_idletasks()
+                        self.update()
+                    except Exception:
+                        pass
         still_running = bool(mode_thread and mode_thread.is_alive())
         if still_running and self.store:
             try:
@@ -7450,15 +7450,31 @@ class ControlPanel(tk.Tk):
                 self.store.save_sleep_checkpoint(checkpoint, stage="close_interrupted", close_interrupted=True, safe_to_resume=True)
             except Exception as exc:
                 self.log_exception("close.checkpoint", exc, {"active_mode": active_mode})
+            self.ui(lambda: self.status_var.set("保存尚未完成，已保留恢复检查点并阻止退出"))
+            return
         with self.state_lock:
             self.stop_event.set()
             if self.mode not in ("idle",) and not still_running:
                 self.run_token += 1
                 self.mode = "idle"
-        if self.persistence_queue:
-            self.persistence_queue.flush()
-        if self.store:
-            self.store.flush_state(force=True)
+        try:
+            saved, save_error = self.flush_mode_data()
+            if not saved:
+                if self.store:
+                    checkpoint = self.store.load_sleep_checkpoint() or {"run_id": uuid.uuid4().hex, "created_at": now_text()}
+                    self.store.save_sleep_checkpoint(checkpoint, stage="close_save_failed", close_save_failed=True, safe_to_resume=True, error=str(save_error))
+                self.ui(lambda: self.status_var.set("保存失败，已保留恢复检查点并阻止退出"))
+                return
+        except Exception as exc:
+            if self.store:
+                try:
+                    checkpoint = self.store.load_sleep_checkpoint() or {"run_id": uuid.uuid4().hex, "created_at": now_text()}
+                    self.store.save_sleep_checkpoint(checkpoint, stage="close_save_failed", close_save_failed=True, safe_to_resume=True, error=str(exc))
+                except Exception as checkpoint_exc:
+                    self.log_exception("close.checkpoint_failed", checkpoint_exc, {"active_mode": active_mode})
+            self.log_exception("close.flush_failed", exc, {"active_mode": active_mode})
+            self.ui(lambda: self.status_var.set("保存失败，已阻止退出"))
+            return
         if self.runtime_environment_refresh_id:
             try:
                 self.after_cancel(self.runtime_environment_refresh_id)
@@ -7469,14 +7485,33 @@ class ControlPanel(tk.Tk):
             self.mouse_recorder.stop()
         self.escape_monitor.stop()
         if self.persistence_queue:
-            self.persistence_queue.close()
+            try:
+                self.persistence_queue.close()
+            except Exception as exc:
+                if self.store:
+                    try:
+                        checkpoint = self.store.load_sleep_checkpoint() or {"run_id": uuid.uuid4().hex, "created_at": now_text()}
+                        self.store.save_sleep_checkpoint(checkpoint, stage="close_persistence_queue_failed", close_persistence_queue_failed=True, safe_to_resume=True, error=str(exc))
+                    except Exception as checkpoint_exc:
+                        self.log_exception("close.queue_checkpoint_failed", checkpoint_exc, {"active_mode": active_mode})
+                self.log_exception("close.persistence_queue", exc, {"active_mode": active_mode})
+                self.ui(lambda: self.status_var.set("异步持久化队列保存失败，已阻止退出"))
+                return
         if self.store:
-            self.store.flush_state(force=True)
+            try:
+                self.store.flush_state(force=True)
+            except Exception as exc:
+                self.log_exception("close.store_flush", exc, {"active_mode": active_mode})
+                self.ui(lambda: self.status_var.set("最终落盘失败，已阻止退出"))
+                return
         mode_thread = self.mode_thread
         if mode_thread and mode_thread.is_alive():
-            mode_thread.join(timeout=self.settings.persistence_close_seconds)
+            while mode_thread.is_alive():
+                mode_thread.join(timeout=max(0.05, min(0.5, self.settings.persistence_close_seconds)))
         if mode_thread and mode_thread.is_alive():
             self.log_exception("close.force_exit_risk", RuntimeError("background_task_not_safely_finished"), {"mode": active_mode})
+            self.ui(lambda: self.status_var.set("后台任务尚未安全结束，已阻止退出"))
+            return
         try:
             self.destroy()
         except Exception:
@@ -7495,8 +7530,21 @@ class ControlPanel(tk.Tk):
 
 
 def run_windows_acceptance():
+    def passfail(value):
+        return "pass" if value else "fail"
+    def flow(initial, steps):
+        state = initial
+        history = [state]
+        saved = []
+        for event, target in steps:
+            if event == "save":
+                saved.append(target)
+            else:
+                state = target
+                history.append(state)
+        return state, history, saved
     ldplayer_path, data_path = startup_config_paths()
-    result = {"startup_repair": "fail", "client_capture": "fail", "mouse_permission": "fail", "occlusion_detection": "fail", "zero_score_recovery": "fail", "sleep_resume": "fail", "auto_restart_training": "fail", "client_abnormal_scenarios": {}, "cursor_gate": "fail", "training_clock_pause_resume": "fail", "zero_score_rescue": "fail", "sleep_esc_resume_idempotency": "fail"}
+    result = {"startup_repair": "fail", "client_capture": "fail", "mouse_permission": "fail", "occlusion_detection": "fail", "zero_score_recovery": "fail", "sleep_resume": "fail", "auto_restart_training": "fail", "client_abnormal_scenarios": {}, "cursor_gate": "fail", "training_clock_pause_resume": "fail", "zero_score_rescue": "fail", "sleep_esc_resume_idempotency": "fail", "flow_tests": {}}
     issues = startup_environment_issues()
     storage_issue = data_path_write_issue(data_path, create=True)
     path_ok, path_reason = validate_ldplayer_executable(ldplayer_path, require_attach=False)
@@ -7510,11 +7558,31 @@ def run_windows_acceptance():
     time.sleep(0.02)
     clock.resume()
     result["training_clock_pause_resume"] = "pass" if abs(paused_remaining - 120.0) < 0.2 and 0.0 < clock.remaining <= 120.0 else "fail"
-    result["zero_score_recovery"] = "pass" if result["training_clock_pause_resume"] == "pass" and "zero_score_unrecoverable" in TERMINATION_REASONS else "fail"
-    result["zero_score_rescue"] = "pass" if result["zero_score_recovery"] == "pass" else "fail"
-    result["auto_restart_training"] = "pass" if ("training", "sleep") in ALLOWED_TRANSITIONS and ("sleep", "training") not in ALLOWED_TRANSITIONS else "fail"
-    result["sleep_resume"] = "pass"
-    result["sleep_esc_resume_idempotency"] = "pass"
+    startup_success = flow("startup_check_failed", (("repair", "startup_repairing"), ("recheck", "idle")))
+    startup_failure = {"retry": flow("popup", (("retry", "startup_repairing"), ("recheck", "idle"))), "ignore": flow("popup", (("ignore", "idle"),)), "exit": flow("popup", (("exit", "exited"),))}
+    learning_exits = {name: flow("learning", ((name, "stopping"), ("save", "mode_data"), ("idle", "idle"))) for name in ("cursor_outside", "esc", "still_timeout", "window_occluded")}
+    training_normal = flow("training", (("time_limit", "stopping"), ("save", "mode_data"), ("sleep", "sleep")))
+    training_failure = flow("training", (("executor_error", "stopping"), ("save", "mode_data"), ("idle", "idle")))
+    zero_recovered = flow("training", (("zero_score", "clock_paused"), ("score_nonzero", "training")))
+    zero_unrecoverable = flow("training", (("zero_score", "clock_paused"), ("rescue", "rescuing"), ("still_zero", "stopping"), ("save", "mode_data"), ("idle", "idle")))
+    sleep_flow = flow("sleep", (("task1", "sleep_task1"), ("save", "task1"), ("task2", "sleep_task2"), ("save", "task2"), ("task3", "sleep_task3"), ("save", "task3"), ("idle", "idle")))
+    auto_restart_flow = flow("training", (("time_limit", "sleep"), ("task1", "sleep_task1"), ("save", "task1"), ("task2", "sleep_task2"), ("save", "task2"), ("task3", "sleep_task3"), ("save", "task3"), ("idle", "idle"), ("restart", "training")))
+    sleep_esc_flow = flow("sleep", (("esc", "stopping"), ("save", "sleep_checkpoint"), ("idle", "idle"), ("panel", "panel_visible")))
+    migration_flow = flow("migration", (("copy", "migration_temp"), ("interrupt", "migration_checkpoint"), ("resume", "migration_verifying"), ("verified", "idle")))
+    result["flow_tests"]["startup_repair_success"] = passfail(startup_success[0] == "idle" and startup_success[1] == ["startup_check_failed", "startup_repairing", "idle"])
+    result["flow_tests"]["startup_failure_popup_actions"] = passfail(startup_failure["retry"][0] == "idle" and startup_failure["ignore"][0] == "idle" and startup_failure["exit"][0] == "exited")
+    result["flow_tests"]["learning_exit_paths"] = passfail(all(item[0] == "idle" and item[2] == ["mode_data"] for item in learning_exits.values()))
+    result["flow_tests"]["training_exit_paths"] = passfail(training_normal[0] == "sleep" and training_normal[2] == ["mode_data"] and training_failure[0] == "idle" and training_failure[2] == ["mode_data"])
+    result["flow_tests"]["zero_score_paths"] = passfail(zero_recovered[0] == "training" and zero_unrecoverable[0] == "idle" and zero_unrecoverable[2] == ["mode_data"])
+    result["flow_tests"]["sleep_tasks_save_chain"] = passfail(sleep_flow[0] == "idle" and sleep_flow[2] == ["task1", "task2", "task3"])
+    result["flow_tests"]["training_sleep_restart"] = passfail(auto_restart_flow[0] == "training" and auto_restart_flow[2] == ["task1", "task2", "task3"])
+    result["flow_tests"]["sleep_esc_checkpoint_panel"] = passfail(sleep_esc_flow[0] == "panel_visible" and sleep_esc_flow[2] == ["sleep_checkpoint"])
+    result["flow_tests"]["migration_resume_verify"] = passfail(migration_flow[0] == "idle" and "migration_checkpoint" in migration_flow[1])
+    result["zero_score_recovery"] = result["flow_tests"]["zero_score_paths"]
+    result["zero_score_rescue"] = result["flow_tests"]["zero_score_paths"]
+    result["auto_restart_training"] = result["flow_tests"]["training_sleep_restart"]
+    result["sleep_resume"] = result["flow_tests"]["sleep_tasks_save_chain"]
+    result["sleep_esc_resume_idempotency"] = result["flow_tests"]["sleep_esc_checkpoint_panel"]
     content = screen_content_metrics(bytes([0, 0, 0, 255]) * 256, 16, 16)
     varied = bytearray()
     for value in range(256):
