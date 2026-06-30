@@ -66,30 +66,30 @@ def should_stop_run(stop_event, deadline, escape_check, termination_reason=None)
 class PausableTrainingClock:
     def __init__(self, seconds):
         self.remaining = float(max(1, seconds))
-        self.last_tick = time.perf_counter()
         self.paused = False
+        self.deadline_perf = time.perf_counter() + self.remaining
 
     def pause(self):
         if not self.paused:
-            self.remaining -= time.perf_counter() - self.last_tick
+            self.remaining = max(0.0, self.deadline_perf - time.perf_counter())
             self.paused = True
 
     def resume(self):
         if self.paused:
-            self.last_tick = time.perf_counter()
+            self.deadline_perf = time.perf_counter() + self.remaining
             self.paused = False
 
     def expired(self):
-        if not self.paused:
-            now = time.perf_counter()
-            self.remaining -= now - self.last_tick
-            self.last_tick = now
-        return self.remaining <= 0
+        if self.paused:
+            return False
+        self.remaining = max(0.0, self.deadline_perf - time.perf_counter())
+        return self.remaining <= 0.0
 
     def deadline(self):
         if self.paused:
             return None
-        return time.perf_counter() + max(0.0, self.remaining)
+        self.remaining = max(0.0, self.deadline_perf - time.perf_counter())
+        return self.deadline_perf
 
 
 def fail_and_exit(message):
@@ -992,7 +992,10 @@ def run_self_test():
     changed_for_topk = replace(changed, nearest_top_k=3)
     topk_model = ScreenNoveltyScorerModel(changed_for_topk)
     assert topk_model.predict({"similarities": [1.0, 0.8, 0.8]}) == 14.67
-    assert runtime.mouse_humanlikeness({"type": "click", "start_rel": [0.5, 0.5]}, 55.0) == 55.0
+    matching_mouse_action = {"type": "click", "start_rel": [0.5, 0.5]}
+    direct_human_score = runtime.models["mouse_humanlikeness_scorer"].predict({"mouse_action": matching_mouse_action, "human_score": 55.0})
+    assert runtime.mouse_humanlikeness(matching_mouse_action, 55.0) == direct_human_score
+    assert direct_human_score != 55.0
     assert 0.0 <= runtime.operation_policy_score(pool.records[0], 0.9) <= 1.0
     assert runtime.models["rescue_policy"].predict({"zero_score": 0.0}) is not None
     assert runtime.reward(70.0, 100.0) > runtime.reward(70.0, 0.0)
@@ -1087,8 +1090,15 @@ def run_self_test():
         ControlPanel.render_sleep_completion_before_idle(sleep_finish_panel, "睡眠模式已中断：任务完成 43.2%，数据已安全保存", 43.2)
         assert sleep_finish_panel.completion_progress == 43.2
         assert sleep_finish_panel.progress_label_var.value == "睡眠模式已中断：任务完成 43.2%，数据已安全保存"
+        one_second_clock = PausableTrainingClock(1)
+        original_deadline = one_second_clock.deadline()
+        time.sleep(1.08)
+        assert one_second_clock.deadline() == original_deadline
+        assert should_stop_run(threading.Event(), one_second_clock.deadline(), None) == "time_limit"
+        assert one_second_clock.expired()
         clock = PausableTrainingClock(900)
         clock.remaining = 200.0
+        clock.deadline_perf = time.perf_counter() + clock.remaining
         clock.pause()
         paused_remaining = clock.remaining
         time.sleep(0.01)
@@ -1127,8 +1137,9 @@ def run_self_test():
         assert WindowCheck(True, "ok", (0, 0, 10, 10), 9, 9, 0.0).occluded_ratio == 0.0
         for name, created in (("model_new.json", "2025-01-02T00:00:00.000"), ("model_old.json", "2025-01-01T00:00:00.000"), ("model_mid.json", "2025-01-01T12:00:00.000")):
             (store.model_dir / name).write_text(json.dumps({"created_at": created, "model": {"type": "bad"}}), encoding="utf-8")
+        (store.model_dir / "partial_model_interrupted.json").write_text(json.dumps({"created_at": "2025-01-04T00:00:00.000"}), encoding="utf-8")
         compact_models = store.compact_ai_models(2)
-        assert compact_models["removed"] == 1 and not (store.model_dir / "model_old.json").exists() and (store.model_dir / "model_mid.json").exists() and (store.model_dir / "model_new.json").exists()
+        assert compact_models["removed"] == 1 and compact_models["model_count"] == 2 and not (store.model_dir / "model_old.json").exists() and (store.model_dir / "model_mid.json").exists() and (store.model_dir / "model_new.json").exists() and (store.model_dir / "partial_model_interrupted.json").exists()
         original_win32gui, original_win32api, original_win32con = globals().get("win32gui"), globals().get("win32api"), globals().get("win32con")
         class FakeWin32Gui:
             @staticmethod
@@ -2415,7 +2426,7 @@ class ModelGroupRuntime:
     def mouse_humanlikeness(self, action, fallback_score):
         model = self.models.get("mouse_humanlikeness_scorer")
         if model:
-            return model.predict({"human_score": fallback_score, "action_features": action_features(action)})
+            return model.predict({"mouse_action": action, "human_score": fallback_score})
         return fallback_score
 
     def operation_policy_score(self, record, similarity):
@@ -5142,7 +5153,7 @@ class ControlPanel(tk.Tk):
         new_ldplayer = str(values.get("ldplayer_path") or DEFAULT_LDPLAYER_PATH)
         new_data_path = Path(str(values.get("data_path") or DEFAULT_DATA_PATH))
         if new_ldplayer != old_values["ldplayer_path"]:
-            ok, reason = validate_ldplayer_executable(new_ldplayer, self.settings, require_attach=True)
+            ok, reason = validate_ldplayer_executable(new_ldplayer, self.settings, require_attach=False)
             if not ok:
                 messagebox.showerror("雷电路径不合法", reason)
                 self.status_var.set("雷电路径校验失败，未保存")
@@ -5503,7 +5514,7 @@ class ControlPanel(tk.Tk):
         path = filedialog.askopenfilename(title="选择 dnplayer.exe", filetypes=[("dnplayer.exe", "dnplayer.exe")])
         if not path:
             return
-        ok, reason = validate_ldplayer_executable(path, self.settings, require_attach=True)
+        ok, reason = validate_ldplayer_executable(path, self.settings, require_attach=False)
         if not ok:
             messagebox.showerror("雷电路径不合法", reason)
             self.status_var.set("雷电路径校验失败，未保存")
@@ -6652,7 +6663,8 @@ class ControlPanel(tk.Tk):
         return self.save_sleep_data(config, status, run_guard=run_guard, status_detail=status_detail, save_model=False, checkpoint_stage=stage)
 
     def save_after_task2(self, config, status, run_guard=None, status_detail=None):
-        return self.save_sleep_data(config, status, run_guard=run_guard, status_detail=status_detail, save_model=True, checkpoint_stage="task2_saved", allow_cleanup=False)
+        completed = status == "completed"
+        return self.save_sleep_data(config, status, run_guard=run_guard, status_detail=status_detail, save_model=completed, checkpoint_stage="task2_saved" if completed else "task2_interrupted_saved", allow_cleanup=False)
 
     def save_after_task3(self, config, status, task3_report=None, status_detail=None):
         return self.save_sleep_data(config, status, run_guard=None, status_detail=status_detail, task3_report=task3_report, save_model=False, checkpoint_stage="task3_final_saved", allow_cleanup=False)
@@ -7087,6 +7099,7 @@ class ControlPanel(tk.Tk):
                     break
                 current_screen_score = self.experience_pool.score_snapshot(snapshot)[0]
                 if current_screen_score <= 0.0:
+                    training_clock.pause()
                     zero_score_events += 1
                     if zero_score_started_at is None:
                         zero_score_started_at = time.perf_counter()
@@ -7097,10 +7110,15 @@ class ControlPanel(tk.Tk):
                         zero_score_started_at = None
                         rescue_started_at = None
                         training_clock.resume()
+                    else:
+                        if not stop_event.is_set():
+                            stop_event.wait(max(self.settings.training_event_wait, self.settings.min_action_delay_seconds))
+                        continue
                 else:
                     zero_score_events = 0
                     zero_score_started_at = None
                     rescue_started_at = None
+                    training_clock.resume()
                 zero_score_factor = clamp(zero_score_events / max(1, self.settings.training_fail_stop_count), 0.0, 1.0)
                 action, decision = service.decide_action(snapshot, zero_score_factor=zero_score_factor)
                 if decision is not None:
