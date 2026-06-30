@@ -3627,6 +3627,7 @@ class DataStore:
 
     def log_error(self, where, error, context=None):
         payload = {
+            "id": uuid.uuid4().hex,
             "time": now_text(),
             "where": str(where),
             "error_type": type(error).__name__,
@@ -3637,6 +3638,7 @@ class DataStore:
         with self.lock:
             with self.error_file.open("a", encoding="utf-8") as file:
                 file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        return payload["id"]
 
 
 @dataclass(frozen=True)
@@ -3866,6 +3868,18 @@ class WindowManager:
     def window_ok(self, force=False):
         return self.check_window(force=force).ok
 
+class ScreenShotError(RuntimeError):
+    pass
+
+
+class ScoreReviewError(RuntimeError):
+    pass
+
+
+class PersistenceError(RuntimeError):
+    pass
+
+
 class ScreenAnalyzer:
     def __init__(self, hash_size):
         self.hash_size = int(hash_size)
@@ -3874,16 +3888,25 @@ class ScreenAnalyzer:
         self.resample = getattr(resampling, "LANCZOS", 1)
 
     def __enter__(self):
-        self.sct = mss.mss()
         return self
 
     def __exit__(self, exc_type, exc, tb):
         self.close()
 
     def capture(self, rect):
+        if mss is None:
+            raise ScreenShotError("mss 不可用，无法启动实时屏幕抓取服务")
+        if self.sct is None:
+            try:
+                self.sct = mss.mss()
+            except Exception as exc:
+                raise ScreenShotError(str(exc)) from exc
         left, top, right, bottom = rect
         width, height = rect_size(rect)
-        shot = self.sct.grab({"left": int(left), "top": int(top), "width": width, "height": height})
+        try:
+            shot = self.sct.grab({"left": int(left), "top": int(top), "width": width, "height": height})
+        except Exception as exc:
+            raise ScreenShotError(str(exc)) from exc
         image = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
         return image
 
@@ -4029,6 +4052,7 @@ class ExperiencePool:
         self.prefix_neighbor_cache = OrderedDict()
         self.global_action_heap = []
         self.nearest_cache = OrderedDict()
+        self.inflight_indices = set()
         self.metric_tree = BKHashTree()
         self.visual_model = {}
         self.index_version = 0
@@ -4233,15 +4257,18 @@ class ExperiencePool:
 
     def sleep_training_batch_indices(self, batch_size):
         with self.lock:
-            action_indices = [index for index, record in enumerate(self.records) if record.get("mouse_action") and self.record_trainable(record)]
+            action_indices = [index for index, record in enumerate(self.records) if index not in self.inflight_indices and record.get("mouse_action") and self.record_trainable(record)]
             if not action_indices:
                 return []
             target = max(1, min(safe_int(batch_size, 1), len(action_indices)))
-            ranked = [index for _, index in heapq.nlargest(min(len(self.global_action_heap), target), self.global_action_heap, key=lambda item: item[0])]
+            available = set(action_indices)
+            ranked = [index for _, index in heapq.nlargest(min(len(self.global_action_heap), target), self.global_action_heap, key=lambda item: item[0]) if index in available]
             recent = action_indices[-target:]
             remaining = target * max(1, self.settings.ui_metric_columns) - len(ranked) - len(recent)
             sampled = random.sample(action_indices, min(len(action_indices), max(0, remaining))) if remaining > 0 else []
-            return list(dict.fromkeys(ranked + recent + sampled))[:target]
+            selected = list(dict.fromkeys(ranked + recent + sampled))[:target]
+            self.inflight_indices.update(selected)
+            return selected
 
     def compute_screen_score(self, hash_value, exclude_id=None, before_index=None, exact_checksum=None, semantic_vector=None):
         if exact_checksum:
@@ -4273,8 +4300,9 @@ class ExperiencePool:
         hash_missing = 0
         unrecoverable = 0
         with self.lock:
-            snapshot = [(index, copy.deepcopy(record)) for index, record in enumerate(self.records)]
+            snapshot = [(index, dict(record)) for index, record in enumerate(self.records)]
         updates = []
+        changed_records = []
         total = len(snapshot)
         if callable(progress_callback):
             progress_callback(0, total)
@@ -4326,12 +4354,14 @@ class ExperiencePool:
                 record["quarantine_reason"] = record.get("quarantine_reason") or "hash_missing"
                 record["score_checked_at"] = now_text()
                 updates.append((index, record, None))
+                changed_records.append(record)
                 if callable(progress_callback):
                     progress_callback(processed, total)
                 continue
             if record.get("quarantined") and record.get("quarantine_reason") in ("image_missing", "image_corrupt", "image_checksum_missing_without_recoverable_image"):
                 unrecoverable += 1
                 updates.append((index, record, hash_value))
+                changed_records.append(record)
                 if callable(progress_callback):
                     progress_callback(processed, total)
                 continue
@@ -4350,6 +4380,7 @@ class ExperiencePool:
             record.update({"screen_score": score, "novelty": score, "score_version": 1, "score_status": "rescored" if bool(lacks or wrong) else "scored", "score_basis": "nearest_screen_content_recheck", "score_checked_at": now_text(), "score_neighbors": [{"id": item["record"].get("id"), "similarity": round(item.get("similarity", 0.0), 4)} for item in neighbors], "score_confidence": round(confidence, 4), "score_rechecked": True, "score_recomputed": bool(lacks or wrong), "reward_version": reward_info["reward_version"], "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": reward_info, "reward_sort_key": reward_info["reward_sort_key"], "total_reward": reward_info["total_reward"], "reward": reward_info["total_reward"], "screen_score_delta": max(0.0, reward_info["screen_score_delta"])})
             checked += 1
             updates.append((index, record, hash_value))
+            changed_records.append(record)
             if callable(progress_callback):
                 progress_callback(processed, total)
         with self.lock:
@@ -4364,74 +4395,80 @@ class ExperiencePool:
             progress_callback(processed_count if interrupted else total, total)
         trainable = sum(1 for record in self.records if self.training_eligible(record))
         degraded = sum(1 for record in self.records if isinstance(record, dict) and record.get("score_status") == "image_unavailable_hash_scored")
-        return {"checked": checked, "processed": processed_count if interrupted else total, "total": total, "complete": not interrupted, "interrupted": interrupted, "rescored": rescored, "missing": missing, "errors": errors, "image_missing": image_missing, "image_corrupt": image_corrupt, "hash_missing": hash_missing, "unrecoverable": unrecoverable, "degraded": degraded, "quarantined": image_missing + image_corrupt + unrecoverable, "trainable": trainable}
+        return {"checked": checked, "processed": processed_count if interrupted else total, "total": total, "complete": not interrupted, "interrupted": interrupted, "rescored": rescored, "missing": missing, "errors": errors, "image_missing": image_missing, "image_corrupt": image_corrupt, "hash_missing": hash_missing, "unrecoverable": unrecoverable, "degraded": degraded, "quarantined": image_missing + image_corrupt + unrecoverable, "trainable": trainable, "changed_records": changed_records, "changed_ids": [record.get("id") for record in changed_records if isinstance(record, dict) and record.get("id")]}
 
     def sleep_training_step(self, batch_size, settle_screen_score=None, run_guard=None):
         indices = self.sleep_training_batch_indices(batch_size)
         if not indices:
             return {"trained": 0, "best_score": 0.0, "avg_score": 0.0, "avg_confidence": 0.0}
-        with self.lock:
-            records_len = len(self.records)
-            snapshot = [(index, self.hashes[index], copy.deepcopy(self.records[index])) for index in indices if index < records_len and self.hashes[index]]
-        updates = []
-        for index, hash_value, record in snapshot:
-            if run_guard and run_guard():
-                break
-            novelty, neighbors, similarity_confidence = self.compute_screen_score(hash_value, exclude_id=record.get("id"), before_index=index, exact_checksum=record.get("image_checksum"), semantic_vector=record.get("screen_semantic_vector"))
-            action = record.get("mouse_action")
-            human_score = clamp(record.get("human_score", self.profile.score(action)), 0.0, 100.0) if action else self.settings.score_default
-            reward = strict_reward_value(novelty, human_score)
-            visits = max(0, safe_int(record.get("sleep_visits", 0), 0))
-            candidate = reward
-            value = candidate
-            confidence = clamp((similarity_confidence + human_score / 100.0 + min(1.0, (visits + 1) / max(1.0, self.settings.nearest_top_k))) / 3.0, 0.0, 1.0)
-            reward_info = reward_breakdown(novelty, human_score, self.settings)
-            settled_delta = 0.0
-            if record.get("reward_version") != reward_info["reward_version"] and callable(settle_screen_score):
-                settled_delta = max(0.0, safe_float(reward_info["screen_score_delta"], 0.0) - max(0.0, safe_float(record.get("screen_score_settled", record.get("screen_score_delta", 0.0)), 0.0)))
-                if settled_delta > 0.0:
-                    settle_screen_score(settled_delta)
-            updates.append((index, value, visits + 1, confidence, novelty, human_score, reward_info, settled_delta))
-        train_records = []
-        with self.lock:
-            total_score = 0.0
-            best_score = None
-            for index, value, visits, confidence, novelty, human_score, reward_info, settled_delta in updates:
-                if index >= len(self.records):
-                    continue
-                record = self.records[index]
-                record["sleep_policy_reward"] = round(value, 4)
-                record["sleep_visits"] = visits
-                record["sleep_confidence"] = round(confidence, 4)
-                record["sleep_novelty"] = round(novelty, 2)
-                record["sleep_human_score"] = round(human_score, 2)
-                record["reward_version"] = reward_info["reward_version"]
-                record["sleep_evaluated_at"] = now_text()
-                record["screen_primary_reward"] = reward_info["screen_primary_reward"]
-                record["human_tie_break_reward"] = reward_info["human_tie_break_reward"]
-                record["reward_breakdown"] = reward_info
-                record["reward_sort_key"] = reward_info["reward_sort_key"]
-                record["total_reward"] = reward_info["total_reward"]
-                record["reward"] = reward_info["total_reward"]
-                record["screen_score_delta"] = max(0.0, reward_info["screen_score_delta"])
-                record["screen_score_settled"] = max(0.0, safe_float(record.get("screen_score_settled", 0.0), 0.0)) + settled_delta
-                train_records.append(record)
-            model_result = self.model.train(train_records)
-            for record in train_records:
-                model_prediction = clamp(safe_float(record.get("model_prediction", self.model.predict(record)), 0.0), 0.0, 1.0)
-                value = safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0)
-                confidence = clamp(safe_float(record.get("sleep_confidence", 0.0), 0.0), 0.0, 1.0)
-                record["sleep_model_confidence"] = round(model_prediction, 4)
-                score = value + (confidence * 0.000000001) + (model_prediction * 0.0000000001)
-                total_score += score
-                best_score = score if best_score is None else max(best_score, score)
-            self.rebuild_action_heap_locked()
-        count = len(updates)
-        model_confidence = safe_float(model_result.get("confidence", 0.0), 0.0)
-        avg_confidence = (sum(item[3] for item in updates) / count if count else 0.0)
-        hardware = read_hardware_state()
-        resource_result = self.model.resource_model.train_from_metrics({"cpu_load": safe_float(hardware.get("cpu_load", 0.0), 0.0), "memory_free_ratio": safe_float(hardware.get("memory_free_ratio", 0.5), 0.5), "capture_ms": safe_float(getattr(self.settings, "training_event_wait", 0.05), 0.05) * 1000.0, "execution_ms": safe_float(getattr(self.settings, "generated_sleep_event_wait", 0.1), 0.1) * 1000.0, "window_instability": 1.0 - avg_confidence, "success_rate": model_confidence, "pool_count": len(self.records), "throughput": count, "batch_size": max(1, safe_int(getattr(self.settings, "sleep_batch_size", 1), 1)), "save_success_rate": 1.0, "training_gain": clamp((best_score or 0.0) / max(1.0, abs(self.settings.reward_total_max)), 0.0, 1.0)})
-        return {"trained": count, "model_trained": safe_int(model_result.get("trained", 0), 0), "model_loss": safe_float(model_result.get("loss", 0.0), 0.0), "best_score": round(best_score or 0.0, 4), "avg_score": round(total_score / count if count else 0.0, 4), "avg_confidence": round(clamp(avg_confidence * 0.6 + model_confidence * 0.4, 0.0, 1.0), 4), **resource_result}
+        try:
+            with self.lock:
+                records_len = len(self.records)
+                snapshot = [(index, self.hashes[index], copy.deepcopy(self.records[index])) for index in indices if index < records_len and self.hashes[index]]
+            updates = []
+            for index, hash_value, record in snapshot:
+                if run_guard and run_guard():
+                    break
+                novelty, neighbors, similarity_confidence = self.compute_screen_score(hash_value, exclude_id=record.get("id"), before_index=index, exact_checksum=record.get("image_checksum"), semantic_vector=record.get("screen_semantic_vector"))
+                action = record.get("mouse_action")
+                human_score = clamp(record.get("human_score", self.profile.score(action)), 0.0, 100.0) if action else self.settings.score_default
+                reward = strict_reward_value(novelty, human_score)
+                visits = max(0, safe_int(record.get("sleep_visits", 0), 0))
+                candidate = reward
+                value = candidate
+                confidence = clamp((similarity_confidence + human_score / 100.0 + min(1.0, (visits + 1) / max(1.0, self.settings.nearest_top_k))) / 3.0, 0.0, 1.0)
+                reward_info = reward_breakdown(novelty, human_score, self.settings)
+                settled_delta = 0.0
+                if record.get("reward_version") != reward_info["reward_version"] and callable(settle_screen_score):
+                    settled_delta = max(0.0, safe_float(reward_info["screen_score_delta"], 0.0) - max(0.0, safe_float(record.get("screen_score_settled", record.get("screen_score_delta", 0.0)), 0.0)))
+                    if settled_delta > 0.0:
+                        settle_screen_score(settled_delta)
+                updates.append((index, value, visits + 1, confidence, novelty, human_score, reward_info, settled_delta))
+            train_records = []
+            with self.lock:
+                total_score = 0.0
+                best_score = None
+                for index, value, visits, confidence, novelty, human_score, reward_info, settled_delta in updates:
+                    if index >= len(self.records):
+                        continue
+                    record = self.records[index]
+                    record["sleep_policy_reward"] = round(value, 4)
+                    record["sleep_visits"] = visits
+                    record["sleep_confidence"] = round(confidence, 4)
+                    record["sleep_novelty"] = round(novelty, 2)
+                    record["sleep_human_score"] = round(human_score, 2)
+                    record["reward_version"] = reward_info["reward_version"]
+                    record["sleep_evaluated_at"] = now_text()
+                    record["screen_primary_reward"] = reward_info["screen_primary_reward"]
+                    record["human_tie_break_reward"] = reward_info["human_tie_break_reward"]
+                    record["reward_breakdown"] = reward_info
+                    record["reward_sort_key"] = reward_info["reward_sort_key"]
+                    record["total_reward"] = reward_info["total_reward"]
+                    record["reward"] = reward_info["total_reward"]
+                    record["screen_score_delta"] = max(0.0, reward_info["screen_score_delta"])
+                    record["screen_score_settled"] = max(0.0, safe_float(record.get("screen_score_settled", 0.0), 0.0)) + settled_delta
+                    train_records.append(record)
+                model_result = self.model.train(train_records)
+                for record in train_records:
+                    model_prediction = clamp(safe_float(record.get("model_prediction", self.model.predict(record)), 0.0), 0.0, 1.0)
+                    value = safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0)
+                    confidence = clamp(safe_float(record.get("sleep_confidence", 0.0), 0.0), 0.0, 1.0)
+                    record["sleep_model_confidence"] = round(model_prediction, 4)
+                    score = value + (confidence * 0.000000001) + (model_prediction * 0.0000000001)
+                    total_score += score
+                    best_score = score if best_score is None else max(best_score, score)
+                self.rebuild_action_heap_locked()
+            count = len(updates)
+            model_confidence = safe_float(model_result.get("confidence", 0.0), 0.0)
+            avg_confidence = (sum(item[3] for item in updates) / count if count else 0.0)
+            hardware = read_hardware_state()
+            resource_result = self.model.resource_model.train_from_metrics({"cpu_load": safe_float(hardware.get("cpu_load", 0.0), 0.0), "memory_free_ratio": safe_float(hardware.get("memory_free_ratio", 0.5), 0.5), "capture_ms": safe_float(getattr(self.settings, "training_event_wait", 0.05), 0.05) * 1000.0, "execution_ms": safe_float(getattr(self.settings, "generated_sleep_event_wait", 0.1), 0.1) * 1000.0, "window_instability": 1.0 - avg_confidence, "success_rate": model_confidence, "pool_count": len(self.records), "throughput": count, "batch_size": max(1, safe_int(getattr(self.settings, "sleep_batch_size", 1), 1)), "save_success_rate": 1.0, "training_gain": clamp((best_score or 0.0) / max(1.0, abs(self.settings.reward_total_max)), 0.0, 1.0)})
+            return {"trained": count, "model_trained": safe_int(model_result.get("trained", 0), 0), "model_loss": safe_float(model_result.get("loss", 0.0), 0.0), "best_score": round(best_score or 0.0, 4), "avg_score": round(total_score / count if count else 0.0, 4), "avg_confidence": round(clamp(avg_confidence * 0.6 + model_confidence * 0.4, 0.0, 1.0), 4), **resource_result}
+
+        finally:
+            with self.lock:
+                for index in indices:
+                    self.inflight_indices.discard(index)
 
     def rebuild_action_heap_locked(self):
         heap = []
@@ -6698,8 +6735,10 @@ class ControlPanel(tk.Tk):
                         self.update_progress(ratio * 25.0, force=True)
                         self.ui(lambda c=current, t=total: self.progress_label_var.set(f"睡眠评分复核中｜已复核 {c}/{t} 条"))
                     recheck_result = self.experience_pool.recheck_screen_scores(self.store, analyzer, run_guard=run_guard, progress_callback=score_progress)
-                self.events.publish("sleep_screen_scores_rechecked", **recheck_result)
-                self.store.merge_experience_records_by_id(copy.deepcopy(self.experience_pool.records))
+                event_result = {key: value for key, value in recheck_result.items() if key != "changed_records"}
+                self.events.publish("sleep_screen_scores_rechecked", **event_result)
+                self.store.merge_experience_records_by_id(recheck_result.get("changed_records", []))
+                recheck_result = event_result
                 if recheck_result.get("complete"):
                     checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task1_saved", task1_completed=True, task1_result=recheck_result)
                 else:
@@ -6712,6 +6751,8 @@ class ControlPanel(tk.Tk):
                 review_status = "quarantined" if blocking_records and trainable_records > 0 else ("completed" if not blocking_records else "failed")
         except Exception as exc:
             review_status = "failed"
+            fatal_error = {"phase": "recalculate_scores", "type": type(exc).__name__, "message": str(exc)}
+            recheck_result = {"complete": False, "checked": safe_int(recheck_result.get("checked", 0), 0) if isinstance(recheck_result, dict) else 0, "fatal_error": fatal_error}
             self.log_exception("sleep_score_recheck", exc, recheck_result)
         self.ui(lambda r=recheck_result: self.progress_label_var.set(f"睡眠训练进度｜评分复核 {r.get('checked', 0)} 条｜重评 {r.get('rescored', 0)} 条｜不可恢复 {r.get('unrecoverable', 0)} 条"))
         blocking_records = sum(safe_int(recheck_result.get(name, 0), 0) for name in ("unrecoverable", "image_missing", "image_corrupt"))
@@ -6719,8 +6760,10 @@ class ControlPanel(tk.Tk):
             self.store.log_error("sleep_score_recheck_unrecoverable", RuntimeError("unrecoverable_or_invalid_screen_records"), recheck_result)
         if review_status in ("failed", "interrupted"):
             failure_detail = {"stage": "评分复核", "review_status": review_status, "result": recheck_result, "auto_restart_allowed": False}
+            log_id = None
             if self.store:
-                self.store.log_error("sleep_review_failed_exit", RuntimeError("sleep_review_failed"), failure_detail)
+                log_id = self.store.log_error("sleep_review_failed_exit", RuntimeError("sleep_review_failed"), failure_detail)
+                failure_detail["log_id"] = log_id
             self.ui(lambda r=recheck_result: self.progress_label_var.set(f"睡眠评分复核失败｜缺失 {r.get('image_missing', 0)}｜损坏 {r.get('image_corrupt', 0)}｜不可恢复 {r.get('unrecoverable', 0)}"))
             self.update_progress(max(self.progress_value, 25.0), force=True)
             saved, save_error, save_report = self.save_after_task1(config, "review_failed", run_guard=run_guard, status_detail=failure_detail)
@@ -6733,7 +6776,20 @@ class ControlPanel(tk.Tk):
                 saved_progress = max(self.progress_value, 25.0)
                 self.render_sleep_completion_before_idle(f"睡眠评分复核失败：任务完成 {saved_progress:.1f}%，失败上下文已安全保存", saved_progress)
                 self.finish_run(token, "睡眠模式已退出：评分复核失败，需人工处理或明确降级策略", saved_progress, release=True, reason="runtime_error")
-                self.ui(lambda d=json.dumps(failure_detail, ensure_ascii=False, indent=2): messagebox.showerror("评分复核失败", d))
+                def show_review_error(d=failure_detail):
+                    fatal = d.get("result", {}).get("fatal_error", {}) if isinstance(d.get("result"), dict) else {}
+                    text = "\n".join([
+                        "睡眠评分复核失败，请先处理图片或存储问题后重试。",
+                        f"阶段：{fatal.get('phase', '重算评分')}",
+                        f"异常类型：{fatal.get('type', 'ScoreReviewError')}",
+                        f"异常信息：{fatal.get('message', d.get('review_status', 'failed'))}",
+                        f"错误编号：{d.get('log_id', '未写入')}",
+                        "可重试：是",
+                        "可跳过：否",
+                        "阻止自动重启训练：是"
+                    ])
+                    messagebox.showerror("评分复核失败", text)
+                self.ui(show_review_error)
             return
         saved, save_error, save_report = self.save_after_task1(config, "task1_completed", run_guard=run_guard, status_detail=recheck_result)
         if not saved:
