@@ -504,6 +504,8 @@ def prepare_startup_environment(check_environment=None, repair_environment=None,
     return False
 
 
+STARTUP_FAILURE_BUTTON_LABELS = ("选择雷电路径", "选择数据目录", "更多", "重试", "忽略", "退出")
+
 def interactive_startup_failure_repair(parent, status_var, message):
     result = {"retry": False, "exit": False, "ignore": False}
     dialog = tk.Toplevel(parent)
@@ -553,7 +555,7 @@ def interactive_startup_failure_repair(parent, status_var, message):
     def exit_program():
         result["exit"] = True
         dialog.destroy()
-    for label, command in (("选择雷电路径", choose_ldplayer), ("选择数据目录", choose_data_path), ("更多", show_log), ("重试", retry), ("忽略", ignore), ("退出", exit_program)):
+    for label, command in zip(STARTUP_FAILURE_BUTTON_LABELS, (choose_ldplayer, choose_data_path, show_log, retry, ignore, exit_program)):
         ttk.Button(actions, text=label, command=command).pack(side="left", padx=4)
     dialog.protocol("WM_DELETE_WINDOW", exit_program)
     parent.wait_window(dialog)
@@ -950,6 +952,7 @@ def run_self_test():
     startup_events = []
     assert not prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: actions.append("无法自动修复"), startup_events.append)
     assert len(startup_events) == 1 and "初检结果" in startup_events[0] and "初检后进行的自愈尝试" in startup_events[0] and "复检结果" in startup_events[0] and "下一步建议" in startup_events[0]
+    assert STARTUP_FAILURE_BUTTON_LABELS == ("选择雷电路径", "选择数据目录", "更多", "重试", "忽略", "退出")
     settings = derive_runtime_settings()
     assert len(settings.human_feature_weights) == len(HUMAN_FEATURE_NAMES)
     assert sum(settings.human_feature_weights) > 0.0
@@ -1021,6 +1024,33 @@ def run_self_test():
     suspended_event = threading.Event()
     assert not TrainingService(stop_check_panel).should_stop(time.perf_counter() - 2.0, stop_config, suspended_event, suspend_time_limit=True)
     assert not suspended_event.is_set()
+    execution_panel = type("ExecutionPanel", (), {})()
+    execution_stop = threading.Event()
+    execution_panel.termination_reason = None
+    execution_panel.should_stop_by_escape = lambda: False
+    execution_panel.window_manager = type("Window", (), {"check_window": lambda self, force=True: type("Check", (), {"ok": True, "reason": "ok"})()})()
+    execution_panel.cursor_inside_window = lambda: False
+    execution_panel.learning_idle_seconds = lambda: 0.0
+    execution_panel.settings = settings
+    execution_panel.mouse_recorder = None
+    execution_panel.status_var = type("Status", (), {"set": lambda self, value: setattr(execution_panel, "status_text", value)})()
+    execution_panel.ui = lambda fn: fn()
+    execution_panel.read_config = lambda: stop_config
+    execution_panel.current_rect = lambda: (0, 0, 100, 100)
+    execution_panel.write_record = lambda *args, **kwargs: setattr(execution_panel, "written_record", (args, kwargs))
+    execution_panel.log_exception = lambda *args, **kwargs: None
+    execution_panel.mark_learning_activity = lambda: None
+    execution_panel.events = type("Events", (), {"publish": lambda self, name, **data: setattr(execution_panel, "published_event", (name, data))})()
+    execution_panel.adaptive_policy = type("Policy", (), {"observe_execution": lambda self, success: setattr(execution_panel, "observed_success", success)})()
+    execution_panel.active_mode_stop_reason = ControlPanel.active_mode_stop_reason.__get__(execution_panel, type(execution_panel))
+    execution_panel.apply_active_stop_reason = ControlPanel.apply_active_stop_reason.__get__(execution_panel, type(execution_panel))
+    class GuardExecutor:
+        def execute(self, action, rect, stop_event, should_stop, on_activity=None):
+            return None if should_stop() else {"type": "click", "path": [], "duration": 0.0}
+    execution_panel.executor = GuardExecutor()
+    execution_snapshot = type("Snapshot", (), {"hash_value": a, "image_checksum": "", "semantic_vector": ()})()
+    assert not TrainingService(execution_panel).execute_and_record(None, "s", time.perf_counter(), (0, 0, 100, 100), execution_snapshot, {"type": "click", "start_rel": [0.5, 0.5]}, {}, execution_stop)[0]
+    assert execution_stop.is_set() and execution_panel.termination_reason == "cursor_outside"
     assert ("sleep", "training") not in ALLOWED_TRANSITIONS
     assert ("sleep", "starting") not in ALLOWED_TRANSITIONS
     assert ("sleep", "idle") not in ALLOWED_TRANSITIONS
@@ -1203,24 +1233,28 @@ def run_self_test():
         assert compact_models["removed"] == 1 and compact_models["model_count"] == 2 and not (store.model_dir / "model_old.json").exists() and (store.model_dir / "model_mid.json").exists() and (store.model_dir / "model_new.json").exists() and (store.model_dir / "partial_model_interrupted.json").exists()
         original_win32gui, original_win32api, original_win32con = globals().get("win32gui"), globals().get("win32api"), globals().get("win32con")
         class FakeWin32Gui:
+            visible = True
+            iconic = False
+            rect = (0, 0, 100, 80)
+            hit = 101
             @staticmethod
             def IsWindow(hwnd):
                 return True
             @staticmethod
             def GetClientRect(hwnd):
-                return (0, 0, 100, 80)
+                return (0, 0, FakeWin32Gui.rect[2] - FakeWin32Gui.rect[0], FakeWin32Gui.rect[3] - FakeWin32Gui.rect[1])
             @staticmethod
             def ClientToScreen(hwnd, point):
-                return point
+                return (FakeWin32Gui.rect[0] + point[0], FakeWin32Gui.rect[1] + point[1])
             @staticmethod
             def IsWindowVisible(hwnd):
-                return True
+                return FakeWin32Gui.visible
             @staticmethod
             def IsIconic(hwnd):
-                return False
+                return FakeWin32Gui.iconic
             @staticmethod
             def WindowFromPoint(point):
-                return 101
+                return FakeWin32Gui.hit
             @staticmethod
             def IsChild(hwnd, other):
                 return False
@@ -1248,6 +1282,18 @@ def run_self_test():
             manager.hwnd = 101
             checked_window = manager.check_window(force=True)
             assert checked_window.ok and checked_window.occluded_ratio == 0.0
+            FakeWin32Gui.iconic = True
+            manager.window_check_cache = {}
+            assert manager.check_window(force=True).reason == "minimized"
+            FakeWin32Gui.iconic = False
+            FakeWin32Gui.rect = (-10, 0, 90, 80)
+            manager.window_check_cache = {}
+            assert manager.check_window(force=True).reason == "out_of_screen"
+            FakeWin32Gui.rect = (0, 0, 100, 80)
+            FakeWin32Gui.hit = 202
+            manager.window_check_cache = {}
+            assert manager.check_window(force=True).reason == "occluded"
+            assert "completed" in ALLOWED_TRANSITIONS[("sleep", "stopping")] and ("sleep", "training") not in ALLOWED_TRANSITIONS
         finally:
             globals()["win32gui"] = original_win32gui
             globals()["win32api"] = original_win32api
@@ -1316,6 +1362,12 @@ def run_self_test():
         dummy_panel.settings = replace(settings, ui_progress_delta=1.0)
         ControlPanel.update_progress(dummy_panel, ControlPanel.idle_progress_value(dummy_panel, "learning", 87.0), force=True)
         assert dummy_panel.progress_value == 0.0 and dummy_panel.progress_var.value == 0.0
+        dummy_panel.mode = "sleep"
+        ControlPanel.update_progress(dummy_panel, 25.0, force=True)
+        ControlPanel.update_progress(dummy_panel, 20.8, force=True)
+        ControlPanel.update_progress(dummy_panel, 100.0, force=True)
+        assert dummy_panel.progress_value == 100.0 and dummy_panel.progress_var.value == 100.0
+        dummy_panel.mode = "idle"
         assert ControlPanel.idle_progress_value(dummy_panel, "training", 91.0) == 0.0
         assert ControlPanel.idle_progress_value(dummy_panel, "migration", 91.0) == 0.0
         store.save_settings({"training_seconds": 1, "still_seconds": 3, "experience_pool_gb": 4, "ai_model_limit": 5, "forbidden": 6})
@@ -5072,7 +5124,13 @@ class TrainingService:
             panel.write_record("training", session_id, snapshot, None, "ai_mouse_failed", decision=decision, planned_action=action, failed_action=True, window_rect_changed=True, execution_error="window_rect_changed")
             panel.adaptive_policy.observe_execution(success=False)
             return False, {"failure_reason": "window_rect_changed"}
-        actual = panel.executor.execute(action, rect, stop_event, panel.should_stop_by_escape, panel.mark_learning_activity)
+        def training_execution_stop():
+            reason = panel.active_mode_stop_reason("training", stop_event, panel.read_config())
+            if reason:
+                panel.apply_active_stop_reason("training", reason, stop_event)
+                return True
+            return False
+        actual = panel.executor.execute(action, rect, stop_event, training_execution_stop, panel.mark_learning_activity)
         panel.events.publish("mouse_action_completed", mode="training", success=bool(actual and not actual.get("execution_error")))
         if not actual:
             panel.log_exception("training.execute", RuntimeError("empty_action_result"))
@@ -6844,6 +6902,10 @@ class ControlPanel(tk.Tk):
 
     def update_progress(self, percent, force=False):
         percent = round(clamp(percent, 0.0, 100.0), 1)
+        mode_getter = getattr(self, "current_mode", None)
+        mode = mode_getter() if callable(mode_getter) else getattr(self, "mode", None)
+        if mode == "sleep" and percent > 0.0:
+            percent = max(getattr(self, "progress_value", 0.0), percent)
         if not force and abs(percent - self.progress_value) < self.settings.ui_progress_delta:
             return
         self.progress_value = percent
