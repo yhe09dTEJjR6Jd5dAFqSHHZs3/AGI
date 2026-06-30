@@ -666,6 +666,7 @@ ALLOWED_TRANSITIONS = {
 
 
 TERMINATION_REASONS = ("window_invalid", "cursor_outside", "rect_changed", "empty_action", "executor_error", "zero_score_unrecoverable", "time_limit", "esc", "still_timeout", "user_stop", "migration_error", "completed")
+RUNNING_MODES = {"starting", "learning", "training", "sleep", "migration"}
 HUMAN_FEATURE_NAMES = ("duration", "direct", "bend", "points", "speed_mean", "speed_variance", "acceleration_change", "pauses", "hover_before", "drag_curvature", "double_click_interval")
 
 RUNTIME_NUMBER_RULES = {
@@ -1285,7 +1286,9 @@ def run_self_test():
         assert edge_points and all(point_inside(edge_rect, x, y) for x, y in edge_points)
         assert mouse_executor.clamp_point_to_rect((-100, 100), edge_rect) == (10, 39)
         assert ControlPanel.sleep_completion_reached(dummy_panel, 3, 3)
+        store.pending_state_writes = 2
         assert ControlPanel.sleep_completion_reached(dummy_panel, 3, 3)
+        store.pending_state_writes = 0
         assert not ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, "failed")
         task3_store = DataStore(root / "task3")
         task3_store.model_dir.mkdir(parents=True, exist_ok=True)
@@ -1405,13 +1408,14 @@ def run_self_test():
         stopped_event.set()
         transition_panel.stop_event = stopped_event
         transition_panel.active_session = ModeSession(7, "training", time.perf_counter(), None, stopped_event)
-        transition_panel.termination_reason = None
+        transition_panel.termination_reason = "user_stop"
         transition_panel.events = type("Events", (), {"publish": lambda self, name=None, **kwargs: {"sequence": 1}})()
         transition_panel.set_mode_ui = lambda mode: None
         transition_panel.ui = lambda fn: fn()
         transition_panel.update_mode_button_states = lambda: None
         sleep_session = ControlPanel.transition(transition_panel, "training", "sleep", reason="time_limit", token=7, fresh_stop_event=True)
         assert sleep_session and not sleep_session.stop_event.is_set() and sleep_session.stop_event is not stopped_event
+        assert sleep_session.termination_reason is None and transition_panel.termination_reason is None
         class DummyVar:
             def __init__(self):
                 self.value = None
@@ -6303,7 +6307,15 @@ class ControlPanel(tk.Tk):
                 self.stop_event = stop_event
                 self.mode = target
                 event = self.events.publish("mode_transition", source=source, target=target, reason=transition_reason, token=session_token)
-                session = ModeSession(session_token, target, time.perf_counter(), deadline, stop_event, transition_reason, event["sequence"])
+                if target in RUNNING_MODES:
+                    self.termination_reason = None
+                    session_reason = None
+                elif target == "stopping":
+                    self.termination_reason = transition_reason
+                    session_reason = transition_reason
+                else:
+                    session_reason = transition_reason
+                session = ModeSession(session_token, target, time.perf_counter(), deadline, stop_event, session_reason, event["sequence"])
                 self.active_session = session
         self.set_mode_ui(target)
         self.ui(self.update_mode_button_states)
@@ -6770,8 +6782,7 @@ class ControlPanel(tk.Tk):
         return size_bytes <= target_bytes
 
     def sleep_completion_reached(self, completed, target_training_steps, review_status="completed"):
-        pending_state = safe_int(getattr(self.store, "pending_state_writes", 0), 0) if self.store else 0
-        return review_status in ("completed", "quarantined") and completed >= target_training_steps and pending_state == 0
+        return review_status in ("completed", "quarantined") and completed >= target_training_steps
 
     def sleep_loop(self, token, config, stop_event, restart_training=False):
         self.events.publish("sleep_started", data_path=str(config.data_path))
@@ -6795,7 +6806,10 @@ class ControlPanel(tk.Tk):
         checkpoint = self.store.load_sleep_checkpoint() if self.store else None
         if not checkpoint or checkpoint.get("completed"):
             checkpoint = {"run_id": uuid.uuid4().hex, "stage": "prepare", "task1_completed": False, "task2_completed": False, "task3_model_cleanup_completed": False, "task3_pool_compaction_completed": False, "created_at": now_text()}
-        run_guard = lambda: should_stop_run(stop_event, None, self.should_stop_by_escape, getattr(self.active_session, "termination_reason", None) or self.termination_reason)
+        def current_session_reason():
+            with self.state_lock:
+                return self.active_session.termination_reason if self.active_session and self.active_session.token == token else None
+        run_guard = lambda: should_stop_run(stop_event, None, self.should_stop_by_escape, current_session_reason())
         self.ui(lambda: self.progress_label_var.set("睡眠准备中｜暂停异步写入并刷盘"))
         try:
             if self.store:
@@ -6910,70 +6924,82 @@ class ControlPanel(tk.Tk):
             completed = target_training_steps
             completed_normally = True
         else:
-            visual_model = self.experience_pool.train_local_vision_model() if self.experience_pool else {"status": "missing_pool"}
-            self.events.publish("sleep_local_vision_model_trained", status=visual_model.get("status"), records=visual_model.get("records", 0), clusters=len(visual_model.get("clusters", [])))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = set()
-                for _ in range(queue_depth):
-                    if not submit_next(executor, futures):
-                        break
-                while not stop_event.is_set() and (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
-                    guarded = run_guard()
-                    if guarded:
-                        with self.state_lock:
-                            self.termination_reason = guarded
-                            if self.active_session:
-                                self.active_session.termination_reason = guarded
-                        stop_event.set()
-                        break
-                    percent = self.sleep_progress_percent(completed, target_training_steps, compaction_progress)
-                    self.update_progress(percent)
-                    if not futures:
-                        submit_next(executor, futures)
-                    done, futures = concurrent.futures.wait(futures, timeout=config.settings.sleep_event_wait, return_when=concurrent.futures.FIRST_COMPLETED)
-                    if not done:
-                        continue
-                    trained = 0
-                    best_score = 0.0
-                    avg_score = 0.0
-                    avg_confidence = 0.0
-                    for future in done:
-                        try:
-                            result = future.result()
-                        except Exception as exc:
-                            self.log_exception("sleep_training", exc, {"submitted": submitted, "completed": completed})
-                            result = {"trained": 0, "best_score": 0.0, "avg_score": 0.0, "avg_confidence": 0.0, "model_loss": None}
-                        completed += 1
-                        trained += safe_int(result.get("trained", 0), 0)
-                        best_score = max(best_score, safe_float(result.get("best_score", 0.0), 0.0))
-                        avg_score += safe_float(result.get("avg_score", 0.0), 0.0)
-                        avg_confidence += safe_float(result.get("avg_confidence", 0.0), 0.0)
-                    for _ in range(queue_depth - len(futures)):
+            try:
+                visual_model = self.experience_pool.train_local_vision_model() if self.experience_pool else {"status": "missing_pool"}
+                self.events.publish("sleep_local_vision_model_trained", status=visual_model.get("status"), records=visual_model.get("records", 0), clusters=len(visual_model.get("clusters", [])))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = set()
+                    for _ in range(queue_depth):
                         if not submit_next(executor, futures):
                             break
-                    divisor = max(1, len(done))
-                    batch_score = avg_score / divisor
-                    batch_confidence = avg_confidence / divisor
-                    screen_score_total = self.store.state.get("screen_score_total", 0.0) if self.store else 0.0
-                    compact = {"changed": False, "size_bytes": self.store.experience_pool_size_bytes() if self.store else 0, "target_bytes": max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))}
-                    compaction_progress = self.sleep_compaction_progress(compact)
-                    compaction_complete = self.sleep_compaction_complete(compact)
-                    if self.sleep_completion_reached(completed, target_training_steps, review_status):
-                        completed_normally = True
-                        self.events.publish("sleep_completion_reached", completed_batches=completed, target_training_steps=target_training_steps, confidence=batch_confidence)
-                        break
-                    divisor = max(1, len(done))
-                    self.events.publish("sleep_batch_completed", trained=trained, best_score=best_score, confidence=batch_confidence, completed_batches=completed)
-                    decision = {"reason": "sleep_prioritized_replay", "confidence": batch_confidence, "candidate_count": trained, "best_score": best_score, "completed_batches": completed, "target_training_steps": target_training_steps, "workers": workers, "pool_compacted": compact.get("changed", False), "pool_removed": compact.get("removed", 0)}
-                    self.update_metrics(0.0, 50.0 + clamp(batch_confidence * 50.0, 0.0, 50.0), 0.0, batch_score, best_score, screen_score_total, decision)
-                    self.ui(lambda c=completed, t=target_training_steps, q=batch_confidence: self.progress_label_var.set(f"睡眠训练进度｜已训练批次 {c}/{t}｜当前置信度 {q * 100.0:.1f}%"))
-                    self.update_progress(self.sleep_progress_percent(completed, target_training_steps, compaction_progress))
-                for future in futures:
-                    future.cancel()
-                if completed_normally and not stop_event.is_set() and self.store:
-                    checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task2_saved", task2_completed=True, completed_batches=completed, target_training_steps=target_training_steps)
+                    while not stop_event.is_set() and (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
+                        guarded = run_guard()
+                        if guarded:
+                            with self.state_lock:
+                                self.termination_reason = guarded
+                                if self.active_session:
+                                    self.active_session.termination_reason = guarded
+                            stop_event.set()
+                            break
+                        percent = self.sleep_progress_percent(completed, target_training_steps, compaction_progress)
+                        self.update_progress(percent)
+                        if not futures:
+                            if self.sleep_completion_reached(completed, target_training_steps, review_status):
+                                completed_normally = True
+                                self.events.publish("sleep_completion_reached", completed_batches=completed, target_training_steps=target_training_steps, confidence=0.0)
+                                break
+                            if not submit_next(executor, futures):
+                                raise RuntimeError("睡眠任务2无可执行批次，但训练目标尚未完成")
+                        done, futures = concurrent.futures.wait(futures, timeout=config.settings.sleep_event_wait, return_when=concurrent.futures.FIRST_COMPLETED)
+                        if not done:
+                            continue
+                        trained = 0
+                        best_score = 0.0
+                        avg_score = 0.0
+                        avg_confidence = 0.0
+                        for future in done:
+                            try:
+                                result = future.result()
+                            except Exception as exc:
+                                self.log_exception("sleep_training", exc, {"submitted": submitted, "completed": completed})
+                                result = {"trained": 0, "best_score": 0.0, "avg_score": 0.0, "avg_confidence": 0.0, "model_loss": None}
+                            completed += 1
+                            trained += safe_int(result.get("trained", 0), 0)
+                            best_score = max(best_score, safe_float(result.get("best_score", 0.0), 0.0))
+                            avg_score += safe_float(result.get("avg_score", 0.0), 0.0)
+                            avg_confidence += safe_float(result.get("avg_confidence", 0.0), 0.0)
+                        for _ in range(queue_depth - len(futures)):
+                            if not submit_next(executor, futures):
+                                break
+                        divisor = max(1, len(done))
+                        batch_score = avg_score / divisor
+                        batch_confidence = avg_confidence / divisor
+                        screen_score_total = self.store.state.get("screen_score_total", 0.0) if self.store else 0.0
+                        compact = {"changed": False, "size_bytes": self.store.experience_pool_size_bytes() if self.store else 0, "target_bytes": max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))}
+                        compaction_progress = self.sleep_compaction_progress(compact)
+                        compaction_complete = self.sleep_compaction_complete(compact)
+                        if self.sleep_completion_reached(completed, target_training_steps, review_status):
+                            completed_normally = True
+                            self.events.publish("sleep_completion_reached", completed_batches=completed, target_training_steps=target_training_steps, confidence=batch_confidence)
+                            break
+                        divisor = max(1, len(done))
+                        self.events.publish("sleep_batch_completed", trained=trained, best_score=best_score, confidence=batch_confidence, completed_batches=completed)
+                        decision = {"reason": "sleep_prioritized_replay", "confidence": batch_confidence, "candidate_count": trained, "best_score": best_score, "completed_batches": completed, "target_training_steps": target_training_steps, "workers": workers, "pool_compacted": compact.get("changed", False), "pool_removed": compact.get("removed", 0)}
+                        self.update_metrics(0.0, 50.0 + clamp(batch_confidence * 50.0, 0.0, 50.0), 0.0, batch_score, best_score, screen_score_total, decision)
+                        self.ui(lambda c=completed, t=target_training_steps, q=batch_confidence: self.progress_label_var.set(f"睡眠训练进度｜已训练批次 {c}/{t}｜当前置信度 {q * 100.0:.1f}%"))
+                        self.update_progress(self.sleep_progress_percent(completed, target_training_steps, compaction_progress))
+                    for future in futures:
+                        future.cancel()
+                    if completed_normally and not stop_event.is_set() and self.store:
+                        checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task2_saved", task2_completed=True, completed_batches=completed, target_training_steps=target_training_steps)
+            except Exception as exc:
+                completed_normally = False
+                self.log_exception("sleep_task2", exc, {"submitted": submitted, "completed": completed, "target_training_steps": target_training_steps})
+                if self.store:
+                    self.store.log_error("sleep_task2_failed", exc, {"submitted": submitted, "completed": completed, "target_training_steps": target_training_steps})
         with self.state_lock:
-            stopped_reason = self.termination_reason if self.termination_reason in ("esc", "user_stop") else None
+            session_reason = self.active_session.termination_reason if self.active_session and self.active_session.token == token else None
+        stopped_reason = session_reason if stop_event.is_set() and session_reason in ("esc", "user_stop") else None
         save_status = "completed" if completed_normally and not stopped_reason else stopped_reason or "incomplete"
         if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
             self.update_progress(70.0, force=True)
@@ -7021,8 +7047,9 @@ class ControlPanel(tk.Tk):
                 if finished and restart_training:
                     self.main_thread_events.put({"type": "restart_training", "token": token, "reason": "completed"})
             else:
-                final_reason = stopped_reason or "user_stop"
-                unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, "用户中断" if stopped_reason else "未完成", models_complete)
+                final_reason = stopped_reason or "runtime_error"
+                unfinished_reason = "用户中断" if stopped_reason else "运行异常"
+                unfinished = self.sleep_unfinished_summary(review_status, completed, target_training_steps, compaction_complete, unfinished_reason, models_complete)
                 interrupted_progress = self.sleep_progress_percent(completed, target_training_steps, compaction_progress)
                 self.render_sleep_completion_before_idle(f"睡眠模式已中断：任务完成 {interrupted_progress:.1f}%，数据已安全保存｜{unfinished}", interrupted_progress)
                 self.finish_run(token, f"睡眠模式未完成：{unfinished}。数据已安全保存", interrupted_progress, release=True, reason=final_reason)
