@@ -2852,19 +2852,43 @@ class DataStore:
         except Exception as exc:
             return self.rebuild_bad_state(exc)
 
+    def fsync_directory(self, path):
+        try:
+            fd = os.open(str(Path(path)), os.O_RDONLY)
+        except Exception:
+            return
+        try:
+            os.fsync(fd)
+        except Exception:
+            pass
+        finally:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
+    def replace_atomic_synced(self, temporary, target):
+        temporary.replace(target)
+        self.fsync_directory(Path(target).parent)
+
     def save_state(self):
         with self.lock:
             temporary = self.state_file.with_suffix(".tmp")
             with temporary.open("w", encoding="utf-8") as file:
                 json.dump(self.state, file, ensure_ascii=False, indent=2)
-            temporary.replace(self.state_file)
+                file.flush()
+                os.fsync(file.fileno())
+            self.replace_atomic_synced(temporary, self.state_file)
 
     def write_json_atomic(self, path, payload):
         with self.lock:
-            temporary = Path(path).with_suffix(Path(path).suffix + ".tmp")
+            target = Path(path)
+            temporary = target.with_suffix(target.suffix + ".tmp")
             with temporary.open("w", encoding="utf-8") as file:
                 json.dump(payload, file, ensure_ascii=False, indent=2)
-            temporary.replace(path)
+                file.flush()
+                os.fsync(file.fileno())
+            self.replace_atomic_synced(temporary, target)
 
     def load_sleep_checkpoint(self):
         try:
@@ -2948,6 +2972,8 @@ class DataStore:
             self.ensure_experience_newline()
             with self.experience_file.open("a", encoding="utf-8") as file:
                 file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                file.flush()
+                os.fsync(file.fileno())
 
     def save_experience_records(self, records):
         with self.lock:
@@ -2955,7 +2981,9 @@ class DataStore:
             with temporary.open("w", encoding="utf-8") as file:
                 for record in records or []:
                     file.write(json.dumps(record, ensure_ascii=False) + "\n")
-            temporary.replace(self.experience_file)
+                file.flush()
+                os.fsync(file.fileno())
+            self.replace_atomic_synced(temporary, self.experience_file)
 
     def merge_experience_records_by_id(self, records):
         updates = {str(record.get("id")): record for record in records or [] if isinstance(record, dict) and record.get("id")}
@@ -2990,12 +3018,16 @@ class DataStore:
                         if record_id not in seen:
                             target.write(json.dumps(record, ensure_ascii=False) + "\n")
                             appended += 1
-                temporary.replace(self.experience_file)
+                    target.flush()
+                    os.fsync(target.fileno())
+                self.replace_atomic_synced(temporary, self.experience_file)
             else:
                 with temporary.open("w", encoding="utf-8") as target:
                     for record in updates.values():
                         target.write(json.dumps(record, ensure_ascii=False) + "\n")
-                temporary.replace(self.experience_file)
+                    target.flush()
+                    os.fsync(target.fileno())
+                self.replace_atomic_synced(temporary, self.experience_file)
                 appended = len(updates)
             return {"changed": bool(changed or appended), "updated": changed, "appended": appended}
 
@@ -3026,13 +3058,15 @@ class DataStore:
             temporary = path.with_suffix(".tmp")
             with temporary.open("w", encoding="utf-8") as file:
                 json.dump(payload, file, ensure_ascii=False, indent=2)
+                file.flush()
+                os.fsync(file.fileno())
             if run_guard and run_guard():
                 try:
                     temporary.unlink(missing_ok=True)
                 except Exception:
                     pass
                 return None
-            temporary.replace(path)
+            self.replace_atomic_synced(temporary, path)
             return path
 
     def model_created_key(self, path):
@@ -3362,7 +3396,7 @@ class DataStore:
                     file.write(item["text"] + "\n")
                 file.flush()
                 os.fsync(file.fileno())
-            temporary.replace(self.experience_file)
+            self.replace_atomic_synced(temporary, self.experience_file)
             for path in delete_after_replace:
                 try:
                     if path.exists() and path.is_file():
@@ -6339,17 +6373,14 @@ class ControlPanel(tk.Tk):
     def sleep_progress_fields(self, completed_steps, target_training_steps, compaction_progress):
         training_ratio = clamp(safe_float(completed_steps, 0.0) / max(1.0, safe_float(target_training_steps, 1.0)), 0.0, 1.0)
         compact_ratio = clamp(compaction_progress, 0.0, 1.0)
-        previous_ratio = clamp(getattr(self, "progress_value", 0.0) / 100.0, 0.0, 1.0)
-        review_ratio = 1.0 if completed_steps > 0 or target_training_steps <= 0 else 0.0
-        model_compaction_ratio = compact_ratio
-        pool_compaction_ratio = compact_ratio
-        save_ratio = clamp((previous_ratio - 0.92) / 0.08, 0.0, 1.0)
-        prepare_ratio = 1.0 if completed_steps > 0 else 0.0
-        stage_ratio = prepare_ratio * 0.05 + review_ratio * 0.25 + training_ratio * 0.40 + model_compaction_ratio * 0.10 + pool_compaction_ratio * 0.12 + save_ratio * 0.08
-        return {"prepare": prepare_ratio, "review": review_ratio, "training": training_ratio, "compaction": compact_ratio, "model_compaction": model_compaction_ratio, "pool_compaction": pool_compaction_ratio, "save": save_ratio, "overall": max(previous_ratio, min(stage_ratio, 0.92 if save_ratio <= 0.0 else 1.0))}
+        overall = 0.25 + training_ratio * 0.45
+        return {"prepare": 1.0, "review": 1.0, "training": training_ratio, "compaction": compact_ratio, "model_compaction": 0.0, "pool_compaction": 0.0, "save": 0.0, "overall": clamp(overall, 0.25, 0.70)}
 
     def sleep_progress_percent(self, completed_steps, target_training_steps, compaction_progress):
         return clamp(self.sleep_progress_fields(completed_steps, target_training_steps, compaction_progress)["overall"] * 100.0, 0.0, 100.0)
+
+    def sleep_stage_progress(self, start, end, ratio):
+        return clamp(safe_float(start, 0.0) + (safe_float(end, 0.0) - safe_float(start, 0.0)) * clamp(safe_float(ratio, 0.0), 0.0, 1.0), 0.0, 100.0)
 
     def sleep_compaction_progress(self, compact):
         if not isinstance(compact, dict):
@@ -6381,7 +6412,7 @@ class ControlPanel(tk.Tk):
         workers = max(1, config.settings.sleep_worker_count)
         queue_depth = max(workers, config.settings.sleep_queue_depth)
         batch_size = max(1, config.settings.sleep_batch_size)
-        minimum_training_batches = max(workers, queue_depth)
+        minimum_training_batches = workers
         target_training_steps = max(minimum_training_batches, math.ceil(max(1, self.experience_pool.count() if self.experience_pool else 1) / batch_size), workers * max(1, config.settings.ui_metric_columns))
         initial_compact = {"changed": False, "size_bytes": self.store.experience_pool_size_bytes() if self.store else 0, "target_bytes": max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))}
         compaction_progress = self.sleep_compaction_progress(initial_compact)
@@ -6474,9 +6505,13 @@ class ControlPanel(tk.Tk):
         def submit_next(executor, futures):
             nonlocal submitted
             if stop_event.is_set() or not (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
-                return
+                return False
+            remaining = target_training_steps - completed - len(futures)
+            if remaining <= 0:
+                return False
             futures.add(executor.submit(train_once))
             submitted += 1
+            return True
         if self.store and not checkpoint.get("task2_completed"):
             checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task2_training", task2_completed=False)
         if checkpoint.get("task2_completed"):
@@ -6488,7 +6523,8 @@ class ControlPanel(tk.Tk):
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = set()
                 for _ in range(queue_depth):
-                    submit_next(executor, futures)
+                    if not submit_next(executor, futures):
+                        break
                 while not stop_event.is_set() and (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
                     guarded = run_guard()
                     if guarded:
@@ -6520,7 +6556,9 @@ class ControlPanel(tk.Tk):
                         best_score = max(best_score, safe_float(result.get("best_score", 0.0), 0.0))
                         avg_score += safe_float(result.get("avg_score", 0.0), 0.0)
                         avg_confidence += safe_float(result.get("avg_confidence", 0.0), 0.0)
-                        submit_next(executor, futures)
+                    for _ in range(queue_depth - len(futures)):
+                        if not submit_next(executor, futures):
+                            break
                     divisor = max(1, len(done))
                     batch_score = avg_score / divisor
                     batch_confidence = avg_confidence / divisor
@@ -6546,8 +6584,8 @@ class ControlPanel(tk.Tk):
             stopped_reason = self.termination_reason if self.termination_reason in ("esc", "user_stop") else None
         save_status = "completed" if completed_normally and not stopped_reason else stopped_reason or "incomplete"
         if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
-            self.update_progress(max(self.progress_value, 92.0), force=True)
-            self.ui(lambda: self.progress_label_var.set("睡眠模式保存中｜进度 92%"))
+            self.update_progress(70.0, force=True)
+            self.ui(lambda: self.progress_label_var.set("睡眠任务2｜保存模型快照 70%"))
         task3_report = None
         saved, save_error, save_report = self.save_after_task2(config, save_status, run_guard=run_guard)
         compaction_complete = bool(save_report.get("compaction_complete", compaction_complete)) if isinstance(save_report, dict) else compaction_complete
@@ -6644,7 +6682,7 @@ class ControlPanel(tk.Tk):
         checkpoint = self.store.save_sleep_checkpoint(checkpoint or {}, stage="task3_model_cleanup_saved", task3_model_cleanup_completed=bool(model_result.get("complete")))
         if not model_result.get("complete"):
             raise RuntimeError("睡眠模式任务3未完成：AI模型清理未完成")
-        self.update_progress(max(self.progress_value, 94.0), force=True)
+        self.update_progress(85.0, force=True)
         if run_guard and run_guard():
             raise RuntimeError("睡眠模式任务3被中断：经验池压缩未执行")
         self.ui(lambda: self.progress_label_var.set("睡眠任务3｜压缩经验池至上限50%"))
@@ -6655,21 +6693,21 @@ class ControlPanel(tk.Tk):
         self.store.save_sleep_checkpoint(checkpoint or {}, stage="task3_pool_compaction_saved", task3_pool_compaction_completed=bool(pool_result.get("complete")))
         if not pool_result.get("complete"):
             raise RuntimeError("睡眠模式任务3未完成：经验池压缩未完成")
-        self.update_progress(max(self.progress_value, 96.0), force=True)
+        self.update_progress(95.0, force=True)
         return model_result, pool_result
 
     def save_after_task1(self, config, status, run_guard=None, status_detail=None):
         stage = "task1_completed" if status == "task1_completed" else "task1_failure_saved"
-        return self.save_sleep_data(config, status, run_guard=run_guard, status_detail=status_detail, save_model=False, checkpoint_stage=stage)
+        return self.save_sleep_data(config, status, run_guard=run_guard, status_detail=status_detail, save_model=False, checkpoint_stage=stage, progress_start=20.0, progress_end=25.0)
 
     def save_after_task2(self, config, status, run_guard=None, status_detail=None):
         completed = status == "completed"
-        return self.save_sleep_data(config, status, run_guard=run_guard, status_detail=status_detail, save_model=completed, checkpoint_stage="task2_saved" if completed else "task2_interrupted_saved", allow_cleanup=False)
+        return self.save_sleep_data(config, status, run_guard=run_guard, status_detail=status_detail, save_model=completed, checkpoint_stage="task2_saved" if completed else "task2_interrupted_saved", allow_cleanup=False, progress_start=70.0, progress_end=75.0)
 
     def save_after_task3(self, config, status, task3_report=None, status_detail=None):
-        return self.save_sleep_data(config, status, run_guard=None, status_detail=status_detail, task3_report=task3_report, save_model=False, checkpoint_stage="task3_final_saved", allow_cleanup=False)
+        return self.save_sleep_data(config, status, run_guard=None, status_detail=status_detail, task3_report=task3_report, save_model=False, checkpoint_stage="task3_final_saved", allow_cleanup=False, progress_start=95.0, progress_end=100.0)
 
-    def save_sleep_data(self, config, status, run_guard=None, status_detail=None, task3_report=None, save_model=True, checkpoint_stage=None, allow_cleanup=False):
+    def save_sleep_data(self, config, status, run_guard=None, status_detail=None, task3_report=None, save_model=True, checkpoint_stage=None, allow_cleanup=False, progress_start=95.0, progress_end=100.0):
         if not self.store or not self.experience_pool:
             return True, None, {"model_count": 0, "experience_size": 0, "target_bytes": 0, "compaction_complete": True, "models_complete": True}
         try:
@@ -6678,11 +6716,11 @@ class ControlPanel(tk.Tk):
             if self.persistence_queue:
                 self.persistence_queue.flush()
             self.store.flush_state(force=True)
-            self.update_progress(max(self.progress_value, 92.0), force=True)
+            self.update_progress(self.sleep_stage_progress(progress_start, progress_end, 0.15), force=True)
             with self.experience_pool.lock:
                 self.store.merge_experience_records_by_id(copy.deepcopy(self.experience_pool.records))
                 model = self.experience_pool.model
-            self.update_progress(max(self.progress_value, 97.0), force=True)
+            self.update_progress(self.sleep_stage_progress(progress_start, progress_end, 0.55), force=True)
             compact = (task3_report or {}).get("pool") if isinstance(task3_report, dict) else None
             if not isinstance(compact, dict):
                 size_bytes = self.store.experience_pool_size_bytes()
@@ -6694,7 +6732,7 @@ class ControlPanel(tk.Tk):
             model_compact = self.store.compact_ai_models(config.ai_model_limit) if allow_cleanup else {"changed": False, "removed": 0, "limit": config.ai_model_limit, "model_count": len(list(self.store.model_dir.glob("model_*.json"))), "complete": True, "deferred_to_task3": True}
             self.experience_pool = ExperiencePool(config.settings, final_records, self.store.load_latest_model_state(config.settings))
             self.brain = ActionBrain(self.experience_pool, config.settings)
-            self.update_progress(max(self.progress_value, 99.0), force=True)
+            self.update_progress(self.sleep_stage_progress(progress_start, progress_end, 0.85), force=True)
             self.store.flush_state(force=True)
             model_count = len(list(self.store.model_dir.glob("model_*.json")))
             target_bytes = max(1, safe_int(compact.get("target_bytes", 0), 0))
