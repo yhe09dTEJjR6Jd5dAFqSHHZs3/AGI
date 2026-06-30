@@ -3690,9 +3690,10 @@ class WindowCheck:
 
 
 class WindowManager:
-    def __init__(self, executable_path, settings):
+    def __init__(self, executable_path, settings, ignored_hwnds=None):
         self.executable_path = Path(executable_path)
         self.settings = settings
+        self.ignored_hwnds = set(int(item) for item in (ignored_hwnds or ()) if item)
         self.process = None
         self.hwnd = None
         self.lock = threading.RLock()
@@ -3815,13 +3816,16 @@ class WindowManager:
     def topmost(self):
         self.foreground()
 
+    def set_ignored_hwnds(self, hwnds):
+        self.ignored_hwnds = set(int(item) for item in (hwnds or ()) if item)
+
 
     def occluded_area_ratio(self, hwnd, rect):
         front = []
         target_area = max(1, rect_area(rect))
         def handler(other, _):
             try:
-                if other == hwnd or win32gui.IsChild(hwnd, other) or not win32gui.IsWindowVisible(other) or win32gui.IsIconic(other):
+                if other == hwnd or other in self.ignored_hwnds or win32gui.IsChild(hwnd, other) or any(win32gui.IsChild(ignored, other) for ignored in self.ignored_hwnds) or not win32gui.IsWindowVisible(other) or win32gui.IsIconic(other):
                     return
                 other_rect = win32gui.GetWindowRect(other)
                 inter = rect_intersection(rect, other_rect)
@@ -3891,7 +3895,7 @@ class WindowManager:
             hits = 0
             for point in points:
                 hit = win32gui.WindowFromPoint(point)
-                if hit == hwnd or win32gui.IsChild(hwnd, hit):
+                if hit == hwnd or win32gui.IsChild(hwnd, hit) or hit in self.ignored_hwnds or any(win32gui.IsChild(ignored, hit) for ignored in self.ignored_hwnds):
                     hits += 1
             cache["occlusion_perf"] = now_perf
             occluded_ratio = self.occluded_area_ratio(hwnd, rect)
@@ -4920,6 +4924,8 @@ class HumanMouseExecutor:
     def execute(self, action, rect, stop_event, should_stop, on_activity=None):
         if not action:
             return None
+        if rect:
+            self.controller.position = self.clamp_point_to_rect(self.controller.position, rect)
         self.window_manager.topmost()
         if not self.window_manager.window_ok(force=True):
             return {"execution_error": "window_not_ready"}
@@ -4984,6 +4990,8 @@ class HumanMouseExecutor:
                     pass
         if stop_event.is_set():
             return None
+        if rect:
+            self.controller.position = self.clamp_point_to_rect(self.controller.position, rect)
         actual = {"type": action_type if action_type in ["click", "drag", "scroll"] else "click", "button": str(button), "source": "ai", "started_at": started_at, "ended_at": now_text(), "started_perf": action_t, "ended_perf": time.perf_counter(), "duration": round(max(0.0, time.perf_counter() - action_t), 6), "start_abs": [int(start_abs[0]), int(start_abs[1])], "end_abs": [int(end_abs[0]), int(end_abs[1])], "path": actual_path}
         if action_type == "scroll":
             actual["scroll"] = action.get("scroll") or [0, 0]
@@ -5490,6 +5498,15 @@ class ControlPanel(tk.Tk):
         self.hint_label = None
         self.metrics_frame = None
         self.app_config_store = AppConfigStore()
+        self.hint_templates = {
+            "idle": "当前处于空闲。可修改允许的六项参数，或启动学习、训练、睡眠模式；启动学习/训练前会自动检查并修复运行环境。",
+            "starting": "正在准备模式。控制面板会最小化，鼠标会被放入雷电模拟器客户区；本程序窗口造成的遮挡不会判定为客户区异常。",
+            "learning": "学习模式：请只在雷电模拟器客户区内操作。ESC、鼠标静止超时、用户鼠标离开客户区或客户区真实异常会结束并保存数据。",
+            "training": "训练模式：AI 鼠标动作会被限制在雷电模拟器客户区内。ESC、用户干预导致鼠标离开客户区或客户区真实异常会结束并保存数据。",
+            "sleep": "睡眠模式：正在检查样本评分、训练一组 AI 模型并清理模型组和经验池；进度条会从 0% 推进到 100%。",
+            "migration": "正在迁移数据目录。请等待复制、校验与保存完成，完成前不要关闭程序。",
+            "stopping": "正在安全保存与退出当前模式。后台写入完成后会回到空闲并显示控制面板。"
+        }
         self.build_ui()
         self.load_persistent_settings()
         self.after_idle(self.fit_complete_panel)
@@ -5568,6 +5585,21 @@ class ControlPanel(tk.Tk):
             style.theme_use("clam")
         except Exception:
             pass
+        bg = "#eef3f8"
+        card_bg = "#ffffff"
+        accent = "#2563eb"
+        text = "#172033"
+        muted = "#5b677a"
+        self.configure(bg=bg)
+        style.configure(".", font=("Microsoft YaHei UI", 10), background=bg, foreground=text)
+        style.configure("TFrame", background=bg)
+        style.configure("Card.TFrame", background=card_bg, relief="flat")
+        style.configure("TLabelframe", background=bg, bordercolor="#cbd5e1", relief="solid")
+        style.configure("TLabelframe.Label", background=bg, foreground=text, font=("Microsoft YaHei UI", 10, "bold"))
+        style.configure("TButton", padding=(14, 8), font=("Microsoft YaHei UI", 10, "bold"))
+        style.map("TButton", background=[("active", "#dbeafe")], foreground=[("disabled", "#94a3b8")])
+        style.configure("TEntry", fieldbackground="#f8fafc", bordercolor="#cbd5e1", padding=4)
+        style.configure("Horizontal.TProgressbar", troughcolor="#dbeafe", background=accent)
         scale = max(0.8, min(2.2, float(self.winfo_fpixels("1i")) / 96.0))
         pane_h = max(1, self.winfo_height() or self.settings.ui_height)
         font_scale = max(0.8, min(2.1, (pane_h / max(1, self.settings.ui_min_height)) ** 0.5 * scale))
@@ -5577,7 +5609,7 @@ class ControlPanel(tk.Tk):
         style.configure("Title.TLabel", font=("Microsoft YaHei UI", title_size, "bold"))
         style.configure("CardTitle.TLabel", font=("Microsoft YaHei UI", card_size))
         style.configure("Value.TLabel", font=("Microsoft YaHei UI", value_size, "bold"))
-        style.configure("Hint.TLabel", foreground="#555555")
+        style.configure("Hint.TLabel", foreground=muted, background=card_bg)
         root = ttk.Frame(self, padding=self.settings.ui_padding)
         root.pack(fill="both", expand=True)
         self.scroll_canvas = tk.Canvas(root, highlightthickness=0, borderwidth=0)
@@ -5585,6 +5617,7 @@ class ControlPanel(tk.Tk):
         self.scroll_canvas.configure(yscrollcommand=scrollbar.set)
         self.scroll_canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+        self.scroll_canvas.configure(background=bg)
         container = ttk.Frame(self.scroll_canvas)
         self.scroll_window = self.scroll_canvas.create_window((0, 0), window=container, anchor="nw")
         container.bind("<Configure>", self.update_scroll_region)
@@ -5632,8 +5665,7 @@ class ControlPanel(tk.Tk):
             self.metric_items.append(self.create_metric(self.metrics_frame, title, variable))
         self.reflow_metrics()
         ttk.Label(status_frame, text="快捷键", style="CardTitle.TLabel").grid(row=1, column=0, sticky="w", pady=(18, 6), padx=(0, 12))
-        hint = "学习模式期间，全局鼠标静止超时会自动结束。鼠标离开雷电模拟器客户区将立即结束当前学习或训练模式；客户区外动作不会作为学习数据保存。ESC 终止当前学习、训练或睡眠。截图与坐标均使用雷电模拟器客户区。"
-        self.hint_label = ttk.Label(status_frame, text=hint, wraplength=max(320, self.settings.ui_width - 120), style="Hint.TLabel")
+        self.hint_label = ttk.Label(status_frame, text=self.hint_text(), wraplength=max(320, self.settings.ui_width - 120), style="Hint.TLabel")
         self.hint_label.grid(row=2, column=0, sticky="ew", pady=6)
         progress_frame = ttk.LabelFrame(container, text=self.progress_label_var.get(), padding=self.settings.ui_section_padding)
         self.progress_label_var.trace_add("write", lambda *args: progress_frame.configure(text=self.progress_label_var.get()))
@@ -5643,6 +5675,29 @@ class ControlPanel(tk.Tk):
         ttk.Label(progress_frame, textvariable=self.progress_text_var, width=8, anchor="e").grid(row=0, column=1, sticky="e", padx=(10, 0))
         ttk.Label(container, textvariable=self.status_var).pack(anchor="w", pady=(10, 0))
 
+
+    def own_window_handles(self):
+        handles = []
+        for widget in (self, *self.winfo_children()):
+            try:
+                handle = int(widget.winfo_id())
+                if handle:
+                    handles.append(handle)
+            except Exception:
+                pass
+        return tuple(dict.fromkeys(handles))
+
+    def hint_text(self):
+        mode = self.current_mode() if hasattr(self, "mode") else "idle"
+        base = self.hint_templates.get(mode, self.hint_templates["idle"])
+        runtime = getattr(self, "runtime_environment_issue", "")
+        if runtime:
+            return base + " 当前提示：" + runtime
+        return base
+
+    def refresh_hint(self):
+        if self.hint_label:
+            self.hint_label.configure(text=self.hint_text())
 
     def fit_complete_panel(self):
         try:
@@ -6280,7 +6335,7 @@ class ControlPanel(tk.Tk):
             return self.mode
 
     def set_mode_ui(self, mode):
-        self.ui(lambda m=mode: self.mode_var.set(MODE_NAMES.get(m, m)))
+        self.ui(lambda m=mode: (self.mode_var.set(MODE_NAMES.get(m, m)), self.refresh_hint()))
 
     def transition(self, expected, target, reason=None, token=None, deadline=None, fresh_stop_event=False):
         with self.state_lock:
@@ -6420,6 +6475,8 @@ class ControlPanel(tk.Tk):
         if mode == "learning" and self.mouse_recorder and self.mouse_recorder.cursor_outside():
             return "cursor_outside"
         if not self.cursor_inside_window():
+            if mode == "training" and hasattr(self, "ensure_cursor_inside_window") and self.ensure_cursor_inside_window():
+                return None
             return "cursor_outside"
         if mode == "learning":
             still_seconds = safe_float(getattr(config, "still_seconds", self.settings.generated_action_complete_wait), self.settings.generated_action_complete_wait) if config else self.settings.generated_action_complete_wait
@@ -6592,7 +6649,9 @@ class ControlPanel(tk.Tk):
         self.ensure_storage_runtime(config)
         if require_attach:
             if not self.window_manager or self.window_manager.executable_path != config.ldplayer_path or self.window_manager.settings != config.settings:
-                self.window_manager = WindowManager(config.ldplayer_path, config.settings)
+                self.window_manager = WindowManager(config.ldplayer_path, config.settings, self.own_window_handles())
+            else:
+                self.window_manager.set_ignored_hwnds(self.own_window_handles())
             if not self.executor or self.executor.window_manager is not self.window_manager or self.executor.settings != config.settings:
                 self.executor = HumanMouseExecutor(self.window_manager, config.settings)
             attached = self.window_manager.launch_or_attach()
@@ -7453,6 +7512,8 @@ class ControlPanel(tk.Tk):
         if not check.ok:
             return "window_invalid"
         if not self.cursor_inside_window():
+            if mode == "training" and hasattr(self, "ensure_cursor_inside_window") and self.ensure_cursor_inside_window():
+                return None
             return "cursor_outside"
         return None
 
