@@ -879,6 +879,13 @@ class ModeSession:
 
 
 @dataclass(frozen=True)
+class StopSnapshot:
+    training_seconds: int
+    still_seconds: float
+    deadline: Optional[float]
+
+
+@dataclass(frozen=True)
 class Config:
     ldplayer_path: Path
     data_path: Path
@@ -1106,7 +1113,7 @@ def run_self_test():
     execution_panel.mouse_recorder = None
     execution_panel.status_var = type("Status", (), {"set": lambda self, value: setattr(execution_panel, "status_text", value)})()
     execution_panel.ui = lambda fn: fn()
-    execution_panel.read_config = lambda: stop_config
+    execution_panel.read_config = lambda: (_ for _ in ()).throw(AssertionError("training stop check must use config snapshot"))
     execution_panel.current_rect = lambda: (0, 0, 100, 100)
     execution_panel.write_record = lambda *args, **kwargs: setattr(execution_panel, "written_record", (args, kwargs))
     execution_panel.log_exception = lambda *args, **kwargs: None
@@ -1649,15 +1656,17 @@ def read_hardware_state():
     memory_free_ratio = clamp(memory_available / memory_total if memory_total > 0 else 0.0, 0.0, 1.0)
     gpu_count = 0
     gpu_memory_total = 0.0
-    try:
-        output = subprocess.check_output(["wmic", "path", "win32_VideoController", "get", "AdapterRAM"], stderr=subprocess.DEVNULL, text=True, timeout=2.0)
-        for line in output.splitlines():
-            number = safe_int(line.strip(), 0)
-            if number > 0:
-                gpu_count += 1
-                gpu_memory_total += float(number)
-    except Exception:
-        pass
+    wmic_path = shutil.which("wmic")
+    if wmic_path:
+        try:
+            output = subprocess.check_output([wmic_path, "path", "win32_VideoController", "get", "AdapterRAM"], stderr=subprocess.DEVNULL, text=True, timeout=2.0)
+            for line in output.splitlines():
+                number = safe_int(line.strip(), 0)
+                if number > 0:
+                    gpu_count += 1
+                    gpu_memory_total += float(number)
+        except Exception:
+            pass
     return {"cpu_count": max(1, cpu_count), "cpu_load": clamp(cpu_load, 0.0, 100.0), "memory_free_ratio": memory_free_ratio, "gpu_count": gpu_count, "gpu_memory_total": max(0.0, gpu_memory_total)}
 
 
@@ -5158,14 +5167,22 @@ class TrainingService:
 
     def prepare_for_event(self, rect):
         panel = self.panel
+        now_perf = time.perf_counter()
+        panel.hardware_state = panel.refresh_hardware_state()
         pool_count = panel.experience_pool.count() if panel.experience_pool else 0
         screen_score_total_value = panel.store.screen_score_total if panel.store else 0.0
-        panel.hardware_state = panel.refresh_hardware_state()
+        metrics = (round(safe_float(panel.hardware_state.get("cpu_load", 0.0), 0.0) / 5.0), round(safe_float(panel.hardware_state.get("memory_free_ratio", 0.0), 0.0), 2), pool_count // 256, round(panel.adaptive_policy._avg(panel.adaptive_policy.execution_latency_ms, 140.0) / 25.0), round(panel.adaptive_policy._avg(panel.adaptive_policy.capture_latency_ms, 24.0) / 10.0))
+        if panel.last_training_runtime_metrics == metrics and now_perf - panel.last_training_runtime_update_perf < 5.0:
+            return panel.settings
         settings = panel.adaptive_policy.build(panel.settings, rect, pool_count, screen_score_total_value, hardware=panel.hardware_state)
+        settings = replace(settings, hash_prefix_bits=panel.settings.hash_prefix_bits, nearest_candidate_limit=panel.settings.nearest_candidate_limit)
         if panel.experience_pool and getattr(panel.experience_pool.model, "resource_model", None):
             features = {"cpu_load": panel.hardware_state.get("cpu_load", 0.0), "memory_free_ratio": panel.hardware_state.get("memory_free_ratio", 0.5), "capture_ms": panel.adaptive_policy._avg(panel.adaptive_policy.capture_latency_ms, 24.0), "execution_ms": panel.adaptive_policy._avg(panel.adaptive_policy.execution_latency_ms, 140.0), "window_instability": panel.adaptive_policy._avg(panel.adaptive_policy.window_change_flags, 0.0), "success_rate": panel.adaptive_policy._avg(panel.adaptive_policy.outcome_flags, 1.0), "pool_count": pool_count}
             settings = panel.experience_pool.model_runtime.apply_runtime_values(settings, features, panel.experience_pool.model.resource_model)
+            settings = replace(settings, hash_prefix_bits=panel.settings.hash_prefix_bits, nearest_candidate_limit=panel.settings.nearest_candidate_limit)
         panel.apply_runtime_settings(settings)
+        panel.last_training_runtime_metrics = metrics
+        panel.last_training_runtime_update_perf = now_perf
         return settings
 
     def observe_screen(self, analyzer, session_id, start, rect):
@@ -5202,7 +5219,7 @@ class TrainingService:
         panel.ui(lambda r=remaining: panel.progress_label_var.set(f"训练模式进度保持 0%｜剩余 {r:.1f} 秒"))
         return False
 
-    def execute_and_record(self, analyzer, session_id, start, rect, snapshot, action, decision, stop_event):
+    def execute_and_record(self, analyzer, session_id, start, rect, snapshot, action, decision, stop_event, config=None):
         panel = self.panel
         if action.get("end_rel") is None:
             action["end_rel"] = action.get("start_rel", [0.5, 0.5])
@@ -5211,8 +5228,13 @@ class TrainingService:
             panel.write_record("training", session_id, snapshot, None, "ai_mouse_failed", decision=decision, planned_action=action, failed_action=True, window_rect_changed=True, execution_error="window_rect_changed")
             panel.adaptive_policy.observe_execution(success=False)
             return False, {"failure_reason": "window_rect_changed"}
+        deadline = None
+        active_session = getattr(panel, "active_session", None)
+        if active_session and active_session.mode == "training":
+            deadline = active_session.deadline
+        stop_snapshot = StopSnapshot(safe_int(getattr(config, "training_seconds", DEFAULT_TRAINING_SECONDS), DEFAULT_TRAINING_SECONDS), safe_float(getattr(config, "still_seconds", DEFAULT_STILL_SECONDS), DEFAULT_STILL_SECONDS), deadline)
         def training_execution_stop():
-            reason = panel.active_mode_stop_reason("training", stop_event, panel.read_config())
+            reason = panel.active_mode_stop_reason("training", stop_event, stop_snapshot, stop_snapshot.deadline)
             if reason:
                 panel.apply_active_stop_reason("training", reason, stop_event)
                 return True
@@ -5257,6 +5279,11 @@ class ControlPanel(tk.Tk):
         self.adaptive_policy = AdaptivePolicy()
         initial_capture_ms = self.measure_capture_latency()
         self.hardware_state = read_hardware_state()
+        now_perf = time.perf_counter()
+        self.hardware_last_full_refresh_perf = now_perf
+        self.hardware_last_light_refresh_perf = now_perf
+        self.last_training_runtime_update_perf = 0.0
+        self.last_training_runtime_metrics = None
         self.settings = derive_runtime_settings(rect=self.screen_rect(), pool_count=0, capture_ms=initial_capture_ms, cpu_load=safe_float(self.hardware_state.get("cpu_load", 0.0), 0.0), hardware=self.hardware_state)
         self.event_journal = deque(maxlen=max(128, self.settings.async_queue_size * max(1, self.settings.ui_metric_columns)))
         self.events.subscribe("*", self.remember_event)
@@ -5321,8 +5348,10 @@ class ControlPanel(tk.Tk):
         self.progress_text_var = tk.StringVar(value="0%")
         self.last_learning_event_perf = 0.0
         self.last_learning_event_hash = None
-        self.hardware_last_full_refresh_perf = 0.0
-        self.hardware_last_light_refresh_perf = 0.0
+        self.hardware_last_full_refresh_perf = getattr(self, "hardware_last_full_refresh_perf", 0.0)
+        self.hardware_last_light_refresh_perf = getattr(self, "hardware_last_light_refresh_perf", 0.0)
+        self.last_training_runtime_update_perf = getattr(self, "last_training_runtime_update_perf", 0.0)
+        self.last_training_runtime_metrics = getattr(self, "last_training_runtime_metrics", None)
         self.progress_label_var = tk.StringVar(value="进度")
         self.runtime_value_specs = {
             "training_seconds": ("训练秒数", self.training_seconds_var, DEFAULT_TRAINING_SECONDS, safe_int, 1),
@@ -7235,8 +7264,7 @@ class ControlPanel(tk.Tk):
 
     def recover_zero_screen_score(self, analyzer, session_id, start, stop_event, zero_score_started_at, rescue_started_at, current_score, config=None):
         stage_names = ("recapture", "verify_window", "refresh_index", "wait_render", "trusted_history", "bounded_random", "rescore")
-        still_seconds = safe_float(getattr(config, "still_seconds", self.settings.generated_action_complete_wait), self.settings.generated_action_complete_wait)
-        threshold = max(self.settings.training_event_wait, min(still_seconds, self.settings.generated_action_complete_wait * max(1, self.settings.training_fail_stop_count)))
+        threshold = max(self.settings.training_event_wait * 3.0, self.settings.generated_action_complete_wait * max(1, self.settings.training_fail_stop_count))
         if not zero_score_started_at or time.perf_counter() - zero_score_started_at < threshold:
             return current_score, zero_score_started_at, rescue_started_at, False
         if rescue_started_at is None:
@@ -7384,7 +7412,7 @@ class ControlPanel(tk.Tk):
                         continue
                 else:
                     consecutive_no_actions = 0
-                success, record = service.execute_and_record(analyzer, session_id, start, rect, snapshot, action, decision, stop_event)
+                success, record = service.execute_and_record(analyzer, session_id, start, rect, snapshot, action, decision, stop_event, config)
                 if not success:
                     consecutive_failures += 1
                     last_training_error = record.get("failure_reason") if isinstance(record, dict) else None
@@ -7517,14 +7545,26 @@ class ControlPanel(tk.Tk):
         except Exception:
             pass
 
-    def refresh_hardware_state(self):
+    def refresh_hardware_state(self, force=False):
         event_perf = time.perf_counter()
-        full = read_hardware_state()
-        if self.hardware_state:
-            full["cpu_load"] = safe_float(full.get("cpu_load", self.hardware_state.get("cpu_load", 0.0)), self.hardware_state.get("cpu_load", 0.0))
-            full["memory_free_ratio"] = safe_float(full.get("memory_free_ratio", self.hardware_state.get("memory_free_ratio", 0.0)), self.hardware_state.get("memory_free_ratio", 0.0))
+        cached = dict(self.hardware_state or {})
+        full_due = force or not cached or event_perf - self.hardware_last_full_refresh_perf >= 45.0
+        light_due = force or not cached or event_perf - self.hardware_last_light_refresh_perf >= 3.0
+        if not full_due and not light_due:
+            return self.hardware_state
+        if full_due:
+            full = read_hardware_state()
+            self.hardware_last_full_refresh_perf = event_perf
+        else:
+            full = dict(cached)
+            if psutil:
+                cpu_load = safe_float(psutil.cpu_percent(interval=0.0), cached.get("cpu_load", 0.0))
+                memory = psutil.virtual_memory()
+                memory_total = safe_float(getattr(memory, "total", 0.0), 0.0)
+                memory_available = safe_float(getattr(memory, "available", 0.0), 0.0)
+                full["cpu_load"] = clamp(cpu_load, 0.0, 100.0)
+                full["memory_free_ratio"] = clamp(memory_available / memory_total if memory_total > 0 else cached.get("memory_free_ratio", 0.0), 0.0, 1.0)
         self.hardware_state = full
-        self.hardware_last_full_refresh_perf = event_perf
         self.hardware_last_light_refresh_perf = event_perf
         return self.hardware_state
 
