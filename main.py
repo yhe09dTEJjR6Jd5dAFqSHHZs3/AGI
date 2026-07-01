@@ -1,4 +1,5 @@
 import concurrent.futures
+import contextlib
 import copy
 import ctypes
 import json
@@ -96,21 +97,24 @@ class PausableTrainingClock:
 def screen_content_metrics(raw, width, height):
     data = bytes(raw or b"")
     if not data or width <= 0 or height <= 0:
-        return {"valid": False, "reason": "empty", "brightness_variance": 0.0, "edge_density": 0.0, "change_rate": 0.0}
+        return {"valid": False, "screenshot_valid": False, "content_valuable": False, "reason": "empty", "brightness_mean": 0.0, "brightness_variance": 0.0, "edge_density": 0.0, "change_rate": 0.0, "black_candidate": False, "transparent_ratio": 0.0}
     pixel_count = min(width * height, len(data) // 4)
     if pixel_count <= 0:
-        return {"valid": False, "reason": "empty", "brightness_variance": 0.0, "edge_density": 0.0, "change_rate": 0.0}
+        return {"valid": False, "screenshot_valid": False, "content_valuable": False, "reason": "empty", "brightness_mean": 0.0, "brightness_variance": 0.0, "edge_density": 0.0, "change_rate": 0.0, "black_candidate": False, "transparent_ratio": 0.0}
     sample_target = min(4096, pixel_count)
     step = max(1, pixel_count // sample_target)
     values = []
     last = None
     edges = 0
     changes = 0
+    transparent = 0
     for index in range(0, pixel_count, step):
         offset = index * 4
-        if offset + 2 >= len(data):
+        if offset + 3 >= len(data):
             break
-        b, g, r = data[offset], data[offset + 1], data[offset + 2]
+        b, g, r, a = data[offset], data[offset + 1], data[offset + 2], data[offset + 3]
+        if a <= 2:
+            transparent += 1
         brightness = (int(r) * 299 + int(g) * 587 + int(b) * 114) / 1000.0
         values.append(brightness)
         if last is not None:
@@ -121,15 +125,40 @@ def screen_content_metrics(raw, width, height):
                 changes += 1
         last = brightness
     if not values:
-        return {"valid": False, "reason": "empty", "brightness_variance": 0.0, "edge_density": 0.0, "change_rate": 0.0}
+        return {"valid": False, "screenshot_valid": False, "content_valuable": False, "reason": "empty", "brightness_mean": 0.0, "brightness_variance": 0.0, "edge_density": 0.0, "change_rate": 0.0, "black_candidate": False, "transparent_ratio": 0.0}
     mean = sum(values) / len(values)
     variance = sum((value - mean) ** 2 for value in values) / len(values)
     divisor = max(1, len(values) - 1)
     edge_density = edges / divisor
     change_rate = changes / divisor
-    valid = variance >= 3.0 or edge_density >= 0.01 or change_rate >= 0.05
-    reason = "ok" if valid else "blank_or_black"
-    return {"valid": valid, "reason": reason, "brightness_variance": round(variance, 4), "edge_density": round(edge_density, 6), "change_rate": round(change_rate, 6)}
+    transparent_ratio = transparent / max(1, len(values))
+    black_candidate = mean <= 2.0 and variance <= 1.0 and transparent_ratio < 0.95
+    screenshot_valid = transparent_ratio < 0.95 and len(data) >= pixel_count * 4
+    content_valuable = variance >= 3.0 or edge_density >= 0.01 or change_rate >= 0.05
+    valid = screenshot_valid and not black_candidate
+    reason = "ok" if valid else ("transparent" if transparent_ratio >= 0.95 else "black_candidate" if black_candidate else "empty")
+    return {"valid": valid, "screenshot_valid": screenshot_valid, "content_valuable": content_valuable, "reason": reason, "brightness_mean": round(mean, 4), "brightness_variance": round(variance, 4), "edge_density": round(edge_density, 6), "change_rate": round(change_rate, 6), "black_candidate": black_candidate, "transparent_ratio": round(transparent_ratio, 6)}
+
+
+def atomic_write_json(path, payload, lock=None):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    guard = lock or contextlib.nullcontext()
+    with guard:
+        with temporary.open("w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        temporary.replace(target)
+        try:
+            fd = os.open(str(target.parent), os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 def fail_and_exit(message):
     try:
@@ -215,10 +244,15 @@ def bootstrap_dependencies():
     except Exception as exc:
         write_startup_install_log([sys.executable, "-m", "pip", "--version"], error=exc)
         raise StartupRepairError(f"无法启动 pip，不能自动安装依赖。请检查 Python 环境或网络。\n{exc}") from exc
+    if os.environ.get("AGI_AUTO_INSTALL_CONFIRMED") != "1":
+        raise StartupRepairError("检测到缺失依赖，但未获得自动安装确认。请使用锁定版本和哈希校验的 requirements.txt 或离线 wheel 包安装；如确认接受运行时 pip 安装风险，请设置 AGI_AUTO_INSTALL_CONFIRMED=1 后重试。缺失依赖：" + "、".join(missing))
     base_command = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--user"]
-    mirrors = [None, "https://pypi.tuna.tsinghua.edu.cn/simple", "https://mirrors.aliyun.com/pypi/simple/"]
+    mirrors = [None]
+    extra_mirror = os.environ.get("AGI_PIP_INDEX_URL")
+    if extra_mirror:
+        mirrors.append(extra_mirror)
     commands = [base_command + (["-i", mirror, "--trusted-host", urlparse(mirror).hostname] if mirror else []) + missing for mirror in mirrors]
-    install_timeout = max(1, (os.cpu_count() or 1) * 30)
+    install_timeout = max(120, min(300, safe_int(os.environ.get("AGI_PIP_INSTALL_TIMEOUT"), 180)))
     env = dict(os.environ)
     env[install_key] = "1"
     failures = []
@@ -1401,12 +1435,14 @@ def run_self_test():
             globals()["win32gui"] = original_win32gui
             globals()["win32api"] = original_win32api
             globals()["win32con"] = original_win32con
-        blank_metrics = screen_content_metrics(bytes([1, 1, 1, 255]) * 400, 20, 20)
+        blank_metrics = screen_content_metrics(bytes([255, 255, 255, 255]) * 400, 20, 20)
+        black_metrics = screen_content_metrics(bytes([0, 0, 0, 255]) * 400, 20, 20)
         varied_raw = bytearray()
         for value in range(400):
             varied_raw.extend([value % 251, (value * 3) % 251, (value * 7) % 251, 255])
         varied_metrics = screen_content_metrics(varied_raw, 20, 20)
-        assert not blank_metrics["valid"] and blank_metrics["reason"] == "blank_or_black"
+        assert blank_metrics["valid"] and not blank_metrics["content_valuable"]
+        assert not black_metrics["valid"] and black_metrics["reason"] == "black_candidate"
         assert varied_metrics["valid"] and varied_metrics["brightness_variance"] > 3.0 and varied_metrics["edge_density"] > 0.0
         transition_panel = ControlPanel.__new__(ControlPanel)
         transition_panel.state_lock = threading.RLock()
@@ -1543,8 +1579,12 @@ def run_self_test():
     blocked.jobs.unfinished_tasks = 1
     blocked.lock = threading.RLock()
     blocked.errors = []
-    blocked.enqueued_sequences = {1}
-    blocked.confirmed_sequences = set()
+    blocked.pending_sequences = {1}
+    blocked.failed_sequences = set()
+    blocked.recent_sequences = deque(maxlen=1024)
+    blocked.last_confirmed_sequence = 0
+    blocked.enqueued_sequences = blocked.pending_sequences
+    blocked.confirmed_sequences = blocked.recent_sequences
     try:
         AsyncPersistenceQueue.flush(blocked, timeout_seconds=0.001, heartbeat=lambda status: heartbeat_statuses.append(status))
         assert False
@@ -3247,12 +3287,7 @@ class AppConfigStore:
         source = AllowedUserEditPolicy.filter(settings, "startup")
         payload = {"schema_version": CONFIG_SCHEMA_VERSION, "ldplayer_path": str(source.get("ldplayer_path") or AGENT_SPEC.default_ldplayer_path), "data_path": str(source.get("data_path") or AGENT_SPEC.default_data_path)}
         try:
-            with self.lock:
-                self.root.mkdir(parents=True, exist_ok=True)
-                temporary = self.settings_file.with_suffix(".tmp")
-                with temporary.open("w", encoding="utf-8") as file:
-                    json.dump(payload, file, ensure_ascii=False, indent=2)
-                temporary.replace(self.settings_file)
+            atomic_write_json(self.settings_file, payload, self.lock)
         except Exception as exc:
             configuration_failure("写入启动配置失败 " + str(self.settings_file), exc)
 
@@ -3349,23 +3384,10 @@ class DataStore:
         self.fsync_directory(Path(target).parent)
 
     def save_state(self):
-        with self.lock:
-            temporary = self.state_file.with_suffix(".tmp")
-            with temporary.open("w", encoding="utf-8") as file:
-                json.dump(self.state, file, ensure_ascii=False, indent=2)
-                file.flush()
-                os.fsync(file.fileno())
-            self.replace_atomic_synced(temporary, self.state_file)
+        atomic_write_json(self.state_file, self.state, self.lock)
 
     def write_json_atomic(self, path, payload):
-        with self.lock:
-            target = Path(path)
-            temporary = target.with_suffix(target.suffix + ".tmp")
-            with temporary.open("w", encoding="utf-8") as file:
-                json.dump(payload, file, ensure_ascii=False, indent=2)
-                file.flush()
-                os.fsync(file.fileno())
-            self.replace_atomic_synced(temporary, target)
+        atomic_write_json(path, payload, self.lock)
 
     def load_sleep_checkpoint(self):
         try:
@@ -3642,11 +3664,7 @@ class DataStore:
         source = AllowedUserEditPolicy.filter(settings, "runtime")
         payload = {"schema_version": CONFIG_SCHEMA_VERSION, "training_seconds": max(1, safe_int(source.get("training_seconds", AGENT_SPEC.default_training_seconds), AGENT_SPEC.default_training_seconds)), "still_seconds": max(0.1, safe_float(source.get("still_seconds", AGENT_SPEC.default_still_seconds), AGENT_SPEC.default_still_seconds)), "experience_pool_gb": max(0.1, safe_float(source.get("experience_pool_gb", AGENT_SPEC.default_experience_pool_gb), AGENT_SPEC.default_experience_pool_gb)), "ai_model_limit": max(1, safe_int(source.get("ai_model_limit", AGENT_SPEC.default_ai_model_limit), AGENT_SPEC.default_ai_model_limit)), "runtime_generated_numbers": RUNTIME_NUMBER_AUDIT}
         try:
-            with self.lock:
-                temporary = self.settings_file.with_suffix(".tmp")
-                with temporary.open("w", encoding="utf-8") as file:
-                    json.dump(payload, file, ensure_ascii=False, indent=2)
-                temporary.replace(self.settings_file)
+            atomic_write_json(self.settings_file, payload, self.lock)
         except Exception as exc:
             configuration_failure("写入运行配置失败 " + str(self.settings_file), exc)
 
@@ -5319,8 +5337,12 @@ class AsyncPersistenceQueue:
         self.image_dropped = 0
         self.lock = threading.RLock()
         self.next_sequence = 0
-        self.enqueued_sequences = set()
-        self.confirmed_sequences = set()
+        self.pending_sequences = set()
+        self.failed_sequences = set()
+        self.recent_sequences = deque(maxlen=1024)
+        self.last_confirmed_sequence = 0
+        self.enqueued_sequences = self.pending_sequences
+        self.confirmed_sequences = self.recent_sequences
         self.errors = []
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self.run)
@@ -5365,7 +5387,7 @@ class AsyncPersistenceQueue:
                 sequence = job.get("persistence_sequence") if isinstance(job, dict) else None
                 if sequence is not None:
                     with self.lock:
-                        self.enqueued_sequences.add(sequence)
+                        self.pending_sequences.add(sequence)
                 return True
             except queue.Full:
                 if not block_when_full:
@@ -5389,8 +5411,10 @@ class AsyncPersistenceQueue:
     def status(self, waited=0.0):
         with self.lock:
             errors = list(self.errors)
-            missing = sorted(self.enqueued_sequences - self.confirmed_sequences)
-        return {"pending": self.jobs.unfinished_tasks, "queued": len(self.jobs.queue), "waited_seconds": round(waited, 1), "errors": errors, "unconfirmed_sequences": missing}
+            missing = sorted(self.pending_sequences | self.failed_sequences)
+            recent = list(self.recent_sequences)
+            last_confirmed = self.last_confirmed_sequence
+        return {"pending": self.jobs.unfinished_tasks, "queued": len(self.jobs.queue), "waited_seconds": round(waited, 1), "errors": errors, "unconfirmed_sequences": missing, "last_confirmed_sequence": last_confirmed, "recent_sequences": recent}
 
     def run(self):
         while True:
@@ -5410,13 +5434,19 @@ class AsyncPersistenceQueue:
                 sequence = job.get("persistence_sequence") if isinstance(job, dict) else None
                 if sequence is not None:
                     with self.lock:
-                        self.confirmed_sequences.add(sequence)
+                        self.pending_sequences.discard(sequence)
+                        self.failed_sequences.discard(sequence)
+                        self.last_confirmed_sequence = max(self.last_confirmed_sequence, safe_int(sequence, self.last_confirmed_sequence))
+                        self.recent_sequences.append(sequence)
             except Exception as exc:
                 store = job.get("store") if isinstance(job, dict) else None
                 sequence = job.get("persistence_sequence") if isinstance(job, dict) else None
                 error_payload = {"sequence": sequence, "type": job.get("type") if isinstance(job, dict) else None, "error": repr(exc)}
                 with self.lock:
                     self.errors.append(error_payload)
+                    if sequence is not None:
+                        self.pending_sequences.discard(sequence)
+                        self.failed_sequences.add(sequence)
                 if store:
                     try:
                         store.log_error("async_persistence", exc, {"type": job.get("type"), "persistence_sequence": sequence})
@@ -5680,7 +5710,10 @@ class ControlPanel(tk.Tk):
         self.last_metric_payload = None
         self.persistence_queue = AsyncPersistenceQueue(self.settings)
         self.persistence_paused = threading.Event()
-        self.main_thread_events = queue.Queue()
+        self.main_thread_events = queue.Queue(maxsize=max(64, self.settings.async_queue_size))
+        self.coalesced_main_thread_events = {}
+        self.main_thread_events_dropped = 0
+        self.shutdown_requested = False
         self.runtime_context = RuntimeContext(self)
         self.mode_controller = ModeController(self)
         self.migration_service = MigrationService(self)
@@ -6029,7 +6062,23 @@ class ControlPanel(tk.Tk):
             except Exception as exc:
                 self.log_exception("ui.dispatch", exc)
             return
-        self.main_thread_events.put({"type": "ui_call", "func": func})
+        self.enqueue_main_thread_event({"type": "ui_call", "func": func}, block=False)
+
+    def enqueue_main_thread_event(self, event, block=False):
+        if getattr(self, "shutdown_requested", False) and event.get("type") == "ui_call":
+            return False
+        key = event.get("coalesce_key") if isinstance(event, dict) else None
+        if key:
+            self.coalesced_main_thread_events[key] = event
+            event = {"type": "coalesced", "key": key}
+        try:
+            self.main_thread_events.put(event, block=block, timeout=0.25 if block else 0)
+            return True
+        except queue.Full:
+            if key:
+                return True
+            self.main_thread_events_dropped += 1
+            return False
 
     def ui_sync(self, func, timeout=None):
         if threading.current_thread() is threading.main_thread():
@@ -6047,7 +6096,9 @@ class ControlPanel(tk.Tk):
                 result["error"] = exc
             finally:
                 done.set()
-        self.main_thread_events.put({"type": "ui_sync_call", "func": apply})
+        if not self.enqueue_main_thread_event({"type": "ui_sync_call", "func": apply}, block=True):
+            done.set()
+            return None
         wait_seconds = timeout if timeout is not None else max(self.settings.window_event_wait, self.settings.key_debounce_seconds)
         done.wait(wait_seconds)
         if "error" in result:
@@ -6150,6 +6201,11 @@ class ControlPanel(tk.Tk):
             try:
                 if event.get("type") in ("ui_call", "ui_sync_call"):
                     func = event.get("func")
+                    if callable(func):
+                        func()
+                elif event.get("type") == "coalesced":
+                    latest = self.coalesced_main_thread_events.pop(event.get("key"), None)
+                    func = latest.get("func") if isinstance(latest, dict) else None
                     if callable(func):
                         func()
                 elif event.get("type") == "restart_training":
@@ -7976,6 +8032,7 @@ class ControlPanel(tk.Tk):
             self.release_window_and_panel()
 
     def close(self):
+        self.shutdown_requested = True
         mode_thread = self.mode_thread
         close_timeout = max(1.0, safe_float(getattr(self.settings, "persistence_close_seconds", 3.0), 3.0))
         deadline = time.perf_counter() + close_timeout
@@ -7985,6 +8042,9 @@ class ControlPanel(tk.Tk):
             self.status_var.set("正在保存，请等待完成")
             self.update_mode_button_states()
             self.request_stop("user_stop")
+            if self.mouse_recorder:
+                self.mouse_recorder.stop()
+            self.escape_monitor.stop()
             if mode_thread and mode_thread.is_alive():
                 while mode_thread.is_alive() and time.perf_counter() < deadline:
                     mode_thread.join(timeout=max(0.05, min(0.25, deadline - time.perf_counter())))
@@ -7998,13 +8058,11 @@ class ControlPanel(tk.Tk):
                     self.log_exception("close.checkpoint", exc, {"active_mode": active_mode})
             self.status_var.set("可恢复退出：后台保存超时，已尽力保留检查点")
             self.log_exception("close.recoverable_timeout", RuntimeError("background_task_close_timeout"), {"active_mode": active_mode, "timeout": close_timeout})
-            try:
-                self.after(250, self.destroy)
-            except Exception:
-                try:
-                    self.destroy()
-                except Exception:
-                    pass
+            force = messagebox.askyesno("后台任务仍在运行", "后台任务尚未结束，已保存可恢复检查点。\n\n选择“是”继续等待；选择“否”强制关闭窗口。", parent=self)
+            if force:
+                self.after(1000, self.close)
+            else:
+                self.destroy()
             return
         with self.state_lock:
             self.stop_event.set()
@@ -8072,13 +8130,11 @@ class ControlPanel(tk.Tk):
                     self.log_exception("close.final_checkpoint", exc, {"active_mode": active_mode})
             self.log_exception("close.force_exit_risk", RuntimeError("background_task_not_safely_finished"), {"mode": active_mode})
             self.status_var.set("可恢复退出：后台任务尚未安全结束，已保留检查点")
-            try:
-                self.after(250, self.destroy)
-            except Exception:
-                try:
-                    self.destroy()
-                except Exception:
-                    pass
+            force = messagebox.askyesno("后台任务仍在运行", "后台任务尚未安全结束，已保存可恢复检查点。\n\n选择“是”继续等待；选择“否”强制关闭窗口。", parent=self)
+            if force:
+                self.after(1000, self.close)
+            else:
+                self.destroy()
             return
         try:
             self.destroy()
@@ -8164,10 +8220,11 @@ def run_windows_acceptance():
     result["sleep_resume"] = result["flow_tests"]["sleep_tasks_save_chain"]
     result["sleep_esc_resume_idempotency"] = result["flow_tests"]["sleep_esc_checkpoint_panel"]
     content = screen_content_metrics(bytes([0, 0, 0, 255]) * 256, 16, 16)
+    white_content = screen_content_metrics(bytes([255, 255, 255, 255]) * 256, 16, 16)
     varied = bytearray()
     for value in range(256):
         varied.extend([value, 255 - value, value // 2, 255])
-    result["screenshot_blank_detection"] = "pass" if not content["valid"] and screen_content_metrics(varied, 16, 16)["valid"] else "fail"
+    result["screenshot_blank_detection"] = "pass" if not content["valid"] and white_content["valid"] and not white_content["content_valuable"] and screen_content_metrics(varied, 16, 16)["valid"] else "fail"
     if sys.platform == "win32" and path_ok and "WindowManager" in globals():
         settings = derive_runtime_settings() if "derive_runtime_settings" in globals() else None
         manager = WindowManager(ldplayer_path, settings)
