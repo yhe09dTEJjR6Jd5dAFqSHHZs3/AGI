@@ -690,16 +690,16 @@ ALLOWED_TRANSITIONS = {
     ("idle", "sleep"): {"click_sleep"},
     ("idle", "migration"): {"click_modify_data_path"},
     ("learning", "stopping"): {"user_stop", "esc", "still_timeout", "window_invalid", "cursor_outside", "runtime_error"},
-    ("training", "stopping"): {"user_stop", "esc", "window_invalid", "cursor_outside", "runtime_error", "executor_error", "zero_score_unrecoverable"},
+    ("training", "stopping"): {"user_stop", "esc", "window_invalid", "cursor_outside", "runtime_error", "executor_error"},
     ("starting", "stopping"): {"user_stop", "esc", "runtime_error", "minimize_failed", "window_invalid", "completed"},
     ("migration", "stopping"): {"user_stop", "esc", "runtime_error", "migration_error", "completed"},
-    ("stopping", "idle"): {"esc", "still_timeout", "window_invalid", "cursor_outside", "user_stop", "runtime_error", "executor_error", "zero_score_unrecoverable", "migration_error", "completed"},
+    ("stopping", "idle"): {"esc", "still_timeout", "window_invalid", "cursor_outside", "user_stop", "runtime_error", "executor_error", "migration_error", "completed"},
     ("training", "sleep"): {"time_limit"},
     ("sleep", "stopping"): {"user_stop", "esc", "runtime_error", "completed"}
 }
 
 
-TERMINATION_REASONS = ("window_invalid", "cursor_outside", "rect_changed", "empty_action", "executor_error", "zero_score_unrecoverable", "time_limit", "esc", "still_timeout", "user_stop", "migration_error", "completed")
+TERMINATION_REASONS = ("window_invalid", "cursor_outside", "rect_changed", "empty_action", "executor_error", "time_limit", "esc", "still_timeout", "user_stop", "migration_error", "completed")
 RUNNING_MODES = {"starting", "learning", "training", "sleep", "migration"}
 HUMAN_FEATURE_NAMES = ("duration", "direct", "bend", "points", "speed_mean", "speed_variance", "acceleration_change", "pauses", "hover_before", "drag_curvature", "double_click_interval")
 
@@ -1134,9 +1134,6 @@ def run_self_test():
     stop_config = type("Config", (), {"training_seconds": 1, "still_seconds": 10.0})()
     expired_event = threading.Event()
     assert TrainingService(stop_check_panel).should_stop(time.perf_counter() - 2.0, stop_config, expired_event)
-    suspended_event = threading.Event()
-    assert not TrainingService(stop_check_panel).should_stop(time.perf_counter() - 2.0, stop_config, suspended_event, suspend_time_limit=True)
-    assert not suspended_event.is_set()
     execution_panel = type("ExecutionPanel", (), {})()
     execution_stop = threading.Event()
     execution_panel.termination_reason = None
@@ -1206,15 +1203,14 @@ def run_self_test():
     assert runtime.mouse_humanlikeness(matching_mouse_action, 55.0) == direct_human_score
     assert direct_human_score != 55.0
     assert 0.0 <= runtime.operation_policy_score(pool.records[0], 0.9) <= 1.0
-    assert runtime.models["rescue_policy"].predict({"zero_score": 0.0}) is not None
     assert runtime.reward(70.0, 100.0) > runtime.reward(70.0, 0.0)
     assert runtime.reward(71.0, 0.0) > runtime.reward(70.0, 100.0)
     assert isinstance(runtime.models["runtime_value_model"].predict({"cpu_load": 0.0, "memory_free_ratio": 0.5}), dict)
     brain = ActionBrain(runtime_pool, changed)
     _, decision = brain.choose(a, novelty, batch, 0.0)
     assert isinstance(decision, dict)
-    random_action, random_decision = brain.choose(a, novelty, [], 0.0, zero_score_factor=1.0)
-    assert random_action and random_decision["reason"] == "zero_score_random_exploration" and random_decision["zero_score_factor"] == 1.0
+    random_action, random_decision = brain.choose(a, novelty, [], 0.0)
+    assert random_action and random_decision["reason"] in {"bounded_bootstrap_exploration", "global_experience"}
     with tempfile.TemporaryDirectory() as folder:
         root = Path(folder)
         executable = root / "dnplayer.exe"
@@ -1345,14 +1341,6 @@ def run_self_test():
         assert model_result["complete"] and pool_result["complete"]
         assert task3_events.index("sleep_model_cleanup_completed") < task3_events.index("experience_pool_compaction_completed")
         assert WindowCheck(True, "ok", (0, 0, 10, 10), 9, 9, 0.0).occluded_ratio == 0.0
-        recovery_panel = ControlPanel.__new__(ControlPanel)
-        recovery_panel.active_session = None
-        recovery_panel.termination_reason = None
-        recovery_panel.window_manager = type("RecoveryWindowManager", (), {"check_window": lambda self, force=False: WindowCheck(True, "ok", (0, 0, 10, 10))})()
-        recovery_panel.should_stop_by_escape = lambda: False
-        recovery_panel.cursor_inside_window = lambda: False
-        recovery_panel.ensure_cursor_inside_window = lambda: False
-        assert ControlPanel.recovery_stop_reason(recovery_panel, threading.Event(), None) == "cursor_outside"
         for name, created in (("model_new.json", "2025-01-02T00:00:00.000"), ("model_old.json", "2025-01-01T00:00:00.000"), ("model_mid.json", "2025-01-01T12:00:00.000")):
             (store.model_dir / name).write_text(json.dumps({"created_at": created, "model": {"type": "bad"}}), encoding="utf-8")
         (store.model_dir / "partial_model_interrupted.json").write_text(json.dumps({"created_at": "2025-01-04T00:00:00.000"}), encoding="utf-8")
@@ -1422,15 +1410,9 @@ def run_self_test():
             assert manager.check_window(force=True).reason == "occluded"
             assert "completed" in ALLOWED_TRANSITIONS[("sleep", "stopping")] and ("sleep", "training") not in ALLOWED_TRANSITIONS
             state_transition_table = (
-                ("training", "zero_score", "pause_clock"),
-                ("zero_score", "recovered", "resume_clock"),
-                ("zero_score", "unrecoverable", "save_then_idle"),
                 ("training_timeout", "sleep", "task1_task2_task3_then_restart"),
             )
-            assert state_transition_table[0][2] == "pause_clock" and "zero_score_unrecoverable" in ALLOWED_TRANSITIONS[("training", "stopping")]
-            assert state_transition_table[1][2] == "resume_clock" and "time_limit" in ALLOWED_TRANSITIONS[("training", "sleep")]
-            assert state_transition_table[2][2] == "save_then_idle" and "zero_score_unrecoverable" in ALLOWED_TRANSITIONS[("stopping", "idle")]
-            assert state_transition_table[3][2] == "task1_task2_task3_then_restart" and ("sleep", "training") not in ALLOWED_TRANSITIONS
+            assert state_transition_table[0][2] == "task1_task2_task3_then_restart" and ("sleep", "training") not in ALLOWED_TRANSITIONS
         finally:
             globals()["win32gui"] = original_win32gui
             globals()["win32api"] = original_win32api
@@ -1543,7 +1525,7 @@ def run_self_test():
         assert len(list(store.model_dir.glob("model_*.json"))) == 1
         model_path = max(store.model_dir.glob("model_*.json"), key=store.model_created_key)
         model_payload = json.loads(model_path.read_text(encoding="utf-8"))
-        assert len(model_payload["model_group"]["models"]) == 6
+        assert len(model_payload["model_group"]["models"]) == 5
         assert [item["key"] for item in model_payload["model_group"]["models"]] == [item["key"] for item in AI_MODEL_GROUP_SPECS]
         model_path.write_bytes(model_path.read_bytes() + (b"m" * 2048))
         assert store.storage_size_bytes() > store.experience_pool_size_bytes()
@@ -2369,10 +2351,9 @@ def strict_reward_target(screen_score, human_similarity):
 AI_MODEL_GROUP_SPECS = (
     {"key": "screen_novelty_scorer", "name": "画面新颖程度评分模型", "goal": "一个画面与经验池中最相似的一批历史画面批量聚合相似度越高，评分越低"},
     {"key": "mouse_humanlikeness_scorer", "name": "鼠标拟人程度评分模型", "goal": "AI鼠标操作与学习模式用户鼠标操作相似度越高，评分越高"},
-    {"key": "operation_policy", "name": "实操模型", "goal": "训练模式非自救期间在雷电模拟器客户区内输出鼠标操作"},
-    {"key": "rescue_policy", "name": "自救模型", "goal": "画面评分持续为0时输出自救操作，直到画面评分不再为0"},
-    {"key": "reward_model", "name": "奖励模型", "goal": "画面评分优先，画面评分相同时鼠标评分越高奖励越高"},
-    {"key": "runtime_value_model", "name": "数值变化模型", "goal": "依据现实条件确定未指定变量初始值，并让变量跟随现实条件变化"},
+    {"key": "operation_policy", "name": "实操模型", "goal": "在训练模式期间，雷电模拟器客户区内，AI输出鼠标操作"},
+    {"key": "reward_model", "name": "奖励模型", "goal": "奖励=收入（画面评分不同的样本，画面评分越高，收入越高；画面评分相同的样本，鼠标评分越高，收入越高）-支出（支出一开始为正极小值，随时间推移逐渐变大，并在收入变高时重置为正极小值）"},
+    {"key": "runtime_value_model", "name": "数学模型", "goal": "依据现实条件确定没有在要求中确定的变量的初始数值，并让它们跟随现实条件的变化而变化"},
 )
 
 
@@ -2770,59 +2751,6 @@ class OperationPolicyModel(TrainableModel):
         return obj
 
 
-class RescuePolicyModel(TrainableModel):
-    key = "rescue_policy"
-    model_type = "trained_zero_score_rescue_policy"
-
-    def fit(self, records):
-        zero_score = [record for record in records or [] if isinstance(record, dict) and safe_float(record.get("before_screen_score", record.get("screen_score", 0.0)), 0.0) <= 0.0 and record.get("mouse_action")]
-        super().fit(zero_score)
-        zero_score.sort(key=lambda record: strict_reward_key(record.get("after_screen_score", record.get("sleep_novelty", record.get("screen_score", 0.0))), record.get("sleep_human_score", record.get("human_score", 50.0))), reverse=True)
-        limit = max(1, safe_int(getattr(self.settings, "nearest_top_k", 1), 1))
-        diverse = []
-        seen = set()
-        for record in zero_score:
-            action = record.get("mouse_action")
-            signature = json.dumps({"type": (action or {}).get("type"), "start": (action or {}).get("start_rel"), "end": (action or {}).get("end_rel"), "scroll": (action or {}).get("scroll")}, sort_keys=True, ensure_ascii=False)
-            if signature not in seen:
-                seen.add(signature)
-                diverse.append(record)
-        self.recovery_actions = [copy.deepcopy(record.get("mouse_action")) for record in diverse[:limit]]
-        if len(self.recovery_actions) < limit:
-            backups = [record for record in records or [] if isinstance(record, dict) and record.get("mouse_action")]
-            backups.sort(key=lambda record: record_screen_human(record), reverse=True)
-            self.recovery_actions.extend(copy.deepcopy(record.get("mouse_action")) for record in backups[:limit - len(self.recovery_actions)])
-        success_scores = [safe_float(record.get("after_screen_score", record.get("sleep_novelty", 0.0)), 0.0) for record in zero_score]
-        recovery_rate = sum(1 for value in success_scores if value > 0.0) / max(1, len(success_scores))
-        self.fallback_mutation = round(clamp(0.9 - recovery_rate * 0.45, 0.25, 0.9), 4)
-        self.metrics = {"zero_score_trajectories": len(zero_score), "recovery_rate": round(recovery_rate, 4), "action_count": sum(1 for record in records or [] if isinstance(record, dict) and record.get("mouse_action"))}
-        return self.metrics
-
-    def parameters(self):
-        return {"trigger": "continuous_zero_screen_score", "recovery_actions": self.recovery_actions, "fallback_mutation": self.fallback_mutation, "selection": "reward_sorted_diverse_recovery_actions", "intelligence_goal": "recover from zero-score states with diverse historically successful interventions"}
-
-    def predict(self, features):
-        actions = self.recovery_actions or []
-        if not actions:
-            return None
-        index = safe_int((features or {}).get("attempt", 0), 0) % len(actions) if isinstance(features, dict) else 0
-        action = copy.deepcopy(actions[index])
-        if isinstance(action, dict) and safe_float((features or {}).get("zero_score", 0.0), 0.0) <= 0.0:
-            action["rescue_priority"] = round(1.0 - min(0.5, index / max(1.0, len(actions) * 2.0)), 4)
-        return action
-
-    def probe_input(self):
-        return {"zero_score": 0.0}
-
-    @classmethod
-    def restore(cls, payload, settings=None):
-        obj = cls(settings, payload)
-        params = payload.get("parameters") if isinstance(payload, dict) else {}
-        obj.recovery_actions = params.get("recovery_actions") if isinstance(params.get("recovery_actions"), list) else []
-        obj.fallback_mutation = safe_float(params.get("fallback_mutation", 0.8), 0.8)
-        return obj
-
-
 class RewardModel(TrainableModel):
     key = "reward_model"
     model_type = "calibrated_screen_first_human_tiebreak_reward_model"
@@ -2891,7 +2819,7 @@ class RuntimeValueModel(TrainableModel):
         return obj
 
 
-TRAINABLE_MODEL_CLASSES = {cls.key: cls for cls in (ScreenNoveltyScorerModel, MouseHumanlikenessScorerModel, OperationPolicyModel, RescuePolicyModel, RewardModel, RuntimeValueModel)}
+TRAINABLE_MODEL_CLASSES = {cls.key: cls for cls in (ScreenNoveltyScorerModel, MouseHumanlikenessScorerModel, OperationPolicyModel, RewardModel, RuntimeValueModel)}
 
 
 def restore_trainable_model(payload, settings=None):
@@ -2996,7 +2924,6 @@ def ai_model_group_snapshot(policy_payload, settings, records):
         "screen_novelty_scorer": {},
         "mouse_humanlikeness_scorer": {},
         "operation_policy": {"policy": policy_payload},
-        "rescue_policy": {},
         "reward_model": {},
         "runtime_value_model": {"resource_model": policy_payload.get("resource_model") if isinstance(policy_payload.get("resource_model"), dict) else {}}
     }
@@ -3549,7 +3476,7 @@ class DataStore:
             model_payload = model.snapshot() if model else None
             model_group = ai_model_group_snapshot(model_payload, settings, ranked)
             if not model_group_complete(model_group, settings):
-                raise RuntimeError("AI模型组快照不完整：六类模型必须都能独立加载并完成探针推理")
+                raise RuntimeError("AI模型组快照不完整：五类模型必须都能独立加载并完成探针推理")
             identity = hashlib.sha256(str(self.root.resolve()).encode("utf-8", "replace")).hexdigest()
             training_digest = hashlib.sha256(json.dumps([record.get("id") for record in ranked[:limit]], ensure_ascii=False).encode("utf-8")).hexdigest()
             payload = {"schema_version": CONFIG_SCHEMA_VERSION, "model_version": 2, "training_data_version": 1, "data_path_id": identity, "checksum": training_digest, "created_at": now_text(), "status": status, "status_detail": status_detail or {}, "screen_score_total": self.screen_score_total, "experience_count": len(records or []), "policy_limit": limit, "training_sample_ids": [record.get("id") for record in ranked[:limit]], "model_group": model_group, "model": model_payload, "policy": [{"id": record.get("id"), "mode": record.get("mode"), "action_type": (record.get("mouse_action") or {}).get("type") if isinstance(record.get("mouse_action"), dict) else None, "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_model_confidence": safe_float(record.get("sleep_model_confidence", record.get("model_prediction", 0.0)), 0.0), "model_prediction": safe_float(record.get("model_prediction", 0.0), 0.0), "model_target": safe_float(record.get("model_target", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
@@ -4895,18 +4822,14 @@ class ActionBrain:
         duration_min = self.settings.action_duration_min if action_type == "drag" else self.settings.random_click_duration_min
         return {"type": action_type, "button": "Button.left", "source": "ai_bootstrap", "start_rel": start, "end_rel": end, "duration": round(random.uniform(min(duration_min, duration_max), max(duration_min, duration_max)), 6), "path_rel": [[start[0], start[1], 0.0], [end[0], end[1], 1.0]], "exploration_policy": "bounded_bootstrap"}
 
-    def fallback_action(self, randomness=0.0):
+    def fallback_action(self):
         learned = self.pool.best_global_action()
-        if randomness > 0.0 and random.random() < clamp(randomness, 0.0, 1.0):
-            return self.random_action(1.0 + randomness), "zero_score_random_exploration"
         if learned and random.random() < self.settings.global_action_probability:
-            return self.mutate_action(learned, 1.8 + randomness), "global_experience"
-        if randomness > 0.0:
-            return self.random_action(1.0 + randomness), "zero_score_random_exploration"
+            return self.mutate_action(learned, 1.8), "global_experience"
         return self.bootstrap_action(0.2), "bounded_bootstrap_exploration"
 
-    def choose(self, hash_value, novelty, batch, screen_score_total, zero_score_factor=0.0):
-        rate = clamp(self.exploration_rate(novelty, screen_score_total) + clamp(zero_score_factor, 0.0, 1.0) * (1.0 - self.settings.explore_min_rate), self.settings.explore_min_rate, self.settings.explore_max_rate)
+    def choose(self, hash_value, novelty, batch, screen_score_total):
+        rate = clamp(self.exploration_rate(novelty, screen_score_total), self.settings.explore_min_rate, self.settings.explore_max_rate)
         usable = []
         for item in batch:
             action = item["record"].get("mouse_action")
@@ -4916,14 +4839,14 @@ class ActionBrain:
             policy_score = self.pool.model_runtime.operation_policy_score(item["record"], item.get("similarity", 0.0))
             usable.append((math.exp(clamp(score + policy_score * 0.000001, self.settings.reward_total_min, self.settings.reward_total_max) / self.settings.softmax_temperature), {"item": item, "score": score, "policy_score": policy_score, "action": action}))
         if random.random() < rate or not usable:
-            action, reason = self.fallback_action(zero_score_factor)
-            decision = {"reason": reason, "exploration_rate": rate, "zero_score_factor": round(clamp(zero_score_factor, 0.0, 1.0), 4), "candidate_count": len(usable), "confidence": 0.0, "nearest_similarity": round(batch[0]["similarity"], 4) if batch else 0.0}
+            action, reason = self.fallback_action()
+            decision = {"reason": reason, "exploration_rate": rate, "candidate_count": len(usable), "confidence": 0.0, "nearest_similarity": round(batch[0]["similarity"], 4) if batch else 0.0}
         else:
             chosen = weighted_choice(usable)
             item = chosen["item"]
             confidence = clamp(item.get("similarity", 0.0) * 0.65 + clamp(chosen.get("score", 0.0), 0.0, 200.0) / 200.0 * (35.0 / 100.0), 0.0, 1.0)
-            action = self.mutate_action(chosen["action"], 1.0 - confidence + rate + zero_score_factor)
-            decision = {"reason": "nearest_rewarded_experience", "exploration_rate": rate, "zero_score_factor": round(clamp(zero_score_factor, 0.0, 1.0), 4), "candidate_count": len(usable), "confidence": round(confidence, 4), "nearest_similarity": round(batch[0]["similarity"], 4) if batch else 0.0, "chosen_similarity": round(item.get("similarity", 0.0), 4), "chosen_reward": round(safe_float(item["record"].get("reward", 0.0), 0.0), 2), "chosen_record_id": item["record"].get("id")}
+            action = self.mutate_action(chosen["action"], 1.0 - confidence + rate)
+            decision = {"reason": "nearest_rewarded_experience", "exploration_rate": rate, "candidate_count": len(usable), "confidence": round(confidence, 4), "nearest_similarity": round(batch[0]["similarity"], 4) if batch else 0.0, "chosen_similarity": round(item.get("similarity", 0.0), 4), "chosen_reward": round(safe_float(item["record"].get("reward", 0.0), 0.0), 2), "chosen_record_id": item["record"].get("id")}
         self.last_action = copy.deepcopy(action) if action else None
         self.last_decision = decision
         return action, decision
@@ -5603,22 +5526,18 @@ class TrainingService:
     def observe_screen(self, analyzer, session_id, start, rect):
         return self.panel.capture_snapshot(analyzer, "training", session_id, start, rect=rect, priority="critical")
 
-    def decide_action(self, snapshot, zero_score_factor=0.0):
+    def decide_action(self, snapshot):
         panel = self.panel
         novelty, batch = panel.experience_pool.novelty(snapshot.hash_value, exact_checksum=getattr(snapshot, "image_checksum", ""), semantic_vector=getattr(snapshot, "semantic_vector", ()))
         screen_score_total = panel.store.screen_score_total if panel.store else 0.0
-        return panel.brain.choose(snapshot.hash_value, novelty, batch, screen_score_total, zero_score_factor=zero_score_factor)
+        return panel.brain.choose(snapshot.hash_value, novelty, batch, screen_score_total)
 
     def should_stop(self, clock, config, stop_event, suspend_time_limit=False):
         panel = self.panel
         if isinstance(clock, PausableTrainingClock):
-            if suspend_time_limit:
-                clock.pause()
-            else:
-                clock.resume()
-            deadline = None if suspend_time_limit else clock.deadline()
+            deadline = clock.deadline()
         else:
-            deadline = None if suspend_time_limit else clock + max(1, config.training_seconds)
+            deadline = clock + max(1, config.training_seconds)
         guarded = panel.active_mode_stop_reason("training", stop_event, config, deadline)
         if guarded:
             panel.termination_reason = guarded
@@ -7802,140 +7721,19 @@ class ControlPanel(tk.Tk):
             self.release_window_and_panel()
 
 
-    def best_zero_score_recovery_action(self, hash_value):
-        rescue_model = None
-        if self.experience_pool and getattr(self.experience_pool, "model_group_models", None):
-            rescue_model = self.experience_pool.model_group_models.get("rescue_policy")
-        batch = self.experience_pool.nearest(hash_value, limit=max(1, self.settings.nearest_top_k)) if self.experience_pool else []
-        model_action = rescue_model.predict({"hash": getattr(hash_value, "hex", ""), "neighbors": batch}) if rescue_model else None
-        if model_action:
-            return self.brain.mutate_action(model_action, safe_float(getattr(rescue_model, "fallback_mutation", 0.8), 0.8))
-        weighted = []
-        for item in batch:
-            record = item.get("record", {})
-            action = record.get("mouse_action")
-            if action:
-                reward = safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0)
-                similarity = clamp(item.get("similarity", 0.0), 0.0, 1.0)
-                weighted.append((max(0.01, reward + 100.0) * max(0.05, similarity), action))
-        action = weighted_choice(weighted) if weighted else (self.experience_pool.best_global_action() if self.experience_pool else None)
-        if action:
-            return self.brain.mutate_action(action, 0.8)
-        return self.brain.random_action(0.15)
-
-    def recovery_stop_reason(self, stop_event, config):
-        if stop_event.is_set():
-            reason = getattr(self.active_session, "termination_reason", None) if self.active_session else None
-            return reason if reason in TERMINATION_REASONS else (self.termination_reason if self.termination_reason in TERMINATION_REASONS else "user_stop")
-        if self.should_stop_by_escape():
-            return "esc"
-        check = self.window_manager.check_window(force=True)
-        if not check.ok:
-            return "window_invalid"
-        if not self.cursor_inside_window():
-            if hasattr(self, "ensure_cursor_inside_window") and self.ensure_cursor_inside_window():
-                return None
-            return "cursor_outside"
-        return None
-
-    def recover_zero_screen_score(self, analyzer, session_id, start, stop_event, zero_score_started_at, rescue_started_at, current_score, config=None):
-        stage_names = ("recapture", "verify_window", "refresh_index", "wait_render", "trusted_history", "bounded_random", "rescore")
-        threshold = max(self.settings.training_event_wait * 3.0, self.settings.generated_action_complete_wait * max(1, self.settings.training_fail_stop_count))
-        if not zero_score_started_at or time.perf_counter() - zero_score_started_at < threshold:
-            return current_score, zero_score_started_at, rescue_started_at, False
-        if rescue_started_at is None:
-            rescue_started_at = time.perf_counter()
-        score = current_score
-        stage_index = 0
-        run_guard = lambda: self.recovery_stop_reason(stop_event, config)
-        max_attempts = len(stage_names) + max(1, self.settings.training_fail_stop_count)
-        while score <= 0.0 and not run_guard() and self.is_run_active(self.active_session.token if self.active_session else None, "training"):
-            if stage_index >= max_attempts:
-                self.termination_reason = "zero_score_unrecoverable"
-                stop_event.set()
-                break
-            stage = stage_names[min(stage_index, len(stage_names) - 1)]
-            self.events.publish("training_zero_score_recovery", stage=stage, elapsed=round(time.perf_counter() - zero_score_started_at, 3), screen_score=score)
-            guarded = run_guard()
-            if guarded:
-                self.termination_reason = guarded
-                stop_event.set()
-                break
-            if stage == "verify_window":
-                check = self.window_manager.check_window(force=True)
-                if not check.ok:
-                    self.termination_reason = "window_invalid"
-                    stop_event.set()
-                    break
-            elif stage == "refresh_index":
-                with self.experience_pool.lock:
-                    self.experience_pool.rebuild_index_locked()
-                    self.experience_pool.nearest_cache.clear()
-            elif stage == "wait_render":
-                stop_event.wait(max(self.settings.generated_action_complete_wait, self.settings.training_event_wait))
-            snapshot = self.capture_snapshot(analyzer, "training", session_id, start, priority="critical")
-            if not snapshot:
-                self.termination_reason = "window_invalid"
-                stop_event.set()
-                break
-            score = self.experience_pool.score_snapshot(snapshot)[0]
-            self.events.publish("training_zero_score_recovery_recheck", stage=stage, screen_score=score)
-            if score > 0.0:
-                return score, None, None, True
-            if stage in ("trusted_history", "bounded_random"):
-                rect = snapshot.rect
-                if stage == "trusted_history":
-                    action = self.best_zero_score_recovery_action(snapshot.hash_value)
-                else:
-                    action = self.brain.random_action(0.35)
-                guarded = run_guard()
-                if guarded:
-                    self.termination_reason = guarded
-                    stop_event.set()
-                    break
-                if action and self.executor and not run_guard():
-                    try:
-                        decision = {"reason": "zero_score_recovery", "zero_score_recovery_stage": stage, "zero_score_factor": 1.0}
-                        before_snapshot = snapshot
-                        actual = self.executor.execute(action, rect, stop_event, lambda: bool(run_guard()), self.mark_learning_activity)
-                        guarded = run_guard()
-                        if guarded:
-                            self.termination_reason = guarded
-                            stop_event.set()
-                        after_snapshot = self.capture_snapshot(analyzer, "training", session_id, start, rect=rect, priority="critical") if not guarded else None
-                        if actual:
-                            record = self.write_record("training", session_id, before_snapshot, actual, "ai_mouse_zero_score_recovery", decision=decision, action_anchor_perf=actual.get("started_perf"), after_snapshot=after_snapshot, planned_action=action, execution_error=actual.get("execution_error"))
-                            if record:
-                                score = safe_float(record.get("after_screen_score", record.get("screen_score", score)), score)
-                        elif before_snapshot:
-                            self.write_record("training", session_id, before_snapshot, None, "ai_mouse_zero_score_recovery_failed", decision=decision, planned_action=action, failed_action=True, execution_error="empty_action_result")
-                    except Exception as exc:
-                        self.log_exception("zero_score_recovery_action", exc, {"stage": stage})
-            stage_index += 1
-            backoff = max(self.settings.training_event_wait, self.settings.generated_action_complete_wait)
-            stop_event.wait(backoff)
-            guarded = run_guard()
-            if guarded:
-                self.termination_reason = guarded
-                stop_event.set()
-        return score, zero_score_started_at, rescue_started_at, score > 0.0
-
     def training_loop(self, token, stop_event, config):
         session_id = uuid.uuid4().hex
         start = time.perf_counter()
         training_clock = PausableTrainingClock(config.training_seconds)
         consecutive_failures = 0
         consecutive_no_actions = 0
-        zero_score_events = 0
-        zero_score_started_at = None
-        rescue_started_at = None
         last_training_error = None
         self.termination_reason = "completed"
         service = self.training_service
         with ScreenAnalyzer(config.settings.hash_size) as analyzer:
             self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start, priority="critical"), None, "mode_start")
             while not stop_event.is_set() and self.is_run_active(token, "training"):
-                if service.should_stop(training_clock, config, stop_event, suspend_time_limit=zero_score_started_at is not None or rescue_started_at is not None):
+                if service.should_stop(training_clock, config, stop_event):
                     break
                 rect = self.current_rect()
                 service.prepare_for_event(rect)
@@ -7948,35 +7746,7 @@ class ControlPanel(tk.Tk):
                     self.termination_reason = "window_invalid"
                     stop_event.set()
                     break
-                current_screen_score = self.experience_pool.score_snapshot(snapshot)[0]
-                if current_screen_score <= 0.0:
-                    training_clock.pause()
-                    zero_score_events += 1
-                    if zero_score_started_at is None:
-                        zero_score_started_at = time.perf_counter()
-                    current_screen_score, zero_score_started_at, rescue_started_at, recovered = self.recover_zero_screen_score(analyzer, session_id, start, stop_event, zero_score_started_at, rescue_started_at, current_screen_score, config)
-                    self.events.publish("training_zero_screen_score", streak=zero_score_events, zero_score_elapsed=round(time.perf_counter() - zero_score_started_at, 3) if zero_score_started_at else 0.0, strategy_stage=min(5, 1 + int(clamp(zero_score_events / max(1, self.settings.training_fail_stop_count), 0.0, 1.0) * 5.0)), screen_score=current_screen_score, recovered=bool(recovered))
-                    if recovered:
-                        zero_score_events = 0
-                        zero_score_started_at = None
-                        rescue_started_at = None
-                        training_clock.resume()
-                    else:
-                        if not stop_event.is_set():
-                            stop_event.wait(max(self.settings.training_event_wait, self.settings.min_action_delay_seconds))
-                        continue
-                else:
-                    zero_score_events = 0
-                    zero_score_started_at = None
-                    rescue_started_at = None
-                    training_clock.resume()
-                zero_score_factor = clamp(zero_score_events / max(1, self.settings.training_fail_stop_count), 0.0, 1.0)
-                action, decision = service.decide_action(snapshot, zero_score_factor=zero_score_factor)
-                if decision is not None:
-                    zero_stage = min(5, 1 + int(zero_score_factor * 5.0)) if zero_score_events > 0 else 0
-                    decision["zero_score_streak"] = zero_score_events
-                    decision["zero_score_strategy_stage"] = zero_stage
-                    decision["zero_score_strategy"] = ["normal", "recapture_validate_window", "refresh_neighbors", "trusted_history_action", "bounded_random_exploration", "alternate_mouse_action"][zero_stage]
+                action, decision = service.decide_action(snapshot)
                 if not action:
                     consecutive_no_actions += 1
                     self.write_record("training", session_id, snapshot, None, "screen_event", decision=decision)
@@ -8180,7 +7950,7 @@ def run_windows_acceptance():
                 history.append(state)
         return state, history, saved
     ldplayer_path, data_path = startup_config_paths()
-    result = {"startup_repair": "fail", "client_capture": "fail", "mouse_permission": "fail", "occlusion_detection": "fail", "zero_score_recovery": "fail", "sleep_resume": "fail", "auto_restart_training": "fail", "client_abnormal_scenarios": {}, "cursor_gate": "fail", "training_clock_pause_resume": "fail", "zero_score_rescue": "fail", "sleep_esc_resume_idempotency": "fail", "flow_tests": {}}
+    result = {"startup_repair": "fail", "client_capture": "fail", "mouse_permission": "fail", "occlusion_detection": "fail", "sleep_resume": "fail", "auto_restart_training": "fail", "client_abnormal_scenarios": {}, "cursor_gate": "fail", "training_clock_pause_resume": "fail", "sleep_esc_resume_idempotency": "fail", "flow_tests": {}}
     issues = startup_environment_issues()
     storage_issue = data_path_write_issue(data_path, create=True)
     path_ok, path_reason = validate_ldplayer_executable(ldplayer_path, require_attach=False)
@@ -8199,8 +7969,6 @@ def run_windows_acceptance():
     learning_exits = {name: flow("learning", ((name, "stopping"), ("save", "mode_data"), ("idle", "idle"))) for name in ("cursor_outside", "esc", "still_timeout", "window_occluded")}
     training_normal = flow("training", (("time_limit", "stopping"), ("save", "mode_data"), ("sleep", "sleep")))
     training_failure = flow("training", (("executor_error", "stopping"), ("save", "mode_data"), ("idle", "idle")))
-    zero_recovered = flow("training", (("zero_score", "clock_paused"), ("score_nonzero", "training")))
-    zero_unrecoverable = flow("training", (("zero_score", "clock_paused"), ("rescue", "rescuing"), ("still_zero", "stopping"), ("save", "mode_data"), ("idle", "idle")))
     sleep_flow = flow("sleep", (("task1", "sleep_task1"), ("save", "task1"), ("task2", "sleep_task2"), ("save", "task2"), ("task3", "sleep_task3"), ("save", "task3"), ("idle", "idle")))
     auto_restart_flow = flow("training", (("time_limit", "sleep"), ("task1", "sleep_task1"), ("save", "task1"), ("task2", "sleep_task2"), ("save", "task2"), ("task3", "sleep_task3"), ("save", "task3"), ("idle", "idle"), ("restart", "training")))
     sleep_esc_flow = flow("sleep", (("esc", "stopping"), ("save", "sleep_checkpoint"), ("idle", "idle"), ("panel", "panel_visible")))
@@ -8209,13 +7977,10 @@ def run_windows_acceptance():
     result["flow_tests"]["startup_failure_popup_actions"] = passfail(startup_failure["retry"][0] == "idle" and startup_failure["ignore"][0] == "idle" and startup_failure["exit"][0] == "exited")
     result["flow_tests"]["learning_exit_paths"] = passfail(all(item[0] == "idle" and item[2] == ["mode_data"] for item in learning_exits.values()))
     result["flow_tests"]["training_exit_paths"] = passfail(training_normal[0] == "sleep" and training_normal[2] == ["mode_data"] and training_failure[0] == "idle" and training_failure[2] == ["mode_data"])
-    result["flow_tests"]["zero_score_paths"] = passfail(zero_recovered[0] == "training" and zero_unrecoverable[0] == "idle" and zero_unrecoverable[2] == ["mode_data"])
     result["flow_tests"]["sleep_tasks_save_chain"] = passfail(sleep_flow[0] == "idle" and sleep_flow[2] == ["task1", "task2", "task3"])
     result["flow_tests"]["training_sleep_restart"] = passfail(auto_restart_flow[0] == "training" and auto_restart_flow[2] == ["task1", "task2", "task3"])
     result["flow_tests"]["sleep_esc_checkpoint_panel"] = passfail(sleep_esc_flow[0] == "panel_visible" and sleep_esc_flow[2] == ["sleep_checkpoint"])
     result["flow_tests"]["migration_resume_verify"] = passfail(migration_flow[0] == "idle" and "migration_checkpoint" in migration_flow[1])
-    result["zero_score_recovery"] = result["flow_tests"]["zero_score_paths"]
-    result["zero_score_rescue"] = result["flow_tests"]["zero_score_paths"]
     result["auto_restart_training"] = result["flow_tests"]["training_sleep_restart"]
     result["sleep_resume"] = result["flow_tests"]["sleep_tasks_save_chain"]
     result["sleep_esc_resume_idempotency"] = result["flow_tests"]["sleep_esc_checkpoint_panel"]
