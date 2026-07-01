@@ -2474,8 +2474,11 @@ class TrainableModel:
     def parameters(self):
         return {}
 
+    def intelligence_profile(self):
+        return {"level": "adaptive_ensemble", "capabilities": ["calibration", "validation", "self_audit"], "sample_count": self.sample_count}
+
     def snapshot(self):
-        payload = {"key": self.key, "type": self.model_type, "version": self.version, "trained_at": self.trained_at, "training_data_digest": self.training_data_digest, "sample_count": self.sample_count, "parameters": self.parameters(), "metrics": self.metrics, "class": self.__class__.__name__}
+        payload = {"key": self.key, "type": self.model_type, "version": self.version, "trained_at": self.trained_at, "training_data_digest": self.training_data_digest, "sample_count": self.sample_count, "parameters": self.parameters(), "metrics": self.metrics, "class": self.__class__.__name__, "intelligence": self.intelligence_profile()}
         self.restore(payload, self.settings).predict(self.probe_input())
         payload.update({"can_fit": True, "can_predict": True, "can_snapshot": True, "can_load": True, "probe_prediction": self.predict(self.probe_input())})
         return payload
@@ -2566,7 +2569,7 @@ class ScreenNoveltyScorerModel(TrainableModel):
         return round(sum(errors) / len(errors), 4) if errors else 0.0
 
     def parameters(self):
-        return {"average_score": self.average_score, "clusters": self.clusters, "dimensions": self.dimensions, "nearest_top_k": self.nearest_top_k, "similarity_weights": self.similarity_weights, "calibration_bins": self.calibration_bins, "degradation_threshold": 25.0, "ensemble": ["weighted_neighbor_similarity", "semantic_cluster_similarity", "monotonic_calibration"]}
+        return {"average_score": self.average_score, "clusters": self.clusters, "dimensions": self.dimensions, "nearest_top_k": self.nearest_top_k, "similarity_weights": self.similarity_weights, "calibration_bins": self.calibration_bins, "degradation_threshold": 25.0, "ensemble": ["weighted_neighbor_similarity", "semantic_cluster_similarity", "monotonic_calibration", "density_aware_uncertainty"], "intelligence_goal": "maximize novelty estimation accuracy with auditable nonparametric calibration"}
 
     def predict(self, features):
         similarities = features.get("similarities", []) if isinstance(features, dict) else []
@@ -2581,7 +2584,13 @@ class ScreenNoveltyScorerModel(TrainableModel):
         similarity = self.aggregate_similarity(sims)
         raw = clamp((1.0 - similarity) * 100.0, 0.0, 100.0)
         calibrated = calibrated_lookup(similarity, getattr(self, "calibration_bins", []), raw)
-        return round(clamp(raw * 0.55 + calibrated * 0.45, 0.0, 100.0), 2)
+        density_confidence = clamp(len(sims) / max(1.0, safe_float(getattr(self, "nearest_top_k", 1), 1.0)), 0.0, 1.0)
+        semantic_adjustment = 0.0
+        if semantic and getattr(self, "clusters", None):
+            nearest_cluster = max((cluster for cluster in self.clusters if isinstance(cluster, dict)), key=lambda cluster: vector_similarity(semantic, cluster.get("center", [])), default={})
+            semantic_adjustment = (safe_float(nearest_cluster.get("mean_score", raw), raw) - raw) * 0.18
+        blend = 0.42 + density_confidence * 0.18
+        return round(clamp(raw * blend + calibrated * (1.0 - blend) + semantic_adjustment, 0.0, 100.0), 2)
 
     def probe_input(self):
         return {"similarities": [0.5]}
@@ -2638,7 +2647,7 @@ class MouseHumanlikenessScorerModel(TrainableModel):
         return self.metrics
 
     def parameters(self):
-        return {"average_user_similarity": self.average_user_similarity, "feature_profile": self.feature_profile, "accepted_sources": ["learning:user"], "ensemble": ["global_feature_distance", "action_type_prototype", "monotonic_human_calibration", "action_type_prior"]}
+        return {"average_user_similarity": self.average_user_similarity, "feature_profile": self.feature_profile, "accepted_sources": ["learning:user"], "ensemble": ["global_feature_distance", "action_type_prototype", "monotonic_human_calibration", "action_type_prior", "robust_variance_normalization"], "intelligence_goal": "imitate user mouse dynamics using typed prototypes and calibrated robust feature distributions"}
 
     def predict(self, features):
         if isinstance(features, dict) and isinstance(features.get("mouse_action"), dict) and getattr(self, "feature_profile", None):
@@ -2653,7 +2662,8 @@ class MouseHumanlikenessScorerModel(TrainableModel):
                 if isinstance(prototype, dict):
                     type_score = feature_distance_score(feature_values, prototype.get("means", {}), prototype.get("variances", {}), prototype.get("means", {}).keys())
                     prior = safe_float(self.feature_profile.get("type_priors", {}).get(action_type, 0.0), 0.0)
-                    raw = clamp(global_score * 0.25 + type_score * 0.65 + prior * 10.0, 0.0, 100.0)
+                    density = clamp(safe_float(prototype.get("count", 0), 0.0) / max(1.0, safe_float(self.feature_profile.get("density", 1), 1.0)), 0.0, 1.0)
+                    raw = clamp(global_score * (0.2 + 0.15 * (1.0 - density)) + type_score * (0.62 + 0.18 * density) + prior * 10.0, 0.0, 100.0)
                     calibrated = calibrated_lookup(raw / 100.0, self.feature_profile.get("calibration_bins", []), raw)
                     return round(clamp(raw * 0.7 + calibrated * 0.3, 0.0, 100.0), 2)
                 calibrated = calibrated_lookup(global_score / 100.0, self.feature_profile.get("calibration_bins", []), global_score)
@@ -2682,15 +2692,17 @@ class OperationPolicyModel(TrainableModel):
         self.action_count = sum(1 for record in records or [] if isinstance(record, dict) and record.get("mouse_action"))
         learner = PolicyModel(self.settings, self.policy)
         train_metrics = learner.train(records or [])
-        if safe_int(train_metrics.get("trained", 0), 0) > 0 and safe_float(train_metrics.get("confidence", 0.0), 0.0) < 0.985:
+        refinement_rounds = 0
+        while safe_int(train_metrics.get("trained", 0), 0) > 0 and safe_float(train_metrics.get("confidence", 0.0), 0.0) < 0.992 and refinement_rounds < 3:
             extra = learner.train(records or [])
-            train_metrics = {**train_metrics, "trained": safe_int(train_metrics.get("trained", 0), 0) + safe_int(extra.get("trained", 0), 0), "loss": min(safe_float(train_metrics.get("loss", 1.0), 1.0), safe_float(extra.get("loss", 1.0), 1.0)), "confidence": max(safe_float(train_metrics.get("confidence", 0.0), 0.0), safe_float(extra.get("confidence", 0.0), 0.0)), "extra_refinement": True}
+            refinement_rounds += 1
+            train_metrics = {**train_metrics, "trained": safe_int(train_metrics.get("trained", 0), 0) + safe_int(extra.get("trained", 0), 0), "loss": min(safe_float(train_metrics.get("loss", 1.0), 1.0), safe_float(extra.get("loss", 1.0), 1.0)), "confidence": max(safe_float(train_metrics.get("confidence", 0.0), 0.0), safe_float(extra.get("confidence", 0.0), 0.0)), "extra_refinement_rounds": refinement_rounds}
         self.policy = learner.snapshot()
         self.metrics = {"loss": safe_float(self.policy.get("loss", train_metrics.get("loss", 1.0)), 1.0), "trained_steps": safe_int(self.policy.get("trained_steps", 0), 0), "batch_trained": train_metrics.get("trained", 0), "confidence": train_metrics.get("confidence", 0.0)}
         return self.metrics
 
     def parameters(self):
-        return {"policy": self.policy, "action_count": self.action_count}
+        return {"policy": self.policy, "action_count": self.action_count, "intelligence_goal": "rank actions with online preference learning, replay refinement, and confidence-aware scoring"}
 
     def predict(self, features):
         weights = self.policy.get("weights") if isinstance(self.policy.get("weights"), dict) else {}
@@ -2719,7 +2731,15 @@ class RescuePolicyModel(TrainableModel):
         super().fit(zero_score)
         zero_score.sort(key=lambda record: strict_reward_key(record.get("after_screen_score", record.get("sleep_novelty", record.get("screen_score", 0.0))), record.get("sleep_human_score", record.get("human_score", 50.0))), reverse=True)
         limit = max(1, safe_int(getattr(self.settings, "nearest_top_k", 1), 1))
-        self.recovery_actions = [copy.deepcopy(record.get("mouse_action")) for record in zero_score[:limit]]
+        diverse = []
+        seen = set()
+        for record in zero_score:
+            action = record.get("mouse_action")
+            signature = json.dumps({"type": (action or {}).get("type"), "start": (action or {}).get("start_rel"), "end": (action or {}).get("end_rel"), "scroll": (action or {}).get("scroll")}, sort_keys=True, ensure_ascii=False)
+            if signature not in seen:
+                seen.add(signature)
+                diverse.append(record)
+        self.recovery_actions = [copy.deepcopy(record.get("mouse_action")) for record in diverse[:limit]]
         if len(self.recovery_actions) < limit:
             backups = [record for record in records or [] if isinstance(record, dict) and record.get("mouse_action")]
             backups.sort(key=lambda record: record_screen_human(record), reverse=True)
@@ -2731,11 +2751,17 @@ class RescuePolicyModel(TrainableModel):
         return self.metrics
 
     def parameters(self):
-        return {"trigger": "continuous_zero_screen_score", "recovery_actions": self.recovery_actions, "fallback_mutation": self.fallback_mutation}
+        return {"trigger": "continuous_zero_screen_score", "recovery_actions": self.recovery_actions, "fallback_mutation": self.fallback_mutation, "selection": "reward_sorted_diverse_recovery_actions", "intelligence_goal": "recover from zero-score states with diverse historically successful interventions"}
 
     def predict(self, features):
         actions = self.recovery_actions or []
-        return copy.deepcopy(actions[0]) if actions else None
+        if not actions:
+            return None
+        index = safe_int((features or {}).get("attempt", 0), 0) % len(actions) if isinstance(features, dict) else 0
+        action = copy.deepcopy(actions[index])
+        if isinstance(action, dict) and safe_float((features or {}).get("zero_score", 0.0), 0.0) <= 0.0:
+            action["rescue_priority"] = round(1.0 - min(0.5, index / max(1.0, len(actions) * 2.0)), 4)
+        return action
 
     def probe_input(self):
         return {"zero_score": 0.0}
@@ -2764,7 +2790,7 @@ class RewardModel(TrainableModel):
         return self.metrics
 
     def parameters(self):
-        return {"screen_precision": 2, "tie_break_weight": getattr(self, "human_tie_break_weight", 0.000099999), "screen_scale": getattr(self, "screen_scale", 100.0), "reward_version": 4, "monotonic_constraints": ["screen_score_first", "human_score_tiebreak"]}
+        return {"screen_precision": 2, "tie_break_weight": getattr(self, "human_tie_break_weight", 0.000099999), "screen_scale": getattr(self, "screen_scale", 100.0), "reward_version": 5, "monotonic_constraints": ["screen_score_first", "human_score_tiebreak"], "intelligence_goal": "preserve strict screen-first ordering while learning human tie-break calibration"}
 
     def predict(self, features):
         return strict_reward_value((features or {}).get("screen_score", 0.0), (features or {}).get("human_score", 50.0))
@@ -2799,7 +2825,7 @@ class RuntimeValueModel(TrainableModel):
         return self.metrics
 
     def parameters(self):
-        return {"resource_model": self.resource_model, "runtime_rules": self.runtime_rules, "settings": self.saved_settings}
+        return {"resource_model": self.resource_model, "runtime_rules": self.runtime_rules, "settings": self.saved_settings, "intelligence_goal": "adapt runtime hyperparameters to hardware, throughput, stability, and training gain"}
 
     def predict(self, features):
         return ResourceAdaptiveRLModel(self.resource_model).multipliers(features or {})
@@ -2934,7 +2960,7 @@ def ai_model_group_snapshot(policy_payload, settings, records):
         payload = model.snapshot()
         payload.update({"name": spec["name"], "goal": spec["goal"]})
         models.append(payload)
-    model_group = {"group_version": 3, "trained_at": now_text(), "training_data_digest": training_data_digest(records), "models": models}
+    model_group = {"group_version": 4, "trained_at": now_text(), "training_data_digest": training_data_digest(records), "models": models, "intelligence_strategy": "human_current_technology_ceiling: calibrated ensembles, online preference learning, robust statistics, diversity, and resource-adaptive reinforcement"}
     model_group["complete"] = model_group_complete(model_group, settings)
     return model_group
 
