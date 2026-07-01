@@ -2376,6 +2376,24 @@ def vector_similarity(left, right):
     return clamp((dot / (na * nb) + 1.0) / 2.0, 0.0, 1.0)
 
 
+def percentile(values, ratio, default=0.0):
+    clean = sorted(safe_float(value, default) for value in values or [] if math.isfinite(safe_float(value, default)))
+    if not clean:
+        return default
+    pos = clamp(ratio, 0.0, 1.0) * (len(clean) - 1)
+    lower = int(math.floor(pos))
+    upper = int(math.ceil(pos))
+    if lower == upper:
+        return clean[lower]
+    return clean[lower] * (upper - pos) + clean[upper] * (pos - lower)
+
+
+def robust_scale(values, default=1.0):
+    q1 = percentile(values, 0.25, default)
+    q3 = percentile(values, 0.75, default)
+    return max(0.0001, (q3 - q1) / 1.349 if q3 > q1 else default)
+
+
 def feature_distance_score(values, means, variances, names):
     if not means:
         return 50.0
@@ -2385,7 +2403,8 @@ def feature_distance_score(values, means, variances, names):
         if name not in means:
             continue
         variance = max(0.0001, safe_float(variances.get(name, 1.0), 1.0))
-        distance += ((safe_float(values.get(name, 0.0), 0.0) - safe_float(means.get(name, 0.0), 0.0)) ** 2) / variance
+        delta = abs(safe_float(values.get(name, 0.0), 0.0) - safe_float(means.get(name, 0.0), 0.0))
+        distance += math.log1p((delta * delta) / variance)
         used += 1
     return round(clamp(100.0 / (1.0 + math.sqrt(distance / max(1, used))), 0.0, 100.0), 2)
 
@@ -2480,8 +2499,8 @@ class ScreenNoveltyScorerModel(TrainableModel):
         semantic_records = [(numeric_vector(record.get("screen_semantic_vector")), safe_float(record.get("sleep_novelty", record.get("novelty", record.get("screen_score", 0.0))), 0.0)) for record in records or [] if isinstance(record, dict)]
         semantic_records = [(vector, score) for vector, score in semantic_records if vector]
         semantic_records.sort(key=lambda item: item[1], reverse=True)
-        cluster_count = max(1, min(safe_int(getattr(self.settings, "nearest_top_k", 1), 1), len(semantic_records))) if semantic_records else 0
-        self.clusters = [{"center": vector_mean([item[0] for item in semantic_records[index::cluster_count]]), "mean_score": round(sum(item[1] for item in semantic_records[index::cluster_count]) / max(1, len(semantic_records[index::cluster_count])), 4), "size": len(semantic_records[index::cluster_count])} for index in range(cluster_count)]
+        cluster_count = max(1, min(max(safe_int(getattr(self.settings, "nearest_top_k", 1), 1), int(math.sqrt(len(semantic_records))) or 1), len(semantic_records))) if semantic_records else 0
+        self.clusters = [{"center": vector_mean([item[0] for item in semantic_records[index::cluster_count]]), "mean_score": round(sum(item[1] for item in semantic_records[index::cluster_count]) / max(1, len(semantic_records[index::cluster_count])), 4), "size": len(semantic_records[index::cluster_count]), "score_p25": round(percentile([item[1] for item in semantic_records[index::cluster_count]], 0.25, 0.0), 4), "score_p75": round(percentile([item[1] for item in semantic_records[index::cluster_count]], 0.75, 0.0), 4)} for index in range(cluster_count)]
         self.dimensions = len(self.clusters[0]["center"]) if self.clusters else 0
         self.nearest_top_k = safe_int(getattr(self.settings, "nearest_top_k", 1), 1)
         self.similarity_weights = self.learn_similarity_weights(records or [])
@@ -2522,8 +2541,11 @@ class ScreenNoveltyScorerModel(TrainableModel):
         if not pairs:
             return {"max": 0.5, "mean": 0.35, "density": 0.15}
         best = (999.0, {"max": 0.5, "mean": 0.35, "density": 0.15})
-        for max_w in (0.35, 0.5, 0.65):
-            for mean_w in (0.2, 0.35, 0.5):
+        grid = tuple(index / 20.0 for index in range(2, 19))
+        for max_w in grid:
+            for mean_w in grid:
+                if max_w + mean_w > 0.98:
+                    continue
                 density_w = max(0.0, 1.0 - max_w - mean_w)
                 error = 0.0
                 for sims, target in pairs:
@@ -2609,7 +2631,8 @@ class MouseHumanlikenessScorerModel(TrainableModel):
                 raw = feature_distance_score(fv, proto.get("means", means), proto.get("variances", variances), (proto.get("means") or means).keys())
                 calibration_pairs.append((raw / 100.0, safe_float(record.get("human_score", self.average_user_similarity), self.average_user_similarity)))
         calibration_bins = monotonic_bins(calibration_pairs, reverse=False, bins=max(4, min(24, len(calibration_pairs)))) if calibration_pairs else []
-        self.feature_profile = {"means": means, "variances": variances, "density": len(features), "prototypes": prototypes, "type_priors": type_priors, "calibration_bins": calibration_bins}
+        robust_variances = {name: round(robust_scale([safe_float(item.get(name, 0.0), 0.0) for item in features], math.sqrt(max(0.0001, variances.get(name, 1.0)))) ** 2, 6) for name in names} if features else {}
+        self.feature_profile = {"means": means, "variances": variances, "robust_variances": robust_variances, "density": len(features), "prototypes": prototypes, "type_priors": type_priors, "calibration_bins": calibration_bins}
         validation = [abs(self.predict({"mouse_action": record.get("mouse_action"), "human_score": safe_float(record.get("human_score", 50.0), 50.0)}) - safe_float(record.get("human_score", self.average_user_similarity), self.average_user_similarity)) for record in learning if record.get("mouse_action")]
         self.metrics = {"mean_score": self.average_user_similarity, "learning_records": len(learning), "feature_dimensions": len(names), "action_type_prototypes": len(prototypes), "validation_mae": round(sum(validation) / len(validation), 4) if validation else 0.0, "degradation_threshold": 30.0}
         return self.metrics
@@ -2623,7 +2646,7 @@ class MouseHumanlikenessScorerModel(TrainableModel):
             means = self.feature_profile.get("means", {})
             variances = self.feature_profile.get("variances", {})
             if means:
-                global_score = feature_distance_score(feature_values, means, variances, means.keys())
+                global_score = feature_distance_score(feature_values, means, self.feature_profile.get("robust_variances", variances), means.keys())
                 action_type = str(features.get("mouse_action", {}).get("type", "click"))
                 prototypes = self.feature_profile.get("prototypes", {})
                 prototype = prototypes.get(action_type) if isinstance(prototypes, dict) else None
@@ -2659,6 +2682,9 @@ class OperationPolicyModel(TrainableModel):
         self.action_count = sum(1 for record in records or [] if isinstance(record, dict) and record.get("mouse_action"))
         learner = PolicyModel(self.settings, self.policy)
         train_metrics = learner.train(records or [])
+        if safe_int(train_metrics.get("trained", 0), 0) > 0 and safe_float(train_metrics.get("confidence", 0.0), 0.0) < 0.985:
+            extra = learner.train(records or [])
+            train_metrics = {**train_metrics, "trained": safe_int(train_metrics.get("trained", 0), 0) + safe_int(extra.get("trained", 0), 0), "loss": min(safe_float(train_metrics.get("loss", 1.0), 1.0), safe_float(extra.get("loss", 1.0), 1.0)), "confidence": max(safe_float(train_metrics.get("confidence", 0.0), 0.0), safe_float(extra.get("confidence", 0.0), 0.0)), "extra_refinement": True}
         self.policy = learner.snapshot()
         self.metrics = {"loss": safe_float(self.policy.get("loss", train_metrics.get("loss", 1.0)), 1.0), "trained_steps": safe_int(self.policy.get("trained_steps", 0), 0), "batch_trained": train_metrics.get("trained", 0), "confidence": train_metrics.get("confidence", 0.0)}
         return self.metrics
