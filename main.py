@@ -1243,6 +1243,29 @@ def run_self_test():
             persistence.flush()
         finally:
             persistence.close()
+        race_queue = AsyncPersistenceQueue.__new__(AsyncPersistenceQueue)
+        race_queue.settings = settings
+        race_queue.close_seconds = settings.persistence_close_seconds
+        race_queue.lock = threading.RLock()
+        race_queue.pending_sequences = set()
+        race_queue.failed_sequences = set()
+        race_queue.stop_event = threading.Event()
+        race_queue.image_dropped = 0
+        race_queue.status = AsyncPersistenceQueue.status.__get__(race_queue, AsyncPersistenceQueue)
+        race_queue.recent_sequences = deque(maxlen=1024)
+        race_queue.last_confirmed_sequence = 0
+        race_queue.errors = []
+        class RaceJobs:
+            def __init__(self, owner):
+                self.owner = owner
+            def put(self, job, block=False, timeout=0):
+                sequence = job.get("persistence_sequence")
+                with self.owner.lock:
+                    self.owner.pending_sequences.discard(sequence)
+                    self.owner.last_confirmed_sequence = max(self.owner.last_confirmed_sequence, sequence)
+        race_queue.jobs = RaceJobs(race_queue)
+        assert AsyncPersistenceQueue.enqueue(race_queue, {"type": "record", "persistence_sequence": 1}, block_when_full=False)
+        assert race_queue.pending_sequences == set() and race_queue.last_confirmed_sequence == 1
         reopened_queue = Image.open(queued_path)
         reopened_queue.load()
         assert reopened_queue.format == "PNG"
@@ -1269,6 +1292,13 @@ def run_self_test():
         under_limit_store.save_experience_records([{"id": "under", "screen_path": "screens/small.png", "reward": 1.0}])
         under_limit_result = under_limit_store.compact_experience_pool(0.1)
         assert under_limit_result["complete"] is True and not under_limit_result["changed"] and under_limit_result["removed"] == 0
+        cancelled_store = DataStore(root / "cancelled_pool")
+        kept_screen = cancelled_store.screen_dir / "kept.png"
+        with kept_screen.open("wb") as file:
+            file.truncate(128 * 1024 * 1024)
+        cancelled_store.save_experience_records([{"id": "kept", "screen_path": "screens/kept.png", "reward": 1.0}])
+        cancelled = cancelled_store.compact_experience_pool(0.1, run_guard=lambda: "esc")
+        assert cancelled["interrupted"] is True and cancelled["removed"] == 0 and kept_screen.exists()
         compacted = store.compact_experience_pool(0.1)
         retained = store.load_experience()
         assert compacted["complete"] is True and compacted["changed"] and shared.exists() and not unique.exists()
@@ -3795,8 +3825,10 @@ class DataStore:
                 path_references[path] += 1
         removed_ids = set()
         removed = 0
+        interrupted = False
         for item in records:
             if run_guard and run_guard():
+                interrupted = True
                 break
             if current <= target_bytes:
                 break
@@ -3814,6 +3846,11 @@ class DataStore:
                         pass
             if progress_callback and (removed == 1 or removed % 100 == 0):
                 progress_callback("删除低奖励样本", removed, max(1, len(records)), {"removed": removed, "size_bytes": current, "target_bytes": target_bytes})
+        if interrupted:
+            size_report = self.experience_pool_size_report([entry["record"] for entry in records])
+            result = {"changed": False, "interrupted": True, "removed": removed, "size_bytes": current, "target_bytes": target_bytes, "complete": False}
+            result.update(size_report)
+            return result
         if removed_ids:
             keep_records = [entry for entry in records if entry["line"] not in removed_ids]
             referenced_after = set()
@@ -3844,7 +3881,7 @@ class DataStore:
             size_report = self.cleanup_orphan_screens([entry["record"] for entry in keep_records])
             current = size_report.get("logical_pool_size_bytes", current)
         else:
-            size_report = self.cleanup_orphan_screens(records)
+            size_report = self.cleanup_orphan_screens([entry["record"] for entry in records])
         complete = current <= target_bytes and size_report.get("orphan_screen_size_bytes", 0) == 0
         if progress_callback:
             progress_callback("最终校验实际磁盘占用", 1, 1, {"removed": removed, "size_bytes": current, "target_bytes": target_bytes})
@@ -5302,17 +5339,25 @@ class AsyncPersistenceQueue:
         started = time.perf_counter()
         timeout = self.close_seconds if timeout_seconds is None else max(0.0, safe_float(timeout_seconds, self.close_seconds))
         interval = max(0.05, min(0.5, self.settings.persistence_event_wait or 0.1))
+        sequence = job.get("persistence_sequence") if isinstance(job, dict) else None
+        registered = False
+        if sequence is not None:
+            with self.lock:
+                self.pending_sequences.add(sequence)
+                registered = True
         while True:
             if self.stop_event.is_set() or (stop_event and stop_event.is_set()):
+                if registered:
+                    with self.lock:
+                        self.pending_sequences.discard(sequence)
                 return False
             try:
                 self.jobs.put(job, block=block_when_full, timeout=interval if block_when_full else 0)
-                sequence = job.get("persistence_sequence") if isinstance(job, dict) else None
-                if sequence is not None:
-                    with self.lock:
-                        self.pending_sequences.add(sequence)
                 return True
             except queue.Full:
+                if registered and not block_when_full:
+                    with self.lock:
+                        self.pending_sequences.discard(sequence)
                 if not block_when_full:
                     store = job.get("store")
                     if store:
@@ -5326,6 +5371,9 @@ class AsyncPersistenceQueue:
                 if heartbeat:
                     heartbeat(self.status(waited))
                 if waited >= timeout:
+                    if registered:
+                        with self.lock:
+                            self.pending_sequences.discard(sequence)
                     store = job.get("store") if isinstance(job, dict) else None
                     if store:
                         store.log_error("async_persistence_enqueue_timeout", TimeoutError("persistence_enqueue_timeout"), self.status(waited))
