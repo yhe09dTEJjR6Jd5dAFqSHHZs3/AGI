@@ -2390,6 +2390,46 @@ def feature_distance_score(values, means, variances, names):
     return round(clamp(100.0 / (1.0 + math.sqrt(distance / max(1, used))), 0.0, 100.0), 2)
 
 
+def monotonic_bins(pairs, reverse=False, bins=16):
+    clean = [(clamp(safe_float(x, 0.0), 0.0, 1.0), clamp(safe_float(y, 0.0), 0.0, 100.0)) for x, y in pairs or []]
+    if not clean:
+        return []
+    clean.sort(key=lambda item: item[0])
+    bucket_count = max(1, min(int(bins), len(clean)))
+    buckets = []
+    for index in range(bucket_count):
+        start = index * len(clean) // bucket_count
+        end = (index + 1) * len(clean) // bucket_count
+        chunk = clean[start:end] or clean[start:start + 1]
+        buckets.append([sum(item[0] for item in chunk) / len(chunk), sum(item[1] for item in chunk) / len(chunk), len(chunk)])
+    values = [item[1] for item in buckets]
+    if reverse:
+        for index in range(1, len(values)):
+            values[index] = min(values[index], values[index - 1])
+    else:
+        for index in range(1, len(values)):
+            values[index] = max(values[index], values[index - 1])
+    return [{"x": round(buckets[index][0], 6), "y": round(values[index], 4), "count": buckets[index][2]} for index in range(len(buckets))]
+
+
+def calibrated_lookup(value, bins, fallback):
+    points = bins if isinstance(bins, list) else []
+    if not points:
+        return fallback
+    x = clamp(safe_float(value, 0.0), 0.0, 1.0)
+    if x <= safe_float(points[0].get("x", 0.0), 0.0):
+        return safe_float(points[0].get("y", fallback), fallback)
+    for left, right in zip(points, points[1:]):
+        lx = safe_float(left.get("x", 0.0), 0.0)
+        rx = safe_float(right.get("x", lx), lx)
+        if x <= rx:
+            ly = safe_float(left.get("y", fallback), fallback)
+            ry = safe_float(right.get("y", fallback), fallback)
+            ratio = 0.0 if rx == lx else (x - lx) / (rx - lx)
+            return ly + (ry - ly) * ratio
+    return safe_float(points[-1].get("y", fallback), fallback)
+
+
 class TrainableModel:
     key = ""
     model_type = "trainable_model"
@@ -2445,8 +2485,30 @@ class ScreenNoveltyScorerModel(TrainableModel):
         self.dimensions = len(self.clusters[0]["center"]) if self.clusters else 0
         self.nearest_top_k = safe_int(getattr(self.settings, "nearest_top_k", 1), 1)
         self.similarity_weights = self.learn_similarity_weights(records or [])
-        self.metrics = {"mean_score": self.average_score, "records": len(values), "semantic_clusters": len(self.clusters), "semantic_dimensions": self.dimensions, "validation_mae": self.validation_mae(records or [])}
+        self.calibration_bins = self.learn_calibration(records or [])
+        self.metrics = {"mean_score": self.average_score, "records": len(values), "semantic_clusters": len(self.clusters), "semantic_dimensions": self.dimensions, "calibration_bins": len(self.calibration_bins), "validation_mae": self.validation_mae(records or [])}
         return self.metrics
+
+    def aggregate_similarity(self, sims):
+        if not sims:
+            return 0.0
+        top = sorted([clamp(safe_float(item, 0.0), 0.0, 1.0) for item in sims], reverse=True)[:max(1, min(safe_int(getattr(self.settings, "nearest_top_k", getattr(self, "nearest_top_k", 1)), getattr(self, "nearest_top_k", 1)), len(sims)))]
+        mean_similarity = sum(top) / len(top)
+        density = sum(1 for item in top if item >= 0.95) / len(top)
+        weights = getattr(self, "similarity_weights", {"max": 0.5, "mean": 0.35, "density": 0.15})
+        return top[0] * safe_float(weights.get("max", 0.5), 0.5) + mean_similarity * safe_float(weights.get("mean", 0.35), 0.35) + density * safe_float(weights.get("density", 0.15), 0.15)
+
+    def learn_calibration(self, records):
+        pairs = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            neighbors = record.get("score_neighbors") or record.get("nearest") or []
+            sims = [item.get("similarity", 0.0) for item in neighbors if isinstance(item, dict)]
+            if sims:
+                target = safe_float(record.get("sleep_novelty", record.get("novelty", record.get("screen_score", 0.0))), 0.0)
+                pairs.append((self.aggregate_similarity(sims), target))
+        return monotonic_bins(pairs, reverse=True, bins=max(4, min(32, safe_int(getattr(self.settings, "nearest_top_k", 8), 8))))
 
     def learn_similarity_weights(self, records):
         pairs = []
@@ -2482,7 +2544,7 @@ class ScreenNoveltyScorerModel(TrainableModel):
         return round(sum(errors) / len(errors), 4) if errors else 0.0
 
     def parameters(self):
-        return {"average_score": self.average_score, "clusters": self.clusters, "dimensions": self.dimensions, "nearest_top_k": self.nearest_top_k, "similarity_weights": self.similarity_weights, "degradation_threshold": 25.0}
+        return {"average_score": self.average_score, "clusters": self.clusters, "dimensions": self.dimensions, "nearest_top_k": self.nearest_top_k, "similarity_weights": self.similarity_weights, "calibration_bins": self.calibration_bins, "degradation_threshold": 25.0, "ensemble": ["weighted_neighbor_similarity", "semantic_cluster_similarity", "monotonic_calibration"]}
 
     def predict(self, features):
         similarities = features.get("similarities", []) if isinstance(features, dict) else []
@@ -2494,12 +2556,10 @@ class ScreenNoveltyScorerModel(TrainableModel):
             sims.sort(reverse=True)
         if not sims:
             return 100.0
-        top = sims[:max(1, min(safe_int(getattr(self.settings, "nearest_top_k", getattr(self, "nearest_top_k", 1)), getattr(self, "nearest_top_k", 1)), len(sims)))]
-        mean_similarity = sum(top) / len(top)
-        density = sum(1 for item in top if item >= 0.95) / len(top)
-        weights = getattr(self, "similarity_weights", {"max": 0.5, "mean": 0.35, "density": 0.15})
-        similarity = top[0] * safe_float(weights.get("max", 0.5), 0.5) + mean_similarity * safe_float(weights.get("mean", 0.35), 0.35) + density * safe_float(weights.get("density", 0.15), 0.15)
-        return round(clamp((1.0 - similarity) * 100.0, 0.0, 100.0), 2)
+        similarity = self.aggregate_similarity(sims)
+        raw = clamp((1.0 - similarity) * 100.0, 0.0, 100.0)
+        calibrated = calibrated_lookup(similarity, getattr(self, "calibration_bins", []), raw)
+        return round(clamp(raw * 0.55 + calibrated * 0.45, 0.0, 100.0), 2)
 
     def probe_input(self):
         return {"similarities": [0.5]}
@@ -2513,6 +2573,7 @@ class ScreenNoveltyScorerModel(TrainableModel):
         obj.dimensions = safe_int(params.get("dimensions", 0), 0)
         obj.nearest_top_k = safe_int(params.get("nearest_top_k", getattr(settings, "nearest_top_k", 1)), 1)
         obj.similarity_weights = params.get("similarity_weights") if isinstance(params.get("similarity_weights"), dict) else {"max": 0.5, "mean": 0.35, "density": 0.15}
+        obj.calibration_bins = params.get("calibration_bins") if isinstance(params.get("calibration_bins"), list) else []
         return obj
 
 
@@ -2537,13 +2598,24 @@ class MouseHumanlikenessScorerModel(TrainableModel):
         for action_type, rows in by_type.items():
             type_names = sorted({name for row in rows for name in row})
             prototypes[action_type] = {"means": {name: round(sum(safe_float(row.get(name, 0.0), 0.0) for row in rows) / len(rows), 6) for name in type_names}, "variances": {name: round(sum((safe_float(row.get(name, 0.0), 0.0) - sum(safe_float(inner.get(name, 0.0), 0.0) for inner in rows) / len(rows)) ** 2 for row in rows) / len(rows), 6) for name in type_names}, "count": len(rows)}
-        self.feature_profile = {"means": means, "variances": variances, "density": len(features), "prototypes": prototypes}
+        type_priors = {name: len(rows) / max(1, len(features)) for name, rows in by_type.items()}
+        calibration_pairs = []
+        for record in learning:
+            action = record.get("mouse_action")
+            if action:
+                fv = action_features(action)
+                action_type = str(action.get("type", "click"))
+                proto = prototypes.get(action_type, {})
+                raw = feature_distance_score(fv, proto.get("means", means), proto.get("variances", variances), (proto.get("means") or means).keys())
+                calibration_pairs.append((raw / 100.0, safe_float(record.get("human_score", self.average_user_similarity), self.average_user_similarity)))
+        calibration_bins = monotonic_bins(calibration_pairs, reverse=False, bins=max(4, min(24, len(calibration_pairs)))) if calibration_pairs else []
+        self.feature_profile = {"means": means, "variances": variances, "density": len(features), "prototypes": prototypes, "type_priors": type_priors, "calibration_bins": calibration_bins}
         validation = [abs(self.predict({"mouse_action": record.get("mouse_action"), "human_score": safe_float(record.get("human_score", 50.0), 50.0)}) - safe_float(record.get("human_score", self.average_user_similarity), self.average_user_similarity)) for record in learning if record.get("mouse_action")]
         self.metrics = {"mean_score": self.average_user_similarity, "learning_records": len(learning), "feature_dimensions": len(names), "action_type_prototypes": len(prototypes), "validation_mae": round(sum(validation) / len(validation), 4) if validation else 0.0, "degradation_threshold": 30.0}
         return self.metrics
 
     def parameters(self):
-        return {"average_user_similarity": self.average_user_similarity, "feature_profile": self.feature_profile, "accepted_sources": ["learning:user"]}
+        return {"average_user_similarity": self.average_user_similarity, "feature_profile": self.feature_profile, "accepted_sources": ["learning:user"], "ensemble": ["global_feature_distance", "action_type_prototype", "monotonic_human_calibration", "action_type_prior"]}
 
     def predict(self, features):
         if isinstance(features, dict) and isinstance(features.get("mouse_action"), dict) and getattr(self, "feature_profile", None):
@@ -2557,8 +2629,12 @@ class MouseHumanlikenessScorerModel(TrainableModel):
                 prototype = prototypes.get(action_type) if isinstance(prototypes, dict) else None
                 if isinstance(prototype, dict):
                     type_score = feature_distance_score(feature_values, prototype.get("means", {}), prototype.get("variances", {}), prototype.get("means", {}).keys())
-                    return round(clamp(global_score * 0.35 + type_score * 0.65, 0.0, 100.0), 2)
-                return global_score
+                    prior = safe_float(self.feature_profile.get("type_priors", {}).get(action_type, 0.0), 0.0)
+                    raw = clamp(global_score * 0.25 + type_score * 0.65 + prior * 10.0, 0.0, 100.0)
+                    calibrated = calibrated_lookup(raw / 100.0, self.feature_profile.get("calibration_bins", []), raw)
+                    return round(clamp(raw * 0.7 + calibrated * 0.3, 0.0, 100.0), 2)
+                calibrated = calibrated_lookup(global_score / 100.0, self.feature_profile.get("calibration_bins", []), global_score)
+                return round(clamp(global_score * 0.7 + calibrated * 0.3, 0.0, 100.0), 2)
         return round(clamp(safe_float((features or {}).get("human_score", self.average_user_similarity), self.average_user_similarity), 0.0, 100.0), 2)
 
     def probe_input(self):
@@ -3051,23 +3127,33 @@ class PolicyModel:
         usable = [record for record in records or [] if isinstance(record, dict) and record.get("mouse_action")]
         if not usable:
             return {"trained": 0, "loss": self.loss, "confidence": 0.0}
-        lr = clamp(1.0 / max(4.0, math.sqrt(self.trained_steps + len(usable) + 1.0)), 0.01, 0.2)
+        usable.sort(key=lambda record: strict_reward_key(*record_screen_human(record)), reverse=True)
+        head = usable[:max(1, len(usable) // 2)]
+        tail = usable[max(1, len(usable) // 2):]
+        replay = head + tail + head[:max(1, len(head) // 3)]
+        lr = clamp(1.0 / max(5.0, math.sqrt(self.trained_steps + len(replay) + 1.0)), 0.008, 0.16)
+        l2 = 0.0005
+        epochs = 2 if len(replay) < max(4, self.settings.nearest_top_k) else 1
         total_loss = 0.0
+        trained = 0
         with self.lock:
-            for record in usable:
-                features = self.features(record)
-                pred = self.predict_features(features)
-                target = self.target(record)
-                error = pred - target
-                total_loss += error * error
-                for name in self.FEATURE_NAMES:
-                    self.weights[name] = clamp(self.weights.get(name, 0.0) - lr * error * features.get(name, 0.0), -8.0, 8.0)
-                record["model_prediction"] = round(pred, 4)
-                record["model_target"] = round(target, 4)
-            self.trained_steps += len(usable)
-            self.loss = round(total_loss / len(usable), 6)
+            for _ in range(epochs):
+                for record in replay:
+                    features = self.features(record)
+                    pred = self.predict_features(features)
+                    target = self.target(record)
+                    error = pred - target
+                    total_loss += error * error
+                    for name in self.FEATURE_NAMES:
+                        penalty = l2 * self.weights.get(name, 0.0) if name != "bias" else 0.0
+                        self.weights[name] = clamp(self.weights.get(name, 0.0) - lr * (error * features.get(name, 0.0) + penalty), -8.0, 8.0)
+                    record["model_prediction"] = round(pred, 4)
+                    record["model_target"] = round(target, 4)
+                    trained += 1
+            self.trained_steps += trained
+            self.loss = round(total_loss / max(1, trained), 6)
             confidence = clamp(1.0 - math.sqrt(self.loss), 0.0, 1.0)
-        return {"trained": len(usable), "loss": self.loss, "confidence": confidence}
+        return {"trained": trained, "loss": self.loss, "confidence": confidence, "epochs": epochs, "replay": len(replay)}
 
     def snapshot(self):
         with self.lock:
