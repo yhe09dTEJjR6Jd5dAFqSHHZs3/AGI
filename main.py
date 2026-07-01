@@ -1311,6 +1311,14 @@ def run_self_test():
         assert model_result["complete"] and pool_result["complete"]
         assert task3_events.index("sleep_model_cleanup_completed") < task3_events.index("experience_pool_compaction_completed")
         assert WindowCheck(True, "ok", (0, 0, 10, 10), 9, 9, 0.0).occluded_ratio == 0.0
+        recovery_panel = ControlPanel.__new__(ControlPanel)
+        recovery_panel.active_session = None
+        recovery_panel.termination_reason = None
+        recovery_panel.window_manager = type("RecoveryWindowManager", (), {"check_window": lambda self, force=False: WindowCheck(True, "ok", (0, 0, 10, 10))})()
+        recovery_panel.should_stop_by_escape = lambda: False
+        recovery_panel.cursor_inside_window = lambda: False
+        recovery_panel.ensure_cursor_inside_window = lambda: False
+        assert ControlPanel.recovery_stop_reason(recovery_panel, threading.Event(), None) == "cursor_outside"
         for name, created in (("model_new.json", "2025-01-02T00:00:00.000"), ("model_old.json", "2025-01-01T00:00:00.000"), ("model_mid.json", "2025-01-01T12:00:00.000")):
             (store.model_dir / name).write_text(json.dumps({"created_at": created, "model": {"type": "bad"}}), encoding="utf-8")
         (store.model_dir / "partial_model_interrupted.json").write_text(json.dumps({"created_at": "2025-01-04T00:00:00.000"}), encoding="utf-8")
@@ -5325,7 +5333,16 @@ class AsyncPersistenceQueue:
 
     def enqueue_image(self, analyzer, image, path, store=None, priority="normal"):
         critical = priority == "critical"
-        return self.enqueue({"type": "image", "analyzer": analyzer, "image": image.copy() if image else None, "path": path, "store": store, "priority": priority, "persistence_sequence": self.allocate_sequence()}, block_when_full=critical)
+        if not critical and self.jobs.full():
+            if store:
+                try:
+                    store.log_error("async_persistence_queue_full", RuntimeError("image_job_dropped_before_copy"), {"path": str(path)})
+                except Exception:
+                    pass
+            self.image_dropped += 1
+            return False
+        prepared_image = image.copy() if image else None
+        return self.enqueue({"type": "image", "analyzer": analyzer, "image": prepared_image, "path": path, "store": store, "priority": priority, "persistence_sequence": self.allocate_sequence()}, block_when_full=critical)
 
     def enqueue_record(self, store, record):
         prepared = copy.deepcopy(record)
@@ -6120,11 +6137,16 @@ class ControlPanel(tk.Tk):
         return max(200, min(3000, int(source * 1000)))
 
     def process_main_thread_events(self):
-        while True:
+        processed = 0
+        started = time.perf_counter()
+        max_events = 50
+        max_seconds = 0.008
+        while processed < max_events and time.perf_counter() - started < max_seconds:
             try:
                 event = self.main_thread_events.get_nowait()
             except queue.Empty:
                 break
+            processed += 1
             try:
                 if event.get("type") in ("ui_call", "ui_sync_call"):
                     func = event.get("func")
@@ -6145,6 +6167,11 @@ class ControlPanel(tk.Tk):
                             self.events.publish("auto_restart_training_failed", reason=failure)
             except Exception as exc:
                 self.log_exception("main_thread_event", exc, event)
+        if not self.main_thread_events.empty():
+            try:
+                self.after(1, self.process_main_thread_events)
+            except Exception:
+                pass
 
     def refresh_runtime_environment_state(self):
         try:
@@ -6872,7 +6899,7 @@ class ControlPanel(tk.Tk):
         self.ensure_storage_runtime(config)
         return result
 
-    def ensure_environment(self, stage, config=None, allow_repair=True, require_attach=False, show_error=True):
+    def ensure_environment(self, stage, config=None, allow_repair=True, require_attach=False, show_error=True, ignored_hwnds=None):
         config = config or self.read_config()
         result = ensure_environment(stage, allow_repair, lambda: self.runtime_environment_issues_for_config(config), lambda actions: self.repair_runtime_environment_for_config(config, actions))
         if not result.ok:
@@ -6884,10 +6911,11 @@ class ControlPanel(tk.Tk):
         self.runtime_environment_issue = ""
         self.ensure_storage_runtime(config)
         if require_attach:
+            ignored_hwnds = tuple(ignored_hwnds or ())
             if not self.window_manager or self.window_manager.executable_path != config.ldplayer_path or self.window_manager.settings != config.settings:
-                self.window_manager = WindowManager(config.ldplayer_path, config.settings, self.own_window_handles())
+                self.window_manager = WindowManager(config.ldplayer_path, config.settings, ignored_hwnds)
             else:
-                self.window_manager.set_ignored_hwnds(self.own_window_handles())
+                self.window_manager.set_ignored_hwnds(ignored_hwnds)
             if not self.executor or self.executor.window_manager is not self.window_manager or self.executor.settings != config.settings:
                 self.executor = HumanMouseExecutor(self.window_manager, config.settings)
             attached = self.window_manager.launch_or_attach()
@@ -6906,8 +6934,8 @@ class ControlPanel(tk.Tk):
                 return result
         return result
 
-    def ensure_runtime(self, config):
-        return self.ensure_environment("runtime", config, allow_repair=True, require_attach=True).ok
+    def ensure_runtime(self, config, ignored_hwnds=None):
+        return self.ensure_environment("runtime", config, allow_repair=True, require_attach=True, ignored_hwnds=ignored_hwnds).ok
 
     def learning_mode(self):
         self.request_active_mode("learning")
@@ -6919,7 +6947,8 @@ class ControlPanel(tk.Tk):
         self.last_active_mode_failure = ""
         config = self.read_config()
         self.status_var.set("正在检查运行环境")
-        if not self.ensure_environment("自动重启训练" if auto_restart else target_mode, config, allow_repair=True, require_attach=True).ok:
+        ignored_hwnds = self.own_window_handles()
+        if not self.ensure_environment("自动重启训练" if auto_restart else target_mode, config, allow_repair=True, require_attach=True, ignored_hwnds=ignored_hwnds).ok:
             self.last_active_mode_failure = getattr(self, "runtime_environment_issue", "运行环境不符合要求") or "运行环境不符合要求"
             self.status_var.set("运行环境不符合要求，未进入模式")
             if auto_restart:
@@ -6940,7 +6969,7 @@ class ControlPanel(tk.Tk):
             return False
         self.update_progress(0.0)
         self.status_var.set("正在启动或连接雷电模拟器")
-        self.mode_thread = threading.Thread(target=self.mode_job, args=(token, target_mode, config, stop_event))
+        self.mode_thread = threading.Thread(target=self.mode_job, args=(token, target_mode, config, stop_event, ignored_hwnds))
         self.mode_thread.start()
         return True
 
@@ -6954,9 +6983,9 @@ class ControlPanel(tk.Tk):
                 return False
         return bool(self.ui_sync(apply, config.settings.window_event_wait))
 
-    def mode_job(self, token, mode, config, stop_event):
+    def mode_job(self, token, mode, config, stop_event, ignored_hwnds=()):
         try:
-            if not self.ensure_runtime(config):
+            if not self.ensure_runtime(config, ignored_hwnds=ignored_hwnds):
                 if self.is_run_active(token):
                     self.ui(lambda: messagebox.showerror("未找到客户区", "没有找到雷电模拟器客户区，请确认路径正确或手动启动雷电模拟器。"))
                     self.finish_run(token, "未找到雷电模拟器", 0.0, reason="runtime_error")
@@ -7748,7 +7777,7 @@ class ControlPanel(tk.Tk):
         if not check.ok:
             return "window_invalid"
         if not self.cursor_inside_window():
-            if mode == "training" and hasattr(self, "ensure_cursor_inside_window") and self.ensure_cursor_inside_window():
+            if hasattr(self, "ensure_cursor_inside_window") and self.ensure_cursor_inside_window():
                 return None
             return "cursor_outside"
         return None
@@ -7948,28 +7977,34 @@ class ControlPanel(tk.Tk):
 
     def close(self):
         mode_thread = self.mode_thread
+        close_timeout = max(1.0, safe_float(getattr(self.settings, "persistence_close_seconds", 3.0), 3.0))
+        deadline = time.perf_counter() + close_timeout
         with self.state_lock:
             active_mode = self.mode
         if active_mode in ["starting", "learning", "training", "sleep", "migration"]:
-            self.ui(lambda: self.status_var.set("正在保存，请等待完成"))
+            self.status_var.set("正在保存，请等待完成")
             self.update_mode_button_states()
             self.request_stop("user_stop")
             if mode_thread and mode_thread.is_alive():
-                while mode_thread.is_alive():
-                    mode_thread.join(timeout=max(0.05, min(0.5, self.settings.persistence_close_seconds)))
-                    try:
-                        self.update_idletasks()
-                        self.update()
-                    except Exception:
-                        pass
+                while mode_thread.is_alive() and time.perf_counter() < deadline:
+                    mode_thread.join(timeout=max(0.05, min(0.25, deadline - time.perf_counter())))
         still_running = bool(mode_thread and mode_thread.is_alive())
-        if still_running and self.store:
+        if still_running:
+            if self.store:
+                try:
+                    checkpoint = self.store.load_sleep_checkpoint() or {"run_id": uuid.uuid4().hex, "created_at": now_text()}
+                    self.store.save_sleep_checkpoint(checkpoint, stage="recoverable_close_timeout", close_interrupted=True, safe_to_resume=True, active_mode=active_mode)
+                except Exception as exc:
+                    self.log_exception("close.checkpoint", exc, {"active_mode": active_mode})
+            self.status_var.set("可恢复退出：后台保存超时，已尽力保留检查点")
+            self.log_exception("close.recoverable_timeout", RuntimeError("background_task_close_timeout"), {"active_mode": active_mode, "timeout": close_timeout})
             try:
-                checkpoint = self.store.load_sleep_checkpoint() or {"run_id": uuid.uuid4().hex, "created_at": now_text()}
-                self.store.save_sleep_checkpoint(checkpoint, stage="close_interrupted", close_interrupted=True, safe_to_resume=True)
-            except Exception as exc:
-                self.log_exception("close.checkpoint", exc, {"active_mode": active_mode})
-            self.ui(lambda: self.status_var.set("保存尚未完成，已保留恢复检查点并阻止退出"))
+                self.after(250, self.destroy)
+            except Exception:
+                try:
+                    self.destroy()
+                except Exception:
+                    pass
             return
         with self.state_lock:
             self.stop_event.set()
@@ -8025,11 +8060,25 @@ class ControlPanel(tk.Tk):
                 return
         mode_thread = self.mode_thread
         if mode_thread and mode_thread.is_alive():
-            while mode_thread.is_alive():
-                mode_thread.join(timeout=max(0.05, min(0.5, self.settings.persistence_close_seconds)))
+            final_deadline = time.perf_counter() + close_timeout
+            while mode_thread.is_alive() and time.perf_counter() < final_deadline:
+                mode_thread.join(timeout=max(0.05, min(0.25, final_deadline - time.perf_counter())))
         if mode_thread and mode_thread.is_alive():
+            if self.store:
+                try:
+                    checkpoint = self.store.load_sleep_checkpoint() or {"run_id": uuid.uuid4().hex, "created_at": now_text()}
+                    self.store.save_sleep_checkpoint(checkpoint, stage="recoverable_close_final_timeout", close_interrupted=True, safe_to_resume=True, active_mode=active_mode)
+                except Exception as exc:
+                    self.log_exception("close.final_checkpoint", exc, {"active_mode": active_mode})
             self.log_exception("close.force_exit_risk", RuntimeError("background_task_not_safely_finished"), {"mode": active_mode})
-            self.ui(lambda: self.status_var.set("后台任务尚未安全结束，已阻止退出"))
+            self.status_var.set("可恢复退出：后台任务尚未安全结束，已保留检查点")
+            try:
+                self.after(250, self.destroy)
+            except Exception:
+                try:
+                    self.destroy()
+                except Exception:
+                    pass
             return
         try:
             self.destroy()
