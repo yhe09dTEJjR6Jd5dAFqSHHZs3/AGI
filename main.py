@@ -2333,8 +2333,61 @@ def training_data_digest(records):
     items = []
     for record in records:
         if isinstance(record, dict):
-            items.append([record.get("id"), record.get("mode"), record.get("mouse_source"), record.get("screen_hash"), record.get("reward"), record.get("human_score")])
+            items.append([record.get("id"), record.get("mode"), record.get("mouse_source"), record.get("screen_hash"), record.get("screen_hash_hex"), record.get("image_checksum"), record.get("reward"), record.get("human_score"), record.get("screen_score"), record.get("sleep_novelty"), record.get("sleep_human_score")])
     return hashlib.sha256(json.dumps(items, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def numeric_vector(values, limit=64):
+    result = []
+    for value in values or []:
+        try:
+            number = float(value)
+        except Exception:
+            continue
+        if math.isfinite(number):
+            result.append(number)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def vector_mean(vectors, limit=64):
+    clean = [numeric_vector(vector, limit) for vector in vectors or []]
+    clean = [vector for vector in clean if vector]
+    if not clean:
+        return []
+    width = min(len(vector) for vector in clean)
+    if width <= 0:
+        return []
+    return [round(sum(vector[index] for vector in clean) / len(clean), 8) for index in range(width)]
+
+
+def vector_similarity(left, right):
+    a = numeric_vector(left)
+    b = numeric_vector(right)
+    width = min(len(a), len(b))
+    if width <= 0:
+        return 0.0
+    dot = sum(a[index] * b[index] for index in range(width))
+    na = math.sqrt(sum(a[index] * a[index] for index in range(width)))
+    nb = math.sqrt(sum(b[index] * b[index] for index in range(width)))
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return clamp((dot / (na * nb) + 1.0) / 2.0, 0.0, 1.0)
+
+
+def feature_distance_score(values, means, variances, names):
+    if not means:
+        return 50.0
+    distance = 0.0
+    used = 0
+    for name in names:
+        if name not in means:
+            continue
+        variance = max(0.0001, safe_float(variances.get(name, 1.0), 1.0))
+        distance += ((safe_float(values.get(name, 0.0), 0.0) - safe_float(means.get(name, 0.0), 0.0)) ** 2) / variance
+        used += 1
+    return round(clamp(100.0 / (1.0 + math.sqrt(distance / max(1, used))), 0.0, 100.0), 2)
 
 
 class TrainableModel:
@@ -2384,11 +2437,15 @@ class ScreenNoveltyScorerModel(TrainableModel):
         super().fit(records)
         values = [safe_float(record.get("sleep_novelty", record.get("novelty", record.get("screen_score", 0.0))), 0.0) for record in records or [] if isinstance(record, dict)]
         self.average_score = round(sum(values) / len(values), 4) if values else 0.0
-        self.clusters = []
-        self.dimensions = 0
+        semantic_records = [(numeric_vector(record.get("screen_semantic_vector")), safe_float(record.get("sleep_novelty", record.get("novelty", record.get("screen_score", 0.0))), 0.0)) for record in records or [] if isinstance(record, dict)]
+        semantic_records = [(vector, score) for vector, score in semantic_records if vector]
+        semantic_records.sort(key=lambda item: item[1], reverse=True)
+        cluster_count = max(1, min(safe_int(getattr(self.settings, "nearest_top_k", 1), 1), len(semantic_records))) if semantic_records else 0
+        self.clusters = [{"center": vector_mean([item[0] for item in semantic_records[index::cluster_count]]), "mean_score": round(sum(item[1] for item in semantic_records[index::cluster_count]) / max(1, len(semantic_records[index::cluster_count])), 4), "size": len(semantic_records[index::cluster_count])} for index in range(cluster_count)]
+        self.dimensions = len(self.clusters[0]["center"]) if self.clusters else 0
         self.nearest_top_k = safe_int(getattr(self.settings, "nearest_top_k", 1), 1)
         self.similarity_weights = self.learn_similarity_weights(records or [])
-        self.metrics = {"mean_score": self.average_score, "records": len(values), "validation_mae": self.validation_mae(records or [])}
+        self.metrics = {"mean_score": self.average_score, "records": len(values), "semantic_clusters": len(self.clusters), "semantic_dimensions": self.dimensions, "validation_mae": self.validation_mae(records or [])}
         return self.metrics
 
     def learn_similarity_weights(self, records):
@@ -2430,6 +2487,11 @@ class ScreenNoveltyScorerModel(TrainableModel):
     def predict(self, features):
         similarities = features.get("similarities", []) if isinstance(features, dict) else []
         sims = sorted([clamp(safe_float(item, 0.0), 0.0, 1.0) for item in similarities], reverse=True)
+        semantic = numeric_vector((features or {}).get("semantic_vector", [])) if isinstance(features, dict) else []
+        if semantic and getattr(self, "clusters", None):
+            cluster_similarity = max((vector_similarity(semantic, cluster.get("center", [])) for cluster in self.clusters if isinstance(cluster, dict)), default=0.0)
+            sims.append(cluster_similarity)
+            sims.sort(reverse=True)
         if not sims:
             return 100.0
         top = sims[:max(1, min(safe_int(getattr(self.settings, "nearest_top_k", getattr(self, "nearest_top_k", 1)), getattr(self, "nearest_top_k", 1)), len(sims)))]
@@ -2467,8 +2529,17 @@ class MouseHumanlikenessScorerModel(TrainableModel):
         names = sorted({name for item in features for name in item})
         means = {name: round(sum(safe_float(item.get(name, 0.0), 0.0) for item in features) / len(features), 6) for name in names} if features else {}
         variances = {name: round(sum((safe_float(item.get(name, 0.0), 0.0) - means[name]) ** 2 for item in features) / len(features), 6) for name in names} if features else {}
-        self.feature_profile = {"means": means, "variances": variances, "density": len(features)}
-        self.metrics = {"mean_score": self.average_user_similarity, "learning_records": len(learning), "feature_dimensions": len(names), "validation_mae": 0.0, "degradation_threshold": 30.0}
+        by_type = defaultdict(list)
+        for record in learning:
+            action = record.get("mouse_action") or {}
+            by_type[str(action.get("type", "click"))].append(action_features(action))
+        prototypes = {}
+        for action_type, rows in by_type.items():
+            type_names = sorted({name for row in rows for name in row})
+            prototypes[action_type] = {"means": {name: round(sum(safe_float(row.get(name, 0.0), 0.0) for row in rows) / len(rows), 6) for name in type_names}, "variances": {name: round(sum((safe_float(row.get(name, 0.0), 0.0) - sum(safe_float(inner.get(name, 0.0), 0.0) for inner in rows) / len(rows)) ** 2 for row in rows) / len(rows), 6) for name in type_names}, "count": len(rows)}
+        self.feature_profile = {"means": means, "variances": variances, "density": len(features), "prototypes": prototypes}
+        validation = [abs(self.predict({"mouse_action": record.get("mouse_action"), "human_score": safe_float(record.get("human_score", 50.0), 50.0)}) - safe_float(record.get("human_score", self.average_user_similarity), self.average_user_similarity)) for record in learning if record.get("mouse_action")]
+        self.metrics = {"mean_score": self.average_user_similarity, "learning_records": len(learning), "feature_dimensions": len(names), "action_type_prototypes": len(prototypes), "validation_mae": round(sum(validation) / len(validation), 4) if validation else 0.0, "degradation_threshold": 30.0}
         return self.metrics
 
     def parameters(self):
@@ -2480,11 +2551,14 @@ class MouseHumanlikenessScorerModel(TrainableModel):
             means = self.feature_profile.get("means", {})
             variances = self.feature_profile.get("variances", {})
             if means:
-                distance = 0.0
-                for name, mean in means.items():
-                    variance = max(0.0001, safe_float(variances.get(name, 1.0), 1.0))
-                    distance += ((safe_float(feature_values.get(name, 0.0), 0.0) - safe_float(mean, 0.0)) ** 2) / variance
-                return round(clamp(100.0 / (1.0 + math.sqrt(distance / max(1, len(means)))), 0.0, 100.0), 2)
+                global_score = feature_distance_score(feature_values, means, variances, means.keys())
+                action_type = str(features.get("mouse_action", {}).get("type", "click"))
+                prototypes = self.feature_profile.get("prototypes", {})
+                prototype = prototypes.get(action_type) if isinstance(prototypes, dict) else None
+                if isinstance(prototype, dict):
+                    type_score = feature_distance_score(feature_values, prototype.get("means", {}), prototype.get("variances", {}), prototype.get("means", {}).keys())
+                    return round(clamp(global_score * 0.35 + type_score * 0.65, 0.0, 100.0), 2)
+                return global_score
         return round(clamp(safe_float((features or {}).get("human_score", self.average_user_similarity), self.average_user_similarity), 0.0, 100.0), 2)
 
     def probe_input(self):
@@ -2507,7 +2581,10 @@ class OperationPolicyModel(TrainableModel):
         super().fit(records)
         self.policy = self.state.get("policy") if isinstance(self.state.get("policy"), dict) else {}
         self.action_count = sum(1 for record in records or [] if isinstance(record, dict) and record.get("mouse_action"))
-        self.metrics = {"loss": safe_float(self.policy.get("loss", 1.0), 1.0), "trained_steps": safe_int(self.policy.get("trained_steps", 0), 0)}
+        learner = PolicyModel(self.settings, self.policy)
+        train_metrics = learner.train(records or [])
+        self.policy = learner.snapshot()
+        self.metrics = {"loss": safe_float(self.policy.get("loss", train_metrics.get("loss", 1.0)), 1.0), "trained_steps": safe_int(self.policy.get("trained_steps", 0), 0), "batch_trained": train_metrics.get("trained", 0), "confidence": train_metrics.get("confidence", 0.0)}
         return self.metrics
 
     def parameters(self):
@@ -2538,9 +2615,17 @@ class RescuePolicyModel(TrainableModel):
     def fit(self, records):
         zero_score = [record for record in records or [] if isinstance(record, dict) and safe_float(record.get("before_screen_score", record.get("screen_score", 0.0)), 0.0) <= 0.0 and record.get("mouse_action")]
         super().fit(zero_score)
-        self.recovery_actions = [copy.deepcopy(record.get("mouse_action")) for record in zero_score[:max(1, safe_int(getattr(self.settings, "nearest_top_k", 1), 1))]]
-        self.fallback_mutation = 0.8
-        self.metrics = {"zero_score_trajectories": len(zero_score), "action_count": sum(1 for record in records or [] if isinstance(record, dict) and record.get("mouse_action"))}
+        zero_score.sort(key=lambda record: strict_reward_key(record.get("after_screen_score", record.get("sleep_novelty", record.get("screen_score", 0.0))), record.get("sleep_human_score", record.get("human_score", 50.0))), reverse=True)
+        limit = max(1, safe_int(getattr(self.settings, "nearest_top_k", 1), 1))
+        self.recovery_actions = [copy.deepcopy(record.get("mouse_action")) for record in zero_score[:limit]]
+        if len(self.recovery_actions) < limit:
+            backups = [record for record in records or [] if isinstance(record, dict) and record.get("mouse_action")]
+            backups.sort(key=lambda record: record_screen_human(record), reverse=True)
+            self.recovery_actions.extend(copy.deepcopy(record.get("mouse_action")) for record in backups[:limit - len(self.recovery_actions)])
+        success_scores = [safe_float(record.get("after_screen_score", record.get("sleep_novelty", 0.0)), 0.0) for record in zero_score]
+        recovery_rate = sum(1 for value in success_scores if value > 0.0) / max(1, len(success_scores))
+        self.fallback_mutation = round(clamp(0.9 - recovery_rate * 0.45, 0.25, 0.9), 4)
+        self.metrics = {"zero_score_trajectories": len(zero_score), "recovery_rate": round(recovery_rate, 4), "action_count": sum(1 for record in records or [] if isinstance(record, dict) and record.get("mouse_action"))}
         return self.metrics
 
     def parameters(self):
@@ -2593,6 +2678,19 @@ class RuntimeValueModel(TrainableModel):
     def fit(self, records):
         super().fit(records)
         self.resource_model = self.state.get("resource_model") if isinstance(self.state.get("resource_model"), dict) else {}
+        learner = ResourceAdaptiveRLModel(self.resource_model)
+        batch = [record for record in records or [] if isinstance(record, dict)]
+        if batch:
+            metrics = {
+                "pool_count": len(batch),
+                "throughput": len(batch),
+                "batch_size": max(1, safe_int(getattr(self.settings, "sleep_batch_size", len(batch)), len(batch))),
+                "success_rate": sum(1 for record in batch if not record.get("quarantined")) / max(1, len(batch)),
+                "training_gain": sum(clamp(safe_float(record.get("sleep_novelty", record.get("novelty", record.get("screen_score", 0.0))), 0.0), 0.0, 100.0) for record in batch) / max(1, len(batch)) / 100.0,
+                **read_hardware_state()
+            }
+            learner.train_from_metrics(metrics)
+        self.resource_model = learner.snapshot()
         self.runtime_rules = RUNTIME_NUMBER_RULES
         self.saved_settings = {name: getattr(self.settings, name) for name in RUNTIME_NUMBER_RULES if hasattr(self.settings, name)} if self.settings else {}
         self.metrics = {"trained_steps": safe_int(self.resource_model.get("trained_steps", 0), 0), "reward_ema": safe_float(self.resource_model.get("reward_ema", 0.0), 0.0)}
