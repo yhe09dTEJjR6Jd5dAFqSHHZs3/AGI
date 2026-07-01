@@ -17,7 +17,7 @@ import time
 import tempfile
 import uuid
 from collections import OrderedDict, defaultdict, deque
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, asdict, fields, replace
 from typing import Optional
 from datetime import datetime
 from pathlib import Path
@@ -2349,7 +2349,62 @@ def semantic_similarity(vector_a, vector_b):
     return clamp((dot / (norm_a * norm_b) + 1.0) * 0.5, 0.0, 1.0)
 
 
-def reward_breakdown(novelty, human_score, settings):
+@dataclass
+class RewardState:
+    best_income: float = 0.0
+    cost: float = 0.000001
+    last_income_improved_at: float = 0.0
+    state_version: int = 1
+
+
+def parse_event_timestamp(value):
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if math.isfinite(number) else time.time()
+    if isinstance(value, str) and value.strip():
+        text = value.strip().replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(text).timestamp()
+        except ValueError:
+            try:
+                return float(text)
+            except ValueError:
+                return time.time()
+    return time.time()
+
+
+def reward_income(screen_score, human_similarity):
+    return strict_reward_value(screen_score, human_similarity)
+
+
+def reward_state_from(value):
+    if isinstance(value, RewardState):
+        return RewardState(value.best_income, value.cost, value.last_income_improved_at, value.state_version)
+    if isinstance(value, dict):
+        return RewardState(safe_float(value.get("best_income", 0.0), 0.0), max(0.000001, safe_float(value.get("cost", 0.000001), 0.000001)), safe_float(value.get("last_income_improved_at", 0.0), 0.0), max(1, safe_int(value.get("state_version", 1), 1)))
+    return RewardState()
+
+
+def reward_with_state(screen_score, human_similarity, state=None, event_time=None):
+    state = reward_state_from(state)
+    timestamp = parse_event_timestamp(event_time)
+    baseline_time = state.last_income_improved_at or timestamp
+    elapsed = max(0.0, timestamp - baseline_time)
+    income = reward_income(screen_score, human_similarity)
+    cost = max(0.000001, state.cost + elapsed * 0.000001)
+    improved = income > state.best_income
+    if improved:
+        state.best_income = income
+        state.cost = 0.000001
+        state.last_income_improved_at = timestamp
+        cost = state.cost
+    else:
+        state.cost = cost
+    reward = income - cost
+    return {"reward_version": 6, "income": round(income, 8), "cost": round(cost, 8), "reward": round(reward, 8), "income_improved": improved, "event_time": timestamp, "state": asdict(state)}
+
+
+def reward_breakdown(novelty, human_score, settings, state=None, event_time=None):
     score_precision = 2
     screen_resolution = 10 ** (-score_precision)
     screen_novelty = round(clamp(novelty, 0.0, 100.0), score_precision)
@@ -2359,8 +2414,9 @@ def reward_breakdown(novelty, human_score, settings):
     human_tiebreak = human_similarity
     human_bonus = round((human_similarity / 100.0) * screen_resolution * (1.0 - 1e-6), 8)
     screen_score_delta = round(clamp(screen_reward, settings.reward_total_min, settings.reward_total_max), 6)
-    total_reward = round(clamp(screen_score_delta + human_bonus, settings.reward_total_min, settings.reward_total_max + screen_resolution), 8)
-    return {"reward_version": 4, "screen_novelty": screen_novelty, "screen_reward": screen_reward, "human_similarity": human_similarity, "human_tiebreak": round(human_tiebreak, 6), "human_bonus": human_bonus, "screen_score_resolution": screen_resolution, "screen_score_delta": screen_score_delta, "basis": ["nearest_screen_batch", "learning_mouse_profile", "lexicographic_screen_then_human", "numeric_human_bonus_below_screen_resolution"], "screen_primary_reward": screen_reward, "human_tie_break_reward": round(human_tiebreak, 6), "mouse_action_delta": human_delta, "total_reward": total_reward, "reward_sort_key": [round(screen_reward, score_precision), round(human_similarity, score_precision)]}
+    stateful = reward_with_state(screen_novelty, human_similarity, state, event_time)
+    total_reward = round(clamp(stateful["reward"], settings.reward_total_min, settings.reward_total_max + screen_resolution), 8)
+    return {"reward_version": stateful["reward_version"], "income": stateful["income"], "cost": stateful["cost"], "income_improved": stateful["income_improved"], "reward_state": stateful["state"], "reward_state_version": stateful["state"]["state_version"], "screen_novelty": screen_novelty, "screen_reward": screen_reward, "human_similarity": human_similarity, "human_tiebreak": round(human_tiebreak, 6), "human_bonus": human_bonus, "screen_score_resolution": screen_resolution, "screen_score_delta": screen_score_delta, "basis": ["nearest_screen_batch", "learning_mouse_profile", "lexicographic_screen_then_human", "numeric_human_bonus_below_screen_resolution", "stateful_time_cost_reset_on_income_improvement"], "screen_primary_reward": screen_reward, "human_tie_break_reward": round(human_tiebreak, 6), "mouse_action_delta": human_delta, "total_reward": total_reward, "reward_sort_key": [round(screen_reward, score_precision), round(human_similarity, score_precision)]}
 
 
 def strict_reward_key(screen_score, human_similarity):
@@ -2783,7 +2839,7 @@ class OperationPolicyModel(TrainableModel):
 
 class RewardModel(TrainableModel):
     key = "reward_model"
-    model_type = "calibrated_screen_first_human_tiebreak_reward_model"
+    model_type = "stateful_income_minus_time_cost_reward_model"
 
     def fit(self, records):
         super().fit(records)
@@ -2792,17 +2848,33 @@ class RewardModel(TrainableModel):
         human_values = [safe_float(record.get("human_score", 50.0), 50.0) for record in records or [] if isinstance(record, dict)]
         self.screen_scale = round(max(1.0, (max(screen_values) - min(screen_values)) if screen_values else 100.0), 6)
         self.human_tie_break_weight = round(min(0.000099999, 0.000099999 * (sum(human_values) / max(1, len(human_values))) / 100.0), 9) if human_values else 0.00005
-        self.metrics = {"average_reward": round(sum(values) / len(values), 4) if values else 0.0, "records": len(values), "calibrated_screen_scale": self.screen_scale, "calibrated_tie_break_weight": self.human_tie_break_weight, "degradation_threshold": 0.0}
+        self.reward_state = reward_state_from(self.state.get("reward_state") if isinstance(self.state, dict) else None)
+        for record in sorted([record for record in records or [] if isinstance(record, dict)], key=lambda item: parse_event_timestamp(item.get("created_at") or item.get("score_checked_at") or item.get("sleep_evaluated_at"))):
+            screen, human = record_screen_human(record)
+            result = reward_with_state(screen, human, self.reward_state, record.get("created_at") or record.get("score_checked_at") or record.get("sleep_evaluated_at"))
+            self.reward_state = reward_state_from(result["state"])
+        self.metrics = {"average_reward": round(sum(values) / len(values), 4) if values else 0.0, "records": len(values), "calibrated_screen_scale": self.screen_scale, "calibrated_tie_break_weight": self.human_tie_break_weight, "degradation_threshold": 0.0, "reward_state_version": self.reward_state.state_version, "best_income": round(self.reward_state.best_income, 8), "cost": round(self.reward_state.cost, 8)}
         return self.metrics
 
     def parameters(self):
-        return {"screen_precision": 2, "tie_break_weight": getattr(self, "human_tie_break_weight", 0.000099999), "screen_scale": getattr(self, "screen_scale", 100.0), "reward_version": 5, "monotonic_constraints": ["screen_score_first", "human_score_tiebreak"], "intelligence_goal": "preserve strict screen-first ordering while learning human tie-break calibration"}
+        return {"screen_precision": 2, "tie_break_weight": getattr(self, "human_tie_break_weight", 0.000099999), "screen_scale": getattr(self, "screen_scale", 100.0), "reward_version": 6, "reward_state": asdict(getattr(self, "reward_state", RewardState())), "monotonic_constraints": ["screen_score_first", "human_score_tiebreak"], "intelligence_goal": "reward equals income minus increasing time cost with cost reset after income improvement"}
 
     def predict(self, features):
-        return strict_reward_value((features or {}).get("screen_score", 0.0), (features or {}).get("human_score", 50.0))
+        features = features or {}
+        result = reward_with_state(features.get("screen_score", 0.0), features.get("human_score", 50.0), features.get("reward_state", getattr(self, "reward_state", RewardState())), features.get("event_time"))
+        if features.get("commit_state", False):
+            self.reward_state = reward_state_from(result["state"])
+        return result["reward"]
 
     def probe_input(self):
-        return {"screen_score": 1.0, "human_score": 50.0}
+        return {"screen_score": 1.0, "human_score": 50.0, "event_time": time.time()}
+
+    @classmethod
+    def restore(cls, payload, settings=None):
+        obj = cls(settings, payload)
+        params = payload.get("parameters") if isinstance(payload, dict) else {}
+        obj.reward_state = reward_state_from(params.get("reward_state") if isinstance(params, dict) else None)
+        return obj
 
 
 class RuntimeValueModel(TrainableModel):
@@ -2902,15 +2974,15 @@ class ModelGroupRuntime:
             return model.predict(features)
         return 0.0
 
-    def reward(self, screen_score, human_score):
+    def reward(self, screen_score, human_score, event_time=None, reward_state=None, commit_state=False):
         model = self.models.get("reward_model")
         if model:
-            return model.predict({"screen_score": screen_score, "human_score": human_score})
-        return strict_reward_value(screen_score, human_score)
+            return model.predict({"screen_score": screen_score, "human_score": human_score, "event_time": event_time, "reward_state": reward_state, "commit_state": commit_state})
+        return reward_with_state(screen_score, human_score, reward_state, event_time)["reward"]
 
-    def reward_breakdown(self, screen_score, human_score):
-        parts = reward_breakdown(screen_score, human_score, self.settings)
-        parts["total_reward"] = self.reward(screen_score, human_score)
+    def reward_breakdown(self, screen_score, human_score, event_time=None, reward_state=None, commit_state=False):
+        parts = reward_breakdown(screen_score, human_score, self.settings, reward_state, event_time)
+        parts["total_reward"] = self.reward(screen_score, human_score, event_time, reward_state, commit_state)
         parts["reward_sort_key"] = list(strict_reward_key(screen_score, human_score))
         parts["basis"] = list(parts.get("basis", [])) + ["model_group_runtime_reward_model"]
         return parts
@@ -3509,7 +3581,7 @@ class DataStore:
                 raise RuntimeError("AI模型组快照不完整：五类模型必须都能独立加载并完成探针推理")
             identity = hashlib.sha256(str(self.root.resolve()).encode("utf-8", "replace")).hexdigest()
             training_digest = hashlib.sha256(json.dumps([record.get("id") for record in ranked[:limit]], ensure_ascii=False).encode("utf-8")).hexdigest()
-            payload = {"schema_version": CONFIG_SCHEMA_VERSION, "model_version": 2, "training_data_version": 1, "data_path_id": identity, "checksum": training_digest, "created_at": now_text(), "status": status, "status_detail": status_detail or {}, "screen_score_total": self.screen_score_total, "experience_count": len(records or []), "policy_limit": limit, "training_sample_ids": [record.get("id") for record in ranked[:limit]], "model_group": model_group, "model": model_payload, "policy": [{"id": record.get("id"), "mode": record.get("mode"), "action_type": (record.get("mouse_action") or {}).get("type") if isinstance(record.get("mouse_action"), dict) else None, "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_model_confidence": safe_float(record.get("sleep_model_confidence", record.get("model_prediction", 0.0)), 0.0), "model_prediction": safe_float(record.get("model_prediction", 0.0), 0.0), "model_target": safe_float(record.get("model_target", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
+            payload = {"schema_version": CONFIG_SCHEMA_VERSION, "model_version": 2, "training_data_version": 1, "data_path_id": identity, "checksum": training_digest, "created_at": now_text(), "status": status, "status_detail": status_detail or {}, "screen_score_total": self.screen_score_total, "reward_state": next((record.get("reward_state") for record in reversed(records or []) if isinstance(record, dict) and isinstance(record.get("reward_state"), dict)), asdict(RewardState())), "experience_count": len(records or []), "policy_limit": limit, "training_sample_ids": [record.get("id") for record in ranked[:limit]], "model_group": model_group, "model": model_payload, "policy": [{"id": record.get("id"), "mode": record.get("mode"), "action_type": (record.get("mouse_action") or {}).get("type") if isinstance(record.get("mouse_action"), dict) else None, "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_model_confidence": safe_float(record.get("sleep_model_confidence", record.get("model_prediction", 0.0)), 0.0), "model_prediction": safe_float(record.get("model_prediction", 0.0), 0.0), "model_target": safe_float(record.get("model_target", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
             path = self.model_dir / f"model_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex}.json"
             temporary = path.with_suffix(".tmp")
             with temporary.open("w", encoding="utf-8") as file:
@@ -3587,7 +3659,8 @@ class DataStore:
         if not model_group_complete(model_group, settings):
             raise ValueError("六模型组无法逐个恢复并推理")
         restored_models = {item.get("key"): item for item in model_group.get("models", [])}
-        return {"weights": clean, "trained_steps": trained_steps, "loss": loss, "resource_model": resource_model, "model_group": model_group, "restored_models": restored_models}
+        reward_state = payload.get("reward_state") if isinstance(payload.get("reward_state"), dict) else None
+        return {"weights": clean, "trained_steps": trained_steps, "loss": loss, "resource_model": resource_model, "model_group": model_group, "restored_models": restored_models, "reward_state": reward_state}
 
     def load_latest_model_state(self, settings=None):
         candidates = sorted(self.model_dir.glob("model_*.json"), key=self.model_created_key, reverse=True)
@@ -4315,6 +4388,7 @@ class ExperiencePool:
         if isinstance(group_payload, dict) and model_group_complete(group_payload, settings):
             self.model_group_models = {item.get("key"): restore_trainable_model(item, settings) for item in group_payload.get("models", [])}
         self.model_runtime = ModelGroupRuntime(self.model_group_models, settings)
+        self.reward_state = reward_state_from((model_state or {}).get("reward_state") if isinstance(model_state, dict) else None)
         self.lock = threading.RLock()
         self.action_cache = []
         self.prefix_neighbor_cache = OrderedDict()
@@ -4656,7 +4730,8 @@ class ExperiencePool:
             if lacks or wrong:
                 rescored += 1
             human_score = self.human_score(record.get("mouse_action")) if record.get("mouse_action") else self.settings.score_default
-            reward_info = reward_breakdown(score, human_score, self.settings)
+            reward_info = reward_breakdown(score, human_score, self.settings, self.reward_state, record.get("created_at") or record.get("score_checked_at"))
+            self.reward_state = reward_state_from(reward_info.get("reward_state"))
             record.update({"screen_score": score, "novelty": score, "score_version": 1, "score_status": "rescored" if bool(lacks or wrong) else "scored", "score_basis": "nearest_screen_content_recheck", "score_checked_at": now_text(), "score_neighbors": [{"id": item["record"].get("id"), "similarity": round(item.get("similarity", 0.0), 4)} for item in neighbors], "score_confidence": round(confidence, 4), "score_rechecked": True, "score_recomputed": bool(lacks or wrong), "reward_version": reward_info["reward_version"], "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": reward_info, "reward_sort_key": reward_info["reward_sort_key"], "total_reward": reward_info["total_reward"], "reward": reward_info["total_reward"], "screen_score_delta": max(0.0, reward_info["screen_score_delta"])})
             checked += 1
             updates.append((index, record, hash_value))
@@ -4697,12 +4772,17 @@ class ExperiencePool:
                 novelty, neighbors, similarity_confidence = self.compute_screen_score(hash_value, exclude_id=record.get("id"), before_index=index, exact_checksum=record.get("image_checksum"), semantic_vector=record.get("screen_semantic_vector"))
                 action = record.get("mouse_action")
                 human_score = clamp(record.get("human_score", self.profile.score(action)), 0.0, 100.0) if action else self.settings.score_default
-                reward = strict_reward_value(novelty, human_score)
+                event_time = record.get("created_at") or record.get("sleep_evaluated_at") or now_text()
+                reward_state = None
+                with self.lock:
+                    reward_state = reward_state_from(self.reward_state)
+                stateful_reward = reward_with_state(novelty, human_score, reward_state, event_time)
+                reward = stateful_reward["reward"]
                 visits = max(0, safe_int(record.get("sleep_visits", 0), 0))
                 candidate = reward
                 value = candidate
                 confidence = clamp((similarity_confidence + human_score / 100.0 + min(1.0, (visits + 1) / max(1.0, self.settings.nearest_top_k))) / 3.0, 0.0, 1.0)
-                reward_info = reward_breakdown(novelty, human_score, self.settings)
+                reward_info = reward_breakdown(novelty, human_score, self.settings, reward_state, event_time)
                 settled_delta = 0.0
                 if record.get("reward_version") != reward_info["reward_version"] and callable(settle_screen_score):
                     settled_delta = max(0.0, safe_float(reward_info["screen_score_delta"], 0.0) - max(0.0, safe_float(record.get("screen_score_settled", record.get("screen_score_delta", 0.0)), 0.0)))
@@ -4730,6 +4810,10 @@ class ExperiencePool:
                     record["reward_sort_key"] = reward_info["reward_sort_key"]
                     record["total_reward"] = reward_info["total_reward"]
                     record["reward"] = reward_info["total_reward"]
+                    record["income"] = reward_info.get("income")
+                    record["cost"] = reward_info.get("cost")
+                    record["reward_state"] = reward_info.get("reward_state")
+                    self.reward_state = reward_state_from(reward_info.get("reward_state"))
                     record["screen_score_delta"] = max(0.0, reward_info["screen_score_delta"])
                     record["screen_score_settled"] = max(0.0, safe_float(record.get("screen_score_settled", 0.0), 0.0)) + settled_delta
                     train_records.append(record)
@@ -4747,7 +4831,8 @@ class ExperiencePool:
             model_confidence = safe_float(model_result.get("confidence", 0.0), 0.0)
             avg_confidence = (sum(item[3] for item in updates) / count if count else 0.0)
             hardware = read_hardware_state()
-            resource_result = self.model.resource_model.train_from_metrics({"cpu_load": safe_float(hardware.get("cpu_load", 0.0), 0.0), "memory_free_ratio": safe_float(hardware.get("memory_free_ratio", 0.5), 0.5), "capture_ms": safe_float(getattr(self.settings, "training_event_wait", 0.05), 0.05) * 1000.0, "execution_ms": safe_float(getattr(self.settings, "generated_sleep_event_wait", 0.1), 0.1) * 1000.0, "window_instability": 1.0 - avg_confidence, "success_rate": model_confidence, "pool_count": len(self.records), "throughput": count, "batch_size": max(1, safe_int(getattr(self.settings, "sleep_batch_size", 1), 1)), "save_success_rate": 1.0, "training_gain": clamp((best_score or 0.0) / max(1.0, abs(self.settings.reward_total_max)), 0.0, 1.0)})
+            with self.lock:
+                resource_result = self.model.resource_model.train_from_metrics({"cpu_load": safe_float(hardware.get("cpu_load", 0.0), 0.0), "memory_free_ratio": safe_float(hardware.get("memory_free_ratio", 0.5), 0.5), "capture_ms": safe_float(getattr(self.settings, "training_event_wait", 0.05), 0.05) * 1000.0, "execution_ms": safe_float(getattr(self.settings, "generated_sleep_event_wait", 0.1), 0.1) * 1000.0, "window_instability": 1.0 - avg_confidence, "success_rate": model_confidence, "pool_count": len(self.records), "throughput": count, "batch_size": max(1, safe_int(getattr(self.settings, "sleep_batch_size", 1), 1)), "save_success_rate": 1.0, "training_gain": clamp((best_score or 0.0) / max(1.0, abs(self.settings.reward_total_max)), 0.0, 1.0)})
             return {"trained": count, "model_trained": safe_int(model_result.get("trained", 0), 0), "model_loss": safe_float(model_result.get("loss", 0.0), 0.0), "best_score": round(best_score or 0.0, 4), "avg_score": round(total_score / count if count else 0.0, 4), "avg_confidence": round(clamp(avg_confidence * 0.6 + model_confidence * 0.4, 0.0, 1.0), 4), **resource_result}
 
         finally:
@@ -7623,7 +7708,9 @@ class ControlPanel(tk.Tk):
         after_novelty = self.experience_pool.compute_screen_score(after_snapshot.hash_value, exact_checksum=getattr(after_snapshot, "image_checksum", ""), semantic_vector=getattr(after_snapshot, "semantic_vector", ()))[0] if after_snapshot else before_novelty
         transition_reward = round(after_novelty - before_novelty, 2)
         scoring_novelty = after_novelty if normalized and after_snapshot else before_novelty
-        reward_info = self.experience_pool.model_runtime.reward_breakdown(scoring_novelty, human_score if normalized else self.settings.score_default)
+        event_time = getattr(after_snapshot, "captured_at", None) or getattr(snapshot, "captured_at", None) or now_text()
+        reward_info = self.experience_pool.model_runtime.reward_breakdown(scoring_novelty, human_score if normalized else self.settings.score_default, event_time=event_time, reward_state=self.experience_pool.reward_state, commit_state=True)
+        self.experience_pool.reward_state = reward_state_from(reward_info.get("reward_state"))
         novelty_reward = reward_info["screen_primary_reward"]
         human_delta = reward_info["mouse_action_delta"]
         reward = reward_info["total_reward"]
@@ -7642,7 +7729,7 @@ class ControlPanel(tk.Tk):
         offset_ms = round((float(offset_source) - snapshot.perf_time) * 1000.0, 3) if offset_source is not None else None
         sims = [round(item["similarity"], 4) for item in batch]
         record_event = self.events.publish("record_ready", mode=mode, session_id=session_id, event_name=event_name)
-        record = {"record_schema_version": 2, "reward_version": reward_info["reward_version"], "id": uuid.uuid4().hex, "event_sequence": record_event["sequence"], "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_semantic_vector": list(getattr(snapshot, "semantic_vector", ())), "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": before_novelty, "screen_score": before_novelty, "score_version": 1, "score_basis": "nearest_screen_content_live", "score_checked_at": now_text(), "score_neighbors": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "before_screen": snapshot.relative_path, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_screen_hash": snapshot.hash_value.hex, "before_screen_score": before_novelty, "after_screen_hash": after_snapshot.hash_value.hex if after_snapshot else snapshot.hash_value.hex, "after_screen_hash_int": after_snapshot.hash_value.value if after_snapshot else snapshot.hash_value.value, "after_screen_hash_bits": after_snapshot.hash_value.bits if after_snapshot else snapshot.hash_value.bits, "after_screen_semantic_vector": list(getattr(after_snapshot, "semantic_vector", ())) if after_snapshot else list(getattr(snapshot, "semantic_vector", ())), "after_screen_score": after_novelty, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "reward_breakdown": {"screen_novelty": reward_info["screen_novelty"], "screen_reward": reward_info["screen_reward"], "human_similarity": reward_info["human_similarity"], "human_tiebreak": reward_info["human_tiebreak"], "screen_score_delta": reward_info["screen_score_delta"], "basis": reward_info["basis"]}, "reward_sort_key": reward_info["reward_sort_key"], "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "screen_score_delta": max(0.0, reward), "screen_score_settled": max(0.0, reward), "penalty_delta": max(0.0, -reward), "screen_score_total": screen_score_total, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "image_checksum": getattr(snapshot, "image_checksum", ""), "after_image_checksum": getattr(after_snapshot, "image_checksum", "") if after_snapshot else getattr(snapshot, "image_checksum", ""), "image_dropped": bool(getattr(snapshot, "image_dropped", False)), "screen_file_expected": not bool(getattr(snapshot, "image_dropped", False)), "capture_latency_ms": capture_latency_ms if capture_latency_ms is not None else getattr(snapshot, "capture_latency_ms", None), "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_event_wait": self.settings.training_event_wait, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
+        record = {"record_schema_version": 2, "reward_version": reward_info["reward_version"], "id": uuid.uuid4().hex, "event_sequence": record_event["sequence"], "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_semantic_vector": list(getattr(snapshot, "semantic_vector", ())), "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": before_novelty, "screen_score": before_novelty, "score_version": 1, "score_basis": "nearest_screen_content_live", "score_checked_at": now_text(), "score_neighbors": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "before_screen": snapshot.relative_path, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_screen_hash": snapshot.hash_value.hex, "before_screen_score": before_novelty, "after_screen_hash": after_snapshot.hash_value.hex if after_snapshot else snapshot.hash_value.hex, "after_screen_hash_int": after_snapshot.hash_value.value if after_snapshot else snapshot.hash_value.value, "after_screen_hash_bits": after_snapshot.hash_value.bits if after_snapshot else snapshot.hash_value.bits, "after_screen_semantic_vector": list(getattr(after_snapshot, "semantic_vector", ())) if after_snapshot else list(getattr(snapshot, "semantic_vector", ())), "after_screen_score": after_novelty, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "income": reward_info.get("income"), "cost": reward_info.get("cost"), "reward_state": reward_info.get("reward_state"), "reward_state_version": reward_info.get("reward_state_version"), "reward_breakdown": {"screen_novelty": reward_info["screen_novelty"], "screen_reward": reward_info["screen_reward"], "human_similarity": reward_info["human_similarity"], "human_tiebreak": reward_info["human_tiebreak"], "screen_score_delta": reward_info["screen_score_delta"], "income": reward_info.get("income"), "cost": reward_info.get("cost"), "basis": reward_info["basis"]}, "reward_sort_key": reward_info["reward_sort_key"], "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "screen_score_delta": max(0.0, reward), "screen_score_settled": max(0.0, reward), "penalty_delta": max(0.0, -reward), "screen_score_total": screen_score_total, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "image_checksum": getattr(snapshot, "image_checksum", ""), "after_image_checksum": getattr(after_snapshot, "image_checksum", "") if after_snapshot else getattr(snapshot, "image_checksum", ""), "image_dropped": bool(getattr(snapshot, "image_dropped", False)), "screen_file_expected": not bool(getattr(snapshot, "image_dropped", False)), "capture_latency_ms": capture_latency_ms if capture_latency_ms is not None else getattr(snapshot, "capture_latency_ms", None), "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_event_wait": self.settings.training_event_wait, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
         if screen_result_unknown:
             record["screen_result_unknown"] = True
             record["exclude_from_training"] = True
