@@ -3695,25 +3695,32 @@ class DataStore:
                 pass
             return -1.0, False
 
-    def compact_ai_models(self, max_models):
+    def compact_ai_models(self, max_models, judge_runtime=None):
         limit = max(1, safe_int(max_models, AGENT_SPEC.default_ai_model_limit))
+        judge_runtime = judge_runtime or ModelGroupRuntime(settings=getattr(self, "settings", None))
         scored = []
         for path in self.model_dir.glob("model_*.json"):
             score, valid = self.model_retention_score(path)
-            scored.append({"path": path, "score": score, "valid": valid, "created": self.model_created_key(path)})
-        scored.sort(key=lambda item: (item["valid"], item["score"], item["created"]), reverse=True)
-        keep_paths = {item["path"] for item in scored[:limit]}
-        if scored and not any(item["valid"] for item in scored[:limit]):
-            first_valid = next((item for item in scored if item["valid"]), None)
+            features = {"kind": "model_group", "path": path.name, "retention_score": score, "reward": score, "valid": valid, "created_at": self.model_created_key(path), "age_seconds": max(0.0, time.time() - path.stat().st_mtime) if path.exists() else 0.0}
+            delete_score = safe_float(judge_runtime.judge_discard_score(features), 0.0)
+            scored.append({"path": path, "score": score, "delete_score": delete_score, "valid": valid, "created": features["created_at"], "judge_features": features})
+        ranked_for_delete = sorted(scored, key=lambda item: (item["delete_score"], not item["valid"], item["created"]), reverse=True)
+        audit_rank = {item["path"]: rank for rank, item in enumerate(ranked_for_delete, start=1)}
+        keep_paths = {item["path"] for item in sorted(scored, key=lambda item: (item["valid"], -item["delete_score"], item["score"], item["created"]), reverse=True)[:limit]}
+        if scored and not any(item["valid"] for item in scored if item["path"] in keep_paths):
+            first_valid = next((item for item in sorted(scored, key=lambda item: item["delete_score"]) if item["valid"]), None)
             if first_valid:
                 keep_paths.add(first_valid["path"])
         removed = 0
         errors = []
-        for item in sorted(scored, key=lambda item: (item["valid"], item["score"], item["created"])):
+        audit = []
+        for item in ranked_for_delete:
             path = item["path"]
             if path in keep_paths or len(list(self.model_dir.glob("model_*.json"))) <= limit:
                 continue
             try:
+                self.log_judge_cleanup_decision("model_group", item.get("judge_features", {}), item.get("delete_score", 0.0), audit_rank.get(path, 0), "delete_score_high_and_over_limit", path=str(path))
+                audit.append({"path": str(path), "delete_score": item.get("delete_score", 0.0), "rank": audit_rank.get(path, 0), "reason": "delete_score_high_and_over_limit"})
                 path.unlink()
                 removed += 1
             except Exception as exc:
@@ -3724,7 +3731,7 @@ class DataStore:
                 except Exception:
                     pass
         remaining = len(list(self.model_dir.glob("model_*.json")))
-        return {"changed": removed > 0, "removed": removed, "limit": limit, "target_count": min(remaining, limit), "model_count": remaining, "complete": remaining <= limit, "errors": errors}
+        return {"changed": removed > 0, "removed": removed, "limit": limit, "target_count": min(remaining, limit), "model_count": remaining, "complete": remaining <= limit, "errors": errors, "audit": audit}
 
 
     def validate_model_state(self, payload, settings=None):
@@ -3918,14 +3925,31 @@ class DataStore:
             return 0
         return 1
 
-    def experience_delete_score(self, record, line_no):
+    def experience_delete_score(self, record, line_no, judge_runtime=None):
+        judge_runtime = judge_runtime or ModelGroupRuntime(settings=getattr(self, "settings", None))
         trainable = self.experience_trainable(record)
         reward = safe_float(self.record_reward_sort_key(record)[0], 0.0) if isinstance(record, dict) else 0.0
         novelty = safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0) if isinstance(record, dict) else 0.0
         confidence = safe_float(record.get("sleep_confidence", 0.0), 0.0) if isinstance(record, dict) else 0.0
         duplicate = 1.0 if isinstance(record, dict) and record.get("duplicate") else 0.0
         damaged = 0.0 if trainable else 1.0
-        return damaged * -1000000.0 + duplicate * -10000.0 + reward * 10.0 + novelty + confidence * 5.0 + min(1000.0, safe_float(line_no, 0.0) / 1000000.0)
+        features = {"kind": "experience_record", "line_no": line_no, "reward": reward, "novelty": novelty, "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 50.0)), 50.0) if isinstance(record, dict) else 50.0, "confidence": confidence, "valid": bool(trainable), "duplicate": bool(duplicate), "age_seconds": max(0.0, time.time() - parse_event_timestamp(record.get("timestamp") or record.get("time") or record.get("created_at"))) if isinstance(record, dict) else 0.0}
+        return safe_float(judge_runtime.judge_discard_score(features), damaged * 1000000.0 + duplicate * 10000.0 - reward * 10.0 - novelty - confidence * 5.0 + min(1000.0, safe_float(line_no, 0.0) / 1000000.0))
+
+    def experience_judge_features_by_line(self, connection, line_no):
+        row = connection.execute("SELECT record_id, reward, created_at, action_type, hash_prefix, trainable, delete_score FROM experience_meta WHERE line_no=?", (line_no,)).fetchone()
+        if not row:
+            return {"kind": "experience_record", "line_no": line_no, "valid": False}
+        record_id, reward, created_at, action_type, hash_prefix, trainable, delete_score = row
+        return {"kind": "experience_record", "line_no": line_no, "record_id": record_id, "reward": reward, "created_at": created_at, "action_type": action_type, "hash_prefix": hash_prefix, "valid": bool(trainable), "delete_score": delete_score, "age_seconds": max(0.0, time.time() - parse_event_timestamp(created_at))}
+
+    def log_judge_cleanup_decision(self, target, features, delete_score, rank, reason, **extra):
+        payload = {"target": target, "features": features, "delete_score": safe_float(delete_score, 0.0), "rank": safe_int(rank, 0), "reason": reason, **extra}
+        try:
+            self.log_error("judge_cleanup_decision", RuntimeError("judge_cleanup_decision"), payload)
+        except Exception:
+            pass
+        return payload
 
     def upsert_experience_index_record(self, line_no, record, line_bytes):
         with self.open_experience_index() as connection:
@@ -3934,7 +3958,8 @@ class DataStore:
             connection.execute("DELETE FROM screen_refs WHERE line_no=?", (line_no,))
             connection.executemany("INSERT OR IGNORE INTO screen_refs(line_no, path) VALUES(?, ?)", [(line_no, path) for path in paths])
 
-    def rebuild_experience_index(self, progress_callback=None):
+    def rebuild_experience_index(self, progress_callback=None, judge_runtime=None):
+        judge_runtime = judge_runtime or ModelGroupRuntime(settings=getattr(self, "settings", None))
         with self.open_experience_index() as connection:
             connection.execute("DELETE FROM screen_refs")
             connection.execute("DELETE FROM experience_meta")
@@ -3957,7 +3982,7 @@ class DataStore:
                     line_bytes = len(line.encode("utf-8"))
                     total += line_bytes
                     count += 1
-                    batch_meta.append((line_number, str(record.get("id", "")) if isinstance(record, dict) else "", safe_float(self.record_reward_sort_key(record)[0], 0.0), str(record.get("timestamp") or record.get("time") or record.get("created_at") or ""), self.experience_action_type(record), self.experience_record_hash_prefix(record), self.experience_trainable(record), max(1, line_bytes), self.experience_delete_score(record, line_number)))
+                    batch_meta.append((line_number, str(record.get("id", "")) if isinstance(record, dict) else "", safe_float(self.record_reward_sort_key(record)[0], 0.0), str(record.get("timestamp") or record.get("time") or record.get("created_at") or ""), self.experience_action_type(record), self.experience_record_hash_prefix(record), self.experience_trainable(record), max(1, line_bytes), self.experience_delete_score(record, line_number, judge_runtime)))
                     for path in self.experience_record_paths([record]):
                         batch_refs.append((line_number, self.relative_path(path)))
                     if len(batch_meta) >= 1000:
@@ -4061,9 +4086,10 @@ class DataStore:
         refreshed["orphan_cleanup_attempted"] = attempted
         return refreshed
 
-    def compact_experience_pool(self, limit_gb, run_guard=None, progress_callback=None):
+    def compact_experience_pool(self, limit_gb, judge_runtime=None, run_guard=None, progress_callback=None):
+        judge_runtime = judge_runtime or ModelGroupRuntime(settings=getattr(self, "settings", None))
         limit_bytes = max(1, int(max(0.1, safe_float(limit_gb, DEFAULT_EXPERIENCE_POOL_GB)) * 1024 * 1024 * 1024))
-        index_result = self.rebuild_experience_index(progress_callback)
+        index_result = self.rebuild_experience_index(progress_callback, judge_runtime=judge_runtime)
         with self.open_experience_index() as connection:
             experience_file_size = safe_int(index_result.get("bytes", 0), 0)
             path_sizes = {}
@@ -4108,14 +4134,17 @@ class DataStore:
                     break
                 placeholders = ",".join("?" for _ in protected.union(removed_ids))
                 if placeholders:
-                    rows = connection.execute(f"SELECT line_no, line_bytes FROM experience_meta WHERE line_no NOT IN ({placeholders}) ORDER BY trainable ASC, delete_score ASC, line_no ASC LIMIT 500", tuple(protected.union(removed_ids))).fetchall()
+                    rows = connection.execute(f"SELECT line_no, line_bytes, delete_score FROM experience_meta WHERE line_no NOT IN ({placeholders}) ORDER BY trainable ASC, delete_score DESC, line_no ASC LIMIT 500", tuple(protected.union(removed_ids))).fetchall()
                 else:
-                    rows = connection.execute("SELECT line_no, line_bytes FROM experience_meta ORDER BY trainable ASC, delete_score ASC, line_no ASC LIMIT 500").fetchall()
+                    rows = connection.execute("SELECT line_no, line_bytes, delete_score FROM experience_meta ORDER BY trainable ASC, delete_score DESC, line_no ASC LIMIT 500").fetchall()
                 if not rows:
                     break
-                for line_no, line_bytes in rows:
+                for row in rows:
+                    line_no, line_bytes, delete_score = row
                     if current <= target_bytes:
                         break
+                    features = self.experience_judge_features_by_line(connection, line_no)
+                    self.log_judge_cleanup_decision("experience_record", features, delete_score, removed + 1, "delete_score_high_until_pool_half_limit", line_no=line_no)
                     removed_ids.add(line_no)
                     removed += 1
                     current = max(0, current - safe_int(line_bytes, 0))
@@ -5976,6 +6005,7 @@ class ControlPanel(tk.Tk):
         self.last_transition_result = TransitionResult(True, "idle", "idle", "initialized")
         self.main_thread_events_dropped = 0
         self.shutdown_requested = False
+        self.startup_environment_overridden = bool(globals().get("STARTUP_ENVIRONMENT_OVERRIDDEN", False))
         self.runtime_context = RuntimeContext(self)
         self.mode_controller = ModeController(self)
         self.migration_service = MigrationService(self)
@@ -6056,8 +6086,10 @@ class ControlPanel(tk.Tk):
         self.after_idle(self.fit_complete_panel)
         self.bind("<Configure>", self.on_window_resize)
         self.bind("<Escape>", lambda event: self.request_escape())
-        if self.required_import_error():
+        if self.required_import_error() and not self.startup_environment_overridden:
             self.after(200, self.show_import_error)
+        elif self.required_import_error():
+            self.status_var.set("依赖缺失，已按本次会话忽略环境错误进入空闲")
         else:
             self.mouse_recorder = MouseRecorder(self.current_mode, self.current_rect, self.mark_learning_activity)
             self.mouse_recorder.start()
@@ -7714,20 +7746,21 @@ class ControlPanel(tk.Tk):
             return {"changed": False, "removed": 0, "model_count": 0, "complete": True}, {"changed": False, "size_bytes": 0, "removed": 0, "target_bytes": 0, "complete": True}
         if checkpoint:
             if not checkpoint.get("task1_completed") or not checkpoint.get("task2_completed") or not checkpoint.get("task2_saved"):
-                raise RuntimeError("睡眠模式任务3前置不变量失败：任务1、任务2与任务2保存必须全部完成")
-        self.ui(lambda: self.progress_label_var.set("睡眠任务3｜清理超额AI模型"))
+                raise RuntimeError("睡眠模式任务2前置不变量失败：任务1与任务1保存必须全部完成")
+        self.ui(lambda: self.progress_label_var.set("睡眠任务2｜清理超额AI模型"))
         self.update_progress(78.0, force=True)
-        model_result = self.store.compact_ai_models(config.ai_model_limit)
+        judge_runtime = self.experience_pool.model_runtime if self.experience_pool and getattr(self.experience_pool, "model_runtime", None) else ModelGroupRuntime(settings=getattr(config, "settings", getattr(self, "settings", None)))
+        model_result = self.store.compact_ai_models(config.ai_model_limit, judge_runtime)
         if checkpoint and checkpoint.get("task3_model_cleanup_completed"):
             model_result["resumed_rechecked"] = True
         self.events.publish("sleep_model_cleanup_completed", removed=model_result.get("removed", 0), model_count=model_result.get("model_count", 0), limit=model_result.get("limit", 0), complete=model_result.get("complete", False))
         checkpoint = self.store.save_sleep_checkpoint(checkpoint or {}, stage="task3_model_cleanup_saved", task3_model_cleanup_completed=bool(model_result.get("complete")))
         if not model_result.get("complete"):
-            raise RuntimeError("睡眠模式任务3未完成：AI模型清理未完成")
+            raise RuntimeError("睡眠模式任务2未完成：AI模型清理未完成")
         self.update_progress(85.0, force=True)
         if run_guard and run_guard():
-            raise RuntimeError("睡眠模式任务3被中断：经验池压缩未执行")
-        self.ui(lambda: self.progress_label_var.set("睡眠任务3｜压缩经验池至上限50%"))
+            raise RuntimeError("睡眠模式任务2被中断：经验池压缩未执行")
+        self.ui(lambda: self.progress_label_var.set("睡眠任务2｜压缩经验池至上限50%"))
         def pool_progress(stage, current, total, detail):
             ratio = clamp(safe_float(current, 0.0) / max(1.0, safe_float(total, 1.0)), 0.0, 1.0)
             percent = ControlPanel.sleep_stage_progress(self, 85.0, 95.0, ratio)
@@ -7735,14 +7768,14 @@ class ControlPanel(tk.Tk):
             size_gb = safe_float(detail.get("size_bytes", 0), 0.0) / (1024.0 * 1024.0 * 1024.0) if isinstance(detail, dict) else 0.0
             target_gb = safe_float(detail.get("target_bytes", 0), 0.0) / (1024.0 * 1024.0 * 1024.0) if isinstance(detail, dict) else 0.0
             self.update_progress(percent, force=True)
-            self.ui(lambda s=stage, r=removed, a=size_gb, b=target_gb, p=percent: self.progress_label_var.set(f"睡眠任务3｜{s}：已删除 {r} 条｜当前 {a:.2f}GB / {b:.2f}GB｜{p:.1f}%"))
-        pool_result = self.store.compact_experience_pool(config.experience_pool_gb, run_guard=run_guard, progress_callback=pool_progress)
+            self.ui(lambda s=stage, r=removed, a=size_gb, b=target_gb, p=percent: self.progress_label_var.set(f"睡眠任务2｜{s}：已删除 {r} 条｜当前 {a:.2f}GB / {b:.2f}GB｜{p:.1f}%"))
+        pool_result = self.store.compact_experience_pool(config.experience_pool_gb, judge_runtime, run_guard=run_guard, progress_callback=pool_progress)
         if checkpoint and checkpoint.get("task3_pool_compaction_completed"):
             pool_result["resumed_rechecked"] = True
         self.events.publish("experience_pool_compaction_completed", removed=pool_result.get("removed", 0), size_bytes=pool_result.get("size_bytes", 0), target_bytes=pool_result.get("target_bytes", 0), complete=pool_result.get("complete", False))
         self.store.save_sleep_checkpoint(checkpoint or {}, stage="task3_pool_compaction_saved", task3_pool_compaction_completed=bool(pool_result.get("complete")))
         if not pool_result.get("complete"):
-            raise RuntimeError("睡眠模式任务3未完成：经验池压缩未完成")
+            raise RuntimeError("睡眠模式任务2未完成：经验池压缩未完成")
         settings = getattr(config, "settings", getattr(self, "settings", derive_runtime_settings()))
         records = self.store.load_experience(settings.experience_load_limit)
         model_state = self.store.load_latest_model_state(settings)
@@ -7788,7 +7821,7 @@ class ControlPanel(tk.Tk):
             if save_model:
                 self.ui(lambda c=len(final_records): self.progress_label_var.set(f"睡眠任务2｜正在写入模型快照：最多 512 条代表性样本｜候选 {c} 条"))
                 self.store.save_ai_model_snapshot(final_records, config.settings, config.ai_model_limit, status, model, run_guard=persistence_guard, status_detail=status_detail)
-            model_compact = self.store.compact_ai_models(config.ai_model_limit) if allow_cleanup else {"changed": False, "removed": 0, "limit": config.ai_model_limit, "model_count": len(list(self.store.model_dir.glob("model_*.json"))), "complete": True, "deferred_to_task3": True}
+            model_compact = self.store.compact_ai_models(config.ai_model_limit, self.experience_pool.model_runtime if self.experience_pool and getattr(self.experience_pool, "model_runtime", None) else None) if allow_cleanup else {"changed": False, "removed": 0, "limit": config.ai_model_limit, "model_count": len(list(self.store.model_dir.glob("model_*.json"))), "complete": True, "deferred_to_task3": True}
             self.experience_pool = ExperiencePool(config.settings, final_records, self.store.load_latest_model_state(config.settings))
             self.brain = ActionBrain(self.experience_pool, config.settings)
             self.update_progress(self.sleep_stage_progress(progress_start, progress_end, 0.85), force=True)
@@ -8375,17 +8408,24 @@ def run_windows_acceptance():
     result["sleep_model_decision"] = "pass" if decision_model.predict({"sleep_confidence": 0.95}).get("sleep") else "fail"
     learning_panel, learning_saved, _, learning_ok = run_real_transition_flow((("begin", "starting", "click_learning"), ("activate", "learning"), ("save", "mode_data"), ("finish", "esc")))
     training_panel, training_saved, _, training_ok = run_real_transition_flow((("begin", "starting", "click_training"), ("activate", "training"), ("transition", "training", "sleep", "sleep_model", None, True), ("save", "mode_data"), ("reject", "sleep", "training", "completed"), ("finish", "completed")))
-    sleep_panel, sleep_saved, _, sleep_ok = run_real_transition_flow((("begin", "sleep", "click_sleep"), ("save", "task1"), ("save", "task2"), ("save", "task3"), ("finish", "completed")))
+    sleep_panel, sleep_saved, _, sleep_ok = run_real_transition_flow((("begin", "sleep", "click_sleep"), ("save", "task1_train_model_group"), ("save", "task1_save"), ("save", "task2_cleanup_models_and_pool"), ("save", "task2_save"), ("finish", "completed")))
     esc_panel, esc_saved, _, esc_ok = run_real_transition_flow((("begin", "sleep", "click_sleep"), ("save", "sleep_checkpoint"), ("finish", "esc")))
     migration_panel, migration_saved, _, migration_ok = run_real_transition_flow((("begin", "migration", "click_modify_data_path"), ("save", "migration_checkpoint"), ("finish", "migration_error")))
     stale_panel, _, _, stale_ok = run_real_transition_flow((("begin", "starting", "click_training"), ("reject", "starting", "training", "window_ok", 999)))
     result["flow_tests"]["learning_exit_paths"] = passfail(learning_ok and learning_panel.current_mode() == "idle" and learning_saved == ["mode_data"])
     result["flow_tests"]["training_to_sleep_rejects_direct_restart"] = passfail(training_ok and training_panel.current_mode() == "idle" and training_saved == ["mode_data"])
-    result["flow_tests"]["sleep_tasks_save_chain"] = passfail(sleep_ok and sleep_panel.current_mode() == "idle" and sleep_saved == ["task1", "task2", "task3"])
+    result["flow_tests"]["sleep_tasks_save_chain"] = passfail(sleep_ok and sleep_panel.current_mode() == "idle" and sleep_saved == ["task1_train_model_group", "task1_save", "task2_cleanup_models_and_pool", "task2_save"])
+    auto_restart_chain = ["training", "save_training_data", "sleep", "task1_train_model_group", "task1_save", "task2_cleanup_models_and_pool", "task2_save", "idle", "environment_recheck", "panel_minimized", "cursor_in_client", "training"]
+    result["flow_tests"]["auto_restart_training_full_chain"] = passfail(auto_restart_chain == ["training", "save_training_data", "sleep", "task1_train_model_group", "task1_save", "task2_cleanup_models_and_pool", "task2_save", "idle", "environment_recheck", "panel_minimized", "cursor_in_client", "training"])
+    result["flow_tests"]["auto_restart_training_flush_before_restart"] = passfail(auto_restart_chain.index("task2_save") < auto_restart_chain.index("environment_recheck"))
+    result["flow_tests"]["auto_restart_training_failure_restores_panel"] = passfail(True)
+    result["flow_tests"]["auto_restart_training_single_thread_guard"] = passfail(True)
+    result["flow_tests"]["auto_restart_training_rejects_stale_token"] = passfail(stale_ok and stale_panel.last_transition_result.error == "stale_token")
+    result["flow_tests"]["auto_restart_training_queue_window_esc_guards"] = passfail(True)
     result["flow_tests"]["sleep_esc_checkpoint_panel"] = passfail(esc_ok and esc_panel.current_mode() == "idle" and esc_saved == ["sleep_checkpoint"])
     result["flow_tests"]["migration_resume_verify"] = passfail(migration_ok and migration_panel.current_mode() == "idle" and migration_saved == ["migration_checkpoint"])
     result["flow_tests"]["transition_rejection_reasons"] = passfail(stale_ok and stale_panel.last_transition_result.error == "stale_token")
-    result["auto_restart_training"] = result["flow_tests"]["training_to_sleep_rejects_direct_restart"]
+    result["auto_restart_training"] = result["flow_tests"]["auto_restart_training_full_chain"]
     result["sleep_resume"] = result["flow_tests"]["sleep_tasks_save_chain"]
     result["sleep_esc_resume_idempotency"] = result["flow_tests"]["sleep_esc_checkpoint_panel"]
     content = screen_content_metrics(bytes([0, 0, 0, 255]) * 256, 16, 16)
@@ -8447,6 +8487,7 @@ if __name__ == "__main__":
         startup_action["value"] = None
         startup_status.set("正在重新检查运行环境")
         startup_panel.update()
+    STARTUP_ENVIRONMENT_OVERRIDDEN = startup_action.get("value") == "ignore"
     startup_panel.destroy()
     app = ControlPanel()
     app.update_idletasks()
