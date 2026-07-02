@@ -52,11 +52,16 @@ AGENT_SPEC = AgentSpec(
 )
 
 
+
+def require(condition, message="self-test check failed"):
+    if not condition:
+        raise RuntimeError(message)
+
 def should_stop_run(stop_event, deadline, escape_check, termination_reason=None):
     if stop_event and stop_event.is_set():
         return termination_reason if termination_reason in TERMINATION_REASONS else "user_stop"
     if deadline is not None and time.perf_counter() >= deadline:
-        return "deadline"
+        return "user_stop"
     if escape_check and escape_check():
         return "esc"
     return None
@@ -666,7 +671,7 @@ ALLOWED_TRANSITIONS = {
 }
 
 
-TERMINATION_REASONS = ("window_invalid", "cursor_outside", "rect_changed", "empty_action", "executor_error", "sleep_model", "esc", "still_timeout", "deadline", "user_stop", "migration_error", "completed")
+TERMINATION_REASONS = ("window_invalid", "cursor_outside", "rect_changed", "empty_action", "executor_error", "sleep_model", "esc", "still_timeout", "user_stop", "migration_error", "completed")
 RUNNING_MODES = {"starting", "learning", "training", "sleep", "migration"}
 HUMAN_FEATURE_NAMES = ("duration", "direct", "bend", "points", "speed_mean", "speed_variance", "acceleration_change", "pauses", "hover_before", "drag_curvature", "double_click_interval")
 
@@ -881,6 +886,15 @@ class ModeSession:
 
 
 @dataclass(frozen=True)
+class TransitionResult:
+    ok: bool
+    source: str
+    target: str
+    reason: str
+    error: str = ""
+
+
+@dataclass(frozen=True)
 class StopSnapshot:
     still_seconds: float
     deadline: Optional[float]
@@ -993,16 +1007,16 @@ def validate_ldplayer_executable(path, settings=None, require_attach=False):
 def run_self_test():
     startup_checks = deque([["依赖异常"], []])
     startup_events = []
-    assert startup_ldplayer_window_issue(Path("D:/LDPlayer9/dnplayer.exe")) is None
-    assert prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: (actions.append("完成修复"), startup_events.append("repair")), startup_events.append)
-    assert startup_events == ["repair"]
+    require(startup_ldplayer_window_issue(Path("D:/LDPlayer9/dnplayer.exe")) is None, 'startup_ldplayer_window_issue(Path("D:/LDPlayer9/dnplayer.exe")) is None')
+    require(prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: (actions.append("完成修复"), startup_events.append("repair")), startup_events.append), 'prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: (actions.append("完成修复"), startup_events.append("repair")), startup_events.append)')
+    require(startup_events == ["repair"], 'startup_events == ["repair"]')
     startup_checks = deque([["桌面异常"], ["桌面异常"]])
     startup_events = []
-    assert not prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: actions.append("无法自动修复"), startup_events.append)
-    assert len(startup_events) == 1 and "初检结果" in startup_events[0] and "初检后进行的自愈尝试" in startup_events[0] and "复检结果" in startup_events[0] and "下一步建议" in startup_events[0]
-    assert STARTUP_FAILURE_BUTTON_LABELS == ("选择雷电路径", "选择数据目录", "更多", "重试", "忽略", "退出")
-    assert "still_timeout" not in ALLOWED_TRANSITIONS[("training", "stopping")]
-    assert "still_timeout" in ALLOWED_TRANSITIONS[("learning", "stopping")]
+    require(not prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: actions.append("无法自动修复"), startup_events.append), 'not prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: actions.append("无法自动修复"), startup_events.append)')
+    require(len(startup_events) == 1 and "初检结果" in startup_events[0] and "初检后进行的自愈尝试" in startup_events[0] and "复检结果" in startup_events[0] and "下一步建议" in startup_events[0], 'len(startup_events) == 1 and "初检结果" in startup_events[0] and "初检后进行的自愈尝试" in startup_events[0] and "复检结果" in startup_events[0] and "下一步建议" in startup_events[0]')
+    require(STARTUP_FAILURE_BUTTON_LABELS == ("选择雷电路径", "选择数据目录", "更多", "重试", "忽略", "退出"), 'STARTUP_FAILURE_BUTTON_LABELS == ("选择雷电路径", "选择数据目录", "更多", "重试", "忽略", "退出")')
+    require("still_timeout" not in ALLOWED_TRANSITIONS[("training", "stopping")], '"still_timeout" not in ALLOWED_TRANSITIONS[("training", "stopping")]')
+    require("still_timeout" in ALLOWED_TRANSITIONS[("learning", "stopping")], '"still_timeout" in ALLOWED_TRANSITIONS[("learning", "stopping")]')
     original_window_manager = globals().get("WindowManager")
     original_probe = globals().get("runtime_capability_probe")
     attach_events = []
@@ -1022,8 +1036,8 @@ def run_self_test():
     globals()["runtime_capability_probe"] = fake_runtime_capability_probe
     try:
         probe_ok, probe_reason = attach_and_probe_ldplayer(Path("D:/LDPlayer9/dnplayer.exe"), settings=None)
-        assert probe_ok, probe_reason
-        assert attach_events == [("attach", "D:/LDPlayer9/dnplayer.exe"), ("probe", 100)]
+        require(probe_ok, probe_reason)
+        require(attach_events == [("attach", "D:/LDPlayer9/dnplayer.exe"), ("probe", 100)], 'attach_events == [("attach", "D:/LDPlayer9/dnplayer.exe"), ("probe", 100)]')
     finally:
         if original_window_manager is None:
             globals().pop("WindowManager", None)
@@ -1031,58 +1045,58 @@ def run_self_test():
             globals()["WindowManager"] = original_window_manager
         globals()["runtime_capability_probe"] = original_probe
     settings = derive_runtime_settings()
-    assert len(settings.human_feature_weights) == len(HUMAN_FEATURE_NAMES)
-    assert sum(settings.human_feature_weights) > 0.0
+    require(len(settings.human_feature_weights) == len(HUMAN_FEATURE_NAMES), 'len(settings.human_feature_weights) == len(HUMAN_FEATURE_NAMES)')
+    require(sum(settings.human_feature_weights) > 0.0, 'sum(settings.human_feature_weights) > 0.0')
     factory = RuntimeNumberFactory(read_hardware_state(), (1280, 720), 8, 24.0, 140.0, 24.0, 1.0, 0.0, 0.97, 0.0)
-    assert factory.count("training_fail_stop_count", 1, 99) >= 1
-    assert "training_fail_stop_count" in factory.audit
-    assert RUNTIME_NUMBER_RULES["training_event_wait"]
+    require(factory.count("training_fail_stop_count", 1, 99) >= 1, 'factory.count("training_fail_stop_count", 1, 99) >= 1')
+    require("training_fail_stop_count" in factory.audit, '"training_fail_stop_count" in factory.audit')
+    require(RUNTIME_NUMBER_RULES["training_event_wait"], 'RUNTIME_NUMBER_RULES["training_event_wait"]')
     for item in fields(Settings):
         value = getattr(settings, item.name)
         if isinstance(value, (int, float)):
-            assert math.isfinite(float(value))
+            require(math.isfinite(float(value)), 'math.isfinite(float(value))')
     raw_empty_weight_settings = replace(settings, human_profile_min_samples=3, human_feature_weights=())
     profile = HumanProfile(raw_empty_weight_settings)
     human_action = {"type": "click", "start_rel": [0.2, 0.3], "end_rel": [0.22, 0.32], "duration": 0.18, "path_rel": [[0.2, 0.3, 0.0], [0.21, 0.31, 0.08], [0.22, 0.32, 0.18]]}
     for _ in range(raw_empty_weight_settings.human_profile_min_samples):
         profile.observe(human_action)
-    assert profile.enough("click")
-    assert profile.score(human_action) > 0.0
-    assert sys.version_info >= MIN_PYTHON_VERSION
-    assert windows_runtime_report()["platform"] == sys.platform
-    assert hasattr(WindowManager, "topmost")
-    assert clamp(12, 0, 10) == 10
+    require(profile.enough("click"), 'profile.enough("click")')
+    require(profile.score(human_action) > 0.0, 'profile.score(human_action) > 0.0')
+    require(sys.version_info >= MIN_PYTHON_VERSION, 'sys.version_info >= MIN_PYTHON_VERSION')
+    require(windows_runtime_report()["platform"] == sys.platform, 'windows_runtime_report()["platform"] == sys.platform')
+    require(hasattr(WindowManager, "topmost"), 'hasattr(WindowManager, "topmost")')
+    require(clamp(12, 0, 10) == 10, 'clamp(12, 0, 10) == 10')
     action = normalize_mouse_action({"type": "click", "start_rel": [2, -1], "duration": 0.3}, (0, 0, 100, 100))
-    assert 0.0 <= action["start_rel"][0] <= 1.0
+    require(0.0 <= action["start_rel"][0] <= 1.0, '0.0 <= action["start_rel"][0] <= 1.0')
     a = HashValue(value=0b1111, bits=4, hex="f")
     b = HashValue(value=0b1101, bits=4, hex="d")
     sim = hash_similarity(a, b)
-    assert 0.0 <= sim <= 1.0
+    require(0.0 <= sim <= 1.0, '0.0 <= sim <= 1.0')
     low_screen = reward_parts(70.0, 100.0, settings)[2]
     high_screen = reward_parts(71.0, 0.0, settings)[2]
     high_human = reward_parts(70.0, 100.0, settings)[2]
     low_human = reward_parts(70.0, 0.0, settings)[2]
-    assert high_screen > low_screen
-    assert high_human > low_human
-    assert high_human < high_screen
+    require(high_screen > low_screen, 'high_screen > low_screen')
+    require(high_human > low_human, 'high_human > low_human')
+    require(high_human < high_screen, 'high_human < high_screen')
     details = reward_breakdown(70.0, 100.0, settings)
     low_human_details = reward_breakdown(70.0, 0.0, settings)
-    assert details["screen_score_delta"] == details["screen_primary_reward"]
-    assert details["reward_sort_key"] > low_human_details["reward_sort_key"]
-    assert details["reward_sort_key"][0] == details["screen_primary_reward"]
-    assert "human_tie_break_reward" in details
-    assert 0.0 < details["human_bonus"] < details["screen_score_resolution"]
-    assert set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "still_seconds", "experience_pool_gb", "ai_model_limit"}
-    assert {"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("learning", "stopping")])
-    assert {"esc", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("training", "stopping")])
-    assert "still_timeout" not in ALLOWED_TRANSITIONS[("training", "stopping")]
-    assert ("training", "idle") not in ALLOWED_TRANSITIONS
-    assert "sleep_model" in ALLOWED_TRANSITIONS[("training", "sleep")]
-    assert should_stop_run(threading.Event(), time.perf_counter() - 1.0, None) == "deadline"
-    assert should_stop_run(threading.Event(), None, None) is None
+    require(details["screen_score_delta"] == details["screen_primary_reward"], 'details["screen_score_delta"] == details["screen_primary_reward"]')
+    require(details["reward_sort_key"] > low_human_details["reward_sort_key"], 'details["reward_sort_key"] > low_human_details["reward_sort_key"]')
+    require(details["reward_sort_key"][0] == details["screen_primary_reward"], 'details["reward_sort_key"][0] == details["screen_primary_reward"]')
+    require("human_tie_break_reward" in details, '"human_tie_break_reward" in details')
+    require(0.0 < details["human_bonus"] < details["screen_score_resolution"], '0.0 < details["human_bonus"] < details["screen_score_resolution"]')
+    require(set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "still_seconds", "experience_pool_gb", "ai_model_limit"}, 'set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "still_seconds", "experience_pool_gb", "ai_model_limit"}')
+    require({"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("learning", "stopping")]), '{"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("learning", "stopping")])')
+    require({"esc", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("training", "stopping")]), '{"esc", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("training", "stopping")])')
+    require("still_timeout" not in ALLOWED_TRANSITIONS[("training", "stopping")], '"still_timeout" not in ALLOWED_TRANSITIONS[("training", "stopping")]')
+    require(("training", "idle") not in ALLOWED_TRANSITIONS, '("training", "idle") not in ALLOWED_TRANSITIONS')
+    require("sleep_model" in ALLOWED_TRANSITIONS[("training", "sleep")], '"sleep_model" in ALLOWED_TRANSITIONS[("training", "sleep")]')
+    require(should_stop_run(threading.Event(), time.perf_counter() - 1.0, None) == "user_stop", 'should_stop_run(threading.Event(), time.perf_counter() - 1.0, None) == "user_stop"')
+    require(should_stop_run(threading.Event(), None, None) is None, 'should_stop_run(threading.Event(), None, None) is None')
     stopped_for_user = threading.Event()
     stopped_for_user.set()
-    assert should_stop_run(stopped_for_user, None, None, "user_stop") == "user_stop"
+    require(should_stop_run(stopped_for_user, None, None, "user_stop") == "user_stop", 'should_stop_run(stopped_for_user, None, None, "user_stop") == "user_stop"')
     stop_check_panel = type("StopCheckPanel", (), {})()
     stop_check_panel.termination_reason = None
     stop_check_panel.should_stop_by_escape = lambda: False
@@ -1098,7 +1112,7 @@ def run_self_test():
     stop_check_panel.mouse_recorder = None
     stop_config = type("Config", (), {"still_seconds": 10.0})()
     expired_event = threading.Event()
-    assert not TrainingService(stop_check_panel).should_stop(stop_config, expired_event)
+    require(not TrainingService(stop_check_panel).should_stop(stop_config, expired_event), 'not TrainingService(stop_check_panel).should_stop(stop_config, expired_event)')
     execution_panel = type("ExecutionPanel", (), {})()
     execution_stop = threading.Event()
     execution_panel.termination_reason = None
@@ -1124,88 +1138,88 @@ def run_self_test():
             return None if should_stop() else {"type": "click", "path": [], "duration": 0.0}
     execution_panel.executor = GuardExecutor()
     execution_snapshot = type("Snapshot", (), {"hash_value": a, "image_checksum": "", "semantic_vector": ()})()
-    assert not TrainingService(execution_panel).execute_and_record(None, "s", time.perf_counter(), (0, 0, 100, 100), execution_snapshot, {"type": "click", "start_rel": [0.5, 0.5]}, {}, execution_stop)[0]
-    assert execution_stop.is_set() and execution_panel.termination_reason == "cursor_outside"
-    assert ("sleep", "training") not in ALLOWED_TRANSITIONS
-    assert ("sleep", "starting") not in ALLOWED_TRANSITIONS
-    assert ("sleep", "idle") not in ALLOWED_TRANSITIONS
-    assert "completed" in ALLOWED_TRANSITIONS[("sleep", "stopping")]
-    assert {"completed", "migration_error", "user_stop"}.issubset(ALLOWED_TRANSITIONS[("migration", "stopping")])
+    require(not TrainingService(execution_panel).execute_and_record(None, "s", time.perf_counter(), (0, 0, 100, 100), execution_snapshot, {"type": "click", "start_rel": [0.5, 0.5]}, {}, execution_stop)[0], 'not TrainingService(execution_panel).execute_and_record(None, "s", time.perf_counter(), (0, 0, 100, 100), execution_snapshot, {"type": "click", "start_rel": [0.')
+    require(execution_stop.is_set() and execution_panel.termination_reason == "cursor_outside", 'execution_stop.is_set() and execution_panel.termination_reason == "cursor_outside"')
+    require(("sleep", "training") not in ALLOWED_TRANSITIONS, '("sleep", "training") not in ALLOWED_TRANSITIONS')
+    require(("sleep", "starting") not in ALLOWED_TRANSITIONS, '("sleep", "starting") not in ALLOWED_TRANSITIONS')
+    require(("sleep", "idle") not in ALLOWED_TRANSITIONS, '("sleep", "idle") not in ALLOWED_TRANSITIONS')
+    require("completed" in ALLOWED_TRANSITIONS[("sleep", "stopping")], '"completed" in ALLOWED_TRANSITIONS[("sleep", "stopping")]')
+    require({"completed", "migration_error", "user_stop"}.issubset(ALLOWED_TRANSITIONS[("migration", "stopping")]), '{"completed", "migration_error", "user_stop"}.issubset(ALLOWED_TRANSITIONS[("migration", "stopping")])')
     pool = ExperiencePool(settings)
     pool.add({"id": "t1", "mode": "learning", "mouse_action": {"type": "click", "start_rel": [0.5, 0.5]}, "reward": 12, "screen_hash_hex": "f", "screen_hash_bits": 4, "mouse_source": "user"})
     pool.add({"id": "t2", "mode": "training", "mouse_action": {"type": "click", "start_rel": [0.52, 0.52]}, "reward": 10, "screen_hash_hex": "d", "screen_hash_bits": 4, "mouse_source": "ai"})
     novelty, batch = pool.novelty(a)
-    assert novelty >= 0.0
-    assert all(item["record"].get("id") != "t1" for item in pool.nearest(a, exclude_id="t1"))
-    assert not pool.nearest(a, before_index=0)
-    assert all(item["record"].get("id") == "t1" for item in pool.nearest(a, before_index=1))
+    require(novelty >= 0.0, 'novelty >= 0.0')
+    require(all(item["record"].get("id") != "t1" for item in pool.nearest(a, exclude_id="t1")), 'all(item["record"].get("id") != "t1" for item in pool.nearest(a, exclude_id="t1"))')
+    require(not pool.nearest(a, before_index=0), 'not pool.nearest(a, before_index=0)')
+    require(all(item["record"].get("id") == "t1" for item in pool.nearest(a, before_index=1)), 'all(item["record"].get("id") == "t1" for item in pool.nearest(a, before_index=1))')
     values = {item.name: getattr(settings, item.name) for item in fields(Settings)}
     values["hash_prefix_bits"] = max(1, settings.hash_prefix_bits - 1)
     changed = Settings(**values)
     pool.apply_settings(changed)
-    assert pool.index_settings.hash_prefix_bits == changed.hash_prefix_bits
-    assert pool.nearest(a)
-    assert semantic_similarity((1.0, 0.0), (1.0, 0.0)) == 1.0
+    require(pool.index_settings.hash_prefix_bits == changed.hash_prefix_bits, 'pool.index_settings.hash_prefix_bits == changed.hash_prefix_bits')
+    require(pool.nearest(a), 'pool.nearest(a)')
+    require(semantic_similarity((1.0, 0.0), (1.0, 0.0)) == 1.0, 'semantic_similarity((1.0, 0.0), (1.0, 0.0)) == 1.0')
     pool.add({"id": "t3", "mode": "learning", "mouse_action": {"type": "click", "start_rel": [0.1, 0.1]}, "reward": 1, "screen_hash_hex": "0", "screen_hash_bits": 4, "mouse_source": "user", "image_checksum": "exact-a", "screen_semantic_vector": [1.0, 0.0]})
-    assert pool.compute_screen_score(a, exact_checksum="exact-a", semantic_vector=[0.0, 1.0])[0] == 0.0
+    require(pool.compute_screen_score(a, exact_checksum="exact-a", semantic_vector=[0.0, 1.0])[0] == 0.0, 'pool.compute_screen_score(a, exact_checksum="exact-a", semantic_vector=[0.0, 1.0])[0] == 0.0')
     recheck_pool = ExperiencePool(settings, [{"id": "record-1", "screen_hash_hex": "f", "screen_hash_bits": 4, "image_checksum": "known"}])
     recheck_result = recheck_pool.recheck_screen_scores()
-    assert recheck_result["total"] == 1 and recheck_result["trainable"] == 1
+    require(recheck_result["total"] == 1 and recheck_result["trainable"] == 1, 'recheck_result["total"] == 1 and recheck_result["trainable"] == 1')
     action_pool = ExperiencePool(settings, [{"id": "bad-action", "mouse_action": {"type": "click", "start_rel": [0.1, 0.1]}, "reward": 999, "screen_hash_hex": "f", "screen_hash_bits": 4, "image_checksum": "bad", "quarantined": True}, {"id": "good-action", "mouse_action": {"type": "click", "start_rel": [0.2, 0.2]}, "reward": 1, "screen_hash_hex": "e", "screen_hash_bits": 4, "image_checksum": "good"}])
-    assert action_pool.best_global_action()["start_rel"] == [0.2, 0.2]
+    require(action_pool.best_global_action()["start_rel"] == [0.2, 0.2], 'action_pool.best_global_action()["start_rel"] == [0.2, 0.2]')
     sleep_result = pool.sleep_training_step(changed.sleep_batch_size)
-    assert sleep_result["trained"] >= 1
-    assert pool.records[0].get("sleep_visits", 0) >= 1
+    require(sleep_result["trained"] >= 1, 'sleep_result["trained"] >= 1')
+    require(pool.records[0].get("sleep_visits", 0) >= 1, 'pool.records[0].get("sleep_visits", 0) >= 1')
     group = ai_model_group_snapshot(pool.model.snapshot(), changed, pool.records)
     runtime_pool = ExperiencePool(changed, pool.records, {"model_group": group})
     runtime = runtime_pool.model_runtime
-    assert runtime.screen_novelty([1.0]) == 0.0
+    require(runtime.screen_novelty([1.0]) == 0.0, 'runtime.screen_novelty([1.0]) == 0.0')
     changed_for_topk = replace(changed, nearest_top_k=3)
     topk_model = ScreenNoveltyScorerModel(changed_for_topk)
-    assert topk_model.predict({"similarities": [1.0, 0.8, 0.8]}) == 14.67
+    require(topk_model.predict({"similarities": [1.0, 0.8, 0.8]}) == 14.67, 'topk_model.predict({"similarities": [1.0, 0.8, 0.8]}) == 14.67')
     matching_mouse_action = {"type": "click", "start_rel": [0.5, 0.5]}
     direct_human_score = runtime.models["mouse_humanlikeness_scorer"].predict({"mouse_action": matching_mouse_action, "human_score": 55.0})
-    assert runtime.mouse_humanlikeness(matching_mouse_action, 55.0) == direct_human_score
-    assert direct_human_score != 55.0
-    assert 0.0 <= runtime.operation_policy_score(pool.records[0], 0.9) <= 1.0
-    assert runtime.reward(70.0, 100.0) > runtime.reward(70.0, 0.0)
-    assert runtime.reward(71.0, 0.0) > runtime.reward(70.0, 100.0)
-    assert isinstance(runtime.models["runtime_value_model"].predict({"cpu_load": 0.0, "memory_free_ratio": 0.5}), dict)
+    require(runtime.mouse_humanlikeness(matching_mouse_action, 55.0) == direct_human_score, 'runtime.mouse_humanlikeness(matching_mouse_action, 55.0) == direct_human_score')
+    require(direct_human_score != 55.0, 'direct_human_score != 55.0')
+    require(0.0 <= runtime.operation_policy_score(pool.records[0], 0.9) <= 1.0, '0.0 <= runtime.operation_policy_score(pool.records[0], 0.9) <= 1.0')
+    require(runtime.reward(70.0, 100.0) > runtime.reward(70.0, 0.0), 'runtime.reward(70.0, 100.0) > runtime.reward(70.0, 0.0)')
+    require(runtime.reward(71.0, 0.0) > runtime.reward(70.0, 100.0), 'runtime.reward(71.0, 0.0) > runtime.reward(70.0, 100.0)')
+    require(isinstance(runtime.models["runtime_value_model"].predict({"cpu_load": 0.0, "memory_free_ratio": 0.5}), dict), 'isinstance(runtime.models["runtime_value_model"].predict({"cpu_load": 0.0, "memory_free_ratio": 0.5}), dict)')
     brain = ActionBrain(runtime_pool, changed)
     _, decision = brain.choose(a, novelty, batch, 0.0)
-    assert isinstance(decision, dict)
+    require(isinstance(decision, dict), 'isinstance(decision, dict)')
     random_action, random_decision = brain.choose(a, novelty, [], 0.0)
-    assert random_action and random_decision["reason"] in {"bounded_bootstrap_exploration", "global_experience"}
+    require(random_action and random_decision["reason"] in {"bounded_bootstrap_exploration", "global_experience"}, 'random_action and random_decision["reason"] in {"bounded_bootstrap_exploration", "global_experience"}')
     with tempfile.TemporaryDirectory() as folder:
         root = Path(folder)
         executable = root / "dnplayer.exe"
         executable.write_bytes(b"")
-        assert validate_ldplayer_executable(executable)[0]
-        assert data_path_write_issue(root) is None
+        require(validate_ldplayer_executable(executable)[0], 'validate_ldplayer_executable(executable)[0]')
+        require(data_path_write_issue(root) is None, 'data_path_write_issue(root) is None')
         store = DataStore(folder)
         store.state_file.write_text("{bad json}", encoding="utf-8")
         rebuilt_state = store.load_state()
-        assert rebuilt_state == {"screen_score_total": 0.0, "penalty": 0.0}
+        require(rebuilt_state == {"screen_score_total": 0.0, "penalty": 0.0}, 'rebuilt_state == {"screen_score_total": 0.0, "penalty": 0.0}')
         analyzer = ScreenAnalyzer(settings.hash_size)
         image = Image.new("RGB", (16, 16), (24, 64, 128))
         png_path = root / "screen.png"
         analyzer.save_image(image, png_path, priority="critical", settings=settings)
-        assert png_path.exists()
+        require(png_path.exists(), 'png_path.exists()')
         reopened = Image.open(png_path)
         reopened.load()
-        assert reopened.format == "PNG"
-        assert image_content_checksum(reopened) == image_content_checksum(image)
+        require(reopened.format == "PNG", 'reopened.format == "PNG"')
+        require(image_content_checksum(reopened) == image_content_checksum(image), 'image_content_checksum(reopened) == image_content_checksum(image)')
         checkpoint = store.save_sleep_checkpoint({"run_id": "self-test", "stage": "task2_training"}, task1_completed=True)
-        assert store.load_sleep_checkpoint()["task1_completed"] is True
+        require(store.load_sleep_checkpoint()["task1_completed"] is True, 'store.load_sleep_checkpoint()["task1_completed"] is True')
         store.clear_sleep_checkpoint()
-        assert store.load_sleep_checkpoint() is None
+        require(store.load_sleep_checkpoint() is None, 'store.load_sleep_checkpoint() is None')
         store.append_runtime_parameter_audit({"a": 1}, {"a": 2}, {"a": {"reality_conditions": {"cpu_load": 0.5}, "semantic_goal": "self test"}})
-        assert store.runtime_audit_file.exists()
+        require(store.runtime_audit_file.exists(), 'store.runtime_audit_file.exists()')
         queued_path = root / "queued.png"
         persistence = AsyncPersistenceQueue(settings)
         try:
             queued_image_ok = persistence.enqueue_image(analyzer, image, queued_path, priority="critical")
-            assert queued_image_ok
+            require(queued_image_ok, 'queued_image_ok')
             persistence.flush()
         finally:
             persistence.close()
@@ -1231,13 +1245,13 @@ def run_self_test():
                     self.owner.last_confirmed_sequence = max(self.owner.last_confirmed_sequence, sequence)
         race_queue.jobs = RaceJobs(race_queue)
         race_enqueue_ok = AsyncPersistenceQueue.enqueue(race_queue, {"type": "record", "persistence_sequence": 1}, block_when_full=False)
-        assert race_enqueue_ok
-        assert race_queue.pending_sequences == set() and race_queue.last_confirmed_sequence == 1
+        require(race_enqueue_ok, 'race_enqueue_ok')
+        require(race_queue.pending_sequences == set() and race_queue.last_confirmed_sequence == 1, 'race_queue.pending_sequences == set() and race_queue.last_confirmed_sequence == 1')
         reopened_queue = Image.open(queued_path)
         reopened_queue.load()
-        assert reopened_queue.format == "PNG"
-        assert image_content_checksum(reopened_queue) == image_content_checksum(image)
-        assert list(store.root.glob("state.bad.*.json")) and json.loads(store.state_file.read_text(encoding="utf-8"))["screen_score_total"] == 0.0
+        require(reopened_queue.format == "PNG", 'reopened_queue.format == "PNG"')
+        require(image_content_checksum(reopened_queue) == image_content_checksum(image), 'image_content_checksum(reopened_queue) == image_content_checksum(image)')
+        require(list(store.root.glob("state.bad.*.json")) and json.loads(store.state_file.read_text(encoding="utf-8"))["screen_score_total"] == 0.0, 'list(store.root.glob("state.bad.*.json")) and json.loads(store.state_file.read_text(encoding="utf-8"))["screen_score_total"] == 0.0')
         shared = store.screen_dir / "shared.png"
         unique = store.screen_dir / "unique.png"
         with shared.open("wb") as file:
@@ -1251,31 +1265,31 @@ def run_self_test():
         ])
         empty_pool_store = DataStore(root / "empty_pool")
         empty_pool_result = empty_pool_store.compact_experience_pool(0.1)
-        assert empty_pool_result["complete"] is True and not empty_pool_result["changed"] and empty_pool_result["removed"] == 0
+        require(empty_pool_result["complete"] is True and not empty_pool_result["changed"] and empty_pool_result["removed"] == 0, 'empty_pool_result["complete"] is True and not empty_pool_result["changed"] and empty_pool_result["removed"] == 0')
         under_limit_store = DataStore(root / "under_limit_pool")
         under_limit_screen = under_limit_store.screen_dir / "small.png"
         with under_limit_screen.open("wb") as file:
             file.truncate(1024)
         under_limit_store.save_experience_records([{"id": "under", "screen_path": "screens/small.png", "reward": 1.0}])
         under_limit_result = under_limit_store.compact_experience_pool(0.1)
-        assert under_limit_result["complete"] is True and not under_limit_result["changed"] and under_limit_result["removed"] == 0
+        require(under_limit_result["complete"] is True and not under_limit_result["changed"] and under_limit_result["removed"] == 0, 'under_limit_result["complete"] is True and not under_limit_result["changed"] and under_limit_result["removed"] == 0')
         cancelled_store = DataStore(root / "cancelled_pool")
         kept_screen = cancelled_store.screen_dir / "kept.png"
         with kept_screen.open("wb") as file:
             file.truncate(128 * 1024 * 1024)
         cancelled_store.save_experience_records([{"id": "kept", "screen_path": "screens/kept.png", "reward": 1.0}])
         cancelled = cancelled_store.compact_experience_pool(0.1, run_guard=lambda: "esc")
-        assert cancelled["interrupted"] is True and cancelled["removed"] == 0 and kept_screen.exists()
+        require(cancelled["interrupted"] is True and cancelled["removed"] == 0 and kept_screen.exists(), 'cancelled["interrupted"] is True and cancelled["removed"] == 0 and kept_screen.exists()')
         compacted = store.compact_experience_pool(0.1)
         retained = store.load_experience()
-        assert compacted["complete"] is True and compacted["changed"] and shared.exists() and not unique.exists()
-        assert [record["id"] for record in retained] == ["high"]
+        require(compacted["complete"] is True and compacted["changed"] and shared.exists() and not unique.exists(), 'compacted["complete"] is True and compacted["changed"] and shared.exists() and not unique.exists()')
+        require([record["id"] for record in retained] == ["high"], '[record["id"] for record in retained] == ["high"]')
         dummy_panel = type("DummyPanel", (), {"store": store})()
-        assert ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 200, "target_bytes": 100}) == 0.5
-        assert ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 100, "target_bytes": 100}) == 1.0
-        assert ControlPanel.sleep_progress_fields(dummy_panel, 0, 10, 1.0)["compaction"] == 1.0
-        assert ControlPanel.sleep_compaction_complete(dummy_panel, {"size_bytes": 100, "target_bytes": 100})
-        assert "AI模型清理未完成" in ControlPanel.sleep_unfinished_summary(dummy_panel, "completed", 3, 3, True, "达到时间上限", False)
+        require(ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 200, "target_bytes": 100}) == 0.5, 'ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 200, "target_bytes": 100}) == 0.5')
+        require(ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 100, "target_bytes": 100}) == 1.0, 'ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 100, "target_bytes": 100}) == 1.0')
+        require(ControlPanel.sleep_progress_fields(dummy_panel, 0, 10, 1.0)["compaction"] == 1.0, 'ControlPanel.sleep_progress_fields(dummy_panel, 0, 10, 1.0)["compaction"] == 1.0')
+        require(ControlPanel.sleep_compaction_complete(dummy_panel, {"size_bytes": 100, "target_bytes": 100}), 'ControlPanel.sleep_compaction_complete(dummy_panel, {"size_bytes": 100, "target_bytes": 100})')
+        require("AI模型清理未完成" in ControlPanel.sleep_unfinished_summary(dummy_panel, "completed", 3, 3, True, "达到时间上限", False), '"AI模型清理未完成" in ControlPanel.sleep_unfinished_summary(dummy_panel, "completed", 3, 3, True, "达到时间上限", False)')
         class SleepDummyVar:
             def __init__(self):
                 self.value = None
@@ -1289,22 +1303,22 @@ def run_self_test():
         sleep_finish_panel.update_idletasks = lambda: setattr(sleep_finish_panel, "idled", True)
         sleep_finish_panel.settings = settings
         ControlPanel.render_sleep_completion_before_idle(sleep_finish_panel, "睡眠模式已中断：任务完成 43.2%，数据已安全保存", 43.2)
-        assert sleep_finish_panel.completion_progress == 43.2
-        assert sleep_finish_panel.progress_label_var.value == "睡眠模式已中断：任务完成 43.2%，数据已安全保存"
+        require(sleep_finish_panel.completion_progress == 43.2, 'sleep_finish_panel.completion_progress == 43.2')
+        require(sleep_finish_panel.progress_label_var.value == "睡眠模式已中断：任务完成 43.2%，数据已安全保存", 'sleep_finish_panel.progress_label_var.value == "睡眠模式已中断：任务完成 43.2%，数据已安全保存"')
         sleep_model = SleepDecisionModel(settings, {})
         sleep_model.fit([{"sleep_confidence": 0.9, "reward": 1.0}, {"sleep_confidence": 0.95, "reward": 2.0}])
-        assert sleep_model.predict({"sleep_confidence": 0.99})["sleep"]
+        require(sleep_model.predict({"sleep_confidence": 0.99})["sleep"], 'sleep_model.predict({"sleep_confidence": 0.99})["sleep"]')
         mouse_executor = HumanMouseExecutor.__new__(HumanMouseExecutor)
         mouse_executor.settings = derive_runtime_settings()
         edge_rect = (10, 20, 30, 40)
         edge_points = mouse_executor.smooth_points((10, 20), (29, 39), 1.0, rect=edge_rect)
-        assert edge_points and all(point_inside(edge_rect, x, y) for x, y in edge_points)
-        assert mouse_executor.clamp_point_to_rect((-100, 100), edge_rect) == (10, 39)
-        assert ControlPanel.sleep_completion_reached(dummy_panel, 3, 3)
+        require(edge_points and all(point_inside(edge_rect, x, y) for x, y in edge_points), 'edge_points and all(point_inside(edge_rect, x, y) for x, y in edge_points)')
+        require(mouse_executor.clamp_point_to_rect((-100, 100), edge_rect) == (10, 39), 'mouse_executor.clamp_point_to_rect((-100, 100), edge_rect) == (10, 39)')
+        require(ControlPanel.sleep_completion_reached(dummy_panel, 3, 3), 'ControlPanel.sleep_completion_reached(dummy_panel, 3, 3)')
         store.pending_state_writes = 2
-        assert ControlPanel.sleep_completion_reached(dummy_panel, 3, 3)
+        require(ControlPanel.sleep_completion_reached(dummy_panel, 3, 3), 'ControlPanel.sleep_completion_reached(dummy_panel, 3, 3)')
         store.pending_state_writes = 0
-        assert not ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, "failed")
+        require(not ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, "failed"), 'not ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, "failed")')
         task3_store = DataStore(root / "task3")
         task3_store.model_dir.mkdir(parents=True, exist_ok=True)
         for name, created in (("model_task3_new.json", "2025-01-03T00:00:00.000"), ("model_task3_old.json", "2025-01-01T00:00:00.000")):
@@ -1323,14 +1337,14 @@ def run_self_test():
         task3_panel.update_progress = lambda value, force=False: setattr(task3_panel, "progress_value", value)
         task3_config = type("Task3Config", (), {"ai_model_limit": 1, "experience_pool_gb": 0.1})()
         model_result, pool_result = ControlPanel.run_sleep_task3(task3_panel, task3_config)
-        assert model_result["complete"] and pool_result["complete"]
-        assert task3_events.index("sleep_model_cleanup_completed") < task3_events.index("experience_pool_compaction_completed")
-        assert WindowCheck(True, "ok", (0, 0, 10, 10), 9, 9, 0.0).occluded_ratio == 0.0
+        require(model_result["complete"] and pool_result["complete"], 'model_result["complete"] and pool_result["complete"]')
+        require(task3_events.index("sleep_model_cleanup_completed") < task3_events.index("experience_pool_compaction_completed"), 'task3_events.index("sleep_model_cleanup_completed") < task3_events.index("experience_pool_compaction_completed")')
+        require(WindowCheck(True, "ok", (0, 0, 10, 10), 9, 9, 0.0).occluded_ratio == 0.0, 'WindowCheck(True, "ok", (0, 0, 10, 10), 9, 9, 0.0).occluded_ratio == 0.0')
         for name, created in (("model_new.json", "2025-01-02T00:00:00.000"), ("model_old.json", "2025-01-01T00:00:00.000"), ("model_mid.json", "2025-01-01T12:00:00.000")):
             (store.model_dir / name).write_text(json.dumps({"created_at": created, "model": {"type": "bad"}}), encoding="utf-8")
         (store.model_dir / "partial_model_interrupted.json").write_text(json.dumps({"created_at": "2025-01-04T00:00:00.000"}), encoding="utf-8")
         compact_models = store.compact_ai_models(2)
-        assert compact_models["removed"] == 1 and compact_models["model_count"] == 2 and not (store.model_dir / "model_old.json").exists() and (store.model_dir / "model_mid.json").exists() and (store.model_dir / "model_new.json").exists() and (store.model_dir / "partial_model_interrupted.json").exists()
+        require(compact_models["removed"] == 1 and compact_models["model_count"] == 2 and not (store.model_dir / "model_old.json").exists() and (store.model_dir / "model_mid.json").exists() and (store.model_dir / "model_new.json").exists() and (store.model_dir / "partial_model_interrupted.json").exists(), 'compact_models["removed"] == 1 and compact_models["model_count"] == 2 and not (store.model_dir / "model_old.json").exists() and (store.model_dir / "model_mid.js')
         original_win32gui, original_win32api, original_win32con = globals().get("win32gui"), globals().get("win32api"), globals().get("win32con")
         class FakeWin32Gui:
             visible = True
@@ -1381,23 +1395,23 @@ def run_self_test():
             manager = WindowManager(executable, settings)
             manager.hwnd = 101
             checked_window = manager.check_window(force=True)
-            assert checked_window.ok and checked_window.occluded_ratio == 0.0
+            require(checked_window.ok and checked_window.occluded_ratio == 0.0, 'checked_window.ok and checked_window.occluded_ratio == 0.0')
             FakeWin32Gui.iconic = True
             manager.window_check_cache = {}
-            assert manager.check_window(force=True).reason == "minimized"
+            require(manager.check_window(force=True).reason == "minimized", 'manager.check_window(force=True).reason == "minimized"')
             FakeWin32Gui.iconic = False
             FakeWin32Gui.rect = (-10, 0, 90, 80)
             manager.window_check_cache = {}
-            assert manager.check_window(force=True).reason == "out_of_screen"
+            require(manager.check_window(force=True).reason == "out_of_screen", 'manager.check_window(force=True).reason == "out_of_screen"')
             FakeWin32Gui.rect = (0, 0, 100, 80)
             FakeWin32Gui.hit = 202
             manager.window_check_cache = {}
-            assert manager.check_window(force=True).reason == "occluded"
-            assert "completed" in ALLOWED_TRANSITIONS[("sleep", "stopping")] and ("sleep", "training") not in ALLOWED_TRANSITIONS
+            require(manager.check_window(force=True).reason == "occluded", 'manager.check_window(force=True).reason == "occluded"')
+            require("completed" in ALLOWED_TRANSITIONS[("sleep", "stopping")] and ("sleep", "training") not in ALLOWED_TRANSITIONS, '"completed" in ALLOWED_TRANSITIONS[("sleep", "stopping")] and ("sleep", "training") not in ALLOWED_TRANSITIONS')
             state_transition_table = (
                 ("training_timeout", "sleep", "task1_task2_task3_then_restart"),
             )
-            assert state_transition_table[0][2] == "task1_task2_task3_then_restart" and ("sleep", "training") not in ALLOWED_TRANSITIONS
+            require(state_transition_table[0][2] == "task1_task2_task3_then_restart" and ("sleep", "training") not in ALLOWED_TRANSITIONS, 'state_transition_table[0][2] == "task1_task2_task3_then_restart" and ("sleep", "training") not in ALLOWED_TRANSITIONS')
         finally:
             globals()["win32gui"] = original_win32gui
             globals()["win32api"] = original_win32api
@@ -1408,9 +1422,9 @@ def run_self_test():
         for value in range(400):
             varied_raw.extend([value % 251, (value * 3) % 251, (value * 7) % 251, 255])
         varied_metrics = screen_content_metrics(varied_raw, 20, 20)
-        assert blank_metrics["valid"] and not blank_metrics["content_valuable"]
-        assert not black_metrics["valid"] and black_metrics["reason"] == "black_candidate"
-        assert varied_metrics["valid"] and varied_metrics["brightness_variance"] > 3.0 and varied_metrics["edge_density"] > 0.0
+        require(blank_metrics["valid"] and not blank_metrics["content_valuable"], 'blank_metrics["valid"] and not blank_metrics["content_valuable"]')
+        require(not black_metrics["valid"] and black_metrics["reason"] == "black_candidate", 'not black_metrics["valid"] and black_metrics["reason"] == "black_candidate"')
+        require(varied_metrics["valid"] and varied_metrics["brightness_variance"] > 3.0 and varied_metrics["edge_density"] > 0.0, 'varied_metrics["valid"] and varied_metrics["brightness_variance"] > 3.0 and varied_metrics["edge_density"] > 0.0')
         transition_panel = ControlPanel.__new__(ControlPanel)
         transition_panel.state_lock = threading.RLock()
         transition_panel.mode = "training"
@@ -1425,8 +1439,8 @@ def run_self_test():
         transition_panel.ui = lambda fn: fn()
         transition_panel.update_mode_button_states = lambda: None
         sleep_session = ControlPanel.transition(transition_panel, "training", "sleep", reason="sleep_model", token=7, fresh_stop_event=True)
-        assert sleep_session and not sleep_session.stop_event.is_set() and sleep_session.stop_event is not stopped_event
-        assert sleep_session.termination_reason is None and transition_panel.termination_reason is None
+        require(sleep_session and not sleep_session.stop_event.is_set() and sleep_session.stop_event is not stopped_event, 'sleep_session and not sleep_session.stop_event.is_set() and sleep_session.stop_event is not stopped_event')
+        require(sleep_session.termination_reason is None and transition_panel.termination_reason is None, 'sleep_session.termination_reason is None and transition_panel.termination_reason is None')
         class DummyVar:
             def __init__(self):
                 self.value = None
@@ -1455,16 +1469,16 @@ def run_self_test():
         original_showerror = messagebox.showerror
         messagebox.showerror = lambda *args, **kwargs: None
         try:
-            assert not hasattr(ControlPanel, "save_user_settings")
-            assert ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(root / "missing.exe"), "data_path": str(store.root), "still_seconds": 4, "experience_pool_gb": 6, "ai_model_limit": 7}) is False
+            require(not hasattr(ControlPanel, "save_user_settings"), 'not hasattr(ControlPanel, "save_user_settings")')
+            require(ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(root / "missing.exe"), "data_path": str(store.root), "still_seconds": 4, "experience_pool_gb": 6, "ai_model_limit": 7}) is False, 'ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(root / "missing.exe"), "data_path": str(store.root), "still_seconds": 4, "experience_pool_')
         finally:
             messagebox.showerror = original_showerror
-        assert modify_panel.ldplayer_var.value == str(executable)
-        assert ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(executable), "data_path": str(store.root), "still_seconds": 4, "experience_pool_gb": 6, "ai_model_limit": 7}) is True
-        assert modify_panel.saved and modify_panel.ai_model_limit_var.value == "7"
+        require(modify_panel.ldplayer_var.value == str(executable), 'modify_panel.ldplayer_var.value == str(executable)')
+        require(ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(executable), "data_path": str(store.root), "still_seconds": 4, "experience_pool_gb": 6, "ai_model_limit": 7}) is True, 'ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(executable), "data_path": str(store.root), "still_seconds": 4, "experience_pool_gb": 6, "a')
+        require(modify_panel.saved and modify_panel.ai_model_limit_var.value == "7", 'modify_panel.saved and modify_panel.ai_model_limit_var.value == "7"')
         target_data_path = root / "submit_new_data"
-        assert ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(executable), "data_path": str(target_data_path), "still_seconds": 9, "experience_pool_gb": 1, "ai_model_limit": 2}) is True
-        assert modify_panel.migration_request[0] == target_data_path and modify_panel.data_var.value == str(store.root)
+        require(ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(executable), "data_path": str(target_data_path), "still_seconds": 9, "experience_pool_gb": 1, "ai_model_limit": 2}) is True, 'ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(executable), "data_path": str(target_data_path), "still_seconds": 9, "experience_pool_gb":')
+        require(modify_panel.migration_request[0] == target_data_path and modify_panel.data_var.value == str(store.root), 'modify_panel.migration_request[0] == target_data_path and modify_panel.data_var.value == str(store.root)')
         dummy_panel.progress_value = 0.4
         dummy_panel.last_progress_update_perf = 0.0
         dummy_panel.progress_var = DummyVar()
@@ -1473,29 +1487,29 @@ def run_self_test():
         dummy_panel.update_mode_button_states = lambda: None
         dummy_panel.settings = replace(settings, ui_progress_delta=1.0)
         ControlPanel.update_progress(dummy_panel, ControlPanel.idle_progress_value(dummy_panel, "learning", 87.0), force=True)
-        assert dummy_panel.progress_value == 0.0 and dummy_panel.progress_var.value == 0.0
+        require(dummy_panel.progress_value == 0.0 and dummy_panel.progress_var.value == 0.0, 'dummy_panel.progress_value == 0.0 and dummy_panel.progress_var.value == 0.0')
         dummy_panel.mode = "sleep"
         ControlPanel.update_progress(dummy_panel, 25.0, force=True)
         ControlPanel.update_progress(dummy_panel, 20.8, force=True)
         ControlPanel.update_progress(dummy_panel, 100.0, force=True)
-        assert dummy_panel.progress_value == 100.0 and dummy_panel.progress_var.value == 100.0
+        require(dummy_panel.progress_value == 100.0 and dummy_panel.progress_var.value == 100.0, 'dummy_panel.progress_value == 100.0 and dummy_panel.progress_var.value == 100.0')
         dummy_panel.mode = "idle"
-        assert ControlPanel.idle_progress_value(dummy_panel, "training", 91.0) == 0.0
-        assert ControlPanel.idle_progress_value(dummy_panel, "migration", 91.0) == 0.0
+        require(ControlPanel.idle_progress_value(dummy_panel, "training", 91.0) == 0.0, 'ControlPanel.idle_progress_value(dummy_panel, "training", 91.0) == 0.0')
+        require(ControlPanel.idle_progress_value(dummy_panel, "migration", 91.0) == 0.0, 'ControlPanel.idle_progress_value(dummy_panel, "migration", 91.0) == 0.0')
         store.save_settings({"still_seconds": 3, "experience_pool_gb": 4, "ai_model_limit": 5, "forbidden": 6})
         saved_settings = json.loads(store.settings_file.read_text(encoding="utf-8"))
-        assert "forbidden" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0 and saved_settings["ai_model_limit"] == 5
+        require("forbidden" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0 and saved_settings["ai_model_limit"] == 5, '"forbidden" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0 and saved_settings["ai_model_limit"] == 5')
         store.experience_file.write_text("{bad json}\n" + json.dumps({"id": "ok"}) + "\n", encoding="utf-8")
         loaded = store.load_experience()
-        assert len(loaded) == 1 and loaded[0]["id"] == "ok"
-        assert (store.root / "experience.bad.jsonl").exists()
+        require(len(loaded) == 1 and loaded[0]["id"] == "ok", 'len(loaded) == 1 and loaded[0]["id"] == "ok"')
+        require((store.root / "experience.bad.jsonl").exists(), '(store.root / "experience.bad.jsonl").exists()')
         screen_path = store.screen_dir / "sample.png"
         screen_path.write_bytes(b"screen")
         store.save_experience_records([{"id": "m1", "mouse_action": {"type": "click"}, "reward": 1.0, "sleep_confidence": 0.5, "screen_path": store.relative_path(screen_path)}])
         before_snapshot_count = len(list(store.model_dir.glob("model_*.json")))
         model_path = store.save_ai_model_snapshot(store.load_experience(), settings, 1, "completed")
         model_path_extra = store.save_ai_model_snapshot(store.load_experience(), settings, 1, "completed")
-        assert model_path.exists() and model_path_extra.exists() and len(list(store.model_dir.glob("model_*.json"))) == before_snapshot_count + 2
+        require(model_path.exists() and model_path_extra.exists() and len(list(store.model_dir.glob("model_*.json"))) == before_snapshot_count + 2, 'model_path.exists() and model_path_extra.exists() and len(list(store.model_dir.glob("model_*.json"))) == before_snapshot_count + 2')
         sleep_task3_panel = type("SnapshotTask3Panel", (), {})()
         sleep_task3_panel.store = store
         sleep_task3_panel.events = type("Events", (), {"publish": lambda self, name, **data: None})()
@@ -1505,25 +1519,25 @@ def run_self_test():
         sleep_task3_panel.update_progress = lambda value, force=False: None
         sleep_task3_config = type("SnapshotTask3Config", (), {"ai_model_limit": 1, "experience_pool_gb": 0.1})()
         ControlPanel.run_sleep_task3(sleep_task3_panel, sleep_task3_config)
-        assert len(list(store.model_dir.glob("model_*.json"))) == 1
+        require(len(list(store.model_dir.glob("model_*.json"))) == 1, 'len(list(store.model_dir.glob("model_*.json"))) == 1')
         model_path = max(store.model_dir.glob("model_*.json"), key=store.model_created_key)
         model_payload = json.loads(model_path.read_text(encoding="utf-8"))
-        assert len(model_payload["model_group"]["models"]) == 6
-        assert [item["key"] for item in model_payload["model_group"]["models"]] == [item["key"] for item in AI_MODEL_GROUP_SPECS]
+        require(len(model_payload["model_group"]["models"]) == 6, 'len(model_payload["model_group"]["models"]) == 6')
+        require([item["key"] for item in model_payload["model_group"]["models"]] == [item["key"] for item in AI_MODEL_GROUP_SPECS], '[item["key"] for item in model_payload["model_group"]["models"]] == [item["key"] for item in AI_MODEL_GROUP_SPECS]')
         model_path.write_bytes(model_path.read_bytes() + (b"m" * 2048))
-        assert store.storage_size_bytes() > store.experience_pool_size_bytes()
+        require(store.storage_size_bytes() > store.experience_pool_size_bytes(), 'store.storage_size_bytes() > store.experience_pool_size_bytes()')
         compact = store.compact_experience_pool(0.1)
-        assert compact["size_bytes"] == store.experience_pool_size_bytes() and model_path.exists()
+        require(compact["size_bytes"] == store.experience_pool_size_bytes() and model_path.exists(), 'compact["size_bytes"] == store.experience_pool_size_bytes() and model_path.exists()')
         old_root = store.root
         new_root = Path(folder) / "new_data"
         migration_panel = type("MigrationPanel", (), {"settings": settings})()
         for name in ("migration_known_names", "migration_items", "migration_counts", "migration_sample_files", "file_digest", "verify_migration"):
             setattr(migration_panel, name, getattr(ControlPanel, name).__get__(migration_panel, type(migration_panel)))
-        assert "models" in migration_panel.migration_known_names()
-        assert any(item[0].parts[0] == "models" for item in migration_panel.migration_items(old_root))
+        require("models" in migration_panel.migration_known_names(), '"models" in migration_panel.migration_known_names()')
+        require(any(item[0].parts[0] == "models" for item in migration_panel.migration_items(old_root)), 'any(item[0].parts[0] == "models" for item in migration_panel.migration_items(old_root))')
         shutil.copytree(old_root, new_root)
         counts = migration_panel.migration_counts(new_root)
-        assert counts["models"] >= 1
+        require(counts["models"] >= 1, 'counts["models"] >= 1')
         migration_panel.verify_migration(old_root, new_root)
     recorder = MouseRecorder(lambda: "learning", lambda: (0, 0, 100, 100), lambda: None)
     recorder.on_move(10, 10)
@@ -1531,12 +1545,12 @@ def run_self_test():
     recorder.on_move(11, 10)
     time.sleep(0.13)
     actions = recorder.pop_actions()
-    assert actions and actions[0]["type"] == "move" and actions[0]["source"] == "user" and len(actions[0]["path"]) >= 2
+    require(actions and actions[0]["type"] == "move" and actions[0]["source"] == "user" and len(actions[0]["path"]) >= 2, 'actions and actions[0]["type"] == "move" and actions[0]["source"] == "user" and len(actions[0]["path"]) >= 2')
     tiny = replace(settings, async_queue_size=1, persistence_event_wait=settings.sleep_event_wait, persistence_close_seconds=settings.sleep_event_wait)
     persistence = AsyncPersistenceQueue(tiny)
-    assert persistence.enqueue({"type": "noop"}, block_when_full=False)
+    require(persistence.enqueue({"type": "noop"}, block_when_full=False), 'persistence.enqueue({"type": "noop"}, block_when_full=False)')
     dropped = persistence.enqueue({"type": "image", "analyzer": None, "image": None, "path": "x"}, block_when_full=False)
-    assert dropped is False
+    require(dropped is False, 'dropped is False')
     heartbeat_statuses = []
     blocked = AsyncPersistenceQueue.__new__(AsyncPersistenceQueue)
     blocked.settings = tiny
@@ -1552,10 +1566,10 @@ def run_self_test():
     blocked.confirmed_sequences = blocked.recent_sequences
     try:
         AsyncPersistenceQueue.flush(blocked, timeout_seconds=0.001, heartbeat=lambda status: heartbeat_statuses.append(status))
-        assert False
+        require(False, 'False')
     except PersistenceFlushError as exc:
-        assert "timeout_seconds" in str(exc)
-        assert heartbeat_statuses and heartbeat_statuses[-1]["pending"] >= 1
+        require("timeout_seconds" in str(exc), '"timeout_seconds" in str(exc)')
+        require(heartbeat_statuses and heartbeat_statuses[-1]["pending"] >= 1, 'heartbeat_statuses and heartbeat_statuses[-1]["pending"] >= 1')
     persistence.close()
     print("self-test passed")
 
@@ -3581,7 +3595,7 @@ class DataStore:
             model_payload = model.snapshot() if model else None
             model_group = ai_model_group_snapshot(model_payload, settings, ranked)
             if not model_group_complete(model_group, settings):
-                raise RuntimeError("AI模型组快照不完整：五类模型必须都能独立加载并完成探针推理")
+                raise RuntimeError("AI模型组快照不完整：六类模型必须都能独立加载并完成探针推理")
             identity = hashlib.sha256(str(self.root.resolve()).encode("utf-8", "replace")).hexdigest()
             training_digest = hashlib.sha256(json.dumps([record.get("id") for record in ranked[:limit]], ensure_ascii=False).encode("utf-8")).hexdigest()
             payload = {"schema_version": CONFIG_SCHEMA_VERSION, "model_version": 2, "training_data_version": 1, "data_path_id": identity, "checksum": training_digest, "created_at": now_text(), "status": status, "status_detail": status_detail or {}, "screen_score_total": self.screen_score_total, "reward_state": next((record.get("reward_state") for record in reversed(records or []) if isinstance(record, dict) and isinstance(record.get("reward_state"), dict)), asdict(RewardState())), "experience_count": len(records or []), "policy_limit": limit, "training_sample_ids": [record.get("id") for record in ranked[:limit]], "model_group": model_group, "model": model_payload, "policy": [{"id": record.get("id"), "mode": record.get("mode"), "action_type": (record.get("mouse_action") or {}).get("type") if isinstance(record.get("mouse_action"), dict) else None, "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_model_confidence": safe_float(record.get("sleep_model_confidence", record.get("model_prediction", 0.0)), 0.0), "model_prediction": safe_float(record.get("model_prediction", 0.0), 0.0), "model_target": safe_float(record.get("model_target", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
@@ -5423,7 +5437,7 @@ class AsyncPersistenceQueue:
         self.confirmed_sequences = self.recent_sequences
         self.errors = []
         self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self.run)
+        self.thread = threading.Thread(target=self.run, name="async-persistence", daemon=False)
         self.thread.start()
 
     def allocate_sequence(self):
@@ -5788,6 +5802,8 @@ class ControlPanel(tk.Tk):
         self.persistence_paused = threading.Event()
         self.main_thread_events = queue.Queue(maxsize=max(64, self.settings.async_queue_size))
         self.coalesced_main_thread_events = {}
+        self.coalesced_main_thread_events_lock = threading.RLock()
+        self.last_transition_result = TransitionResult(True, "idle", "idle", "initialized")
         self.main_thread_events_dropped = 0
         self.shutdown_requested = False
         self.runtime_context = RuntimeContext(self)
@@ -6129,6 +6145,8 @@ class ControlPanel(tk.Tk):
         self.event_journal.append(event)
 
     def ui(self, func):
+        if getattr(self, "shutdown_requested", False):
+            return
         if threading.current_thread() is threading.main_thread():
             try:
                 func()
@@ -6142,7 +6160,8 @@ class ControlPanel(tk.Tk):
             return False
         key = event.get("coalesce_key") if isinstance(event, dict) else None
         if key:
-            self.coalesced_main_thread_events[key] = event
+            with self.coalesced_main_thread_events_lock:
+                self.coalesced_main_thread_events[key] = event
             event = {"type": "coalesced", "key": key}
         try:
             self.main_thread_events.put(event, block=block, timeout=0.25 if block else 0)
@@ -6277,7 +6296,8 @@ class ControlPanel(tk.Tk):
                     if callable(func):
                         func()
                 elif event.get("type") == "coalesced":
-                    latest = self.coalesced_main_thread_events.pop(event.get("key"), None)
+                    with self.coalesced_main_thread_events_lock:
+                        latest = self.coalesced_main_thread_events.pop(event.get("key"), None)
                     func = latest.get("func") if isinstance(latest, dict) else None
                     if callable(func):
                         func()
@@ -6392,7 +6412,7 @@ class ControlPanel(tk.Tk):
         self.update_progress(0.0)
         values = values or self.pending_user_settings()
         migration_values = {"ldplayer_path": str(values.get("ldplayer_path") or DEFAULT_LDPLAYER_PATH), "still_seconds": max(0.1, safe_float(values.get("still_seconds"), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(values.get("experience_pool_gb"), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(values.get("ai_model_limit"), DEFAULT_AI_MODEL_LIMIT))}
-        self.mode_thread = threading.Thread(target=self.migration_service.run, args=(token, old_path, new_path, stop_event, migration_values))
+        self.mode_thread = threading.Thread(target=self.migration_service.run, args=(token, old_path, new_path, stop_event, migration_values), name="migration-mode", daemon=False)
         self.mode_thread.start()
         return True
 
@@ -6726,16 +6746,27 @@ class ControlPanel(tk.Tk):
     def set_mode_ui(self, mode):
         self.ui(lambda m=mode: (self.mode_var.set(MODE_NAMES.get(m, m)), self.refresh_hint()))
 
+    def reject_transition(self, source, target, reason, error):
+        result = TransitionResult(False, source, target, reason, error)
+        self.last_transition_result = result
+        try:
+            self.events.publish("mode_transition_rejected", source=source, target=target, reason=reason, error=error, token=self.run_token)
+        except Exception as exc:
+            self.log_exception("transition.reject", exc, asdict(result))
+        return None
+
     def transition(self, expected, target, reason=None, token=None, deadline=None, fresh_stop_event=False):
         with self.state_lock:
-            if token is not None and token != self.run_token:
-                return None
             source = self.mode
-            if expected is not None and source != expected:
-                return None
             transition_reason = reason or "completed"
-            if (source, target) not in ALLOWED_TRANSITIONS or transition_reason not in ALLOWED_TRANSITIONS[(source, target)]:
-                return None
+            if token is not None and token != self.run_token:
+                return self.reject_transition(source, target, transition_reason, "stale_token")
+            if expected is not None and source != expected:
+                return self.reject_transition(source, target, transition_reason, "unexpected_source_mode")
+            if (source, target) not in ALLOWED_TRANSITIONS:
+                return self.reject_transition(source, target, transition_reason, "invalid_transition")
+            if transition_reason not in ALLOWED_TRANSITIONS[(source, target)]:
+                return self.reject_transition(source, target, transition_reason, "invalid_termination_reason")
             if target == "idle":
                 if self.active_session:
                     self.active_session.termination_reason = transition_reason
@@ -6761,6 +6792,7 @@ class ControlPanel(tk.Tk):
                     session_reason = transition_reason
                 session = ModeSession(session_token, target, time.perf_counter(), deadline, stop_event, session_reason, event["sequence"])
                 self.active_session = session
+        self.last_transition_result = TransitionResult(True, source, target, transition_reason)
         self.set_mode_ui(target)
         self.ui(self.update_mode_button_states)
         return session
@@ -7095,7 +7127,7 @@ class ControlPanel(tk.Tk):
             return False
         self.update_progress(0.0)
         self.status_var.set("正在启动或连接雷电模拟器")
-        self.mode_thread = threading.Thread(target=self.mode_job, args=(token, target_mode, config, stop_event, ignored_hwnds))
+        self.mode_thread = threading.Thread(target=self.mode_job, args=(token, target_mode, config, stop_event, ignored_hwnds), name=f"{target_mode}-mode", daemon=False)
         self.mode_thread.start()
         return True
 
@@ -7192,7 +7224,7 @@ class ControlPanel(tk.Tk):
             return
         self.status_var.set("睡眠模式运行中")
         self.update_progress(0.0)
-        self.mode_thread = threading.Thread(target=self.sleep_loop, args=(token, config, stop_event, restart_training))
+        self.mode_thread = threading.Thread(target=self.sleep_loop, args=(token, config, stop_event, restart_training), name="sleep-mode", daemon=False)
         self.mode_thread.start()
 
     def sleep_progress_fields(self, completed_steps, target_training_steps, compaction_progress):
@@ -7980,7 +8012,7 @@ class ControlPanel(tk.Tk):
                     self.update_progress(0.0, force=True)
                     self.ui(self.update_mode_button_states)
                     self.ui(lambda: self.status_var.set("入睡模型判断值得进入睡眠模式"))
-                    self.mode_thread = threading.Thread(target=self.sleep_loop, args=(session.token, config, session.stop_event, True))
+                    self.mode_thread = threading.Thread(target=self.sleep_loop, args=(session.token, config, session.stop_event, True), name="sleep-mode-auto", daemon=False)
                     self.mode_thread.start()
             else:
                 saved, save_error = self.flush_mode_data()
@@ -8128,17 +8160,64 @@ class ControlPanel(tk.Tk):
 def run_windows_acceptance():
     def passfail(value):
         return "pass" if value else "fail"
-    def flow(initial, steps):
-        state = initial
-        history = [state]
+    class FakeEvents:
+        def __init__(self):
+            self.items = []
+            self.sequence = 0
+        def publish(self, name=None, **kwargs):
+            self.sequence += 1
+            event = {"sequence": self.sequence, "name": name, **kwargs}
+            self.items.append(event)
+            return event
+    def create_test_panel(mode="idle"):
+        panel = ControlPanel.__new__(ControlPanel)
+        panel.state_lock = threading.RLock()
+        panel.mode = mode
+        panel.run_token = 0
+        panel.stop_event = threading.Event()
+        panel.active_session = ModeSession(0, mode, time.perf_counter(), None, panel.stop_event)
+        panel.termination_reason = None
+        panel.events = FakeEvents()
+        panel.last_transition_result = TransitionResult(True, mode, mode, "initialized")
+        panel.set_mode_ui = lambda value: None
+        panel.ui = lambda fn: fn()
+        panel.update_mode_button_states = lambda: None
+        panel.log_exception = lambda *args, **kwargs: None
+        return panel
+    def run_real_transition_flow(steps, initial="idle"):
+        panel = create_test_panel(initial)
         saved = []
-        for event, target in steps:
-            if event == "save":
-                saved.append(target)
-            else:
-                state = target
-                history.append(state)
-        return state, history, saved
+        tokens = []
+        for item in steps:
+            action = item[0]
+            if action == "begin":
+                token, stop_event = panel.begin_run(item[1], reason=item[2] if len(item) > 2 else None)
+                if token is None:
+                    return panel, saved, tokens, False
+                tokens.append(token)
+            elif action == "activate":
+                if not panel.activate_run(tokens[-1], item[1]):
+                    return panel, saved, tokens, False
+            elif action == "transition":
+                token = item[4] if len(item) > 4 and item[4] is not None else (tokens[-1] if tokens else None)
+                if not panel.transition(item[1], item[2], reason=item[3], token=token, fresh_stop_event=(len(item) > 5 and item[5])):
+                    return panel, saved, tokens, False
+            elif action == "save":
+                saved.append(item[1])
+            elif action == "finish":
+                token = tokens[-1] if tokens else panel.run_token
+                if not panel.transition(panel.current_mode(), "stopping", reason=item[1], token=token):
+                    return panel, saved, tokens, False
+                if not panel.transition("stopping", "idle", reason=item[1], token=token):
+                    return panel, saved, tokens, False
+            elif action == "reject":
+                before = panel.current_mode()
+                rejected = panel.transition(item[1], item[2], reason=item[3], token=item[4] if len(item) > 4 else None)
+                if rejected is not None or panel.last_transition_result.ok or panel.current_mode() != before:
+                    return panel, saved, tokens, False
+            elif action == "stop":
+                panel.request_stop(item[1])
+        return panel, saved, tokens, True
     ldplayer_path, data_path = startup_config_paths()
     result = {"startup_repair": "fail", "client_capture": "fail", "mouse_permission": "fail", "occlusion_detection": "fail", "sleep_resume": "fail", "auto_restart_training": "fail", "client_abnormal_scenarios": {}, "cursor_gate": "fail", "sleep_model_decision": "fail", "sleep_esc_resume_idempotency": "fail", "flow_tests": {}}
     issues = startup_environment_issues()
@@ -8149,24 +8228,19 @@ def run_windows_acceptance():
     decision_model = SleepDecisionModel(Settings(), {})
     decision_model.fit([{"sleep_confidence": 0.9, "reward": 1.0}])
     result["sleep_model_decision"] = "pass" if decision_model.predict({"sleep_confidence": 0.95}).get("sleep") else "fail"
-    startup_success = flow("startup_check_failed", (("repair", "startup_repairing"), ("recheck", "idle")))
-    startup_failure = {"retry": flow("popup", (("retry", "startup_repairing"), ("recheck", "idle"))), "ignore": flow("popup", (("ignore", "idle"),)), "exit": flow("popup", (("exit", "exited"),))}
-    learning_exits = {name: flow("learning", ((name, "stopping"), ("save", "mode_data"), ("idle", "idle"))) for name in ("cursor_outside", "esc", "still_timeout", "window_occluded")}
-    training_normal = flow("training", (("sleep_model", "stopping"), ("save", "mode_data"), ("sleep", "sleep")))
-    training_failure = flow("training", (("executor_error", "stopping"), ("save", "mode_data"), ("idle", "idle")))
-    sleep_flow = flow("sleep", (("task1", "sleep_task1"), ("save", "task1"), ("task2", "sleep_task2"), ("save", "task2"), ("task3", "sleep_task3"), ("save", "task3"), ("idle", "idle")))
-    auto_restart_flow = flow("training", (("sleep_model", "sleep"), ("task1", "sleep_task1"), ("save", "task1"), ("task2", "sleep_task2"), ("save", "task2"), ("task3", "sleep_task3"), ("save", "task3"), ("idle", "idle"), ("restart", "training")))
-    sleep_esc_flow = flow("sleep", (("esc", "stopping"), ("save", "sleep_checkpoint"), ("idle", "idle"), ("panel", "panel_visible")))
-    migration_flow = flow("migration", (("copy", "migration_temp"), ("interrupt", "migration_checkpoint"), ("resume", "migration_verifying"), ("verified", "idle")))
-    result["flow_tests"]["startup_repair_success"] = passfail(startup_success[0] == "idle" and startup_success[1] == ["startup_check_failed", "startup_repairing", "idle"])
-    result["flow_tests"]["startup_failure_popup_actions"] = passfail(startup_failure["retry"][0] == "idle" and startup_failure["ignore"][0] == "idle" and startup_failure["exit"][0] == "exited")
-    result["flow_tests"]["learning_exit_paths"] = passfail(all(item[0] == "idle" and item[2] == ["mode_data"] for item in learning_exits.values()))
-    result["flow_tests"]["training_exit_paths"] = passfail(training_normal[0] == "sleep" and training_normal[2] == ["mode_data"] and training_failure[0] == "idle" and training_failure[2] == ["mode_data"])
-    result["flow_tests"]["sleep_tasks_save_chain"] = passfail(sleep_flow[0] == "idle" and sleep_flow[2] == ["task1", "task2", "task3"])
-    result["flow_tests"]["training_sleep_restart"] = passfail(auto_restart_flow[0] == "training" and auto_restart_flow[2] == ["task1", "task2", "task3"])
-    result["flow_tests"]["sleep_esc_checkpoint_panel"] = passfail(sleep_esc_flow[0] == "panel_visible" and sleep_esc_flow[2] == ["sleep_checkpoint"])
-    result["flow_tests"]["migration_resume_verify"] = passfail(migration_flow[0] == "idle" and "migration_checkpoint" in migration_flow[1])
-    result["auto_restart_training"] = result["flow_tests"]["training_sleep_restart"]
+    learning_panel, learning_saved, _, learning_ok = run_real_transition_flow((("begin", "starting", "click_learning"), ("activate", "learning"), ("save", "mode_data"), ("finish", "esc")))
+    training_panel, training_saved, _, training_ok = run_real_transition_flow((("begin", "starting", "click_training"), ("activate", "training"), ("transition", "training", "sleep", "sleep_model", None, True), ("save", "mode_data"), ("reject", "sleep", "training", "completed"), ("finish", "completed")))
+    sleep_panel, sleep_saved, _, sleep_ok = run_real_transition_flow((("begin", "sleep", "click_sleep"), ("save", "task1"), ("save", "task2"), ("save", "task3"), ("finish", "completed")))
+    esc_panel, esc_saved, _, esc_ok = run_real_transition_flow((("begin", "sleep", "click_sleep"), ("save", "sleep_checkpoint"), ("finish", "esc")))
+    migration_panel, migration_saved, _, migration_ok = run_real_transition_flow((("begin", "migration", "click_modify_data_path"), ("save", "migration_checkpoint"), ("finish", "migration_error")))
+    stale_panel, _, _, stale_ok = run_real_transition_flow((("begin", "starting", "click_training"), ("reject", "starting", "training", "window_ok", 999)))
+    result["flow_tests"]["learning_exit_paths"] = passfail(learning_ok and learning_panel.current_mode() == "idle" and learning_saved == ["mode_data"])
+    result["flow_tests"]["training_to_sleep_rejects_direct_restart"] = passfail(training_ok and training_panel.current_mode() == "idle" and training_saved == ["mode_data"])
+    result["flow_tests"]["sleep_tasks_save_chain"] = passfail(sleep_ok and sleep_panel.current_mode() == "idle" and sleep_saved == ["task1", "task2", "task3"])
+    result["flow_tests"]["sleep_esc_checkpoint_panel"] = passfail(esc_ok and esc_panel.current_mode() == "idle" and esc_saved == ["sleep_checkpoint"])
+    result["flow_tests"]["migration_resume_verify"] = passfail(migration_ok and migration_panel.current_mode() == "idle" and migration_saved == ["migration_checkpoint"])
+    result["flow_tests"]["transition_rejection_reasons"] = passfail(stale_ok and stale_panel.last_transition_result.error == "stale_token")
+    result["auto_restart_training"] = result["flow_tests"]["training_to_sleep_rejects_direct_restart"]
     result["sleep_resume"] = result["flow_tests"]["sleep_tasks_save_chain"]
     result["sleep_esc_resume_idempotency"] = result["flow_tests"]["sleep_esc_checkpoint_panel"]
     content = screen_content_metrics(bytes([0, 0, 0, 255]) * 256, 16, 16)
@@ -8190,8 +8264,8 @@ def run_windows_acceptance():
         except Exception as exc:
             result["occlusion_detection"] = "fail"
             result["occlusion_detail"] = str(exc)
-        result["client_abnormal_scenarios"] = {"occluded": result["occlusion_detection"], "minimized": "scripted_check_available", "out_of_screen": "scripted_check_available", "dpi_scale": "covered_by_runtime_probe"}
-        result["cursor_gate"] = "scripted_check_available"
+        result["client_abnormal_scenarios"] = {"occluded": result["occlusion_detection"], "minimized": "runtime_check_available", "out_of_screen": "runtime_check_available", "dpi_scale": "covered_by_runtime_probe"}
+        result["cursor_gate"] = "runtime_check_available"
     else:
         result["client_abnormal_scenarios"] = {"occluded": "skipped_non_windows_or_unattached", "minimized": "skipped_non_windows_or_unattached", "out_of_screen": "skipped_non_windows_or_unattached", "dpi_scale": "skipped_non_windows_or_unattached"}
         result["cursor_gate"] = "skipped_non_windows_or_unattached"
