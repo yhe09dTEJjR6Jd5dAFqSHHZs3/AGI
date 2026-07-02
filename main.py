@@ -36,7 +36,6 @@ OPTIONAL_MODULES = ("pynput.keyboard",)
 class AgentSpec:
     default_ldplayer_path: str
     default_data_path: str
-    default_training_seconds: int
     default_still_seconds: float
     default_experience_pool_gb: float
     default_ai_model_limit: int
@@ -46,11 +45,10 @@ class AgentSpec:
 AGENT_SPEC = AgentSpec(
     default_ldplayer_path=r"D:\LDPlayer9\dnplayer.exe",
     default_data_path=r"C:\Users\Administrator\Desktop\AAA",
-    default_training_seconds=900,
     default_still_seconds=10.0,
     default_experience_pool_gb=10.0,
     default_ai_model_limit=10,
-    editable_fields=("ldplayer_path", "data_path", "training_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit")
+    editable_fields=("ldplayer_path", "data_path", "still_seconds", "experience_pool_gb", "ai_model_limit")
 )
 
 
@@ -59,39 +57,7 @@ def should_stop_run(stop_event, deadline, escape_check, termination_reason=None)
         return termination_reason if termination_reason in TERMINATION_REASONS else "user_stop"
     if escape_check and escape_check():
         return "esc"
-    if deadline is not None and time.perf_counter() >= deadline:
-        return "time_limit"
     return None
-
-
-class PausableTrainingClock:
-    def __init__(self, seconds):
-        self.remaining = float(max(1, seconds))
-        self.paused = False
-        self.deadline_perf = time.perf_counter() + self.remaining
-
-    def pause(self):
-        if not self.paused:
-            self.remaining = max(0.0, self.deadline_perf - time.perf_counter())
-            self.paused = True
-
-    def resume(self):
-        if self.paused:
-            self.deadline_perf = time.perf_counter() + self.remaining
-            self.paused = False
-
-    def expired(self):
-        if self.paused:
-            return False
-        self.remaining = max(0.0, self.deadline_perf - time.perf_counter())
-        return self.remaining <= 0.0
-
-    def deadline(self):
-        if self.paused:
-            return None
-        self.remaining = max(0.0, self.deadline_perf - time.perf_counter())
-        return self.deadline_perf
-
 
 
 def screen_content_metrics(raw, width, height):
@@ -645,26 +611,25 @@ def configuration_failure(area, error):
 
 
 def default_runtime_settings_payload():
-    return {"training_seconds": AGENT_SPEC.default_training_seconds, "still_seconds": AGENT_SPEC.default_still_seconds, "experience_pool_gb": AGENT_SPEC.default_experience_pool_gb, "ai_model_limit": AGENT_SPEC.default_ai_model_limit}
+    return {"still_seconds": AGENT_SPEC.default_still_seconds, "experience_pool_gb": AGENT_SPEC.default_experience_pool_gb, "ai_model_limit": AGENT_SPEC.default_ai_model_limit}
 
 
 DEFAULT_LDPLAYER_PATH = AGENT_SPEC.default_ldplayer_path
 DEFAULT_DATA_PATH = AGENT_SPEC.default_data_path
-DEFAULT_TRAINING_SECONDS = AGENT_SPEC.default_training_seconds
 DEFAULT_STILL_SECONDS = AGENT_SPEC.default_still_seconds
 DEFAULT_EXPERIENCE_POOL_GB = AGENT_SPEC.default_experience_pool_gb
 DEFAULT_AI_MODEL_LIMIT = AGENT_SPEC.default_ai_model_limit
 MODE_NAMES = {"idle": "空闲", "starting": "准备中", "learning": "学习模式", "training": "训练模式", "sleep": "睡眠模式", "migration": "数据迁移", "stopping": "正在退出"}
 CONFIG_SCHEMA_VERSION = 1
 USER_EDITABLE_STARTUP_FIELDS = ("ldplayer_path", "data_path")
-USER_EDITABLE_RUNTIME_FIELDS = ("training_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit")
+USER_EDITABLE_RUNTIME_FIELDS = ("still_seconds", "experience_pool_gb", "ai_model_limit")
 USER_EDITABLE_FIELDS = AGENT_SPEC.editable_fields
 
 
 class AllowedUserEditPolicy:
     ALLOWED_FIELDS = frozenset(AGENT_SPEC.editable_fields)
     STARTUP_FIELDS = frozenset(("ldplayer_path", "data_path"))
-    RUNTIME_FIELDS = frozenset(("training_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit"))
+    RUNTIME_FIELDS = frozenset(("still_seconds", "experience_pool_gb", "ai_model_limit"))
 
     @classmethod
     def filter(cls, settings, scope=None):
@@ -694,12 +659,12 @@ ALLOWED_TRANSITIONS = {
     ("starting", "stopping"): {"user_stop", "esc", "runtime_error", "minimize_failed", "window_invalid", "completed"},
     ("migration", "stopping"): {"user_stop", "esc", "runtime_error", "migration_error", "completed"},
     ("stopping", "idle"): {"esc", "still_timeout", "window_invalid", "cursor_outside", "user_stop", "runtime_error", "executor_error", "migration_error", "completed"},
-    ("training", "sleep"): {"time_limit"},
+    ("training", "sleep"): {"sleep_model"},
     ("sleep", "stopping"): {"user_stop", "esc", "runtime_error", "completed"}
 }
 
 
-TERMINATION_REASONS = ("window_invalid", "cursor_outside", "rect_changed", "empty_action", "executor_error", "time_limit", "esc", "still_timeout", "user_stop", "migration_error", "completed")
+TERMINATION_REASONS = ("window_invalid", "cursor_outside", "rect_changed", "empty_action", "executor_error", "sleep_model", "esc", "still_timeout", "user_stop", "migration_error", "completed")
 RUNNING_MODES = {"starting", "learning", "training", "sleep", "migration"}
 HUMAN_FEATURE_NAMES = ("duration", "direct", "bend", "points", "speed_mean", "speed_variance", "acceleration_change", "pauses", "hover_before", "drag_curvature", "double_click_interval")
 
@@ -915,7 +880,6 @@ class ModeSession:
 
 @dataclass(frozen=True)
 class StopSnapshot:
-    training_seconds: int
     still_seconds: float
     deadline: Optional[float]
 
@@ -924,7 +888,6 @@ class StopSnapshot:
 class Config:
     ldplayer_path: Path
     data_path: Path
-    training_seconds: int
     still_seconds: float
     experience_pool_gb: float
     ai_model_limit: int
@@ -1107,13 +1070,13 @@ def run_self_test():
     assert details["reward_sort_key"][0] == details["screen_primary_reward"]
     assert "human_tie_break_reward" in details
     assert 0.0 < details["human_bonus"] < details["screen_score_resolution"]
-    assert set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "training_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit"}
+    assert set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "still_seconds", "experience_pool_gb", "ai_model_limit"}
     assert {"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("learning", "stopping")])
     assert {"esc", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("training", "stopping")])
     assert "still_timeout" not in ALLOWED_TRANSITIONS[("training", "stopping")]
     assert ("training", "idle") not in ALLOWED_TRANSITIONS
-    assert "time_limit" in ALLOWED_TRANSITIONS[("training", "sleep")]
-    assert should_stop_run(threading.Event(), time.perf_counter() - 1.0, None) == "time_limit"
+    assert "sleep_model" in ALLOWED_TRANSITIONS[("training", "sleep")]
+    assert should_stop_run(threading.Event(), time.perf_counter() - 1.0, None) is None
     assert should_stop_run(threading.Event(), None, None) is None
     stopped_for_user = threading.Event()
     stopped_for_user.set()
@@ -1131,9 +1094,9 @@ def run_self_test():
     stop_check_panel.apply_active_stop_reason = ControlPanel.apply_active_stop_reason.__get__(stop_check_panel, type(stop_check_panel))
     stop_check_panel.settings = settings
     stop_check_panel.mouse_recorder = None
-    stop_config = type("Config", (), {"training_seconds": 1, "still_seconds": 10.0})()
+    stop_config = type("Config", (), {"still_seconds": 10.0})()
     expired_event = threading.Event()
-    assert TrainingService(stop_check_panel).should_stop(time.perf_counter() - 2.0, stop_config, expired_event)
+    assert not TrainingService(stop_check_panel).should_stop(stop_config, expired_event)
     execution_panel = type("ExecutionPanel", (), {})()
     execution_stop = threading.Event()
     execution_panel.termination_reason = None
@@ -1324,21 +1287,9 @@ def run_self_test():
         ControlPanel.render_sleep_completion_before_idle(sleep_finish_panel, "睡眠模式已中断：任务完成 43.2%，数据已安全保存", 43.2)
         assert sleep_finish_panel.completion_progress == 43.2
         assert sleep_finish_panel.progress_label_var.value == "睡眠模式已中断：任务完成 43.2%，数据已安全保存"
-        one_second_clock = PausableTrainingClock(1)
-        original_deadline = one_second_clock.deadline()
-        time.sleep(1.08)
-        assert one_second_clock.deadline() == original_deadline
-        assert should_stop_run(threading.Event(), one_second_clock.deadline(), None) == "time_limit"
-        assert one_second_clock.expired()
-        clock = PausableTrainingClock(900)
-        clock.remaining = 200.0
-        clock.deadline_perf = time.perf_counter() + clock.remaining
-        clock.pause()
-        paused_remaining = clock.remaining
-        time.sleep(0.01)
-        assert abs(clock.remaining - paused_remaining) < 0.001
-        clock.resume()
-        assert 0.0 < clock.remaining <= 200.0
+        sleep_model = SleepDecisionModel(settings, {})
+        sleep_model.fit([{"sleep_confidence": 0.9, "reward": 1.0}, {"sleep_confidence": 0.95, "reward": 2.0}])
+        assert sleep_model.predict({"sleep_confidence": 0.99})["sleep"]
         mouse_executor = HumanMouseExecutor.__new__(HumanMouseExecutor)
         mouse_executor.settings = derive_runtime_settings()
         edge_rect = (10, 20, 30, 40)
@@ -1469,7 +1420,7 @@ def run_self_test():
         transition_panel.set_mode_ui = lambda mode: None
         transition_panel.ui = lambda fn: fn()
         transition_panel.update_mode_button_states = lambda: None
-        sleep_session = ControlPanel.transition(transition_panel, "training", "sleep", reason="time_limit", token=7, fresh_stop_event=True)
+        sleep_session = ControlPanel.transition(transition_panel, "training", "sleep", reason="sleep_model", token=7, fresh_stop_event=True)
         assert sleep_session and not sleep_session.stop_event.is_set() and sleep_session.stop_event is not stopped_event
         assert sleep_session.termination_reason is None and transition_panel.termination_reason is None
         class DummyVar:
@@ -1482,19 +1433,17 @@ def run_self_test():
         modify_panel = ControlPanel.__new__(ControlPanel)
         modify_panel.ldplayer_var = DummyVar()
         modify_panel.data_var = DummyVar()
-        modify_panel.training_seconds_var = DummyVar()
         modify_panel.still_seconds_var = DummyVar()
         modify_panel.experience_pool_gb_var = DummyVar()
         modify_panel.ai_model_limit_var = DummyVar()
         modify_panel.status_var = DummyVar()
         modify_panel.ldplayer_var.set(str(executable))
         modify_panel.data_var.set(str(store.root))
-        modify_panel.training_seconds_var.set("1")
         modify_panel.still_seconds_var.set("3")
         modify_panel.experience_pool_gb_var.set("4")
         modify_panel.ai_model_limit_var.set("5")
         modify_panel.settings = settings
-        modify_panel.runtime_value_specs = {"training_seconds": ("训练秒数", modify_panel.training_seconds_var, DEFAULT_TRAINING_SECONDS, safe_int, 1), "still_seconds": ("静止秒数", modify_panel.still_seconds_var, DEFAULT_STILL_SECONDS, safe_float, 0.1), "experience_pool_gb": ("经验池 GB", modify_panel.experience_pool_gb_var, DEFAULT_EXPERIENCE_POOL_GB, safe_float, 0.1), "ai_model_limit": ("AI 模型个数", modify_panel.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, 1)}
+        modify_panel.runtime_value_specs = {"still_seconds": ("静止秒数", modify_panel.still_seconds_var, DEFAULT_STILL_SECONDS, safe_float, 0.1), "experience_pool_gb": ("经验池 GB", modify_panel.experience_pool_gb_var, DEFAULT_EXPERIENCE_POOL_GB, safe_float, 0.1), "ai_model_limit": ("AI 模型个数", modify_panel.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, 1)}
         modify_panel.update_mode_button_states = lambda: setattr(modify_panel, "updated", True)
         modify_panel.refresh_runtime_environment_state = lambda: setattr(modify_panel, "refreshed", True)
         modify_panel.save_persistent_settings = lambda: setattr(modify_panel, "saved", True)
@@ -1503,14 +1452,14 @@ def run_self_test():
         messagebox.showerror = lambda *args, **kwargs: None
         try:
             assert not hasattr(ControlPanel, "save_user_settings")
-            assert ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(root / "missing.exe"), "data_path": str(store.root), "training_seconds": 2, "still_seconds": 4, "experience_pool_gb": 6, "ai_model_limit": 7}) is False
+            assert ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(root / "missing.exe"), "data_path": str(store.root), "still_seconds": 4, "experience_pool_gb": 6, "ai_model_limit": 7}) is False
         finally:
             messagebox.showerror = original_showerror
         assert modify_panel.ldplayer_var.value == str(executable)
-        assert ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(executable), "data_path": str(store.root), "training_seconds": 2, "still_seconds": 4, "experience_pool_gb": 6, "ai_model_limit": 7}) is True
-        assert modify_panel.saved and modify_panel.training_seconds_var.value == "2" and modify_panel.ai_model_limit_var.value == "7"
+        assert ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(executable), "data_path": str(store.root), "still_seconds": 4, "experience_pool_gb": 6, "ai_model_limit": 7}) is True
+        assert modify_panel.saved and modify_panel.ai_model_limit_var.value == "7"
         target_data_path = root / "submit_new_data"
-        assert ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(executable), "data_path": str(target_data_path), "training_seconds": 8, "still_seconds": 9, "experience_pool_gb": 1, "ai_model_limit": 2}) is True
+        assert ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(executable), "data_path": str(target_data_path), "still_seconds": 9, "experience_pool_gb": 1, "ai_model_limit": 2}) is True
         assert modify_panel.migration_request[0] == target_data_path and modify_panel.data_var.value == str(store.root)
         dummy_panel.progress_value = 0.4
         dummy_panel.last_progress_update_perf = 0.0
@@ -1529,7 +1478,7 @@ def run_self_test():
         dummy_panel.mode = "idle"
         assert ControlPanel.idle_progress_value(dummy_panel, "training", 91.0) == 0.0
         assert ControlPanel.idle_progress_value(dummy_panel, "migration", 91.0) == 0.0
-        store.save_settings({"training_seconds": 1, "still_seconds": 3, "experience_pool_gb": 4, "ai_model_limit": 5, "forbidden": 6})
+        store.save_settings({"still_seconds": 3, "experience_pool_gb": 4, "ai_model_limit": 5, "forbidden": 6})
         saved_settings = json.loads(store.settings_file.read_text(encoding="utf-8"))
         assert "forbidden" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0 and saved_settings["ai_model_limit"] == 5
         store.experience_file.write_text("{bad json}\n" + json.dumps({"id": "ok"}) + "\n", encoding="utf-8")
@@ -1555,7 +1504,7 @@ def run_self_test():
         assert len(list(store.model_dir.glob("model_*.json"))) == 1
         model_path = max(store.model_dir.glob("model_*.json"), key=store.model_created_key)
         model_payload = json.loads(model_path.read_text(encoding="utf-8"))
-        assert len(model_payload["model_group"]["models"]) == 5
+        assert len(model_payload["model_group"]["models"]) == 6
         assert [item["key"] for item in model_payload["model_group"]["models"]] == [item["key"] for item in AI_MODEL_GROUP_SPECS]
         model_path.write_bytes(model_path.read_bytes() + (b"m" * 2048))
         assert store.storage_size_bytes() > store.experience_pool_size_bytes()
@@ -2438,6 +2387,7 @@ AI_MODEL_GROUP_SPECS = (
     {"key": "screen_novelty_scorer", "name": "画面新颖程度评分模型", "goal": "一个画面与经验池中最相似的一批历史画面批量聚合相似度越高，评分越低"},
     {"key": "mouse_humanlikeness_scorer", "name": "鼠标拟人程度评分模型", "goal": "AI鼠标操作与学习模式用户鼠标操作相似度越高，评分越高"},
     {"key": "operation_policy", "name": "实操模型", "goal": "在训练模式期间，雷电模拟器客户区内，AI输出鼠标操作"},
+    {"key": "sleep_decision_model", "name": "入睡模型", "goal": "在训练模式期间，判断是否值得进入睡眠模式"},
     {"key": "reward_model", "name": "奖励模型", "goal": "奖励=收入（画面评分不同的样本，画面评分越高，收入越高；画面评分相同的样本，鼠标评分越高，收入越高）-支出（支出一开始为正极小值，随时间推移逐渐变大，并在收入变高时重置为正极小值）"},
     {"key": "runtime_value_model", "name": "数学模型", "goal": "依据现实条件确定没有在要求中确定的变量的初始数值，并让它们跟随现实条件的变化而变化"},
 )
@@ -2921,7 +2871,45 @@ class RuntimeValueModel(TrainableModel):
         return obj
 
 
-TRAINABLE_MODEL_CLASSES = {cls.key: cls for cls in (ScreenNoveltyScorerModel, MouseHumanlikenessScorerModel, OperationPolicyModel, RewardModel, RuntimeValueModel)}
+class SleepDecisionModel(TrainableModel):
+    key = "sleep_decision_model"
+    model_type = "training_sleep_worthiness_model"
+
+    def fit(self, records):
+        super().fit(records)
+        values = [safe_float(record.get("sleep_model_confidence", record.get("sleep_confidence", 0.0)), 0.0) for record in records or [] if isinstance(record, dict)]
+        rewards = [safe_float(record.get("reward", record.get("sleep_policy_reward", 0.0)), 0.0) for record in records or [] if isinstance(record, dict)]
+        self.threshold = round(percentile(values, 0.75, 0.8), 4) if values else 0.8
+        self.reward_floor = round(percentile(rewards, 0.25, 0.0), 4) if rewards else 0.0
+        self.metrics = {"threshold": self.threshold, "reward_floor": self.reward_floor, "records": len(values)}
+        return self.metrics
+
+    def parameters(self):
+        return {"threshold": getattr(self, "threshold", 0.8), "reward_floor": getattr(self, "reward_floor", 0.0), "intelligence_goal": "judge whether training mode is worth entering sleep mode"}
+
+    def predict(self, features):
+        features = features or {}
+        confidence = clamp(safe_float(features.get("sleep_confidence", features.get("model_confidence", 0.0)), 0.0), 0.0, 1.0)
+        reward = safe_float(features.get("reward", 0.0), 0.0)
+        failures = safe_int(features.get("consecutive_failures", 0), 0)
+        no_actions = safe_int(features.get("consecutive_no_actions", 0), 0)
+        pressure = clamp(failures * 0.15 + no_actions * 0.1, 0.0, 0.5)
+        score = confidence + pressure
+        return {"sleep": score >= safe_float(getattr(self, "threshold", 0.8), 0.8) or (failures + no_actions >= 3 and reward <= safe_float(getattr(self, "reward_floor", 0.0), 0.0)), "score": round(score, 4), "threshold": safe_float(getattr(self, "threshold", 0.8), 0.8)}
+
+    def probe_input(self):
+        return {"sleep_confidence": 0.9, "reward": 0.0, "consecutive_failures": 0, "consecutive_no_actions": 0}
+
+    @classmethod
+    def restore(cls, payload, settings=None):
+        obj = cls(settings, payload)
+        params = payload.get("parameters") if isinstance(payload, dict) else {}
+        obj.threshold = safe_float(params.get("threshold", 0.8), 0.8) if isinstance(params, dict) else 0.8
+        obj.reward_floor = safe_float(params.get("reward_floor", 0.0), 0.0) if isinstance(params, dict) else 0.0
+        return obj
+
+
+TRAINABLE_MODEL_CLASSES = {cls.key: cls for cls in (ScreenNoveltyScorerModel, MouseHumanlikenessScorerModel, OperationPolicyModel, RewardModel, RuntimeValueModel, SleepDecisionModel)}
 
 
 def restore_trainable_model(payload, settings=None):
@@ -2987,6 +2975,16 @@ class ModelGroupRuntime:
         parts["basis"] = list(parts.get("basis", [])) + ["model_group_runtime_reward_model"]
         return parts
 
+    def should_sleep(self, features):
+        model = self.models.get("sleep_decision_model")
+        if model:
+            return model.predict(features or {})
+        confidence = clamp(safe_float((features or {}).get("sleep_confidence", 0.0), 0.0), 0.0, 1.0)
+        failures = safe_int((features or {}).get("consecutive_failures", 0), 0)
+        no_actions = safe_int((features or {}).get("consecutive_no_actions", 0), 0)
+        score = clamp(confidence + failures * 0.15 + no_actions * 0.1, 0.0, 1.0)
+        return {"sleep": score >= 0.85 or failures + no_actions >= 3, "score": round(score, 4), "threshold": 0.85}
+
     def apply_runtime_values(self, settings, features, fallback_model=None):
         model = self.models.get("runtime_value_model")
         if model:
@@ -3026,6 +3024,7 @@ def ai_model_group_snapshot(policy_payload, settings, records):
         "screen_novelty_scorer": {},
         "mouse_humanlikeness_scorer": {},
         "operation_policy": {"policy": policy_payload},
+        "sleep_decision_model": {},
         "reward_model": {},
         "runtime_value_model": {"resource_model": policy_payload.get("resource_model") if isinstance(policy_payload.get("resource_model"), dict) else {}}
     }
@@ -3692,7 +3691,7 @@ class DataStore:
 
     def save_settings(self, settings):
         source = AllowedUserEditPolicy.filter(settings, "runtime")
-        payload = {"schema_version": CONFIG_SCHEMA_VERSION, "training_seconds": max(1, safe_int(source.get("training_seconds", AGENT_SPEC.default_training_seconds), AGENT_SPEC.default_training_seconds)), "still_seconds": max(0.1, safe_float(source.get("still_seconds", AGENT_SPEC.default_still_seconds), AGENT_SPEC.default_still_seconds)), "experience_pool_gb": max(0.1, safe_float(source.get("experience_pool_gb", AGENT_SPEC.default_experience_pool_gb), AGENT_SPEC.default_experience_pool_gb)), "ai_model_limit": max(1, safe_int(source.get("ai_model_limit", AGENT_SPEC.default_ai_model_limit), AGENT_SPEC.default_ai_model_limit)), "runtime_generated_numbers": RUNTIME_NUMBER_AUDIT}
+        payload = {"schema_version": CONFIG_SCHEMA_VERSION, "still_seconds": max(0.1, safe_float(source.get("still_seconds", AGENT_SPEC.default_still_seconds), AGENT_SPEC.default_still_seconds)), "experience_pool_gb": max(0.1, safe_float(source.get("experience_pool_gb", AGENT_SPEC.default_experience_pool_gb), AGENT_SPEC.default_experience_pool_gb)), "ai_model_limit": max(1, safe_int(source.get("ai_model_limit", AGENT_SPEC.default_ai_model_limit), AGENT_SPEC.default_ai_model_limit)), "runtime_generated_numbers": RUNTIME_NUMBER_AUDIT}
         try:
             atomic_write_json(self.settings_file, payload, self.lock)
         except Exception as exc:
@@ -5665,25 +5664,16 @@ class TrainingService:
         screen_score_total = panel.store.screen_score_total if panel.store else 0.0
         return panel.brain.choose(snapshot.hash_value, novelty, batch, screen_score_total)
 
-    def should_stop(self, clock, config, stop_event, suspend_time_limit=False):
+    def should_stop(self, config, stop_event):
         panel = self.panel
-        if isinstance(clock, PausableTrainingClock):
-            deadline = clock.deadline()
-        else:
-            deadline = clock + max(1, config.training_seconds)
-        guarded = panel.active_mode_stop_reason("training", stop_event, config, deadline)
+        guarded = panel.active_mode_stop_reason("training", stop_event, config, None)
         if guarded:
             panel.termination_reason = guarded
             stop_event.set()
             panel.apply_active_stop_reason("training", guarded, stop_event)
             return True
         panel.update_progress(0.0)
-        if isinstance(clock, PausableTrainingClock):
-            remaining = max(0.0, clock.remaining)
-        else:
-            elapsed = time.perf_counter() - clock
-            remaining = max(0.0, config.training_seconds - elapsed)
-        panel.ui(lambda r=remaining: panel.progress_label_var.set(f"训练模式进度保持 0%｜剩余 {r:.1f} 秒"))
+        panel.ui(lambda: panel.progress_label_var.set("训练模式进度保持 0%｜等待入睡模型判断"))
         return False
 
     def execute_and_record(self, analyzer, session_id, start, rect, snapshot, action, decision, stop_event, config=None):
@@ -5699,7 +5689,7 @@ class TrainingService:
         active_session = getattr(panel, "active_session", None)
         if active_session and active_session.mode == "training":
             deadline = active_session.deadline
-        stop_snapshot = StopSnapshot(safe_int(getattr(config, "training_seconds", DEFAULT_TRAINING_SECONDS), DEFAULT_TRAINING_SECONDS), safe_float(getattr(config, "still_seconds", DEFAULT_STILL_SECONDS), DEFAULT_STILL_SECONDS), deadline)
+        stop_snapshot = StopSnapshot(safe_float(getattr(config, "still_seconds", DEFAULT_STILL_SECONDS), DEFAULT_STILL_SECONDS), deadline)
         def training_execution_stop():
             reason = panel.active_mode_stop_reason("training", stop_event, stop_snapshot, stop_snapshot.deadline)
             if reason:
@@ -5798,7 +5788,6 @@ class ControlPanel(tk.Tk):
         self.escape_monitor = EscapeMonitor(self.request_escape, self.settings.key_debounce_seconds)
         self.ldplayer_var = tk.StringVar(value=DEFAULT_LDPLAYER_PATH)
         self.data_var = tk.StringVar(value=DEFAULT_DATA_PATH)
-        self.training_seconds_var = tk.StringVar(value=str(DEFAULT_TRAINING_SECONDS))
         self.still_seconds_var = tk.StringVar(value=str(DEFAULT_STILL_SECONDS))
         self.experience_pool_gb_var = tk.StringVar(value=str(DEFAULT_EXPERIENCE_POOL_GB))
         self.ai_model_limit_var = tk.StringVar(value=str(DEFAULT_AI_MODEL_LIMIT))
@@ -5824,7 +5813,6 @@ class ControlPanel(tk.Tk):
         self.last_training_runtime_metrics = getattr(self, "last_training_runtime_metrics", None)
         self.progress_label_var = tk.StringVar(value="进度")
         self.runtime_value_specs = {
-            "training_seconds": ("训练秒数", self.training_seconds_var, DEFAULT_TRAINING_SECONDS, safe_int, 1),
             "still_seconds": ("静止秒数", self.still_seconds_var, DEFAULT_STILL_SECONDS, safe_float, 0.1),
             "experience_pool_gb": ("经验池 GB", self.experience_pool_gb_var, DEFAULT_EXPERIENCE_POOL_GB, safe_float, 0.1),
             "ai_model_limit": ("AI 模型个数", self.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, 1)
@@ -5837,7 +5825,7 @@ class ControlPanel(tk.Tk):
         self.metrics_frame = None
         self.app_config_store = AppConfigStore()
         self.hint_templates = {
-            "idle": "当前处于空闲。可修改允许的六项参数，或启动学习、训练、睡眠模式；启动学习/训练前会自动检查并修复运行环境。",
+            "idle": "当前处于空闲。可修改允许的五项参数，或启动学习、训练、睡眠模式；启动学习/训练前会自动检查并修复运行环境。",
             "starting": "正在准备模式。控制面板会最小化，鼠标会被放入雷电模拟器客户区；本程序窗口造成的遮挡不会判定为客户区异常。",
             "learning": "学习模式：请只在雷电模拟器客户区内操作。ESC、鼠标静止超时、用户鼠标离开客户区或客户区真实异常会结束并保存数据。",
             "training": "训练模式：AI 鼠标动作会被限制在雷电模拟器客户区内。ESC、用户干预导致鼠标离开客户区或客户区真实异常会结束并保存数据。",
@@ -5872,14 +5860,14 @@ class ControlPanel(tk.Tk):
         data_path = filedialog.askdirectory(title="选择数据存储路径", initialdir=values["data_path"] or DEFAULT_DATA_PATH, parent=self)
         if data_path:
             values["data_path"] = data_path
-        for field in ("experience_pool_gb", "ai_model_limit", "still_seconds", "training_seconds"):
+        for field in ("experience_pool_gb", "ai_model_limit", "still_seconds"):
             changed = self.ask_runtime_value(field, values[field])
             if changed is not None:
                 values[field] = changed
         self.submit_user_settings(values)
 
     def pending_user_settings(self):
-        return {"ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH, "data_path": self.data_var.get().strip() or DEFAULT_DATA_PATH, "training_seconds": max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS)), "still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))}
+        return {"ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH, "data_path": self.data_var.get().strip() or DEFAULT_DATA_PATH, "still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))}
 
     def ask_runtime_value(self, field, current_value):
         AllowedUserEditPolicy.assert_allowed(field)
@@ -5890,7 +5878,6 @@ class ControlPanel(tk.Tk):
         return max(minimum, parser(answer, default))
 
     def apply_runtime_value_vars(self, values):
-        self.training_seconds_var.set(self.format_runtime_value("training_seconds", values["training_seconds"]))
         self.still_seconds_var.set(self.format_runtime_value("still_seconds", values["still_seconds"]))
         self.experience_pool_gb_var.set(self.format_runtime_value("experience_pool_gb", values["experience_pool_gb"]))
         self.ai_model_limit_var.set(self.format_runtime_value("ai_model_limit", values["ai_model_limit"]))
@@ -5906,7 +5893,7 @@ class ControlPanel(tk.Tk):
                 self.status_var.set("雷电路径校验失败，未保存")
                 self.update_mode_button_states()
                 return False
-        normalized = {"ldplayer_path": new_ldplayer, "data_path": str(new_data_path), "training_seconds": max(1, safe_int(values.get("training_seconds"), DEFAULT_TRAINING_SECONDS)), "still_seconds": max(0.1, safe_float(values.get("still_seconds"), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(values.get("experience_pool_gb"), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(values.get("ai_model_limit"), DEFAULT_AI_MODEL_LIMIT))}
+        normalized = {"ldplayer_path": new_ldplayer, "data_path": str(new_data_path), "still_seconds": max(0.1, safe_float(values.get("still_seconds"), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(values.get("experience_pool_gb"), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(values.get("ai_model_limit"), DEFAULT_AI_MODEL_LIMIT))}
         if Path(old_values["data_path"]) != new_data_path:
             return self.start_data_migration(new_data_path, normalized)
         self.ldplayer_var.set(new_ldplayer)
@@ -5975,7 +5962,7 @@ class ControlPanel(tk.Tk):
         time_frame = ttk.Frame(path_frame)
         time_frame.grid(row=2, column=1, columnspan=2, sticky="w", pady=6)
         ttk.Label(path_frame, text="时间设置").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=6)
-        for field, label in (("training_seconds", "训练/秒"), ("still_seconds", "静止/秒"), ("experience_pool_gb", "经验池/GB"), ("ai_model_limit", "AI模型/个")):
+        for field, label in (("still_seconds", "静止/秒"), ("experience_pool_gb", "经验池/GB"), ("ai_model_limit", "AI模型/个")):
             variable = self.runtime_value_specs[field][1]
             item_frame = ttk.Frame(time_frame)
             item_frame.pack(side="left", padx=(0, 12))
@@ -6263,7 +6250,7 @@ class ControlPanel(tk.Tk):
                 elif event.get("type") == "restart_training":
                     self.status_var.set("睡眠模式已保存，正在自动调度训练模式")
                     old_token = event.get("token")
-                    reason = event.get("reason") or "time_limit"
+                    reason = event.get("reason") or "sleep_model"
                     if self.is_run_active(old_token, "sleep"):
                         self.finish_run(old_token, "睡眠模式已退出，数据已保存", 0.0, release=False, reason=reason)
                     if self.current_mode() == "idle":
@@ -6307,7 +6294,7 @@ class ControlPanel(tk.Tk):
         return True
 
     def format_runtime_value(self, field, value):
-        if field in ("training_seconds", "ai_model_limit"):
+        if field == "ai_model_limit":
             return str(safe_int(value, self.runtime_value_specs[field][2]))
         return str(safe_float(value, self.runtime_value_specs[field][2]))
 
@@ -6370,7 +6357,7 @@ class ControlPanel(tk.Tk):
         self.status_var.set("正在迁移数据")
         self.update_progress(0.0)
         values = values or self.pending_user_settings()
-        migration_values = {"ldplayer_path": str(values.get("ldplayer_path") or DEFAULT_LDPLAYER_PATH), "training_seconds": max(1, safe_int(values.get("training_seconds"), DEFAULT_TRAINING_SECONDS)), "still_seconds": max(0.1, safe_float(values.get("still_seconds"), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(values.get("experience_pool_gb"), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(values.get("ai_model_limit"), DEFAULT_AI_MODEL_LIMIT))}
+        migration_values = {"ldplayer_path": str(values.get("ldplayer_path") or DEFAULT_LDPLAYER_PATH), "still_seconds": max(0.1, safe_float(values.get("still_seconds"), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(values.get("experience_pool_gb"), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(values.get("ai_model_limit"), DEFAULT_AI_MODEL_LIMIT))}
         self.mode_thread = threading.Thread(target=self.migration_service.run, args=(token, old_path, new_path, stop_event, migration_values))
         self.mode_thread.start()
         return True
@@ -6563,7 +6550,7 @@ class ControlPanel(tk.Tk):
                 if size == 0:
                     self.ui(lambda c=copied, t=total: self.progress_label_var.set(f"数据迁移中｜已迁移 {c}/{t} 字节"))
             if not stop_event.is_set() and self.is_run_active(token, "migration"):
-                DataStore(temp_root).save_settings({"training_seconds": values["training_seconds"], "still_seconds": values["still_seconds"], "experience_pool_gb": values["experience_pool_gb"], "ai_model_limit": values["ai_model_limit"]})
+                DataStore(temp_root).save_settings({"still_seconds": values["still_seconds"], "experience_pool_gb": values["experience_pool_gb"], "ai_model_limit": values["ai_model_limit"]})
                 if new_root.exists():
                     backup_root = new_root.parent / f".backup_{new_root.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                     shutil.copytree(new_root, backup_root)
@@ -6624,8 +6611,7 @@ class ControlPanel(tk.Tk):
         self.data_var.set(str(startup.get("data_path", self.data_var.get())))
         data_settings = DataStore(Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)).load_settings()
         if not data_settings:
-            DataStore(Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)).save_settings({"training_seconds": DEFAULT_TRAINING_SECONDS, "still_seconds": DEFAULT_STILL_SECONDS, "experience_pool_gb": DEFAULT_EXPERIENCE_POOL_GB, "ai_model_limit": DEFAULT_AI_MODEL_LIMIT})
-        self.training_seconds_var.set(str(max(1, safe_int(data_settings.get("training_seconds", self.training_seconds_var.get()), DEFAULT_TRAINING_SECONDS))))
+            DataStore(Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)).save_settings({"still_seconds": DEFAULT_STILL_SECONDS, "experience_pool_gb": DEFAULT_EXPERIENCE_POOL_GB, "ai_model_limit": DEFAULT_AI_MODEL_LIMIT})
         self.still_seconds_var.set(str(max(0.1, safe_float(data_settings.get("still_seconds", self.still_seconds_var.get()), DEFAULT_STILL_SECONDS))))
         self.experience_pool_gb_var.set(str(max(0.1, safe_float(data_settings.get("experience_pool_gb", self.experience_pool_gb_var.get()), DEFAULT_EXPERIENCE_POOL_GB))))
         self.ai_model_limit_var.set(str(max(1, safe_int(data_settings.get("ai_model_limit", self.ai_model_limit_var.get()), DEFAULT_AI_MODEL_LIMIT))))
@@ -6634,7 +6620,7 @@ class ControlPanel(tk.Tk):
     def save_persistent_settings(self):
         data_path = Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)
         self.app_config_store.save_settings({"ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH, "data_path": str(data_path)})
-        DataStore(data_path).save_settings({"training_seconds": max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS)), "still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))})
+        DataStore(data_path).save_settings({"still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))})
 
     def screen_rect(self):
         width = safe_int(getattr(win32api, "GetSystemMetrics", lambda _: self.winfo_screenwidth())(0), self.winfo_screenwidth())
@@ -6657,12 +6643,10 @@ class ControlPanel(tk.Tk):
         return max(1.0, sum(cost) / len(cost)) if cost else 24.0
 
     def read_config(self):
-        AllowedUserEditPolicy.assert_allowed("ldplayer_path", "data_path", "training_seconds", "still_seconds", "experience_pool_gb", "ai_model_limit")
-        training_seconds = max(1, safe_int(self.training_seconds_var.get(), DEFAULT_TRAINING_SECONDS))
+        AllowedUserEditPolicy.assert_allowed("ldplayer_path", "data_path", "still_seconds", "experience_pool_gb", "ai_model_limit")
         still_seconds = max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS))
         experience_pool_gb = max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB))
         ai_model_limit = max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))
-        self.training_seconds_var.set(str(training_seconds))
         self.still_seconds_var.set(str(still_seconds))
         self.experience_pool_gb_var.set(str(experience_pool_gb))
         self.ai_model_limit_var.set(str(ai_model_limit))
@@ -6683,7 +6667,7 @@ class ControlPanel(tk.Tk):
         self.settings = settings
         self.escape_monitor.debounce_seconds = settings.key_debounce_seconds
         self.ui(lambda: self.minsize(settings.ui_min_width, settings.ui_min_height))
-        return Config(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH), data_path, training_seconds, still_seconds, experience_pool_gb, ai_model_limit, settings)
+        return Config(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH), data_path, still_seconds, experience_pool_gb, ai_model_limit, settings)
 
     def apply_runtime_settings(self, settings):
         previous_settings = {item.name: getattr(self.settings, item.name) for item in fields(Settings)} if self.settings else {}
@@ -7859,7 +7843,6 @@ class ControlPanel(tk.Tk):
     def training_loop(self, token, stop_event, config):
         session_id = uuid.uuid4().hex
         start = time.perf_counter()
-        training_clock = PausableTrainingClock(config.training_seconds)
         consecutive_failures = 0
         consecutive_no_actions = 0
         last_training_error = None
@@ -7868,7 +7851,7 @@ class ControlPanel(tk.Tk):
         with ScreenAnalyzer(config.settings.hash_size) as analyzer:
             self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start, priority="critical"), None, "mode_start")
             while not stop_event.is_set() and self.is_run_active(token, "training"):
-                if service.should_stop(training_clock, config, stop_event):
+                if service.should_stop(config, stop_event):
                     break
                 rect = self.current_rect()
                 service.prepare_for_event(rect)
@@ -7904,6 +7887,12 @@ class ControlPanel(tk.Tk):
                         self.ui(lambda e=last_training_error: self.status_var.set(f"训练模式结束：连续执行失败：{e}"))
                     continue
                 consecutive_failures = 0
+                sleep_decision = self.experience_pool.model_runtime.should_sleep({"sleep_confidence": safe_float(record.get("sleep_model_confidence", record.get("sleep_confidence", 0.0)), 0.0) if isinstance(record, dict) else 0.0, "reward": safe_float(record.get("reward", 0.0), 0.0) if isinstance(record, dict) else 0.0, "consecutive_failures": consecutive_failures, "consecutive_no_actions": consecutive_no_actions, "elapsed_seconds": time.perf_counter() - start})
+                if sleep_decision.get("sleep"):
+                    self.termination_reason = "sleep_model"
+                    stop_event.set()
+                    self.ui(lambda d=sleep_decision: self.status_var.set(f"入睡模型判断值得进入睡眠模式：{safe_float(d.get('score', 0.0), 0.0):.2f}"))
+                    break
                 delay = safe_float(record["mouse_action"].get("duration", 0.0), 0.0) if record and record.get("mouse_action") else 0.0
                 deadline = time.perf_counter() + max(self.settings.min_action_delay_seconds, delay)
                 while time.perf_counter() < deadline and not stop_event.is_set():
@@ -7915,16 +7904,16 @@ class ControlPanel(tk.Tk):
             self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start, priority="critical"), None, "mode_end")
         if self.is_run_active(token, "training") or self.is_run_active(token, "stopping"):
             final_reason = self.termination_reason or ("esc" if self.should_stop_by_escape() else "user_stop")
-            if final_reason == "time_limit":
+            if final_reason == "sleep_model":
                 saved, save_error = self.flush_mode_data()
                 if not saved:
                     self.finish_run(token, "保存失败：" + str(save_error), 0.0, release=False, reason="runtime_error")
                     return
-                session = self.transition("training", "sleep", reason="time_limit", token=token, fresh_stop_event=True)
+                session = self.transition("training", "sleep", reason="sleep_model", token=token, fresh_stop_event=True)
                 if session:
                     self.update_progress(0.0, force=True)
                     self.ui(self.update_mode_button_states)
-                    self.ui(lambda: self.status_var.set("训练模式达到时间上限，进入睡眠模式"))
+                    self.ui(lambda: self.status_var.set("入睡模型判断值得进入睡眠模式"))
                     self.mode_thread = threading.Thread(target=self.sleep_loop, args=(session.token, config, session.stop_event, True))
                     self.mode_thread.start()
             else:
@@ -8085,27 +8074,22 @@ def run_windows_acceptance():
                 history.append(state)
         return state, history, saved
     ldplayer_path, data_path = startup_config_paths()
-    result = {"startup_repair": "fail", "client_capture": "fail", "mouse_permission": "fail", "occlusion_detection": "fail", "sleep_resume": "fail", "auto_restart_training": "fail", "client_abnormal_scenarios": {}, "cursor_gate": "fail", "training_clock_pause_resume": "fail", "sleep_esc_resume_idempotency": "fail", "flow_tests": {}}
+    result = {"startup_repair": "fail", "client_capture": "fail", "mouse_permission": "fail", "occlusion_detection": "fail", "sleep_resume": "fail", "auto_restart_training": "fail", "client_abnormal_scenarios": {}, "cursor_gate": "fail", "sleep_model_decision": "fail", "sleep_esc_resume_idempotency": "fail", "flow_tests": {}}
     issues = startup_environment_issues()
     storage_issue = data_path_write_issue(data_path, create=True)
     path_ok, path_reason = validate_ldplayer_executable(ldplayer_path, require_attach=False)
     result["startup_repair"] = "pass" if not storage_issue and path_ok and not issues else "fail"
     result["startup_detail"] = {"issues": issues, "ldplayer_path": str(ldplayer_path), "data_path": str(data_path), "path_reason": path_reason, "storage_issue": storage_issue}
-    clock = PausableTrainingClock(900)
-    clock.remaining = 120.0
-    clock.deadline_perf = time.perf_counter() + clock.remaining
-    clock.pause()
-    paused_remaining = clock.remaining
-    time.sleep(0.02)
-    clock.resume()
-    result["training_clock_pause_resume"] = "pass" if abs(paused_remaining - 120.0) < 0.2 and 0.0 < clock.remaining <= 120.0 else "fail"
+    decision_model = SleepDecisionModel(Settings(), {})
+    decision_model.fit([{"sleep_confidence": 0.9, "reward": 1.0}])
+    result["sleep_model_decision"] = "pass" if decision_model.predict({"sleep_confidence": 0.95}).get("sleep") else "fail"
     startup_success = flow("startup_check_failed", (("repair", "startup_repairing"), ("recheck", "idle")))
     startup_failure = {"retry": flow("popup", (("retry", "startup_repairing"), ("recheck", "idle"))), "ignore": flow("popup", (("ignore", "idle"),)), "exit": flow("popup", (("exit", "exited"),))}
     learning_exits = {name: flow("learning", ((name, "stopping"), ("save", "mode_data"), ("idle", "idle"))) for name in ("cursor_outside", "esc", "still_timeout", "window_occluded")}
-    training_normal = flow("training", (("time_limit", "stopping"), ("save", "mode_data"), ("sleep", "sleep")))
+    training_normal = flow("training", (("sleep_model", "stopping"), ("save", "mode_data"), ("sleep", "sleep")))
     training_failure = flow("training", (("executor_error", "stopping"), ("save", "mode_data"), ("idle", "idle")))
     sleep_flow = flow("sleep", (("task1", "sleep_task1"), ("save", "task1"), ("task2", "sleep_task2"), ("save", "task2"), ("task3", "sleep_task3"), ("save", "task3"), ("idle", "idle")))
-    auto_restart_flow = flow("training", (("time_limit", "sleep"), ("task1", "sleep_task1"), ("save", "task1"), ("task2", "sleep_task2"), ("save", "task2"), ("task3", "sleep_task3"), ("save", "task3"), ("idle", "idle"), ("restart", "training")))
+    auto_restart_flow = flow("training", (("sleep_model", "sleep"), ("task1", "sleep_task1"), ("save", "task1"), ("task2", "sleep_task2"), ("save", "task2"), ("task3", "sleep_task3"), ("save", "task3"), ("idle", "idle"), ("restart", "training")))
     sleep_esc_flow = flow("sleep", (("esc", "stopping"), ("save", "sleep_checkpoint"), ("idle", "idle"), ("panel", "panel_visible")))
     migration_flow = flow("migration", (("copy", "migration_temp"), ("interrupt", "migration_checkpoint"), ("resume", "migration_verifying"), ("verified", "idle")))
     result["flow_tests"]["startup_repair_success"] = passfail(startup_success[0] == "idle" and startup_success[1] == ["startup_check_failed", "startup_repairing", "idle"])
