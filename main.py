@@ -55,6 +55,8 @@ AGENT_SPEC = AgentSpec(
 def should_stop_run(stop_event, deadline, escape_check, termination_reason=None):
     if stop_event and stop_event.is_set():
         return termination_reason if termination_reason in TERMINATION_REASONS else "user_stop"
+    if deadline is not None and time.perf_counter() >= deadline:
+        return "deadline"
     if escape_check and escape_check():
         return "esc"
     return None
@@ -664,7 +666,7 @@ ALLOWED_TRANSITIONS = {
 }
 
 
-TERMINATION_REASONS = ("window_invalid", "cursor_outside", "rect_changed", "empty_action", "executor_error", "sleep_model", "esc", "still_timeout", "user_stop", "migration_error", "completed")
+TERMINATION_REASONS = ("window_invalid", "cursor_outside", "rect_changed", "empty_action", "executor_error", "sleep_model", "esc", "still_timeout", "deadline", "user_stop", "migration_error", "completed")
 RUNNING_MODES = {"starting", "learning", "training", "sleep", "migration"}
 HUMAN_FEATURE_NAMES = ("duration", "direct", "bend", "points", "speed_mean", "speed_variance", "acceleration_change", "pauses", "hover_before", "drag_curvature", "double_click_interval")
 
@@ -1076,7 +1078,7 @@ def run_self_test():
     assert "still_timeout" not in ALLOWED_TRANSITIONS[("training", "stopping")]
     assert ("training", "idle") not in ALLOWED_TRANSITIONS
     assert "sleep_model" in ALLOWED_TRANSITIONS[("training", "sleep")]
-    assert should_stop_run(threading.Event(), time.perf_counter() - 1.0, None) is None
+    assert should_stop_run(threading.Event(), time.perf_counter() - 1.0, None) == "deadline"
     assert should_stop_run(threading.Event(), None, None) is None
     stopped_for_user = threading.Event()
     stopped_for_user.set()
@@ -1202,7 +1204,8 @@ def run_self_test():
         queued_path = root / "queued.png"
         persistence = AsyncPersistenceQueue(settings)
         try:
-            assert persistence.enqueue_image(analyzer, image, queued_path, priority="critical")
+            queued_image_ok = persistence.enqueue_image(analyzer, image, queued_path, priority="critical")
+            assert queued_image_ok
             persistence.flush()
         finally:
             persistence.close()
@@ -1227,7 +1230,8 @@ def run_self_test():
                     self.owner.pending_sequences.discard(sequence)
                     self.owner.last_confirmed_sequence = max(self.owner.last_confirmed_sequence, sequence)
         race_queue.jobs = RaceJobs(race_queue)
-        assert AsyncPersistenceQueue.enqueue(race_queue, {"type": "record", "persistence_sequence": 1}, block_when_full=False)
+        race_enqueue_ok = AsyncPersistenceQueue.enqueue(race_queue, {"type": "record", "persistence_sequence": 1}, block_when_full=False)
+        assert race_enqueue_ok
         assert race_queue.pending_sequences == set() and race_queue.last_confirmed_sequence == 1
         reopened_queue = Image.open(queued_path)
         reopened_queue.load()
@@ -3605,13 +3609,43 @@ class DataStore:
         except Exception:
             return path.name
 
+    def model_retention_score(self, path):
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+            self.validate_model_state(payload)
+            policy = payload.get("policy") if isinstance(payload.get("policy"), list) else []
+            validation_gain = max([safe_float(item.get("reward", item.get("sleep_policy_reward", 0.0)), 0.0) for item in policy] or [0.0])
+            coverage = min(1.0, safe_float(len({item.get("id") for item in policy if isinstance(item, dict) and item.get("id")}), 0.0) / max(1.0, safe_float(payload.get("experience_count", 1), 1.0)))
+            stability = 1.0 - clamp(safe_float(((payload.get("model") or {}).get("loss")), 1.0), 0.0, 1.0)
+            age_seconds = max(0.0, time.time() - parse_event_timestamp(payload.get("created_at")))
+            recent = 1.0 / (1.0 + age_seconds / 86400.0)
+            return validation_gain * max(0.001, coverage) * max(0.001, stability) * max(0.001, recent), True
+        except Exception as exc:
+            try:
+                self.log_error("compact_ai_models.score", exc, {"path": str(path)})
+            except Exception:
+                pass
+            return -1.0, False
+
     def compact_ai_models(self, max_models):
         limit = max(1, safe_int(max_models, AGENT_SPEC.default_ai_model_limit))
-        models = sorted(self.model_dir.glob("model_*.json"), key=self.model_created_key, reverse=True)
-        keep = min(len(models), limit)
+        scored = []
+        for path in self.model_dir.glob("model_*.json"):
+            score, valid = self.model_retention_score(path)
+            scored.append({"path": path, "score": score, "valid": valid, "created": self.model_created_key(path)})
+        scored.sort(key=lambda item: (item["valid"], item["score"], item["created"]), reverse=True)
+        keep_paths = {item["path"] for item in scored[:limit]}
+        if scored and not any(item["valid"] for item in scored[:limit]):
+            first_valid = next((item for item in scored if item["valid"]), None)
+            if first_valid:
+                keep_paths.add(first_valid["path"])
         removed = 0
         errors = []
-        for path in models[keep:]:
+        for item in sorted(scored, key=lambda item: (item["valid"], item["score"], item["created"])):
+            path = item["path"]
+            if path in keep_paths or len(list(self.model_dir.glob("model_*.json"))) <= limit:
+                continue
             try:
                 path.unlink()
                 removed += 1
@@ -5411,10 +5445,10 @@ class AsyncPersistenceQueue:
         return self.enqueue({"type": "image", "analyzer": analyzer, "image": prepared_image, "path": path, "store": store, "priority": priority, "persistence_sequence": self.allocate_sequence()}, block_when_full=critical)
 
     def enqueue_record(self, store, record):
-        prepared = copy.deepcopy(record)
         sequence = self.allocate_sequence()
-        prepared["persistence_sequence"] = sequence
-        prepared["persistence_status"] = "queued"
+        record["persistence_sequence"] = sequence
+        record["persistence_status"] = "queued"
+        prepared = copy.deepcopy(record)
         return self.enqueue({"type": "record", "store": store, "record": prepared, "persistence_sequence": sequence}, block_when_full=True)
 
     def enqueue(self, job, block_when_full=False, timeout_seconds=None, stop_event=None, heartbeat=None):
@@ -6551,22 +6585,22 @@ class ControlPanel(tk.Tk):
                     self.ui(lambda c=copied, t=total: self.progress_label_var.set(f"数据迁移中｜已迁移 {c}/{t} 字节"))
             if not stop_event.is_set() and self.is_run_active(token, "migration"):
                 DataStore(temp_root).save_settings({"still_seconds": values["still_seconds"], "experience_pool_gb": values["experience_pool_gb"], "ai_model_limit": values["ai_model_limit"]})
+                journal_path = new_root.parent / f".{new_root.name}.migration.journal.json"
+                atomic_write_json(journal_path, {"stage": "prepare", "old_path": str(old_root), "new_path": str(new_root), "temp_path": str(temp_root), "created_at": now_text()}, self.store.lock if self.store else threading.RLock())
+                self.verify_migration(old_root, temp_root)
+                atomic_write_json(journal_path, {"stage": "verify", "old_path": str(old_root), "new_path": str(new_root), "temp_path": str(temp_root), "created_at": now_text()}, self.store.lock if self.store else threading.RLock())
                 if new_root.exists():
-                    backup_root = new_root.parent / f".backup_{new_root.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                    shutil.copytree(new_root, backup_root)
-                    for item in temp_root.iterdir():
-                        target = new_root / item.name
-                        if target.exists():
-                            if target.is_dir():
-                                shutil.rmtree(target)
-                            else:
-                                target.unlink()
-                        shutil.move(str(item), str(target))
-                    shutil.rmtree(temp_root, ignore_errors=True)
-                else:
-                    temp_root.replace(new_root)
-                    temp_root = None
+                    backup_root = new_root.parent / f".backup_{new_root.name}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+                    new_root.replace(backup_root)
+                atomic_write_json(journal_path, {"stage": "swap", "old_path": str(old_root), "new_path": str(new_root), "temp_path": str(temp_root), "backup_path": str(backup_root) if backup_root else None, "created_at": now_text()}, self.store.lock if self.store else threading.RLock())
+                temp_root.replace(new_root)
+                temp_root = None
                 self.verify_migration(old_root, new_root)
+                atomic_write_json(journal_path, {"stage": "committed", "old_path": str(old_root), "new_path": str(new_root), "backup_path": str(backup_root) if backup_root else None, "created_at": now_text()}, self.store.lock if self.store else threading.RLock())
+                try:
+                    journal_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
                 self.ui(lambda path=str(new_root), v=dict(values): (self.ldplayer_var.set(v["ldplayer_path"]), self.data_var.set(path), self.apply_runtime_value_vars(v)))
                 self.app_config_store.save_settings({"ldplayer_path": values["ldplayer_path"], "data_path": str(new_root)})
                 self.store = DataStore(new_root)
@@ -7209,8 +7243,8 @@ class ControlPanel(tk.Tk):
             self.apply_runtime_settings(learned_settings)
         completed = 0
         submitted = 0
-        workers = max(1, config.settings.sleep_worker_count)
-        queue_depth = max(workers, config.settings.sleep_queue_depth)
+        workers = 1
+        queue_depth = 1
         batch_size = max(1, config.settings.sleep_batch_size)
         minimum_training_batches = workers
         target_training_steps = max(minimum_training_batches, math.ceil(max(1, self.experience_pool.count() if self.experience_pool else 1) / batch_size), workers * max(1, config.settings.ui_metric_columns))
@@ -7221,7 +7255,7 @@ class ControlPanel(tk.Tk):
         models_complete = False
         checkpoint = self.store.load_sleep_checkpoint() if self.store else None
         if not checkpoint or checkpoint.get("completed"):
-            checkpoint = {"run_id": uuid.uuid4().hex, "stage": "prepare", "task1_completed": False, "task2_completed": False, "task3_model_cleanup_completed": False, "task3_pool_compaction_completed": False, "created_at": now_text()}
+            checkpoint = {"run_id": uuid.uuid4().hex, "session_seed": uuid.uuid4().hex, "sample_order": [], "stage": "prepare", "task1_completed": False, "task2_completed": False, "task3_model_cleanup_completed": False, "task3_pool_compaction_completed": False, "created_at": now_text()}
         def current_session_reason():
             with self.state_lock:
                 return self.active_session.termination_reason if self.active_session and self.active_session.token == token else None
@@ -7707,7 +7741,7 @@ class ControlPanel(tk.Tk):
             reward = 0.0
             reward_info = dict(reward_info)
             reward_info["basis"] = "screen_result_unknown_excluded"
-        screen_score_total = self.store.add_screen_score_total(reward)
+        screen_score_total = safe_float(self.store.state.get("screen_score_total", 0.0), 0.0) + reward
         started_perf = safe_float(normalized.get("started_perf"), None) if normalized else None
         offset_source = started_perf if started_perf is not None else action_anchor_perf
         offset_ms = round((float(offset_source) - snapshot.perf_time) * 1000.0, 3) if offset_source is not None else None
@@ -7722,8 +7756,40 @@ class ControlPanel(tk.Tk):
             record["exclude_from_training"] = True
         if decision:
             record["ai_decision"] = decision
-        self.persistence_queue.enqueue_record(self.store, record)
-        self.events.publish("save_completed", kind="record", record_id=record.get("id"))
+        record["persistence_status"] = "prepared"
+        if record.get("image_dropped") or not record.get("screen_file_expected", True):
+            record["exclude_from_training"] = True
+            record["score_status"] = "image_unavailable_untrainable"
+        queued = self.persistence_queue.enqueue_record(self.store, record) if self.persistence_queue else False
+        if queued:
+            try:
+                self.persistence_queue.flush(timeout_seconds=self.settings.persistence_close_seconds)
+                record["persistence_status"] = "committed"
+                record["persistence_committed_at"] = now_text()
+            except Exception as exc:
+                record["persistence_status"] = "failed"
+                record["exclude_from_training"] = True
+                if self.store:
+                    self.store.log_error("record_persistence_commit_failed", exc, {"record_id": record.get("id"), "persistence_sequence": record.get("persistence_sequence")})
+                return None
+        else:
+            try:
+                record["persistence_status"] = "committed"
+                record["persistence_committed_at"] = now_text()
+                self.store.append_experience(record)
+                self.store.flush_state(force=True)
+            except Exception as exc:
+                record["persistence_status"] = "failed"
+                record["exclude_from_training"] = True
+                if self.store:
+                    self.store.log_error("record_persistence_sync_failed", exc, {"record_id": record.get("id")})
+                self.events.publish("save_failed", kind="record", record_id=record.get("id"), error=str(exc))
+                with self.state_lock:
+                    self.termination_reason = "runtime_error"
+                return None
+        screen_score_total = self.store.add_screen_score_total(reward)
+        record["screen_score_total"] = screen_score_total
+        self.events.publish("save_completed", kind="record", record_id=record.get("id"), persistence_status=record.get("persistence_status"))
         self.experience_pool.add(record)
         self.update_metrics(after_novelty, human_score, novelty_reward, human_delta, reward, screen_score_total, decision)
         return record
