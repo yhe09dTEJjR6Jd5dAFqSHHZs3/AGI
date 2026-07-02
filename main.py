@@ -1183,6 +1183,7 @@ def run_self_test():
     require(runtime.mouse_humanlikeness(matching_mouse_action, 55.0) == direct_human_score, 'runtime.mouse_humanlikeness(matching_mouse_action, 55.0) == direct_human_score')
     require(direct_human_score != 55.0, 'direct_human_score != 55.0')
     require(0.0 <= runtime.operation_policy_score(pool.records[0], 0.9) <= 1.0, '0.0 <= runtime.operation_policy_score(pool.records[0], 0.9) <= 1.0')
+    require(runtime.judge_discard_score({"reward": -1.0, "valid": False}) > runtime.judge_discard_score({"reward": 100.0, "valid": True}), 'runtime.judge_discard_score({"reward": -1.0, "valid": False}) > runtime.judge_discard_score({"reward": 100.0, "valid": True})')
     require(runtime.reward(70.0, 100.0) > runtime.reward(70.0, 0.0), 'runtime.reward(70.0, 100.0) > runtime.reward(70.0, 0.0)')
     require(runtime.reward(71.0, 0.0) > runtime.reward(70.0, 100.0), 'runtime.reward(71.0, 0.0) > runtime.reward(70.0, 100.0)')
     require(isinstance(runtime.models["runtime_value_model"].predict({"cpu_load": 0.0, "memory_free_ratio": 0.5}), dict), 'isinstance(runtime.models["runtime_value_model"].predict({"cpu_load": 0.0, "memory_free_ratio": 0.5}), dict)')
@@ -1523,7 +1524,7 @@ def run_self_test():
         require(len(list(store.model_dir.glob("model_*.json"))) == 1, 'len(list(store.model_dir.glob("model_*.json"))) == 1')
         model_path = max(store.model_dir.glob("model_*.json"), key=store.model_created_key)
         model_payload = json.loads(model_path.read_text(encoding="utf-8"))
-        require(len(model_payload["model_group"]["models"]) == 6, 'len(model_payload["model_group"]["models"]) == 6')
+        require(len(model_payload["model_group"]["models"]) == 7, 'len(model_payload["model_group"]["models"]) == 7')
         require([item["key"] for item in model_payload["model_group"]["models"]] == [item["key"] for item in AI_MODEL_GROUP_SPECS], '[item["key"] for item in model_payload["model_group"]["models"]] == [item["key"] for item in AI_MODEL_GROUP_SPECS]')
         model_path.write_bytes(model_path.read_bytes() + (b"m" * 2048))
         require(store.storage_size_bytes() > store.experience_pool_size_bytes(), 'store.storage_size_bytes() > store.experience_pool_size_bytes()')
@@ -2403,12 +2404,13 @@ def strict_reward_target(screen_score, human_similarity):
 
 
 AI_MODEL_GROUP_SPECS = (
-    {"key": "screen_novelty_scorer", "name": "画面新颖程度评分模型", "goal": "一个画面与经验池中最相似的一批历史画面批量聚合相似度越高，评分越低"},
-    {"key": "mouse_humanlikeness_scorer", "name": "鼠标拟人程度评分模型", "goal": "AI鼠标操作与学习模式用户鼠标操作相似度越高，评分越高"},
-    {"key": "operation_policy", "name": "实操模型", "goal": "在训练模式期间，雷电模拟器客户区内，AI输出鼠标操作"},
-    {"key": "sleep_decision_model", "name": "入睡模型", "goal": "在训练模式期间，判断是否值得进入睡眠模式"},
+    {"key": "sleep_decision_model", "name": "入睡模型", "goal": "训练模式期间，判断是否值得进入睡眠模式"},
+    {"key": "operation_policy", "name": "活动模型", "goal": "训练模式期间，雷电模拟器客户区内，AI输出鼠标操作"},
+    {"key": "judge_model", "name": "法官模型", "goal": "睡眠模式期间，找出最值得删除的AI模型组或经验池数据"},
+    {"key": "runtime_value_model", "name": "数学模型", "goal": "依据现实条件确定所有未在要求中确定的变量的初始数值，并让它们跟随现实条件的变化而变化"},
+    {"key": "screen_novelty_scorer", "name": "画面新颖程度评分模型", "goal": "一个画面与经验池中和它最相似的一批历史画面相似度越高（0%→100%），评分越低"},
+    {"key": "mouse_humanlikeness_scorer", "name": "鼠标拟人程度评分模型", "goal": "AI在训练模式期间输出的鼠标操作，与用户在学习模式期间的鼠标操作相似度越高（0%→100%），评分越高"},
     {"key": "reward_model", "name": "奖励模型", "goal": "奖励=收入（画面评分不同的样本，画面评分越高，收入越高；画面评分相同的样本，鼠标评分越高，收入越高）-支出（支出一开始为正极小值，随时间推移逐渐变大，并在收入变高时重置为正极小值）"},
-    {"key": "runtime_value_model", "name": "数学模型", "goal": "依据现实条件确定没有在要求中确定的变量的初始数值，并让它们跟随现实条件的变化而变化"},
 )
 
 
@@ -2846,6 +2848,57 @@ class RewardModel(TrainableModel):
         return obj
 
 
+class JudgeModel(TrainableModel):
+    key = "judge_model"
+    model_type = "retention_deletion_judge_model"
+
+    def fit(self, records):
+        super().fit(records)
+        clean = [record for record in records or [] if isinstance(record, dict)]
+        rewards = [safe_float(record.get("reward", record.get("total_reward", 0.0)), 0.0) for record in clean]
+        novelty = [safe_float(record.get("sleep_novelty", record.get("novelty", record.get("screen_score", 0.0))), 0.0) for record in clean]
+        human = [safe_float(record.get("sleep_human_score", record.get("human_score", 50.0)), 50.0) for record in clean]
+        confidence = [safe_float(record.get("sleep_confidence", 0.0), 0.0) for record in clean]
+        self.reward_floor = round(percentile(rewards, 0.25, 0.0), 6) if rewards else 0.0
+        self.novelty_floor = round(percentile(novelty, 0.25, 0.0), 6) if novelty else 0.0
+        self.human_floor = round(percentile(human, 0.25, 50.0), 6) if human else 50.0
+        self.confidence_floor = round(percentile(confidence, 0.25, 0.0), 6) if confidence else 0.0
+        self.metrics = {"records": len(clean), "reward_floor": self.reward_floor, "novelty_floor": self.novelty_floor, "human_floor": self.human_floor, "confidence_floor": self.confidence_floor}
+        return self.metrics
+
+    def parameters(self):
+        return {"reward_floor": getattr(self, "reward_floor", 0.0), "novelty_floor": getattr(self, "novelty_floor", 0.0), "human_floor": getattr(self, "human_floor", 50.0), "confidence_floor": getattr(self, "confidence_floor", 0.0), "intelligence_goal": "rank the most disposable AI model groups and experience records during sleep cleanup"}
+
+    def predict(self, features):
+        features = features or {}
+        reward = safe_float(features.get("reward", features.get("retention_score", 0.0)), 0.0)
+        novelty = safe_float(features.get("novelty", features.get("screen_score", 0.0)), 0.0)
+        human = safe_float(features.get("human_score", 50.0), 50.0)
+        confidence = safe_float(features.get("confidence", features.get("sleep_confidence", 0.0)), 0.0)
+        valid = 1.0 if features.get("valid", True) else 0.0
+        duplicate = 1.0 if features.get("duplicate", False) else 0.0
+        age_days = max(0.0, safe_float(features.get("age_seconds", 0.0), 0.0) / 86400.0)
+        reward_gap = safe_float(getattr(self, "reward_floor", 0.0), 0.0) - reward
+        novelty_gap = safe_float(getattr(self, "novelty_floor", 0.0), 0.0) - novelty
+        human_gap = safe_float(getattr(self, "human_floor", 50.0), 50.0) - human
+        confidence_gap = safe_float(getattr(self, "confidence_floor", 0.0), 0.0) - confidence
+        score = (1.0 - valid) * 1000000.0 + duplicate * 10000.0 + max(0.0, reward_gap) * 10.0 + max(0.0, novelty_gap) + max(0.0, human_gap) * 0.1 + max(0.0, confidence_gap) * 5.0 + age_days * 0.01
+        return round(score, 8)
+
+    def probe_input(self):
+        return {"reward": 0.0, "novelty": 0.0, "human_score": 50.0, "confidence": 0.0, "valid": True}
+
+    @classmethod
+    def restore(cls, payload, settings=None):
+        obj = cls(settings, payload)
+        params = payload.get("parameters") if isinstance(payload, dict) else {}
+        obj.reward_floor = safe_float(params.get("reward_floor", 0.0), 0.0) if isinstance(params, dict) else 0.0
+        obj.novelty_floor = safe_float(params.get("novelty_floor", 0.0), 0.0) if isinstance(params, dict) else 0.0
+        obj.human_floor = safe_float(params.get("human_floor", 50.0), 50.0) if isinstance(params, dict) else 50.0
+        obj.confidence_floor = safe_float(params.get("confidence_floor", 0.0), 0.0) if isinstance(params, dict) else 0.0
+        return obj
+
+
 class RuntimeValueModel(TrainableModel):
     key = "runtime_value_model"
     model_type = "resource_adaptive_runtime_value_model"
@@ -2928,7 +2981,7 @@ class SleepDecisionModel(TrainableModel):
         return obj
 
 
-TRAINABLE_MODEL_CLASSES = {cls.key: cls for cls in (ScreenNoveltyScorerModel, MouseHumanlikenessScorerModel, OperationPolicyModel, RewardModel, RuntimeValueModel, SleepDecisionModel)}
+TRAINABLE_MODEL_CLASSES = {cls.key: cls for cls in (ScreenNoveltyScorerModel, MouseHumanlikenessScorerModel, OperationPolicyModel, JudgeModel, RewardModel, RuntimeValueModel, SleepDecisionModel)}
 
 
 def restore_trainable_model(payload, settings=None):
@@ -2980,6 +3033,13 @@ class ModelGroupRuntime:
             features["confidence"] = clamp(similarity, 0.0, 1.0)
             return model.predict(features)
         return 0.0
+
+    def judge_discard_score(self, features):
+        model = self.models.get("judge_model")
+        if model:
+            return model.predict(features or {})
+        data = features or {}
+        return (0.0 if data.get("valid", True) else 1000000.0) + (10000.0 if data.get("duplicate", False) else 0.0) - safe_float(data.get("reward", data.get("retention_score", 0.0)), 0.0)
 
     def reward(self, screen_score, human_score, event_time=None, reward_state=None, commit_state=False):
         model = self.models.get("reward_model")
@@ -3044,6 +3104,7 @@ def ai_model_group_snapshot(policy_payload, settings, records):
         "mouse_humanlikeness_scorer": {},
         "operation_policy": {"policy": policy_payload},
         "sleep_decision_model": {},
+        "judge_model": {},
         "reward_model": {},
         "runtime_value_model": {"resource_model": policy_payload.get("resource_model") if isinstance(policy_payload.get("resource_model"), dict) else {}}
     }
@@ -3602,7 +3663,7 @@ class DataStore:
             model_payload = model.snapshot() if model else None
             model_group = ai_model_group_snapshot(model_payload, settings, ranked)
             if not model_group_complete(model_group, settings):
-                raise RuntimeError("AI模型组快照不完整：六类模型必须都能独立加载并完成探针推理")
+                raise RuntimeError("AI模型组快照不完整：七类模型必须都能独立加载并完成探针推理")
             identity = hashlib.sha256(str(self.root.resolve()).encode("utf-8", "replace")).hexdigest()
             training_digest = hashlib.sha256(json.dumps([record.get("id") for record in ranked[:limit]], ensure_ascii=False).encode("utf-8")).hexdigest()
             payload = {"schema_version": CONFIG_SCHEMA_VERSION, "model_version": 2, "training_data_version": 1, "data_path_id": identity, "checksum": training_digest, "created_at": now_text(), "status": status, "status_detail": status_detail or {}, "screen_score_total": self.screen_score_total, "reward_state": next((record.get("reward_state") for record in reversed(records or []) if isinstance(record, dict) and isinstance(record.get("reward_state"), dict)), asdict(RewardState())), "experience_count": len(records or []), "policy_limit": limit, "training_sample_ids": [record.get("id") for record in ranked[:limit]], "model_group": model_group, "model": model_payload, "policy": [{"id": record.get("id"), "mode": record.get("mode"), "action_type": (record.get("mouse_action") or {}).get("type") if isinstance(record.get("mouse_action"), dict) else None, "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_model_confidence": safe_float(record.get("sleep_model_confidence", record.get("model_prediction", 0.0)), 0.0), "model_prediction": safe_float(record.get("model_prediction", 0.0), 0.0), "model_target": safe_float(record.get("model_target", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
