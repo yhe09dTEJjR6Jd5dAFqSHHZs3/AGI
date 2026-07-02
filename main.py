@@ -8,6 +8,7 @@ import hashlib
 import math
 import random
 import queue
+import sqlite3
 import subprocess
 import sys
 import os
@@ -1461,7 +1462,7 @@ def run_self_test():
         modify_panel.experience_pool_gb_var.set("4")
         modify_panel.ai_model_limit_var.set("5")
         modify_panel.settings = settings
-        modify_panel.runtime_value_specs = {"still_seconds": ("静止秒数", modify_panel.still_seconds_var, DEFAULT_STILL_SECONDS, safe_float, 0.1), "experience_pool_gb": ("经验池 GB", modify_panel.experience_pool_gb_var, DEFAULT_EXPERIENCE_POOL_GB, safe_float, 0.1), "ai_model_limit": ("AI 模型个数", modify_panel.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, 1)}
+        modify_panel.runtime_value_specs = {"still_seconds": ("静止秒数", modify_panel.still_seconds_var, DEFAULT_STILL_SECONDS, safe_float, 0.1), "experience_pool_gb": ("经验池 GB", modify_panel.experience_pool_gb_var, DEFAULT_EXPERIENCE_POOL_GB, safe_float, 0.1), "ai_model_limit": ("AI 模型组上限", modify_panel.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, 1)}
         modify_panel.update_mode_button_states = lambda: setattr(modify_panel, "updated", True)
         modify_panel.refresh_runtime_environment_state = lambda: setattr(modify_panel, "refreshed", True)
         modify_panel.save_persistent_settings = lambda: setattr(modify_panel, "saved", True)
@@ -3344,6 +3345,7 @@ class DataStore:
         self.screen_dir = self.root / "screens"
         self.model_dir = self.root / "models"
         self.experience_file = self.root / "experience.jsonl"
+        self.experience_index_file = self.root / "experience.sqlite3"
         self.state_file = self.root / "state.json"
         self.settings_file = self.root / "settings.json"
         self.sleep_checkpoint_file = self.root / "sleep_checkpoint.json"
@@ -3519,6 +3521,11 @@ class DataStore:
                 file.write(json.dumps(record, ensure_ascii=False) + "\n")
                 file.flush()
                 os.fsync(file.fileno())
+            try:
+                line_no = self.next_experience_index_line()
+                self.upsert_experience_index_record(line_no, record, len(json.dumps(record, ensure_ascii=False).encode("utf-8")) + 1)
+            except Exception as exc:
+                self.log_error("append_experience.index", exc, {"id": str(record.get("id")) if isinstance(record, dict) else None})
 
     def save_experience_records(self, records):
         with self.lock:
@@ -3802,6 +3809,122 @@ class DataStore:
                 self.quarantine_bad_experience(line_number, text, exc)
         return records[:limit]
 
+
+    def count_experience_lines(self):
+        if not self.experience_file.exists():
+            return 0
+        count = 0
+        with self.experience_file.open("rb") as file:
+            for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                count += chunk.count(b"\n")
+        return count
+
+    def next_experience_index_line(self):
+        if self.experience_index_file.exists():
+            try:
+                with self.open_experience_index() as connection:
+                    value = connection.execute("SELECT COALESCE(MAX(line_no), 0) + 1 FROM experience_meta").fetchone()[0]
+                    return max(1, safe_int(value, 1))
+            except Exception as exc:
+                self.log_error("next_experience_index_line", exc, {"path": str(self.experience_index_file)})
+        return max(1, self.count_experience_lines())
+
+    def open_experience_index(self):
+        connection = sqlite3.connect(str(self.experience_index_file))
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("CREATE TABLE IF NOT EXISTS experience_meta(line_no INTEGER PRIMARY KEY, record_id TEXT, reward REAL, created_at TEXT, action_type TEXT, hash_prefix TEXT, trainable INTEGER, line_bytes INTEGER, delete_score REAL)")
+        connection.execute("CREATE TABLE IF NOT EXISTS screen_refs(line_no INTEGER, path TEXT, PRIMARY KEY(line_no, path))")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_experience_reward ON experience_meta(reward)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_experience_created_at ON experience_meta(created_at)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_experience_action_type ON experience_meta(action_type)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_experience_hash_prefix ON experience_meta(hash_prefix)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_experience_trainable ON experience_meta(trainable)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_experience_delete_score ON experience_meta(delete_score)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_screen_refs_path ON screen_refs(path)")
+        return connection
+
+    def experience_record_hash_prefix(self, record):
+        for key in ("screen_hash", "image_hash", "hash", "before_hash", "after_hash"):
+            value = record.get(key) if isinstance(record, dict) else None
+            if value:
+                return str(value)[:16]
+        value = record.get("screen_path") if isinstance(record, dict) else None
+        return hashlib.sha1(str(value or record.get("id", "")).encode("utf-8", "ignore")).hexdigest()[:16] if isinstance(record, dict) else ""
+
+    def experience_action_type(self, record):
+        action = record.get("mouse_action") if isinstance(record, dict) else None
+        if isinstance(action, dict):
+            for key in ("type", "button", "action", "kind"):
+                if action.get(key):
+                    return str(action.get(key))[:64]
+        return str(record.get("mouse_source") or record.get("mode") or "unknown")[:64] if isinstance(record, dict) else "unknown"
+
+    def experience_trainable(self, record):
+        if not isinstance(record, dict):
+            return 0
+        if record.get("image_dropped") or record.get("persistence_status") == "dropped":
+            return 0
+        if not record.get("mouse_action"):
+            return 0
+        paths = self.experience_record_paths([record])
+        if any(not path.exists() or not path.is_file() for path in paths):
+            return 0
+        return 1
+
+    def experience_delete_score(self, record, line_no):
+        trainable = self.experience_trainable(record)
+        reward = safe_float(self.record_reward_sort_key(record)[0], 0.0) if isinstance(record, dict) else 0.0
+        novelty = safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0) if isinstance(record, dict) else 0.0
+        confidence = safe_float(record.get("sleep_confidence", 0.0), 0.0) if isinstance(record, dict) else 0.0
+        duplicate = 1.0 if isinstance(record, dict) and record.get("duplicate") else 0.0
+        damaged = 0.0 if trainable else 1.0
+        return damaged * -1000000.0 + duplicate * -10000.0 + reward * 10.0 + novelty + confidence * 5.0 + min(1000.0, safe_float(line_no, 0.0) / 1000000.0)
+
+    def upsert_experience_index_record(self, line_no, record, line_bytes):
+        with self.open_experience_index() as connection:
+            paths = [self.relative_path(path) for path in self.experience_record_paths([record])]
+            connection.execute("REPLACE INTO experience_meta(line_no, record_id, reward, created_at, action_type, hash_prefix, trainable, line_bytes, delete_score) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)", (line_no, str(record.get("id", "")) if isinstance(record, dict) else "", safe_float(self.record_reward_sort_key(record)[0], 0.0) if isinstance(record, dict) else 0.0, str(record.get("timestamp") or record.get("time") or record.get("created_at") or "") if isinstance(record, dict) else "", self.experience_action_type(record), self.experience_record_hash_prefix(record), self.experience_trainable(record), max(1, safe_int(line_bytes, 1)), self.experience_delete_score(record, line_no)))
+            connection.execute("DELETE FROM screen_refs WHERE line_no=?", (line_no,))
+            connection.executemany("INSERT OR IGNORE INTO screen_refs(line_no, path) VALUES(?, ?)", [(line_no, path) for path in paths])
+
+    def rebuild_experience_index(self, progress_callback=None):
+        with self.open_experience_index() as connection:
+            connection.execute("DELETE FROM screen_refs")
+            connection.execute("DELETE FROM experience_meta")
+            if not self.experience_file.exists():
+                return {"records": 0, "bytes": 0}
+            count = 0
+            total = 0
+            batch_meta = []
+            batch_refs = []
+            with self.experience_file.open("r", encoding="utf-8") as file:
+                for line_number, line in enumerate(file, start=1):
+                    text = line.strip()
+                    if not text:
+                        continue
+                    try:
+                        record = json.loads(text)
+                    except Exception as exc:
+                        self.quarantine_bad_experience(line_number, text, exc)
+                        continue
+                    line_bytes = len(line.encode("utf-8"))
+                    total += line_bytes
+                    count += 1
+                    batch_meta.append((line_number, str(record.get("id", "")) if isinstance(record, dict) else "", safe_float(self.record_reward_sort_key(record)[0], 0.0), str(record.get("timestamp") or record.get("time") or record.get("created_at") or ""), self.experience_action_type(record), self.experience_record_hash_prefix(record), self.experience_trainable(record), max(1, line_bytes), self.experience_delete_score(record, line_number)))
+                    for path in self.experience_record_paths([record]):
+                        batch_refs.append((line_number, self.relative_path(path)))
+                    if len(batch_meta) >= 1000:
+                        connection.executemany("INSERT OR REPLACE INTO experience_meta VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)", batch_meta)
+                        connection.executemany("INSERT OR IGNORE INTO screen_refs VALUES(?, ?)", batch_refs)
+                        batch_meta.clear(); batch_refs.clear()
+                        if progress_callback:
+                            progress_callback("建立经验索引", count, max(1, count), {"removed": 0, "size_bytes": total})
+            if batch_meta:
+                connection.executemany("INSERT OR REPLACE INTO experience_meta VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)", batch_meta)
+                connection.executemany("INSERT OR IGNORE INTO screen_refs VALUES(?, ?)", batch_refs)
+            return {"records": count, "bytes": total}
+
     def storage_size_bytes(self):
         total = 0
         if not self.root.exists():
@@ -3894,120 +4017,106 @@ class DataStore:
 
     def compact_experience_pool(self, limit_gb, run_guard=None, progress_callback=None):
         limit_bytes = max(1, int(max(0.1, safe_float(limit_gb, DEFAULT_EXPERIENCE_POOL_GB)) * 1024 * 1024 * 1024))
-        records = self.load_experience()
-        if progress_callback:
-            progress_callback("扫描经验记录", 0, max(1, len(records)), {"removed": 0, "size_bytes": 0, "target_bytes": limit_bytes})
-        path_sizes = {}
-        for path in self.experience_record_paths(records):
-            try:
-                path_sizes[path] = path.stat().st_size
-            except Exception:
-                pass
-        experience_file_size = 0
-        if self.experience_file.exists():
-            try:
-                experience_file_size = self.experience_file.stat().st_size
-            except Exception:
-                pass
-        current = experience_file_size + sum(path_sizes.values())
-        size_report = self.cleanup_orphan_screens(records)
-        if progress_callback:
-            progress_callback("统计引用图片", len(path_sizes), max(1, len(path_sizes)), {"removed": 0, "size_bytes": current, "target_bytes": limit_bytes})
-        if current <= limit_bytes:
-            complete = current <= limit_bytes and size_report.get("orphan_screen_size_bytes", 0) == 0
-            result = {"changed": bool(size_report.get("orphan_cleanup_attempted", 0)), "size_bytes": current, "removed": 0, "target_bytes": limit_bytes, "complete": complete}
-            result.update(size_report)
-            return result
-        target_bytes = max(1, limit_bytes // 2)
-        records = []
-        if self.experience_file.exists():
-            with self.experience_file.open("r", encoding="utf-8") as file:
-                for line_number, line in enumerate(file, start=1):
-                    text = line.strip()
-                    if not text:
-                        continue
-                    try:
-                        record = json.loads(text)
-                    except Exception as exc:
-                        self.quarantine_bad_experience(line_number, text, exc)
-                        continue
-                    reward = self.record_reward_sort_key(record)
-                    records.append({"reward": reward, "line": line_number, "text": text, "record": record})
-        records.sort(key=lambda item: (item["reward"], item["line"]))
-        if progress_callback:
-            progress_callback("按奖励排序", len(records), max(1, len(records)), {"removed": 0, "size_bytes": current, "target_bytes": target_bytes})
-        path_references = defaultdict(int)
-        record_paths = {}
-        for item in records:
-            paths = self.experience_record_paths([item["record"]])
-            record_paths[item["line"]] = paths
-            for path in paths:
-                path_references[path] += 1
-        removed_ids = set()
-        removed = 0
-        interrupted = False
-        for item in records:
-            if run_guard and run_guard():
-                interrupted = True
-                break
-            if current <= target_bytes:
-                break
-            removed += 1
-            removed_ids.add(item["line"])
-            current = max(0, current - (len(item["text"].encode("utf-8")) + 1))
-            for path in record_paths.get(item["line"], set()):
-                path_references[path] = max(0, path_references[path] - 1)
-                if path_references[path] == 0:
-                    try:
-                        if path.exists() and path.is_file():
-                            size = path_sizes.get(path, path.stat().st_size)
-                            current = max(0, current - size)
-                    except Exception:
-                        pass
-            if progress_callback and (removed == 1 or removed % 100 == 0):
-                progress_callback("删除低奖励样本", removed, max(1, len(records)), {"removed": removed, "size_bytes": current, "target_bytes": target_bytes})
-        if interrupted:
-            size_report = self.experience_pool_size_report([entry["record"] for entry in records])
-            result = {"changed": False, "interrupted": True, "removed": removed, "size_bytes": current, "target_bytes": target_bytes, "complete": False}
-            result.update(size_report)
-            return result
-        if removed_ids:
-            keep_records = [entry for entry in records if entry["line"] not in removed_ids]
-            referenced_after = set()
-            for entry in keep_records:
-                referenced_after.update(record_paths.get(entry["line"], set()))
-            delete_after_replace = [path for path in path_sizes if path not in referenced_after]
-            temporary = self.experience_file.with_suffix(".compact.tmp")
-            with temporary.open("w", encoding="utf-8") as file:
-                for index, item in enumerate(keep_records, start=1):
-                    file.write(item["text"] + "\n")
-                    if progress_callback and (index == 1 or index % 500 == 0):
-                        progress_callback("重写经验文件", index, max(1, len(keep_records)), {"removed": removed, "size_bytes": current, "target_bytes": target_bytes})
-                file.flush()
-                os.fsync(file.fileno())
-            self.replace_atomic_synced(temporary, self.experience_file)
-            for index, path in enumerate(delete_after_replace, start=1):
+        index_result = self.rebuild_experience_index(progress_callback)
+        with self.open_experience_index() as connection:
+            experience_file_size = safe_int(index_result.get("bytes", 0), 0)
+            path_sizes = {}
+            for (relative,) in connection.execute("SELECT DISTINCT path FROM screen_refs"):
                 try:
-                    if path.exists() and path.is_file():
-                        path.unlink()
+                    path = (self.root / relative).resolve()
+                    if path.is_file() and self.root.resolve() in (path, *path.parents):
+                        path_sizes[relative] = path.stat().st_size
                 except Exception as exc:
+                    self.log_error("compact_experience_pool.stat", exc, {"path": str(relative)})
+            current = experience_file_size + sum(path_sizes.values())
+            if progress_callback:
+                progress_callback("统计经验索引", safe_int(index_result.get("records", 0), 0), max(1, safe_int(index_result.get("records", 0), 0)), {"removed": 0, "size_bytes": current, "target_bytes": limit_bytes})
+            if current <= limit_bytes:
+                return {"changed": False, "size_bytes": current, "removed": 0, "target_bytes": limit_bytes, "complete": True, "logical_pool_size_bytes": current, "physical_pool_size_bytes": current, "orphan_screen_size_bytes": 0, "orphan_screen_count": 0, "orphan_screen_paths": []}
+            target_bytes = max(1, limit_bytes // 2)
+            keep_min = max(1, safe_int(DEFAULT_AI_MODEL_LIMIT, 10))
+            protected = set()
+            for column in ("hash_prefix", "action_type"):
+                values = [row[0] for row in connection.execute(f"SELECT DISTINCT {column} FROM experience_meta WHERE trainable=1 AND {column} IS NOT NULL AND {column} != ''")]
+                for value in values:
+                    protected.update(row[0] for row in connection.execute(f"SELECT line_no FROM experience_meta WHERE trainable=1 AND {column}=? ORDER BY reward DESC, line_no DESC LIMIT ?", (value, keep_min)))
+            reward_buckets = [(None, 0.0), (0.0, 25.0), (25.0, 50.0), (50.0, 75.0), (75.0, None)]
+            for low, high in reward_buckets:
+                if low is None:
+                    query = "SELECT line_no FROM experience_meta WHERE trainable=1 AND reward < ? ORDER BY line_no DESC LIMIT ?"
+                    args = (high, keep_min)
+                elif high is None:
+                    query = "SELECT line_no FROM experience_meta WHERE trainable=1 AND reward >= ? ORDER BY line_no DESC LIMIT ?"
+                    args = (low, keep_min)
+                else:
+                    query = "SELECT line_no FROM experience_meta WHERE trainable=1 AND reward >= ? AND reward < ? ORDER BY line_no DESC LIMIT ?"
+                    args = (low, high, keep_min)
+                protected.update(row[0] for row in connection.execute(query, args))
+            path_refs = {relative: count for relative, count in connection.execute("SELECT path, COUNT(*) FROM screen_refs GROUP BY path")}
+            removed_ids = set()
+            removed = 0
+            interrupted = False
+            while current > target_bytes:
+                if run_guard and run_guard():
+                    interrupted = True
+                    break
+                placeholders = ",".join("?" for _ in protected.union(removed_ids))
+                if placeholders:
+                    rows = connection.execute(f"SELECT line_no, line_bytes FROM experience_meta WHERE line_no NOT IN ({placeholders}) ORDER BY trainable ASC, delete_score ASC, line_no ASC LIMIT 500", tuple(protected.union(removed_ids))).fetchall()
+                else:
+                    rows = connection.execute("SELECT line_no, line_bytes FROM experience_meta ORDER BY trainable ASC, delete_score ASC, line_no ASC LIMIT 500").fetchall()
+                if not rows:
+                    break
+                for line_no, line_bytes in rows:
+                    if current <= target_bytes:
+                        break
+                    removed_ids.add(line_no)
+                    removed += 1
+                    current = max(0, current - safe_int(line_bytes, 0))
+                    for (relative,) in connection.execute("SELECT path FROM screen_refs WHERE line_no=?", (line_no,)):
+                        path_refs[relative] = max(0, path_refs.get(relative, 0) - 1)
+                        if path_refs[relative] == 0:
+                            current = max(0, current - path_sizes.get(relative, 0))
+                    if progress_callback and (removed == 1 or removed % 500 == 0):
+                        progress_callback("分批淘汰经验样本", removed, max(1, safe_int(index_result.get("records", 0), 0)), {"removed": removed, "size_bytes": current, "target_bytes": target_bytes})
+            if interrupted:
+                return {"changed": False, "interrupted": True, "removed": removed, "size_bytes": current, "target_bytes": target_bytes, "complete": False}
+            if not removed_ids:
+                return {"changed": False, "removed": 0, "size_bytes": current, "target_bytes": target_bytes, "complete": current <= target_bytes}
+            temporary = self.experience_file.with_suffix(".compact.tmp")
+            delete_after_replace = [relative for relative, count in path_refs.items() if count <= 0]
+            with self.experience_file.open("r", encoding="utf-8") as source, temporary.open("w", encoding="utf-8") as target:
+                kept = 0
+                for line_number, line in enumerate(source, start=1):
+                    if line_number in removed_ids:
+                        continue
+                    target.write(line)
+                    kept += 1
+                    if progress_callback and (kept == 1 or kept % 1000 == 0):
+                        progress_callback("流式重写经验文件", kept, max(1, safe_int(index_result.get("records", 0), 0) - removed), {"removed": removed, "size_bytes": current, "target_bytes": target_bytes})
+                target.flush()
+                os.fsync(target.fileno())
+            self.replace_atomic_synced(temporary, self.experience_file)
+            deleted_paths = []
+            for relative in delete_after_replace:
+                try:
+                    path = (self.root / relative).resolve()
+                    if path.exists() and path.is_file() and self.root.resolve() in (path, *path.parents):
+                        path.unlink()
+                        deleted_paths.append(str(path))
+                except Exception as exc:
+                    self.log_error("compact_experience_pool.unlink", exc, {"path": str(relative)})
+            rebuilt = self.rebuild_experience_index(progress_callback)
+            current = safe_int(rebuilt.get("bytes", 0), 0)
+            with self.open_experience_index() as refreshed:
+                for (relative,) in refreshed.execute("SELECT DISTINCT path FROM screen_refs"):
                     try:
-                        self.log_error("compact_experience_pool.unlink", exc, {"path": str(path)})
-                    except Exception:
-                        pass
-                if progress_callback and (index == 1 or index % 100 == 0):
-                    progress_callback("删除不再引用的截图", index, max(1, len(delete_after_replace)), {"removed": removed, "size_bytes": current, "target_bytes": target_bytes})
-            current = self.experience_pool_size_bytes([entry["record"] for entry in keep_records])
-            size_report = self.cleanup_orphan_screens([entry["record"] for entry in keep_records])
-            current = size_report.get("logical_pool_size_bytes", current)
-        else:
-            size_report = self.cleanup_orphan_screens([entry["record"] for entry in records])
-        complete = current <= target_bytes and size_report.get("orphan_screen_size_bytes", 0) == 0
-        if progress_callback:
-            progress_callback("最终校验实际磁盘占用", 1, 1, {"removed": removed, "size_bytes": current, "target_bytes": target_bytes})
-        result = {"changed": bool(removed_ids) or bool(size_report.get("orphan_cleanup_attempted", 0)), "size_bytes": current, "removed": removed, "target_bytes": target_bytes, "complete": complete}
-        result.update(size_report)
-        return result
+                        path = (self.root / relative).resolve()
+                        if path.is_file() and self.root.resolve() in (path, *path.parents):
+                            current += path.stat().st_size
+                    except Exception as exc:
+                        self.log_error("compact_experience_pool.final_stat", exc, {"path": str(relative)})
+            return {"changed": True, "size_bytes": current, "removed": removed, "target_bytes": target_bytes, "complete": current <= target_bytes, "deleted_screen_paths": deleted_paths, "orphan_screen_size_bytes": 0, "orphan_screen_count": 0, "orphan_screen_paths": []}
 
     def log_error(self, where, error, context=None):
         payload = {
@@ -5585,10 +5694,26 @@ class AsyncPersistenceQueue:
                 if isinstance(job, dict) and job.get("type") == "image":
                     dropped += 1
                     self.jobs.unfinished_tasks = max(0, self.jobs.unfinished_tasks - 1)
+                    sequence = job.get("persistence_sequence")
+                    with self.lock:
+                        if sequence is not None:
+                            self.pending_sequences.discard(sequence)
+                            self.recent_sequences.append(sequence)
+                        self.errors.append({"sequence": sequence, "type": "image", "status": "dropped", "path": str(job.get("path"))})
+                    image = job.get("image")
+                    if image is not None and hasattr(image, "close"):
+                        try:
+                            image.close()
+                        except Exception:
+                            pass
+                    record = job.get("record")
+                    if isinstance(record, dict):
+                        record["image_dropped"] = True
+                        record["persistence_status"] = "dropped"
                     store = job.get("store")
                     if store:
                         try:
-                            store.log_error("async_persistence_close", RuntimeError("image_dropped"), {"path": str(job.get("path"))})
+                            store.log_error("async_persistence_close", RuntimeError("image_dropped"), {"path": str(job.get("path")), "persistence_sequence": sequence})
                         except Exception:
                             pass
                 else:
@@ -5865,7 +5990,7 @@ class ControlPanel(tk.Tk):
         self.runtime_value_specs = {
             "still_seconds": ("静止秒数", self.still_seconds_var, DEFAULT_STILL_SECONDS, safe_float, 0.1),
             "experience_pool_gb": ("经验池 GB", self.experience_pool_gb_var, DEFAULT_EXPERIENCE_POOL_GB, safe_float, 0.1),
-            "ai_model_limit": ("AI 模型个数", self.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, 1)
+            "ai_model_limit": ("AI 模型组上限", self.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, 1)
         }
         self.modify_buttons = []
         self.runtime_environment_refresh_id = None
@@ -6012,7 +6137,7 @@ class ControlPanel(tk.Tk):
         time_frame = ttk.Frame(path_frame)
         time_frame.grid(row=2, column=1, columnspan=2, sticky="w", pady=6)
         ttk.Label(path_frame, text="时间设置").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=6)
-        for field, label in (("still_seconds", "静止/秒"), ("experience_pool_gb", "经验池/GB"), ("ai_model_limit", "AI模型/个")):
+        for field, label in (("still_seconds", "静止/秒"), ("experience_pool_gb", "经验池/GB"), ("ai_model_limit", "AI模型组/组")):
             variable = self.runtime_value_specs[field][1]
             item_frame = ttk.Frame(time_frame)
             item_frame.pack(side="left", padx=(0, 12))
@@ -6896,8 +7021,6 @@ class ControlPanel(tk.Tk):
         if mode == "learning" and self.mouse_recorder and self.mouse_recorder.cursor_outside():
             return "cursor_outside"
         if not self.cursor_inside_window():
-            if mode == "training" and hasattr(self, "ensure_cursor_inside_window") and self.ensure_cursor_inside_window():
-                return None
             return "cursor_outside"
         if mode == "learning":
             still_seconds = safe_float(getattr(config, "still_seconds", self.settings.generated_action_complete_wait), self.settings.generated_action_complete_wait) if config else self.settings.generated_action_complete_wait
@@ -7275,11 +7398,13 @@ class ControlPanel(tk.Tk):
             self.apply_runtime_settings(learned_settings)
         completed = 0
         submitted = 0
-        workers = 1
-        queue_depth = 1
+        workers = max(1, safe_int(config.settings.sleep_worker_count, 1))
+        queue_depth = max(1, safe_int(config.settings.sleep_queue_depth, 1))
         batch_size = max(1, config.settings.sleep_batch_size)
-        minimum_training_batches = workers
-        target_training_steps = max(minimum_training_batches, math.ceil(max(1, self.experience_pool.count() if self.experience_pool else 1) / batch_size), workers * max(1, config.settings.ui_metric_columns))
+        pool_count = max(1, self.experience_pool.count() if self.experience_pool else 1)
+        minimum_training_batches = max(1, workers)
+        convergence_batches = max(1, math.ceil(pool_count / batch_size))
+        target_training_steps = max(minimum_training_batches, convergence_batches)
         initial_compact = {"changed": False, "size_bytes": self.store.experience_pool_size_bytes() if self.store else 0, "target_bytes": max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))}
         compaction_progress = self.sleep_compaction_progress(initial_compact)
         compaction_complete = self.sleep_compaction_complete(initial_compact)
