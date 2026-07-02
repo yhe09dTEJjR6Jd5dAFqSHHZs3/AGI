@@ -37,7 +37,6 @@ OPTIONAL_MODULES = ("pynput.keyboard",)
 class AgentSpec:
     default_ldplayer_path: str
     default_data_path: str
-    default_still_seconds: float
     default_experience_pool_gb: float
     default_ai_model_limit: int
     editable_fields: tuple
@@ -46,10 +45,9 @@ class AgentSpec:
 AGENT_SPEC = AgentSpec(
     default_ldplayer_path=r"D:\LDPlayer9\dnplayer.exe",
     default_data_path=r"C:\Users\Administrator\Desktop\AAA",
-    default_still_seconds=10.0,
     default_experience_pool_gb=10.0,
     default_ai_model_limit=10,
-    editable_fields=("ldplayer_path", "data_path", "still_seconds", "experience_pool_gb", "ai_model_limit")
+    editable_fields=("ldplayer_path", "data_path", "experience_pool_gb", "ai_model_limit")
 )
 
 
@@ -619,25 +617,24 @@ def configuration_failure(area, error):
 
 
 def default_runtime_settings_payload():
-    return {"still_seconds": AGENT_SPEC.default_still_seconds, "experience_pool_gb": AGENT_SPEC.default_experience_pool_gb, "ai_model_limit": AGENT_SPEC.default_ai_model_limit}
+    return {"experience_pool_gb": AGENT_SPEC.default_experience_pool_gb, "ai_model_limit": AGENT_SPEC.default_ai_model_limit}
 
 
 DEFAULT_LDPLAYER_PATH = AGENT_SPEC.default_ldplayer_path
 DEFAULT_DATA_PATH = AGENT_SPEC.default_data_path
-DEFAULT_STILL_SECONDS = AGENT_SPEC.default_still_seconds
 DEFAULT_EXPERIENCE_POOL_GB = AGENT_SPEC.default_experience_pool_gb
 DEFAULT_AI_MODEL_LIMIT = AGENT_SPEC.default_ai_model_limit
 MODE_NAMES = {"idle": "空闲", "starting": "准备中", "learning": "学习模式", "training": "训练模式", "sleep": "睡眠模式", "migration": "数据迁移", "stopping": "正在退出"}
 CONFIG_SCHEMA_VERSION = 1
 USER_EDITABLE_STARTUP_FIELDS = ("ldplayer_path", "data_path")
-USER_EDITABLE_RUNTIME_FIELDS = ("still_seconds", "experience_pool_gb", "ai_model_limit")
+USER_EDITABLE_RUNTIME_FIELDS = ("experience_pool_gb", "ai_model_limit")
 USER_EDITABLE_FIELDS = AGENT_SPEC.editable_fields
 
 
 class AllowedUserEditPolicy:
     ALLOWED_FIELDS = frozenset(AGENT_SPEC.editable_fields)
     STARTUP_FIELDS = frozenset(("ldplayer_path", "data_path"))
-    RUNTIME_FIELDS = frozenset(("still_seconds", "experience_pool_gb", "ai_model_limit"))
+    RUNTIME_FIELDS = frozenset(("experience_pool_gb", "ai_model_limit"))
 
     @classmethod
     def filter(cls, settings, scope=None):
@@ -662,17 +659,17 @@ ALLOWED_TRANSITIONS = {
     ("starting", "training"): {"window_ok"},
     ("idle", "sleep"): {"click_sleep"},
     ("idle", "migration"): {"click_modify_data_path"},
-    ("learning", "stopping"): {"user_stop", "esc", "still_timeout", "window_invalid", "cursor_outside", "runtime_error"},
+    ("learning", "stopping"): {"user_stop", "esc", "window_invalid", "cursor_outside", "runtime_error"},
     ("training", "stopping"): {"user_stop", "esc", "window_invalid", "cursor_outside", "runtime_error", "executor_error"},
     ("starting", "stopping"): {"user_stop", "esc", "runtime_error", "minimize_failed", "window_invalid", "completed"},
     ("migration", "stopping"): {"user_stop", "esc", "runtime_error", "migration_error", "completed"},
-    ("stopping", "idle"): {"esc", "still_timeout", "window_invalid", "cursor_outside", "user_stop", "runtime_error", "executor_error", "migration_error", "completed"},
+    ("stopping", "idle"): {"esc", "window_invalid", "cursor_outside", "user_stop", "runtime_error", "executor_error", "migration_error", "completed"},
     ("training", "sleep"): {"sleep_model"},
     ("sleep", "stopping"): {"user_stop", "esc", "runtime_error", "completed"}
 }
 
 
-TERMINATION_REASONS = ("window_invalid", "cursor_outside", "rect_changed", "empty_action", "executor_error", "sleep_model", "esc", "still_timeout", "user_stop", "migration_error", "completed")
+TERMINATION_REASONS = ("window_invalid", "cursor_outside", "rect_changed", "empty_action", "executor_error", "sleep_model", "esc", "user_stop", "migration_error", "completed")
 RUNNING_MODES = {"starting", "learning", "training", "sleep", "migration"}
 HUMAN_FEATURE_NAMES = ("duration", "direct", "bend", "points", "speed_mean", "speed_variance", "acceleration_change", "pauses", "hover_before", "drag_curvature", "double_click_interval")
 
@@ -896,16 +893,9 @@ class TransitionResult:
 
 
 @dataclass(frozen=True)
-class StopSnapshot:
-    still_seconds: float
-    deadline: Optional[float]
-
-
-@dataclass(frozen=True)
 class Config:
     ldplayer_path: Path
     data_path: Path
-    still_seconds: float
     experience_pool_gb: float
     ai_model_limit: int
     settings: Settings
@@ -1016,8 +1006,6 @@ def run_self_test():
     require(not prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: actions.append("无法自动修复"), startup_events.append), 'not prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: actions.append("无法自动修复"), startup_events.append)')
     require(len(startup_events) == 1 and "初检结果" in startup_events[0] and "初检后进行的自愈尝试" in startup_events[0] and "复检结果" in startup_events[0] and "下一步建议" in startup_events[0], 'len(startup_events) == 1 and "初检结果" in startup_events[0] and "初检后进行的自愈尝试" in startup_events[0] and "复检结果" in startup_events[0] and "下一步建议" in startup_events[0]')
     require(STARTUP_FAILURE_BUTTON_LABELS == ("选择雷电路径", "选择数据目录", "更多", "重试", "忽略", "退出"), 'STARTUP_FAILURE_BUTTON_LABELS == ("选择雷电路径", "选择数据目录", "更多", "重试", "忽略", "退出")')
-    require("still_timeout" not in ALLOWED_TRANSITIONS[("training", "stopping")], '"still_timeout" not in ALLOWED_TRANSITIONS[("training", "stopping")]')
-    require("still_timeout" in ALLOWED_TRANSITIONS[("learning", "stopping")], '"still_timeout" in ALLOWED_TRANSITIONS[("learning", "stopping")]')
     original_window_manager = globals().get("WindowManager")
     original_probe = globals().get("runtime_capability_probe")
     attach_events = []
@@ -1087,10 +1075,9 @@ def run_self_test():
     require(details["reward_sort_key"][0] == details["screen_primary_reward"], 'details["reward_sort_key"][0] == details["screen_primary_reward"]')
     require("human_tie_break_reward" in details, '"human_tie_break_reward" in details')
     require(0.0 < details["human_bonus"] < details["screen_score_resolution"], '0.0 < details["human_bonus"] < details["screen_score_resolution"]')
-    require(set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "still_seconds", "experience_pool_gb", "ai_model_limit"}, 'set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "still_seconds", "experience_pool_gb", "ai_model_limit"}')
-    require({"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("learning", "stopping")]), '{"esc", "still_timeout", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("learning", "stopping")])')
+    require(set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "experience_pool_gb", "ai_model_limit"}, 'set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "experience_pool_gb", "ai_model_limit"}')
+    require({"esc", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("learning", "stopping")]), '{"esc", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("learning", "stopping")])')
     require({"esc", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("training", "stopping")]), '{"esc", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("training", "stopping")])')
-    require("still_timeout" not in ALLOWED_TRANSITIONS[("training", "stopping")], '"still_timeout" not in ALLOWED_TRANSITIONS[("training", "stopping")]')
     require(("training", "idle") not in ALLOWED_TRANSITIONS, '("training", "idle") not in ALLOWED_TRANSITIONS')
     require("sleep_model" in ALLOWED_TRANSITIONS[("training", "sleep")], '"sleep_model" in ALLOWED_TRANSITIONS[("training", "sleep")]')
     require(should_stop_run(threading.Event(), time.perf_counter() - 1.0, None) == "user_stop", 'should_stop_run(threading.Event(), time.perf_counter() - 1.0, None) == "user_stop"')
@@ -1111,7 +1098,7 @@ def run_self_test():
     stop_check_panel.apply_active_stop_reason = ControlPanel.apply_active_stop_reason.__get__(stop_check_panel, type(stop_check_panel))
     stop_check_panel.settings = settings
     stop_check_panel.mouse_recorder = None
-    stop_config = type("Config", (), {"still_seconds": 10.0})()
+    stop_config = type("Config", (), {})()
     expired_event = threading.Event()
     require(not TrainingService(stop_check_panel).should_stop(stop_config, expired_event), 'not TrainingService(stop_check_panel).should_stop(stop_config, expired_event)')
     execution_panel = type("ExecutionPanel", (), {})()
@@ -1453,17 +1440,15 @@ def run_self_test():
         modify_panel = ControlPanel.__new__(ControlPanel)
         modify_panel.ldplayer_var = DummyVar()
         modify_panel.data_var = DummyVar()
-        modify_panel.still_seconds_var = DummyVar()
         modify_panel.experience_pool_gb_var = DummyVar()
         modify_panel.ai_model_limit_var = DummyVar()
         modify_panel.status_var = DummyVar()
         modify_panel.ldplayer_var.set(str(executable))
         modify_panel.data_var.set(str(store.root))
-        modify_panel.still_seconds_var.set("3")
         modify_panel.experience_pool_gb_var.set("4")
         modify_panel.ai_model_limit_var.set("5")
         modify_panel.settings = settings
-        modify_panel.runtime_value_specs = {"still_seconds": ("静止秒数", modify_panel.still_seconds_var, DEFAULT_STILL_SECONDS, safe_float, 0.1), "experience_pool_gb": ("经验池 GB", modify_panel.experience_pool_gb_var, DEFAULT_EXPERIENCE_POOL_GB, safe_float, 0.1), "ai_model_limit": ("AI 模型组上限", modify_panel.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, 1)}
+        modify_panel.runtime_value_specs = {"experience_pool_gb": ("经验池 GB", modify_panel.experience_pool_gb_var, DEFAULT_EXPERIENCE_POOL_GB, safe_float, 0.1), "ai_model_limit": ("AI 模型组上限", modify_panel.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, 1)}
         modify_panel.update_mode_button_states = lambda: setattr(modify_panel, "updated", True)
         modify_panel.refresh_runtime_environment_state = lambda: setattr(modify_panel, "refreshed", True)
         modify_panel.save_persistent_settings = lambda: setattr(modify_panel, "saved", True)
@@ -1472,14 +1457,14 @@ def run_self_test():
         messagebox.showerror = lambda *args, **kwargs: None
         try:
             require(not hasattr(ControlPanel, "save_user_settings"), 'not hasattr(ControlPanel, "save_user_settings")')
-            require(ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(root / "missing.exe"), "data_path": str(store.root), "still_seconds": 4, "experience_pool_gb": 6, "ai_model_limit": 7}) is False, 'ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(root / "missing.exe"), "data_path": str(store.root), "still_seconds": 4, "experience_pool_')
+            require(ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(root / "missing.exe"), "data_path": str(store.root), "experience_pool_gb": 6, "ai_model_limit": 7}) is False, 'ControlPanel.submit_user_settings rejects missing ldplayer path')
         finally:
             messagebox.showerror = original_showerror
         require(modify_panel.ldplayer_var.value == str(executable), 'modify_panel.ldplayer_var.value == str(executable)')
-        require(ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(executable), "data_path": str(store.root), "still_seconds": 4, "experience_pool_gb": 6, "ai_model_limit": 7}) is True, 'ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(executable), "data_path": str(store.root), "still_seconds": 4, "experience_pool_gb": 6, "a')
+        require(ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(executable), "data_path": str(store.root), "experience_pool_gb": 6, "ai_model_limit": 7}) is True, 'ControlPanel.submit_user_settings accepts allowed settings')
         require(modify_panel.saved and modify_panel.ai_model_limit_var.value == "7", 'modify_panel.saved and modify_panel.ai_model_limit_var.value == "7"')
         target_data_path = root / "submit_new_data"
-        require(ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(executable), "data_path": str(target_data_path), "still_seconds": 9, "experience_pool_gb": 1, "ai_model_limit": 2}) is True, 'ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(executable), "data_path": str(target_data_path), "still_seconds": 9, "experience_pool_gb":')
+        require(ControlPanel.submit_user_settings(modify_panel, {"ldplayer_path": str(executable), "data_path": str(target_data_path), "experience_pool_gb": 1, "ai_model_limit": 2}) is True, 'ControlPanel.submit_user_settings starts migration for allowed settings')
         require(modify_panel.migration_request[0] == target_data_path and modify_panel.data_var.value == str(store.root), 'modify_panel.migration_request[0] == target_data_path and modify_panel.data_var.value == str(store.root)')
         dummy_panel.progress_value = 0.4
         dummy_panel.last_progress_update_perf = 0.0
@@ -1498,7 +1483,7 @@ def run_self_test():
         dummy_panel.mode = "idle"
         require(ControlPanel.idle_progress_value(dummy_panel, "training", 91.0) == 0.0, 'ControlPanel.idle_progress_value(dummy_panel, "training", 91.0) == 0.0')
         require(ControlPanel.idle_progress_value(dummy_panel, "migration", 91.0) == 0.0, 'ControlPanel.idle_progress_value(dummy_panel, "migration", 91.0) == 0.0')
-        store.save_settings({"still_seconds": 3, "experience_pool_gb": 4, "ai_model_limit": 5, "forbidden": 6})
+        store.save_settings({"experience_pool_gb": 4, "ai_model_limit": 5, "forbidden": 6})
         saved_settings = json.loads(store.settings_file.read_text(encoding="utf-8"))
         require("forbidden" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0 and saved_settings["ai_model_limit"] == 5, '"forbidden" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0 and saved_settings["ai_model_limit"] == 5')
         store.experience_file.write_text("{bad json}\n" + json.dumps({"id": "ok"}) + "\n", encoding="utf-8")
@@ -3807,7 +3792,7 @@ class DataStore:
 
     def save_settings(self, settings):
         source = AllowedUserEditPolicy.filter(settings, "runtime")
-        payload = {"schema_version": CONFIG_SCHEMA_VERSION, "still_seconds": max(0.1, safe_float(source.get("still_seconds", AGENT_SPEC.default_still_seconds), AGENT_SPEC.default_still_seconds)), "experience_pool_gb": max(0.1, safe_float(source.get("experience_pool_gb", AGENT_SPEC.default_experience_pool_gb), AGENT_SPEC.default_experience_pool_gb)), "ai_model_limit": max(1, safe_int(source.get("ai_model_limit", AGENT_SPEC.default_ai_model_limit), AGENT_SPEC.default_ai_model_limit)), "runtime_generated_numbers": RUNTIME_NUMBER_AUDIT}
+        payload = {"schema_version": CONFIG_SCHEMA_VERSION, "experience_pool_gb": max(0.1, safe_float(source.get("experience_pool_gb", AGENT_SPEC.default_experience_pool_gb), AGENT_SPEC.default_experience_pool_gb)), "ai_model_limit": max(1, safe_int(source.get("ai_model_limit", AGENT_SPEC.default_ai_model_limit), AGENT_SPEC.default_ai_model_limit)), "runtime_generated_numbers": RUNTIME_NUMBER_AUDIT}
         try:
             atomic_write_json(self.settings_file, payload, self.lock)
         except Exception as exc:
@@ -5923,9 +5908,8 @@ class TrainingService:
         active_session = getattr(panel, "active_session", None)
         if active_session and active_session.mode == "training":
             deadline = active_session.deadline
-        stop_snapshot = StopSnapshot(safe_float(getattr(config, "still_seconds", DEFAULT_STILL_SECONDS), DEFAULT_STILL_SECONDS), deadline)
         def training_execution_stop():
-            reason = panel.active_mode_stop_reason("training", stop_event, stop_snapshot, stop_snapshot.deadline)
+            reason = panel.active_mode_stop_reason("training", stop_event, config, deadline)
             if reason:
                 panel.apply_active_stop_reason("training", reason, stop_event)
                 return True
@@ -6024,7 +6008,6 @@ class ControlPanel(tk.Tk):
         self.escape_monitor = EscapeMonitor(self.request_escape, self.settings.key_debounce_seconds)
         self.ldplayer_var = tk.StringVar(value=DEFAULT_LDPLAYER_PATH)
         self.data_var = tk.StringVar(value=DEFAULT_DATA_PATH)
-        self.still_seconds_var = tk.StringVar(value=str(DEFAULT_STILL_SECONDS))
         self.experience_pool_gb_var = tk.StringVar(value=str(DEFAULT_EXPERIENCE_POOL_GB))
         self.ai_model_limit_var = tk.StringVar(value=str(DEFAULT_AI_MODEL_LIMIT))
         self.mode_var = tk.StringVar(value=MODE_NAMES["idle"])
@@ -6049,7 +6032,6 @@ class ControlPanel(tk.Tk):
         self.last_training_runtime_metrics = getattr(self, "last_training_runtime_metrics", None)
         self.progress_label_var = tk.StringVar(value="进度")
         self.runtime_value_specs = {
-            "still_seconds": ("静止秒数", self.still_seconds_var, DEFAULT_STILL_SECONDS, safe_float, 0.1),
             "experience_pool_gb": ("经验池 GB", self.experience_pool_gb_var, DEFAULT_EXPERIENCE_POOL_GB, safe_float, 0.1),
             "ai_model_limit": ("AI 模型组上限", self.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, 1)
         }
@@ -6061,9 +6043,9 @@ class ControlPanel(tk.Tk):
         self.metrics_frame = None
         self.app_config_store = AppConfigStore()
         self.hint_templates = {
-            "idle": "当前处于空闲。可修改允许的五项参数，或启动学习、训练、睡眠模式；启动学习/训练前会自动检查并修复运行环境。",
+            "idle": "当前处于空闲。可修改允许的四项参数，或启动学习、训练、睡眠模式；启动学习/训练前会自动检查并修复运行环境。",
             "starting": "正在准备模式。控制面板会最小化，鼠标会被放入雷电模拟器客户区；本程序窗口造成的遮挡不会判定为客户区异常。",
-            "learning": "学习模式：请只在雷电模拟器客户区内操作。ESC、鼠标静止超时、用户鼠标离开客户区或客户区真实异常会结束并保存数据。",
+            "learning": "学习模式：请只在雷电模拟器客户区内操作。ESC、用户鼠标离开客户区或客户区真实异常会结束并保存数据。",
             "training": "训练模式：AI 鼠标动作会被限制在雷电模拟器客户区内。ESC、用户干预导致鼠标离开客户区或客户区真实异常会结束并保存数据。",
             "sleep": "睡眠模式：正在检查样本评分、训练一组 AI 模型并清理模型组和经验池；进度条会从 0% 推进到 100%。",
             "migration": "正在迁移数据目录。请等待复制、校验与保存完成，完成前不要关闭程序。",
@@ -6096,14 +6078,14 @@ class ControlPanel(tk.Tk):
         data_path = filedialog.askdirectory(title="选择数据存储路径", initialdir=values["data_path"] or DEFAULT_DATA_PATH, parent=self)
         if data_path:
             values["data_path"] = data_path
-        for field in ("experience_pool_gb", "ai_model_limit", "still_seconds"):
+        for field in ("experience_pool_gb", "ai_model_limit"):
             changed = self.ask_runtime_value(field, values[field])
             if changed is not None:
                 values[field] = changed
         self.submit_user_settings(values)
 
     def pending_user_settings(self):
-        return {"ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH, "data_path": self.data_var.get().strip() or DEFAULT_DATA_PATH, "still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))}
+        return {"ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH, "data_path": self.data_var.get().strip() or DEFAULT_DATA_PATH, "experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))}
 
     def ask_runtime_value(self, field, current_value):
         AllowedUserEditPolicy.assert_allowed(field)
@@ -6114,7 +6096,6 @@ class ControlPanel(tk.Tk):
         return max(minimum, parser(answer, default))
 
     def apply_runtime_value_vars(self, values):
-        self.still_seconds_var.set(self.format_runtime_value("still_seconds", values["still_seconds"]))
         self.experience_pool_gb_var.set(self.format_runtime_value("experience_pool_gb", values["experience_pool_gb"]))
         self.ai_model_limit_var.set(self.format_runtime_value("ai_model_limit", values["ai_model_limit"]))
 
@@ -6129,7 +6110,7 @@ class ControlPanel(tk.Tk):
                 self.status_var.set("雷电路径校验失败，未保存")
                 self.update_mode_button_states()
                 return False
-        normalized = {"ldplayer_path": new_ldplayer, "data_path": str(new_data_path), "still_seconds": max(0.1, safe_float(values.get("still_seconds"), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(values.get("experience_pool_gb"), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(values.get("ai_model_limit"), DEFAULT_AI_MODEL_LIMIT))}
+        normalized = {"ldplayer_path": new_ldplayer, "data_path": str(new_data_path), "experience_pool_gb": max(0.1, safe_float(values.get("experience_pool_gb"), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(values.get("ai_model_limit"), DEFAULT_AI_MODEL_LIMIT))}
         if Path(old_values["data_path"]) != new_data_path:
             return self.start_data_migration(new_data_path, normalized)
         self.ldplayer_var.set(new_ldplayer)
@@ -6186,7 +6167,7 @@ class ControlPanel(tk.Tk):
         self.scroll_canvas.bind("<Enter>", self.bind_mousewheel)
         self.scroll_canvas.bind("<Leave>", self.unbind_mousewheel)
         ttk.Label(container, text="雷电模拟器学习训练控制面板", style="Title.TLabel").pack(anchor="w")
-        path_frame = ttk.LabelFrame(container, text="路径与时间", padding=self.settings.ui_section_padding)
+        path_frame = ttk.LabelFrame(container, text="路径与容量", padding=self.settings.ui_section_padding)
         path_frame.pack(fill="x", pady=(16, 10))
         path_frame.columnconfigure(1, weight=1)
         ttk.Label(path_frame, text="雷电模拟器").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=6)
@@ -6197,8 +6178,8 @@ class ControlPanel(tk.Tk):
         ttk.Label(path_frame, text="").grid(row=1, column=2, padx=(8, 0), pady=6)
         time_frame = ttk.Frame(path_frame)
         time_frame.grid(row=2, column=1, columnspan=2, sticky="w", pady=6)
-        ttk.Label(path_frame, text="时间设置").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=6)
-        for field, label in (("still_seconds", "静止/秒"), ("experience_pool_gb", "经验池/GB"), ("ai_model_limit", "AI模型组/组")):
+        ttk.Label(path_frame, text="容量设置").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=6)
+        for field, label in (("experience_pool_gb", "经验池/GB"), ("ai_model_limit", "AI模型组/组")):
             variable = self.runtime_value_specs[field][1]
             item_frame = ttk.Frame(time_frame)
             item_frame.pack(side="left", padx=(0, 12))
@@ -6597,7 +6578,7 @@ class ControlPanel(tk.Tk):
         self.status_var.set("正在迁移数据")
         self.update_progress(0.0)
         values = values or self.pending_user_settings()
-        migration_values = {"ldplayer_path": str(values.get("ldplayer_path") or DEFAULT_LDPLAYER_PATH), "still_seconds": max(0.1, safe_float(values.get("still_seconds"), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(values.get("experience_pool_gb"), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(values.get("ai_model_limit"), DEFAULT_AI_MODEL_LIMIT))}
+        migration_values = {"ldplayer_path": str(values.get("ldplayer_path") or DEFAULT_LDPLAYER_PATH), "experience_pool_gb": max(0.1, safe_float(values.get("experience_pool_gb"), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(values.get("ai_model_limit"), DEFAULT_AI_MODEL_LIMIT))}
         self.mode_thread = threading.Thread(target=self.migration_service.run, args=(token, old_path, new_path, stop_event, migration_values), name="migration-mode", daemon=False)
         self.mode_thread.start()
         return True
@@ -6790,7 +6771,7 @@ class ControlPanel(tk.Tk):
                 if size == 0:
                     self.ui(lambda c=copied, t=total: self.progress_label_var.set(f"数据迁移中｜已迁移 {c}/{t} 字节"))
             if not stop_event.is_set() and self.is_run_active(token, "migration"):
-                DataStore(temp_root).save_settings({"still_seconds": values["still_seconds"], "experience_pool_gb": values["experience_pool_gb"], "ai_model_limit": values["ai_model_limit"]})
+                DataStore(temp_root).save_settings({"experience_pool_gb": values["experience_pool_gb"], "ai_model_limit": values["ai_model_limit"]})
                 journal_path = new_root.parent / f".{new_root.name}.migration.journal.json"
                 atomic_write_json(journal_path, {"stage": "prepare", "old_path": str(old_root), "new_path": str(new_root), "temp_path": str(temp_root), "created_at": now_text()}, self.store.lock if self.store else threading.RLock())
                 self.verify_migration(old_root, temp_root)
@@ -6851,8 +6832,7 @@ class ControlPanel(tk.Tk):
         self.data_var.set(str(startup.get("data_path", self.data_var.get())))
         data_settings = DataStore(Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)).load_settings()
         if not data_settings:
-            DataStore(Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)).save_settings({"still_seconds": DEFAULT_STILL_SECONDS, "experience_pool_gb": DEFAULT_EXPERIENCE_POOL_GB, "ai_model_limit": DEFAULT_AI_MODEL_LIMIT})
-        self.still_seconds_var.set(str(max(0.1, safe_float(data_settings.get("still_seconds", self.still_seconds_var.get()), DEFAULT_STILL_SECONDS))))
+            DataStore(Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)).save_settings({"experience_pool_gb": DEFAULT_EXPERIENCE_POOL_GB, "ai_model_limit": DEFAULT_AI_MODEL_LIMIT})
         self.experience_pool_gb_var.set(str(max(0.1, safe_float(data_settings.get("experience_pool_gb", self.experience_pool_gb_var.get()), DEFAULT_EXPERIENCE_POOL_GB))))
         self.ai_model_limit_var.set(str(max(1, safe_int(data_settings.get("ai_model_limit", self.ai_model_limit_var.get()), DEFAULT_AI_MODEL_LIMIT))))
         self.update_mode_button_states()
@@ -6860,7 +6840,7 @@ class ControlPanel(tk.Tk):
     def save_persistent_settings(self):
         data_path = Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)
         self.app_config_store.save_settings({"ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH, "data_path": str(data_path)})
-        DataStore(data_path).save_settings({"still_seconds": max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS)), "experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))})
+        DataStore(data_path).save_settings({"experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))})
 
     def screen_rect(self):
         width = safe_int(getattr(win32api, "GetSystemMetrics", lambda _: self.winfo_screenwidth())(0), self.winfo_screenwidth())
@@ -6883,11 +6863,9 @@ class ControlPanel(tk.Tk):
         return max(1.0, sum(cost) / len(cost)) if cost else 24.0
 
     def read_config(self):
-        AllowedUserEditPolicy.assert_allowed("ldplayer_path", "data_path", "still_seconds", "experience_pool_gb", "ai_model_limit")
-        still_seconds = max(0.1, safe_float(self.still_seconds_var.get(), DEFAULT_STILL_SECONDS))
+        AllowedUserEditPolicy.assert_allowed("ldplayer_path", "data_path", "experience_pool_gb", "ai_model_limit")
         experience_pool_gb = max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB))
         ai_model_limit = max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))
-        self.still_seconds_var.set(str(still_seconds))
         self.experience_pool_gb_var.set(str(experience_pool_gb))
         self.ai_model_limit_var.set(str(ai_model_limit))
         self.save_persistent_settings()
@@ -6907,7 +6885,7 @@ class ControlPanel(tk.Tk):
         self.settings = settings
         self.escape_monitor.debounce_seconds = settings.key_debounce_seconds
         self.ui(lambda: self.minsize(settings.ui_min_width, settings.ui_min_height))
-        return Config(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH), data_path, still_seconds, experience_pool_gb, ai_model_limit, settings)
+        return Config(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH), data_path, experience_pool_gb, ai_model_limit, settings)
 
     def apply_runtime_settings(self, settings):
         previous_settings = {item.name: getattr(self.settings, item.name) for item in fields(Settings)} if self.settings else {}
@@ -7083,10 +7061,6 @@ class ControlPanel(tk.Tk):
             return "cursor_outside"
         if not self.cursor_inside_window():
             return "cursor_outside"
-        if mode == "learning":
-            still_seconds = safe_float(getattr(config, "still_seconds", self.settings.generated_action_complete_wait), self.settings.generated_action_complete_wait) if config else self.settings.generated_action_complete_wait
-            if self.learning_idle_seconds() >= still_seconds:
-                return "still_timeout"
         return None
 
     def apply_active_stop_reason(self, mode, reason, stop_event):
@@ -7098,8 +7072,6 @@ class ControlPanel(tk.Tk):
             self.ui(lambda m=mode: self.status_var.set(f"{MODE_NAMES.get(m, m)}结束：雷电模拟器客户区异常"))
         elif reason == "cursor_outside":
             self.ui(lambda m=mode: self.status_var.set(f"{MODE_NAMES.get(m, m)}结束：鼠标位于雷电模拟器客户区外"))
-        elif reason == "still_timeout":
-            self.ui(lambda m=mode: self.status_var.set(f"{MODE_NAMES.get(m, m)}结束：鼠标静止超时"))
         return True
 
     def cursor_position(self):
@@ -8058,15 +8030,8 @@ class ControlPanel(tk.Tk):
                     self.apply_active_stop_reason("learning", reason, stop_event)
                     break
                 now_perf = time.perf_counter()
-                idle_seconds = self.learning_idle_seconds()
-                remaining = max(0.0, config.still_seconds - idle_seconds)
-                self.ui(lambda e=learning_events, c=learning_screens, r=remaining: self.progress_label_var.set(f"学习模式进度保持 0%｜静止剩余 {r:.1f} 秒｜学习事件 {e}｜截图 {c}"))
+                self.ui(lambda e=learning_events, c=learning_screens: self.progress_label_var.set(f"学习模式进度保持 0%｜学习事件 {e}｜截图 {c}"))
                 self.update_progress(0.0)
-                if idle_seconds >= config.still_seconds:
-                    termination_reason = "still_timeout"
-                    stop_event.set()
-                    self.ui(lambda: self.status_var.set("学习模式结束：鼠标静止超时"))
-                    break
                 event_seen = False
                 if self.mouse_recorder:
                     markers = self.mouse_recorder.pop_start_markers()
@@ -8093,10 +8058,7 @@ class ControlPanel(tk.Tk):
                                 termination_reason = reason
                                 self.apply_active_stop_reason("learning", reason, stop_event)
                                 break
-                            remaining_wait = max(0.0, config.still_seconds - self.learning_idle_seconds())
-                            if remaining_wait <= 0.0:
-                                break
-                            self.mouse_recorder.wait(min(0.1, remaining_wait))
+                            self.mouse_recorder.wait(0.1)
                 else:
                     while not stop_event.is_set():
                         reason = self.active_mode_stop_reason("learning", stop_event, config)
@@ -8104,10 +8066,7 @@ class ControlPanel(tk.Tk):
                             termination_reason = reason
                             self.apply_active_stop_reason("learning", reason, stop_event)
                             break
-                        remaining_wait = max(0.0, config.still_seconds - self.learning_idle_seconds())
-                        if remaining_wait <= 0.0:
-                            break
-                        stop_event.wait(min(0.1, remaining_wait))
+                        stop_event.wait(0.1)
             self.write_record("learning", session_id, self.capture_snapshot(analyzer, "learning", session_id, start, priority="critical"), None, "mode_end")
         if self.is_run_active(token, "learning") or self.is_run_active(token, "stopping"):
             saved, save_error = self.flush_mode_data()
