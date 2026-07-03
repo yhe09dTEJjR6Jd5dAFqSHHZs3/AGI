@@ -24,7 +24,6 @@ from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from urllib.parse import urlparse
 
 MIN_PYTHON_VERSION = (3, 10)
 
@@ -223,7 +222,7 @@ def bootstrap_dependencies():
     extra_mirror = os.environ.get("AGI_PIP_INDEX_URL")
     if extra_mirror:
         mirrors.append(extra_mirror)
-    commands = [base_command + (["-i", mirror, "--trusted-host", urlparse(mirror).hostname] if mirror else []) + missing for mirror in mirrors]
+    commands = [base_command + (["-i", mirror] if mirror else []) + missing for mirror in mirrors]
     install_timeout = max(120, min(300, safe_int(os.environ.get("AGI_PIP_INSTALL_TIMEOUT"), 180)))
     env = dict(os.environ)
     env[install_key] = "1"
@@ -1329,6 +1328,33 @@ def run_self_test():
         edge_points = mouse_executor.smooth_points((10, 20), (29, 39), 1.0, rect=edge_rect)
         require(edge_points and all(point_inside(edge_rect, x, y) for x, y in edge_points), 'edge_points and all(point_inside(edge_rect, x, y) for x, y in edge_points)')
         require(mouse_executor.clamp_point_to_rect((-100, 100), edge_rect) == (10, 39), 'mouse_executor.clamp_point_to_rect((-100, 100), edge_rect) == (10, 39)')
+        class GuardWindowManager:
+            def __init__(self):
+                self.topmost_called = False
+            def topmost(self):
+                self.topmost_called = True
+            def window_ok(self, force=False):
+                return True
+        class GuardController:
+            def __init__(self):
+                self.position = (-5, -5)
+            def press(self, button):
+                raise AssertionError("press must not run when cursor starts outside")
+            def release(self, button):
+                pass
+            def scroll(self, x, y):
+                raise AssertionError("scroll must not run when cursor starts outside")
+        guard_executor = HumanMouseExecutor.__new__(HumanMouseExecutor)
+        guard_executor.window_manager = GuardWindowManager()
+        guard_executor.settings = mouse_executor.settings
+        guard_executor.controller = GuardController()
+        guard_stop = threading.Event()
+        guard_calls = {"count": 0}
+        def guard_should_stop():
+            guard_calls["count"] += 1
+            return False
+        guard_actual = guard_executor.execute({"type": "click", "start_rel": [0.5, 0.5]}, edge_rect, guard_stop, guard_should_stop)
+        require(guard_actual is None and guard_stop.is_set() and guard_executor.controller.position == (-5, -5) and not guard_executor.window_manager.topmost_called and guard_calls["count"] >= 2, 'guard_actual is None and guard_stop.is_set() and guard_executor.controller.position == (-5, -5) and not guard_executor.window_manager.topmost_called and guard_calls["count"] >= 2')
         require(ControlPanel.sleep_completion_reached(dummy_panel, 3, 3), 'ControlPanel.sleep_completion_reached(dummy_panel, 3, 3)')
         store.pending_state_writes = 2
         require(ControlPanel.sleep_completion_reached(dummy_panel, 3, 3), 'ControlPanel.sleep_completion_reached(dummy_panel, 3, 3)')
@@ -5572,9 +5598,18 @@ class HumanMouseExecutor:
     def execute(self, action, rect, stop_event, should_stop, on_activity=None):
         if not action:
             return None
-        if rect:
-            self.controller.position = self.clamp_point_to_rect(self.controller.position, rect)
+        if stop_event.is_set() or should_stop():
+            stop_event.set()
+            return None
+        current = self.controller.position
+        if rect and not point_inside(rect, current[0], current[1]):
+            should_stop()
+            stop_event.set()
+            return None
         self.window_manager.topmost()
+        if stop_event.is_set() or should_stop():
+            stop_event.set()
+            return None
         if not self.window_manager.window_ok(force=True):
             return {"execution_error": "window_not_ready"}
         action = normalize_mouse_action(action, rect)
@@ -5587,6 +5622,13 @@ class HumanMouseExecutor:
         if not point_inside(rect, start_abs[0], start_abs[1]) or not point_inside(rect, end_abs[0], end_abs[1]):
             return {"execution_error": "point_outside_client", "rect": list(rect), "start_abs": [int(start_abs[0]), int(start_abs[1])], "end_abs": [int(end_abs[0]), int(end_abs[1])]}
         current = self.controller.position
+        if stop_event.is_set() or should_stop():
+            stop_event.set()
+            return None
+        if rect and not point_inside(rect, current[0], current[1]):
+            should_stop()
+            stop_event.set()
+            return None
         distance_to_start = math.hypot(start_abs[0] - current[0], start_abs[1] - current[1])
         main_distance = math.hypot(end_abs[0] - start_abs[0], end_abs[1] - start_abs[1])
         duration = safe_float(action.get("duration", 0.0), 0.0)
@@ -5638,8 +5680,6 @@ class HumanMouseExecutor:
                     pass
         if stop_event.is_set():
             return None
-        if rect:
-            self.controller.position = self.clamp_point_to_rect(self.controller.position, rect)
         actual = {"type": action_type if action_type in ["click", "drag", "scroll"] else "click", "button": str(button), "source": "ai", "started_at": started_at, "ended_at": now_text(), "started_perf": action_t, "ended_perf": time.perf_counter(), "duration": round(max(0.0, time.perf_counter() - action_t), 6), "start_abs": [int(start_abs[0]), int(start_abs[1])], "end_abs": [int(end_abs[0]), int(end_abs[1])], "path": actual_path}
         if action_type == "scroll":
             actual["scroll"] = action.get("scroll") or [0, 0]
