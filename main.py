@@ -1198,8 +1198,8 @@ def run_self_test():
         reopened.load()
         require(reopened.format == "PNG", 'reopened.format == "PNG"')
         require(image_content_checksum(reopened) == image_content_checksum(image), 'image_content_checksum(reopened) == image_content_checksum(image)')
-        checkpoint = store.save_sleep_checkpoint({"run_id": "self-test", "stage": "task2_training"}, task1_completed=True)
-        require(store.load_sleep_checkpoint()["task1_completed"] is True, 'store.load_sleep_checkpoint()["task1_completed"] is True')
+        checkpoint = store.save_sleep_checkpoint({"run_id": "self-test", "stage": "task2_training"}, task1_model_group_trained=True)
+        require(store.load_sleep_checkpoint()["task1_model_group_trained"] is True, 'store.load_sleep_checkpoint()["task1_model_group_trained"] is True')
         store.clear_sleep_checkpoint()
         require(store.load_sleep_checkpoint() is None, 'store.load_sleep_checkpoint() is None')
         store.append_runtime_parameter_audit({"a": 1}, {"a": 2}, {"a": {"reality_conditions": {"cpu_load": 0.5}, "semantic_goal": "self test"}})
@@ -1325,7 +1325,7 @@ def run_self_test():
         task3_panel.progress_value = 0.0
         task3_panel.update_progress = lambda value, force=False: setattr(task3_panel, "progress_value", value)
         task3_config = type("Task3Config", (), {"ai_model_limit": 1, "experience_pool_gb": 0.1})()
-        model_result, pool_result = ControlPanel.run_sleep_task3(task3_panel, task3_config)
+        model_result, pool_result = ControlPanel.run_sleep_task2(task3_panel, task3_config)
         require(model_result["complete"] and pool_result["complete"], 'model_result["complete"] and pool_result["complete"]')
         require(task3_events.index("sleep_model_cleanup_completed") < task3_events.index("experience_pool_compaction_completed"), 'task3_events.index("sleep_model_cleanup_completed") < task3_events.index("experience_pool_compaction_completed")')
         require(WindowCheck(True, "ok", (0, 0, 10, 10), 9, 9, 0.0).occluded_ratio == 0.0, 'WindowCheck(True, "ok", (0, 0, 10, 10), 9, 9, 0.0).occluded_ratio == 0.0')
@@ -1398,9 +1398,9 @@ def run_self_test():
             require(manager.check_window(force=True).reason == "occluded", 'manager.check_window(force=True).reason == "occluded"')
             require("completed" in ALLOWED_TRANSITIONS[("sleep", "stopping")] and ("sleep", "training") not in ALLOWED_TRANSITIONS, '"completed" in ALLOWED_TRANSITIONS[("sleep", "stopping")] and ("sleep", "training") not in ALLOWED_TRANSITIONS')
             state_transition_table = (
-                ("training_timeout", "sleep", "task1_task2_task3_then_restart"),
+                ("training_timeout", "sleep", "task1_task2_then_restart"),
             )
-            require(state_transition_table[0][2] == "task1_task2_task3_then_restart" and ("sleep", "training") not in ALLOWED_TRANSITIONS, 'state_transition_table[0][2] == "task1_task2_task3_then_restart" and ("sleep", "training") not in ALLOWED_TRANSITIONS')
+            require(state_transition_table[0][2] == "task1_task2_then_restart" and ("sleep", "training") not in ALLOWED_TRANSITIONS, 'state_transition_table[0][2] == "task1_task2_then_restart" and ("sleep", "training") not in ALLOWED_TRANSITIONS')
         finally:
             globals()["win32gui"] = original_win32gui
             globals()["win32api"] = original_win32api
@@ -1505,7 +1505,7 @@ def run_self_test():
         sleep_task3_panel.ui = lambda fn: fn()
         sleep_task3_panel.update_progress = lambda value, force=False: None
         sleep_task3_config = type("SnapshotTask3Config", (), {"ai_model_limit": 1, "experience_pool_gb": 0.1})()
-        ControlPanel.run_sleep_task3(sleep_task3_panel, sleep_task3_config)
+        ControlPanel.run_sleep_task2(sleep_task3_panel, sleep_task3_config)
         require(len(list(store.model_dir.glob("model_*.json"))) == 1, 'len(list(store.model_dir.glob("model_*.json"))) == 1')
         model_path = max(store.model_dir.glob("model_*.json"), key=store.model_created_key)
         model_payload = json.loads(model_path.read_text(encoding="utf-8"))
@@ -7477,7 +7477,7 @@ class ControlPanel(tk.Tk):
         models_complete = False
         checkpoint = self.store.load_sleep_checkpoint() if self.store else None
         if not checkpoint or checkpoint.get("completed"):
-            checkpoint = {"run_id": uuid.uuid4().hex, "session_seed": uuid.uuid4().hex, "sample_order": [], "stage": "prepare", "task1_completed": False, "task2_completed": False, "task3_model_cleanup_completed": False, "task3_pool_compaction_completed": False, "created_at": now_text()}
+            checkpoint = {"run_id": uuid.uuid4().hex, "session_seed": uuid.uuid4().hex, "sample_order": [], "stage": "prepare", "task1_model_group_trained": False, "task1_saved": False, "task2_cleanup_completed": False, "task2_saved": False, "created_at": now_text()}
         def current_session_reason():
             with self.state_lock:
                 return self.active_session.termination_reason if self.active_session and self.active_session.token == token else None
@@ -7499,83 +7499,7 @@ class ControlPanel(tk.Tk):
         finally:
             self.persistence_paused.clear()
         self.update_progress(5.0, force=True)
-        self.ui(lambda: self.progress_label_var.set("睡眠评分复核中｜正在检查全部画面评分"))
-        recheck_result = {"checked": 0, "rescored": 0, "missing": 0, "errors": 0, "image_missing": 0, "image_corrupt": 0, "hash_missing": 0, "unrecoverable": 0}
-        review_status = "failed"
-        try:
-            if self.store and not checkpoint.get("task1_completed"):
-                checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task1_recheck", task1_completed=False)
-            if checkpoint.get("task1_completed"):
-                recheck_result = checkpoint.get("task1_result", recheck_result)
-            else:
-                with ScreenAnalyzer(config.settings.hash_size) as analyzer:
-                    def score_progress(current, total):
-                        ratio = clamp(safe_float(current, 0.0) / max(1.0, safe_float(total, 1.0)), 0.0, 1.0)
-                        self.update_progress(self.sleep_stage_progress(5.0, 25.0, ratio), force=True)
-                        self.ui(lambda c=current, t=total: self.progress_label_var.set(f"睡眠评分复核中｜已复核 {c}/{t} 条"))
-                    recheck_result = self.experience_pool.recheck_screen_scores(self.store, analyzer, run_guard=run_guard, progress_callback=score_progress)
-                event_result = {key: value for key, value in recheck_result.items() if key != "changed_records"}
-                self.events.publish("sleep_screen_scores_rechecked", **event_result)
-                self.store.merge_experience_records_by_id(recheck_result.get("changed_records", []))
-                recheck_result = event_result
-                if recheck_result.get("complete"):
-                    checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task1_saved", task1_completed=True, task1_result=recheck_result)
-                else:
-                    checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task1_interrupted", task1_completed=False, task1_result=recheck_result)
-                    review_status = "interrupted"
-                    stop_event.set()
-            blocking_records = sum(safe_int(recheck_result.get(name, 0), 0) for name in ("unrecoverable", "image_missing", "image_corrupt"))
-            trainable_records = safe_int(recheck_result.get("trainable", 0), 0)
-            if review_status != "interrupted":
-                review_status = "quarantined" if blocking_records and trainable_records > 0 else ("completed" if not blocking_records else "failed")
-        except Exception as exc:
-            review_status = "failed"
-            fatal_error = {"phase": "recalculate_scores", "type": type(exc).__name__, "message": str(exc)}
-            recheck_result = {"complete": False, "checked": safe_int(recheck_result.get("checked", 0), 0) if isinstance(recheck_result, dict) else 0, "fatal_error": fatal_error}
-            self.log_exception("sleep_score_recheck", exc, recheck_result)
-        self.ui(lambda r=recheck_result: self.progress_label_var.set(f"睡眠训练进度｜评分复核 {r.get('checked', 0)} 条｜重评 {r.get('rescored', 0)} 条｜不可恢复 {r.get('unrecoverable', 0)} 条"))
-        blocking_records = sum(safe_int(recheck_result.get(name, 0), 0) for name in ("unrecoverable", "image_missing", "image_corrupt"))
-        if self.store and blocking_records:
-            self.store.log_error("sleep_score_recheck_unrecoverable", RuntimeError("unrecoverable_or_invalid_screen_records"), recheck_result)
-        if review_status in ("failed", "interrupted"):
-            failure_detail = {"stage": "评分复核", "review_status": review_status, "result": recheck_result, "auto_restart_allowed": False}
-            log_id = None
-            if self.store:
-                log_id = self.store.log_error("sleep_review_failed_exit", RuntimeError("sleep_review_failed"), failure_detail)
-                failure_detail["log_id"] = log_id
-            self.ui(lambda r=recheck_result: self.progress_label_var.set(f"睡眠评分复核失败｜缺失 {r.get('image_missing', 0)}｜损坏 {r.get('image_corrupt', 0)}｜不可恢复 {r.get('unrecoverable', 0)}"))
-            self.update_progress(max(self.progress_value, 25.0), force=True)
-            saved, save_error, save_report = self.save_after_task1(config, "review_failed", run_guard=run_guard, status_detail=failure_detail)
-            if not saved:
-                if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
-                    self.finish_run(token, "保存失败：" + str(save_error), self.progress_value, release=False, reason="runtime_error")
-                    self.ui(lambda e=str(save_error): messagebox.showerror("保存失败", e))
-                return
-            if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
-                saved_progress = max(self.progress_value, 25.0)
-                self.render_sleep_completion_before_idle(f"睡眠评分复核失败：任务完成 {saved_progress:.1f}%，失败上下文已安全保存", saved_progress)
-                self.finish_run(token, "睡眠模式已退出：评分复核失败，需人工处理或明确降级策略", saved_progress, release=True, reason="runtime_error")
-                def show_review_error(d=failure_detail):
-                    fatal = d.get("result", {}).get("fatal_error", {}) if isinstance(d.get("result"), dict) else {}
-                    text = "\n".join([
-                        "睡眠评分复核失败，请先处理图片或存储问题后重试。",
-                        f"阶段：{fatal.get('phase', '重算评分')}",
-                        f"异常类型：{fatal.get('type', 'ScoreReviewError')}",
-                        f"异常信息：{fatal.get('message', d.get('review_status', 'failed'))}",
-                        f"错误编号：{d.get('log_id', '未写入')}",
-                        "可重试：是",
-                        "可跳过：否",
-                        "阻止自动重启训练：是"
-                    ])
-                    messagebox.showerror("评分复核失败", text)
-                self.ui(show_review_error)
-            return
-        saved, save_error, save_report = self.save_after_task1(config, "task1_completed", run_guard=run_guard, status_detail=recheck_result)
-        if not saved:
-            if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
-                self.finish_run(token, "保存失败：" + str(save_error), self.progress_value, release=False, reason="runtime_error")
-                self.ui(lambda e=str(save_error): messagebox.showerror("保存失败", e))
-            return
+        review_status = "completed"
         def train_once():
             if run_guard():
                 return {"trained": 0, "best_score": 0.0, "avg_score": 0.0, "avg_confidence": 0.0}
@@ -7590,9 +7514,9 @@ class ControlPanel(tk.Tk):
             futures.add(executor.submit(train_once))
             submitted += 1
             return True
-        if self.store and not checkpoint.get("task2_completed"):
-            checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task2_training", task2_completed=False)
-        if checkpoint.get("task2_completed"):
+        if self.store and not checkpoint.get("task1_model_group_trained"):
+            checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task1_model_group_training", task1_model_group_trained=False)
+        if checkpoint.get("task1_model_group_trained"):
             completed = target_training_steps
             completed_normally = True
         else:
@@ -7621,7 +7545,7 @@ class ControlPanel(tk.Tk):
                                 self.events.publish("sleep_completion_reached", completed_batches=completed, target_training_steps=target_training_steps, confidence=0.0)
                                 break
                             if not submit_next(executor, futures):
-                                raise RuntimeError("睡眠任务2无可执行批次，但训练目标尚未完成")
+                                raise RuntimeError("睡眠任务1无可执行批次，但训练目标尚未完成")
                         done, futures = concurrent.futures.wait(futures, timeout=config.settings.sleep_event_wait, return_when=concurrent.futures.FIRST_COMPLETED)
                         if not done:
                             continue
@@ -7663,21 +7587,21 @@ class ControlPanel(tk.Tk):
                     for future in futures:
                         future.cancel()
                     if completed_normally and not stop_event.is_set() and self.store:
-                        checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task2_saved", task2_completed=True, completed_batches=completed, target_training_steps=target_training_steps)
+                        checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task1_model_group_trained", task1_model_group_trained=True, completed_batches=completed, target_training_steps=target_training_steps)
             except Exception as exc:
                 completed_normally = False
-                self.log_exception("sleep_task2", exc, {"submitted": submitted, "completed": completed, "target_training_steps": target_training_steps})
+                self.log_exception("sleep_task1", exc, {"submitted": submitted, "completed": completed, "target_training_steps": target_training_steps})
                 if self.store:
-                    self.store.log_error("sleep_task2_failed", exc, {"submitted": submitted, "completed": completed, "target_training_steps": target_training_steps})
+                    self.store.log_error("sleep_task1_failed", exc, {"submitted": submitted, "completed": completed, "target_training_steps": target_training_steps})
         with self.state_lock:
             session_reason = self.active_session.termination_reason if self.active_session and self.active_session.token == token else None
         stopped_reason = session_reason if stop_event.is_set() and session_reason in ("esc", "user_stop") else None
         save_status = "completed" if completed_normally and not stopped_reason else stopped_reason or "incomplete"
         if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
             self.update_progress(70.0, force=True)
-            self.ui(lambda: self.progress_label_var.set("睡眠任务2｜保存模型快照 70%"))
-        task3_report = None
-        saved, save_error, save_report = self.save_after_task2(config, save_status, run_guard=run_guard)
+            self.ui(lambda: self.progress_label_var.set("睡眠任务1｜保存模型快照 70%"))
+        task2_report = None
+        saved, save_error, save_report = self.save_after_task1(config, save_status, run_guard=run_guard)
         compaction_complete = bool(save_report.get("compaction_complete", compaction_complete)) if isinstance(save_report, dict) else compaction_complete
         models_complete = bool(save_report.get("models_complete", models_complete)) if isinstance(save_report, dict) else models_complete
         if saved and completed_normally and not stopped_reason:
@@ -7685,22 +7609,22 @@ class ControlPanel(tk.Tk):
                 if self.store:
                     checkpoint = self.store.load_sleep_checkpoint() or checkpoint
                 if self.store:
-                    checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task3_model_cleanup", task3_model_cleanup_completed=bool(checkpoint.get("task3_model_cleanup_completed")))
-                model_result, pool_result = self.run_sleep_task3(config, run_guard=run_guard, checkpoint=checkpoint)
+                    checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task2_cleanup", task2_cleanup_completed=bool(checkpoint.get("task2_cleanup_completed")))
+                model_result, pool_result = self.run_sleep_task2(config, run_guard=run_guard, checkpoint=checkpoint)
                 if self.store:
-                    checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task3_saved", task3_model_cleanup_completed=bool(model_result.get("complete")), task3_pool_compaction_completed=bool(pool_result.get("complete")))
-                task3_report = {"model": model_result, "pool": pool_result}
+                    checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task2_saved", task2_cleanup_completed=bool(model_result.get("complete") and pool_result.get("complete")), task2_saved=bool(model_result.get("complete") and pool_result.get("complete")))
+                task2_report = {"model": model_result, "pool": pool_result}
                 compaction_complete = bool(pool_result.get("complete"))
                 models_complete = bool(model_result.get("complete"))
-                saved, save_error, save_report = self.save_after_task3(config, save_status, task3_report=task3_report)
+                saved, save_error, save_report = self.save_after_task2(config, save_status, task2_report=task2_report)
             except Exception as exc:
                 completed_normally = False
                 compaction_complete = False
                 models_complete = False
-                task3_report = {"error": str(exc), "error_type": type(exc).__name__}
-                self.log_exception("sleep_task3", exc, task3_report)
+                task2_report = {"error": str(exc), "error_type": type(exc).__name__}
+                self.log_exception("sleep_task2", exc, task2_report)
                 if self.store:
-                    self.store.log_error("sleep_task3_failed", exc, task3_report)
+                    self.store.log_error("sleep_task2_failed", exc, task2_report)
                 save_status = "incomplete"
         if not saved:
             if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
@@ -7730,7 +7654,7 @@ class ControlPanel(tk.Tk):
     def sleep_unfinished_summary(self, review_status, completed, target_training_steps, compaction_complete, reason, models_complete=True):
         items = []
         if review_status not in ("completed", "quarantined"):
-            items.append("评分复核未完成")
+            items.append("任务1训练未完成")
         if completed < target_training_steps:
             items.append(f"训练批次 {completed}/{target_training_steps}")
         if not compaction_complete:
@@ -7741,20 +7665,22 @@ class ControlPanel(tk.Tk):
             items.append("后续训练循环尚未确认")
         return f"{reason}；未完成：" + "，".join(items)
 
-    def run_sleep_task3(self, config, run_guard=None, checkpoint=None):
+    def run_sleep_task2(self, config, run_guard=None, checkpoint=None):
         if not self.store:
             return {"changed": False, "removed": 0, "model_count": 0, "complete": True}, {"changed": False, "size_bytes": 0, "removed": 0, "target_bytes": 0, "complete": True}
         if checkpoint:
-            if not checkpoint.get("task1_completed") or not checkpoint.get("task2_completed") or not checkpoint.get("task2_saved"):
+            if not checkpoint.get("task1_model_group_trained") or not checkpoint.get("task1_saved"):
                 raise RuntimeError("睡眠模式任务2前置不变量失败：任务1与任务1保存必须全部完成")
         self.ui(lambda: self.progress_label_var.set("睡眠任务2｜清理超额AI模型"))
         self.update_progress(78.0, force=True)
-        judge_runtime = self.experience_pool.model_runtime if self.experience_pool and getattr(self.experience_pool, "model_runtime", None) else ModelGroupRuntime(settings=getattr(config, "settings", getattr(self, "settings", None)))
+        pool = getattr(self, "experience_pool", None)
+        settings = getattr(config, "settings", None) or getattr(self, "settings", derive_runtime_settings())
+        judge_runtime = pool.model_runtime if pool and getattr(pool, "model_runtime", None) else ModelGroupRuntime(settings=settings)
         model_result = self.store.compact_ai_models(config.ai_model_limit, judge_runtime)
-        if checkpoint and checkpoint.get("task3_model_cleanup_completed"):
+        if checkpoint and checkpoint.get("task2_model_cleanup_completed"):
             model_result["resumed_rechecked"] = True
         self.events.publish("sleep_model_cleanup_completed", removed=model_result.get("removed", 0), model_count=model_result.get("model_count", 0), limit=model_result.get("limit", 0), complete=model_result.get("complete", False))
-        checkpoint = self.store.save_sleep_checkpoint(checkpoint or {}, stage="task3_model_cleanup_saved", task3_model_cleanup_completed=bool(model_result.get("complete")))
+        checkpoint = self.store.save_sleep_checkpoint(checkpoint or {}, stage="task2_model_cleanup_saved", task2_model_cleanup_completed=bool(model_result.get("complete")))
         if not model_result.get("complete"):
             raise RuntimeError("睡眠模式任务2未完成：AI模型清理未完成")
         self.update_progress(85.0, force=True)
@@ -7770,13 +7696,13 @@ class ControlPanel(tk.Tk):
             self.update_progress(percent, force=True)
             self.ui(lambda s=stage, r=removed, a=size_gb, b=target_gb, p=percent: self.progress_label_var.set(f"睡眠任务2｜{s}：已删除 {r} 条｜当前 {a:.2f}GB / {b:.2f}GB｜{p:.1f}%"))
         pool_result = self.store.compact_experience_pool(config.experience_pool_gb, judge_runtime, run_guard=run_guard, progress_callback=pool_progress)
-        if checkpoint and checkpoint.get("task3_pool_compaction_completed"):
+        if checkpoint and checkpoint.get("task2_pool_compaction_completed"):
             pool_result["resumed_rechecked"] = True
         self.events.publish("experience_pool_compaction_completed", removed=pool_result.get("removed", 0), size_bytes=pool_result.get("size_bytes", 0), target_bytes=pool_result.get("target_bytes", 0), complete=pool_result.get("complete", False))
-        self.store.save_sleep_checkpoint(checkpoint or {}, stage="task3_pool_compaction_saved", task3_pool_compaction_completed=bool(pool_result.get("complete")))
+        self.store.save_sleep_checkpoint(checkpoint or {}, stage="task2_pool_compaction_saved", task2_pool_compaction_completed=bool(pool_result.get("complete")))
         if not pool_result.get("complete"):
             raise RuntimeError("睡眠模式任务2未完成：经验池压缩未完成")
-        settings = getattr(config, "settings", getattr(self, "settings", derive_runtime_settings()))
+        settings = getattr(config, "settings", None) or getattr(self, "settings", derive_runtime_settings())
         records = self.store.load_experience(settings.experience_load_limit)
         model_state = self.store.load_latest_model_state(settings)
         self.experience_pool = ExperiencePool(settings, records, model_state)
@@ -7785,17 +7711,13 @@ class ControlPanel(tk.Tk):
         return model_result, pool_result
 
     def save_after_task1(self, config, status, run_guard=None, status_detail=None):
-        stage = "task1_completed" if status == "task1_completed" else "task1_failure_saved"
-        return self.save_sleep_data(config, status, run_guard=run_guard, status_detail=status_detail, save_model=False, checkpoint_stage=stage, progress_start=25.0, progress_end=30.0)
-
-    def save_after_task2(self, config, status, run_guard=None, status_detail=None):
         completed = status == "completed"
-        return self.save_sleep_data(config, status, run_guard=run_guard, status_detail=status_detail, save_model=completed, checkpoint_stage="task2_saved" if completed else "task2_interrupted_saved", allow_cleanup=False, progress_start=70.0, progress_end=78.0)
+        return self.save_sleep_data(config, status, run_guard=run_guard, status_detail=status_detail, save_model=completed, checkpoint_stage="task1_saved" if completed else "task1_interrupted_saved", allow_cleanup=False, progress_start=70.0, progress_end=78.0)
 
-    def save_after_task3(self, config, status, task3_report=None, status_detail=None):
-        return self.save_sleep_data(config, status, run_guard=None, status_detail=status_detail, task3_report=task3_report, save_model=False, checkpoint_stage="task3_final_saved", allow_cleanup=False, progress_start=95.0, progress_end=100.0)
+    def save_after_task2(self, config, status, task2_report=None, status_detail=None):
+        return self.save_sleep_data(config, status, run_guard=None, status_detail=status_detail, task2_report=task2_report, save_model=False, checkpoint_stage="task2_saved", allow_cleanup=False, progress_start=95.0, progress_end=100.0)
 
-    def save_sleep_data(self, config, status, run_guard=None, status_detail=None, task3_report=None, save_model=True, checkpoint_stage=None, allow_cleanup=False, progress_start=95.0, progress_end=100.0):
+    def save_sleep_data(self, config, status, run_guard=None, status_detail=None, task2_report=None, save_model=True, checkpoint_stage=None, allow_cleanup=False, progress_start=95.0, progress_end=100.0):
         if not self.store or not self.experience_pool:
             return True, None, {"model_count": 0, "experience_size": 0, "target_bytes": 0, "compaction_complete": True, "models_complete": True}
         try:
@@ -7806,22 +7728,22 @@ class ControlPanel(tk.Tk):
             self.store.flush_state(force=True)
             self.ui(lambda: self.progress_label_var.set(f"睡眠保存｜状态文件已同步 {self.sleep_stage_progress(progress_start, progress_end, 0.15):.1f}%"))
             self.update_progress(self.sleep_stage_progress(progress_start, progress_end, 0.15), force=True)
-            task3_compacted = isinstance(task3_report, dict) and isinstance(task3_report.get("pool"), dict) and bool(task3_report["pool"].get("complete"))
+            task2_compacted = isinstance(task2_report, dict) and isinstance(task2_report.get("pool"), dict) and bool(task2_report["pool"].get("complete"))
             with self.experience_pool.lock:
-                if not task3_compacted:
+                if not task2_compacted:
                     self.store.merge_experience_records_by_id(copy.deepcopy(self.experience_pool.records))
                 model = self.experience_pool.model
             self.update_progress(self.sleep_stage_progress(progress_start, progress_end, 0.55), force=True)
-            compact = (task3_report or {}).get("pool") if isinstance(task3_report, dict) else None
+            compact = (task2_report or {}).get("pool") if isinstance(task2_report, dict) else None
             if not isinstance(compact, dict):
                 size_bytes = self.store.experience_pool_size_bytes()
                 target_bytes = max(1, int(config.experience_pool_gb * 1024 * 1024 * 1024))
                 compact = {"changed": False, "size_bytes": size_bytes, "removed": 0, "target_bytes": target_bytes, "complete": size_bytes <= target_bytes}
             final_records = self.store.load_experience(config.settings.experience_load_limit)
             if save_model:
-                self.ui(lambda c=len(final_records): self.progress_label_var.set(f"睡眠任务2｜正在写入模型快照：最多 512 条代表性样本｜候选 {c} 条"))
+                self.ui(lambda c=len(final_records): self.progress_label_var.set(f"睡眠任务1｜正在写入模型快照：最多 512 条代表性样本｜候选 {c} 条"))
                 self.store.save_ai_model_snapshot(final_records, config.settings, config.ai_model_limit, status, model, run_guard=persistence_guard, status_detail=status_detail)
-            model_compact = self.store.compact_ai_models(config.ai_model_limit, self.experience_pool.model_runtime if self.experience_pool and getattr(self.experience_pool, "model_runtime", None) else None) if allow_cleanup else {"changed": False, "removed": 0, "limit": config.ai_model_limit, "model_count": len(list(self.store.model_dir.glob("model_*.json"))), "complete": True, "deferred_to_task3": True}
+            model_compact = self.store.compact_ai_models(config.ai_model_limit, self.experience_pool.model_runtime if self.experience_pool and getattr(self.experience_pool, "model_runtime", None) else None) if allow_cleanup else {"changed": False, "removed": 0, "limit": config.ai_model_limit, "model_count": len(list(self.store.model_dir.glob("model_*.json"))), "complete": True, "deferred_to_task2": True}
             self.experience_pool = ExperiencePool(config.settings, final_records, self.store.load_latest_model_state(config.settings))
             self.brain = ActionBrain(self.experience_pool, config.settings)
             self.update_progress(self.sleep_stage_progress(progress_start, progress_end, 0.85), force=True)
@@ -7832,11 +7754,11 @@ class ControlPanel(tk.Tk):
             report = {"model_count": model_count, "experience_size": experience_size, "target_bytes": target_bytes, "compaction_complete": bool(compact.get("complete", experience_size <= target_bytes)), "models_complete": model_count <= max(1, safe_int(config.ai_model_limit, AGENT_SPEC.default_ai_model_limit)), "compact": compact, "model_compact": model_compact}
             if checkpoint_stage:
                 checkpoint = self.store.load_sleep_checkpoint() or {}
-                checkpoint_payload = {"current_task": checkpoint_stage, "input_record_version": checkpoint.get("input_record_version", 0), "output_record_version": now_text(), "flushed": True, "model_count": model_count, "experience_pool_size": experience_size, "allowed_next_task": checkpoint_stage in ("task2_saved", "task3_final_saved")}
-                if checkpoint_stage == "task1_completed":
-                    checkpoint_payload.update({"task1_completed": True, "task1_result": status_detail if isinstance(status_detail, dict) else {"status_detail": status_detail}, "allowed_next_task": True})
+                checkpoint_payload = {"current_task": checkpoint_stage, "input_record_version": checkpoint.get("input_record_version", 0), "output_record_version": now_text(), "flushed": True, "model_count": model_count, "experience_pool_size": experience_size, "allowed_next_task": checkpoint_stage in ("task1_saved", "task2_saved")}
+                if checkpoint_stage == "task1_saved":
+                    checkpoint_payload.update({"task1_model_group_trained": True, "task1_saved": True, "allowed_next_task": True})
                 if checkpoint_stage == "task2_saved":
-                    checkpoint_payload.update({"task1_completed": True, "task2_completed": True, "task2_saved": True})
+                    checkpoint_payload.update({"task2_cleanup_completed": True, "task2_saved": True})
                 self.store.save_sleep_checkpoint(checkpoint, stage=checkpoint_stage, **checkpoint_payload)
             self.events.publish("save_completed", kind="sleep_data", status=status, **report)
             self.ui(lambda c=self.experience_pool.count(): self.pool_var.set(str(c)))
