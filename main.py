@@ -1273,6 +1273,32 @@ def run_self_test():
         retained = store.load_experience()
         require(compacted["complete"] is True and compacted["changed"] and shared.exists() and not unique.exists(), 'compacted["complete"] is True and compacted["changed"] and shared.exists() and not unique.exists()')
         require([record["id"] for record in retained] == ["high"], '[record["id"] for record in retained] == ["high"]')
+        protected_store = DataStore(root / "protected_pool")
+        protected_records = []
+        for index in range(60):
+            protected_screen = protected_store.screen_dir / f"protected_{index}.png"
+            with protected_screen.open("wb") as file:
+                file.truncate(2 * 1024 * 1024)
+            protected_records.append({
+                "id": f"protected-{index}",
+                "screen_path": f"screens/protected_{index}.png",
+                "mouse_action": {"type": f"action-{index}"},
+                "screen_hash": f"hash-{index}",
+                "reward": 1000.0 - index,
+                "sleep_novelty": 100.0,
+                "sleep_confidence": 1.0
+            })
+        protected_store.save_experience_records(protected_records)
+        protected_compacted = protected_store.compact_experience_pool(0.1)
+        protected_retained = protected_store.load_experience()
+        require(
+            protected_compacted["complete"] is True and protected_compacted["size_bytes"] <= protected_compacted["target_bytes"] and protected_compacted["removed"] > 0,
+            'protected_compacted["complete"] is True and protected_compacted["size_bytes"] <= protected_compacted["target_bytes"] and protected_compacted["removed"] > 0'
+        )
+        require(
+            protected_store.experience_pool_size_bytes(protected_retained) <= protected_compacted["target_bytes"],
+            'protected_store.experience_pool_size_bytes(protected_retained) <= protected_compacted["target_bytes"]'
+        )
         dummy_panel = type("DummyPanel", (), {"store": store})()
         require(ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 200, "target_bytes": 100}) == 0.5, 'ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 200, "target_bytes": 100}) == 0.5')
         require(ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 100, "target_bytes": 100}) == 1.0, 'ControlPanel.sleep_compaction_progress(dummy_panel, {"size_bytes": 100, "target_bytes": 100}) == 1.0')
@@ -4128,32 +4154,95 @@ class DataStore:
             removed_ids = set()
             removed = 0
             interrupted = False
-            while current > target_bytes:
-                if run_guard and run_guard():
-                    interrupted = True
+            absolute_keep = set()
+            action_query = "SELECT DISTINCT action_type FROM experience_meta WHERE trainable=1 AND action_type IS NOT NULL AND action_type != ''"
+            keep_query = "SELECT line_no FROM experience_meta WHERE trainable=1 AND action_type=? ORDER BY reward DESC, delete_score ASC, line_no DESC LIMIT 1"
+            for (action_type,) in connection.execute(action_query):
+                row = connection.execute(keep_query, (action_type,)).fetchone()
+                if row:
+                    absolute_keep.add(row[0])
+            phases = [
+                ("protected_first_pass", protected),
+                ("relax_protected_until_action_minimum", absolute_keep),
+                ("absolute_minimum_only", absolute_keep)
+            ]
+            for phase_name, phase_keep in phases:
+                if current <= target_bytes or interrupted:
                     break
-                placeholders = ",".join("?" for _ in protected.union(removed_ids))
-                if placeholders:
-                    rows = connection.execute(f"SELECT line_no, line_bytes, delete_score FROM experience_meta WHERE line_no NOT IN ({placeholders}) ORDER BY trainable ASC, delete_score DESC, line_no ASC LIMIT 500", tuple(protected.union(removed_ids))).fetchall()
-                else:
-                    rows = connection.execute("SELECT line_no, line_bytes, delete_score FROM experience_meta ORDER BY trainable ASC, delete_score DESC, line_no ASC LIMIT 500").fetchall()
-                if not rows:
-                    break
-                for row in rows:
-                    line_no, line_bytes, delete_score = row
-                    if current <= target_bytes:
+                while current > target_bytes:
+                    if run_guard and run_guard():
+                        interrupted = True
                         break
-                    features = self.experience_judge_features_by_line(connection, line_no)
-                    self.log_judge_cleanup_decision("experience_record", features, delete_score, removed + 1, "delete_score_high_until_pool_half_limit", line_no=line_no)
-                    removed_ids.add(line_no)
-                    removed += 1
-                    current = max(0, current - safe_int(line_bytes, 0))
-                    for (relative,) in connection.execute("SELECT path FROM screen_refs WHERE line_no=?", (line_no,)):
-                        path_refs[relative] = max(0, path_refs.get(relative, 0) - 1)
-                        if path_refs[relative] == 0:
-                            current = max(0, current - path_sizes.get(relative, 0))
-                    if progress_callback and (removed == 1 or removed % 500 == 0):
-                        progress_callback("分批淘汰经验样本", removed, max(1, safe_int(index_result.get("records", 0), 0)), {"removed": removed, "size_bytes": current, "target_bytes": target_bytes})
+                    excluded = set(phase_keep).union(removed_ids)
+                    placeholders = ",".join("?" for _ in excluded)
+                    if placeholders:
+                        query = f"SELECT line_no, line_bytes, delete_score FROM experience_meta WHERE line_no NOT IN ({placeholders}) ORDER BY trainable ASC, delete_score DESC, line_no ASC LIMIT 500"
+                        rows = connection.execute(query, tuple(excluded)).fetchall()
+                    else:
+                        rows = connection.execute("SELECT line_no, line_bytes, delete_score FROM experience_meta ORDER BY trainable ASC, delete_score DESC, line_no ASC LIMIT 500").fetchall()
+                    if not rows:
+                        break
+                    for row in rows:
+                        line_no, line_bytes, delete_score = row
+                        if current <= target_bytes:
+                            break
+                        features = self.experience_judge_features_by_line(connection, line_no)
+                        self.log_judge_cleanup_decision("experience_record", features, delete_score, removed + 1, "delete_score_high_until_pool_half_limit", line_no=line_no, phase=phase_name)
+                        removed_ids.add(line_no)
+                        removed += 1
+                        current = max(0, current - safe_int(line_bytes, 0))
+                        for (relative,) in connection.execute("SELECT path FROM screen_refs WHERE line_no=?", (line_no,)):
+                            path_refs[relative] = max(0, path_refs.get(relative, 0) - 1)
+                            if path_refs[relative] == 0:
+                                current = max(0, current - path_sizes.get(relative, 0))
+                        if progress_callback and (removed == 1 or removed % 500 == 0):
+                            progress_callback(
+                                "分批淘汰经验样本",
+                                removed,
+                                max(1, safe_int(index_result.get("records", 0), 0)),
+                                {"removed": removed, "size_bytes": current, "target_bytes": target_bytes, "phase": phase_name}
+                            )
+            if current > target_bytes and not interrupted:
+                while current > target_bytes:
+                    if run_guard and run_guard():
+                        interrupted = True
+                        break
+                    excluded = set(removed_ids)
+                    placeholders = ",".join("?" for _ in excluded)
+                    if placeholders:
+                        query = f"SELECT line_no, line_bytes, delete_score FROM experience_meta WHERE line_no NOT IN ({placeholders}) ORDER BY delete_score DESC, line_no ASC LIMIT 500"
+                        rows = connection.execute(query, tuple(excluded)).fetchall()
+                    else:
+                        rows = connection.execute("SELECT line_no, line_bytes, delete_score FROM experience_meta ORDER BY delete_score DESC, line_no ASC LIMIT 500").fetchall()
+                    if not rows:
+                        break
+                    for line_no, line_bytes, delete_score in rows:
+                        if current <= target_bytes:
+                            break
+                        features = self.experience_judge_features_by_line(connection, line_no)
+                        self.log_judge_cleanup_decision(
+                            "experience_record",
+                            features,
+                            delete_score,
+                            removed + 1,
+                            "delete_even_absolute_minimum_until_pool_half_limit",
+                            line_no=line_no,
+                            phase="hard_capacity_threshold"
+                        )
+                        removed_ids.add(line_no)
+                        removed += 1
+                        current = max(0, current - safe_int(line_bytes, 0))
+                        for (relative,) in connection.execute("SELECT path FROM screen_refs WHERE line_no=?", (line_no,)):
+                            path_refs[relative] = max(0, path_refs.get(relative, 0) - 1)
+                            if path_refs[relative] == 0:
+                                current = max(0, current - path_sizes.get(relative, 0))
+                        if progress_callback and (removed == 1 or removed % 500 == 0):
+                            progress_callback(
+                                "强制达成经验池阈值",
+                                removed,
+                                max(1, safe_int(index_result.get("records", 0), 0)),
+                                {"removed": removed, "size_bytes": current, "target_bytes": target_bytes, "phase": "hard_capacity_threshold"}
+                            )
             if interrupted:
                 return {"changed": False, "interrupted": True, "removed": removed, "size_bytes": current, "target_bytes": target_bytes, "complete": False}
             if not removed_ids:
@@ -4191,7 +4280,28 @@ class DataStore:
                             current += path.stat().st_size
                     except Exception as exc:
                         self.log_error("compact_experience_pool.final_stat", exc, {"path": str(relative)})
-            return {"changed": True, "size_bytes": current, "removed": removed, "target_bytes": target_bytes, "complete": current <= target_bytes, "deleted_screen_paths": deleted_paths, "orphan_screen_size_bytes": 0, "orphan_screen_count": 0, "orphan_screen_paths": []}
+            complete = current <= target_bytes
+            checkpoint_path = None
+            if not complete:
+                checkpoint_path = self.root / "experience_compaction_failed_checkpoint.json"
+                payload = {"time": now_text(), "size_bytes": current, "target_bytes": target_bytes, "removed": removed, "deleted_screen_paths": deleted_paths}
+                try:
+                    checkpoint_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                    self.log_error("compact_experience_pool.threshold_unmet", RuntimeError("experience_pool_compaction_threshold_unmet"), payload)
+                except Exception as exc:
+                    self.log_error("compact_experience_pool.checkpoint", exc, payload)
+            return {
+                "changed": True,
+                "size_bytes": current,
+                "removed": removed,
+                "target_bytes": target_bytes,
+                "complete": complete,
+                "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
+                "deleted_screen_paths": deleted_paths,
+                "orphan_screen_size_bytes": 0,
+                "orphan_screen_count": 0,
+                "orphan_screen_paths": []
+            }
 
     def log_error(self, where, error, context=None):
         payload = {
