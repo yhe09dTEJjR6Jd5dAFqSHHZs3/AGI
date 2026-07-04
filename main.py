@@ -733,7 +733,7 @@ REQUIREMENT_TEST_MATRIX = OrderedDict((
     ("REQ-SLEEP-012", {"requirement": "睡眠ESC中断后回空闲并恢复面板", "test": "sleep_esc_checkpoint_panel"}),
     ("REQ-SLEEP-013", {"requirement": "经验池超限后压缩至上限的50%", "test": "experience_pool_compact_to_half_limit"}),
     ("REQ-SLEEP-014", {"requirement": "自动重训真实调用任务1任务2环境面板鼠标链路", "test": "auto_restart_training_behavior_chain"}),
-    ("REQ-MODEL-015", {"requirement": "模型组必须严格包含七类模型", "test": "model_group_exact_seven_models"})
+    ("REQ-MODEL-015", {"requirement": "AI模型快照必须严格包含全部AI模型", "test": "ai_models_exact_seven_models"})
 ))
 HUMAN_FEATURE_NAMES = ("duration", "direct", "bend", "points", "speed_mean", "speed_variance", "acceleration_change", "pauses", "hover_before", "drag_curvature", "double_click_interval")
 
@@ -1336,8 +1336,8 @@ def run_self_test():
     sleep_result = pool.sleep_training_step(changed.sleep_batch_size)
     require(sleep_result["trained"] >= 1, 'sleep_result["trained"] >= 1')
     require(pool.records[0].get("sleep_visits", 0) >= 1, 'pool.records[0].get("sleep_visits", 0) >= 1')
-    group = ai_model_group_snapshot(pool.model.snapshot(), changed, pool.records)
-    runtime_pool = ExperiencePool(changed, pool.records, {"model_group": group})
+    models_payload = ai_models_snapshot(pool.model.snapshot(), changed, pool.records)
+    runtime_pool = ExperiencePool(changed, pool.records, {"ai_models": models_payload})
     runtime = runtime_pool.model_runtime
     require(runtime.screen_novelty([1.0]) == 0.0, 'runtime.screen_novelty([1.0]) == 0.0')
     changed_for_topk = replace(changed, nearest_top_k=3)
@@ -1387,8 +1387,8 @@ def run_self_test():
         reopened.load()
         require(reopened.format == "PNG", 'reopened.format == "PNG"')
         require(image_content_checksum(reopened) == image_content_checksum(image), 'image_content_checksum(reopened) == image_content_checksum(image)')
-        checkpoint = store.save_sleep_checkpoint({"run_id": "self-test", "stage": "task2_training"}, task1_model_group_trained=True)
-        require(store.load_sleep_checkpoint()["task1_model_group_trained"] is True, 'store.load_sleep_checkpoint()["task1_model_group_trained"] is True')
+        checkpoint = store.save_sleep_checkpoint({"run_id": "self-test", "stage": "task2_training"}, task1_ai_models_trained=True)
+        require(store.load_sleep_checkpoint()["task1_ai_models_trained"] is True, 'store.load_sleep_checkpoint()["task1_ai_models_trained"] is True')
         store.clear_sleep_checkpoint()
         require(store.load_sleep_checkpoint() is None, 'store.load_sleep_checkpoint() is None')
         store.append_runtime_parameter_audit({"a": 1}, {"a": 2}, {"a": {"reality_conditions": {"cpu_load": 0.5}, "semantic_goal": "self test"}})
@@ -1598,7 +1598,7 @@ def run_self_test():
         esc_config = type("EscTask2Config", (), {"ai_model_limit": 1, "experience_pool_gb": 0.1})()
         esc_raised = False
         try:
-            ControlPanel.run_sleep_task2(esc_panel, esc_config, run_guard=esc_during_model_cleanup, checkpoint={"task1_model_group_trained": True, "task1_saved": True})
+            ControlPanel.run_sleep_task2(esc_panel, esc_config, run_guard=esc_during_model_cleanup, checkpoint={"task1_ai_models_trained": True, "task1_saved": True})
         except RuntimeError as exc:
             esc_raised = "AI模型清理" in str(exc) and "中断" in str(exc)
         esc_checkpoint = esc_model_store.load_sleep_checkpoint() or {}
@@ -1777,8 +1777,8 @@ def run_self_test():
         require(len(list(store.model_dir.glob("model_*.json"))) == 1, 'len(list(store.model_dir.glob("model_*.json"))) == 1')
         model_path = max(store.model_dir.glob("model_*.json"), key=store.model_created_key)
         model_payload = json.loads(model_path.read_text(encoding="utf-8"))
-        require(len(model_payload["model_group"]["models"]) == 7, 'len(model_payload["model_group"]["models"]) == 7')
-        require([item["key"] for item in model_payload["model_group"]["models"]] == [item["key"] for item in AI_MODEL_GROUP_SPECS], '[item["key"] for item in model_payload["model_group"]["models"]] == [item["key"] for item in AI_MODEL_GROUP_SPECS]')
+        require(len(model_payload["ai_models"]["models"]) == 7, 'len(model_payload["ai_models"]["models"]) == 7')
+        require([item["key"] for item in model_payload["ai_models"]["models"]] == [item["key"] for item in AI_MODEL_SPECS], '[item["key"] for item in model_payload["ai_models"]["models"]] == [item["key"] for item in AI_MODEL_SPECS]')
         model_path.write_bytes(model_path.read_bytes() + (b"m" * 2048))
         require(store.storage_size_bytes() > store.experience_pool_size_bytes(), 'store.storage_size_bytes() > store.experience_pool_size_bytes()')
         compact = store.compact_experience_pool(0.1)
@@ -2665,7 +2665,7 @@ def strict_reward_target(screen_score, human_similarity):
     return clamp((screen / 100.0 + human / 100.0 * tie_cap) / (1.0 + tie_cap), 0.0, 1.0)
 
 
-AI_MODEL_GROUP_SPECS = (
+AI_MODEL_SPECS = (
     {"key": "sleep_decision_model", "name": "入睡模型", "goal": "训练模式期间，判断是否值得进入睡眠模式"},
     {"key": "operation_policy", "name": "活动模型", "goal": "训练模式期间，雷电模拟器客户区内，AI输出鼠标操作"},
     {"key": "judge_model", "name": "法官模型", "goal": "睡眠模式期间，找出最值得删除的AI模型或经验池数据"},
@@ -3112,7 +3112,7 @@ class RewardModel(TrainableModel):
 
 class JudgeModel(TrainableModel):
     key = "judge_model"
-    model_type = "retention_deletion_judge_model"
+    model_type = "multi_objective_retention_deletion_judge_model"
 
     def fit(self, records):
         super().fit(records)
@@ -3122,14 +3122,17 @@ class JudgeModel(TrainableModel):
         human = [safe_float(record.get("sleep_human_score", record.get("human_score", 50.0)), 50.0) for record in clean]
         confidence = [safe_float(record.get("sleep_confidence", 0.0), 0.0) for record in clean]
         self.reward_floor = round(percentile(rewards, 0.25, 0.0), 6) if rewards else 0.0
+        self.reward_median = round(percentile(rewards, 0.50, 0.0), 6) if rewards else 0.0
+        self.reward_ceiling = round(percentile(rewards, 0.90, 0.0), 6) if rewards else 0.0
+        self.reward_scale = round(robust_scale(rewards, 1.0), 6) if rewards else 1.0
         self.novelty_floor = round(percentile(novelty, 0.25, 0.0), 6) if novelty else 0.0
         self.human_floor = round(percentile(human, 0.25, 50.0), 6) if human else 50.0
         self.confidence_floor = round(percentile(confidence, 0.25, 0.0), 6) if confidence else 0.0
-        self.metrics = {"records": len(clean), "reward_floor": self.reward_floor, "novelty_floor": self.novelty_floor, "human_floor": self.human_floor, "confidence_floor": self.confidence_floor}
+        self.metrics = {"records": len(clean), "reward_floor": self.reward_floor, "reward_median": self.reward_median, "reward_ceiling": self.reward_ceiling, "reward_scale": self.reward_scale, "novelty_floor": self.novelty_floor, "human_floor": self.human_floor, "confidence_floor": self.confidence_floor}
         return self.metrics
 
     def parameters(self):
-        return {"reward_floor": getattr(self, "reward_floor", 0.0), "novelty_floor": getattr(self, "novelty_floor", 0.0), "human_floor": getattr(self, "human_floor", 50.0), "confidence_floor": getattr(self, "confidence_floor", 0.0), "intelligence_goal": "rank the most disposable AI model groups and experience records during sleep cleanup"}
+        return {"reward_floor": getattr(self, "reward_floor", 0.0), "reward_median": getattr(self, "reward_median", 0.0), "reward_ceiling": getattr(self, "reward_ceiling", 0.0), "reward_scale": getattr(self, "reward_scale", 1.0), "novelty_floor": getattr(self, "novelty_floor", 0.0), "human_floor": getattr(self, "human_floor", 50.0), "confidence_floor": getattr(self, "confidence_floor", 0.0), "signals": ["validity", "duplicate", "calibrated_reward_deficit", "coverage", "stability", "recency", "diversity", "size_cost", "validation_loss"], "intelligence_goal": "rank the most disposable AI models and experience records with robust multi-objective retention utility"}
 
     def predict(self, features):
         features = features or {}
@@ -3140,26 +3143,41 @@ class JudgeModel(TrainableModel):
         valid = 1.0 if features.get("valid", True) else 0.0
         duplicate = 1.0 if features.get("duplicate", False) else 0.0
         age_days = max(0.0, safe_float(features.get("age_seconds", 0.0), 0.0) / 86400.0)
-        reward_gap = safe_float(getattr(self, "reward_floor", 0.0), 0.0) - reward
+        coverage = clamp(safe_float(features.get("coverage", 0.0), 0.0), 0.0, 1.0)
+        stability = clamp(safe_float(features.get("stability", 0.0), 0.0), 0.0, 1.0)
+        diversity = clamp(safe_float(features.get("diversity", coverage), coverage), 0.0, 1.0)
+        loss = max(0.0, safe_float(features.get("loss", 1.0), 1.0))
+        size_mb = max(0.0, safe_float(features.get("size_bytes", 0.0), 0.0) / 1048576.0)
+        reward_floor = safe_float(getattr(self, "reward_floor", 0.0), 0.0)
+        reward_median = safe_float(getattr(self, "reward_median", reward_floor), reward_floor)
+        reward_scale = max(0.0001, safe_float(getattr(self, "reward_scale", 1.0), 1.0))
+        reward_deficit = clamp((reward_median - reward) / reward_scale, -10.0, 10.0)
         novelty_gap = safe_float(getattr(self, "novelty_floor", 0.0), 0.0) - novelty
         human_gap = safe_float(getattr(self, "human_floor", 50.0), 50.0) - human
         confidence_gap = safe_float(getattr(self, "confidence_floor", 0.0), 0.0) - confidence
-        score = (1.0 - valid) * 1000000.0 + duplicate * 10000.0 + max(0.0, reward_gap) * 10.0 + max(0.0, novelty_gap) + max(0.0, human_gap) * 0.1 + max(0.0, confidence_gap) * 5.0 + age_days * 0.01
+        recency_penalty = math.log1p(age_days) * (1.0 - clamp(reward / max(0.0001, abs(safe_float(getattr(self, "reward_ceiling", reward_median), reward_median)) + 1.0), 0.0, 1.0))
+        utility_risk = max(0.0, reward_deficit) * 18.0 + max(0.0, novelty_gap) * 0.8 + max(0.0, human_gap) * 0.25 + max(0.0, confidence_gap) * 8.0
+        redundancy_risk = (1.0 - coverage) * 16.0 + (1.0 - diversity) * 12.0 + duplicate * 10000.0
+        quality_risk = (1.0 - stability) * 22.0 + clamp(loss, 0.0, 10.0) * 6.0
+        cost_risk = math.log1p(size_mb) * 0.8 + recency_penalty
+        score = (1.0 - valid) * 1000000.0 + utility_risk + redundancy_risk + quality_risk + cost_risk
         return round(score, 8)
 
     def probe_input(self):
-        return {"reward": 0.0, "novelty": 0.0, "human_score": 50.0, "confidence": 0.0, "valid": True}
+        return {"reward": 0.0, "novelty": 0.0, "human_score": 50.0, "confidence": 0.0, "valid": True, "coverage": 0.0, "stability": 0.0}
 
     @classmethod
     def restore(cls, payload, settings=None):
         obj = cls(settings, payload)
         params = payload.get("parameters") if isinstance(payload, dict) else {}
         obj.reward_floor = safe_float(params.get("reward_floor", 0.0), 0.0) if isinstance(params, dict) else 0.0
+        obj.reward_median = safe_float(params.get("reward_median", 0.0), 0.0) if isinstance(params, dict) else 0.0
+        obj.reward_ceiling = safe_float(params.get("reward_ceiling", 0.0), 0.0) if isinstance(params, dict) else 0.0
+        obj.reward_scale = safe_float(params.get("reward_scale", 1.0), 1.0) if isinstance(params, dict) else 1.0
         obj.novelty_floor = safe_float(params.get("novelty_floor", 0.0), 0.0) if isinstance(params, dict) else 0.0
         obj.human_floor = safe_float(params.get("human_floor", 50.0), 50.0) if isinstance(params, dict) else 50.0
         obj.confidence_floor = safe_float(params.get("confidence_floor", 0.0), 0.0) if isinstance(params, dict) else 0.0
         return obj
-
 
 class RuntimeValueModel(TrainableModel):
     key = "runtime_value_model"
@@ -3211,16 +3229,21 @@ class SleepDecisionModel(TrainableModel):
 
     def fit(self, records):
         super().fit(records)
-        values = [safe_float(record.get("sleep_input_confidence", record.get("sleep_model_confidence", record.get("sleep_confidence", 0.0))), 0.0) for record in records or [] if isinstance(record, dict)]
-        rewards = [safe_float(record.get("reward", record.get("sleep_policy_reward", 0.0)), 0.0) for record in records or [] if isinstance(record, dict)]
-        self.threshold = round(clamp(percentile(values, 0.72, 0.82), 0.55, 0.95), 4) if values else 0.82
+        clean = [record for record in records or [] if isinstance(record, dict)]
+        values = [safe_float(record.get("sleep_input_confidence", record.get("sleep_model_confidence", record.get("sleep_confidence", 0.0))), 0.0) for record in clean]
+        rewards = [safe_float(record.get("reward", record.get("sleep_policy_reward", 0.0)), 0.0) for record in clean]
+        scores = [safe_float(record.get("sleep_novelty", record.get("screen_score", 0.0)), 0.0) for record in clean]
+        self.threshold = round(clamp(percentile(values, 0.68, 0.82), 0.50, 0.94), 4) if values else 0.82
         self.reward_floor = round(percentile(rewards, 0.30, 0.0), 4) if rewards else 0.0
-        self.reward_ceiling = round(percentile(rewards, 0.80, 0.0), 4) if rewards else 0.0
-        self.metrics = {"threshold": self.threshold, "reward_floor": self.reward_floor, "reward_ceiling": self.reward_ceiling, "records": len(values), "degradation_threshold": 0.18}
+        self.reward_median = round(percentile(rewards, 0.50, 0.0), 4) if rewards else 0.0
+        self.reward_ceiling = round(percentile(rewards, 0.85, 0.0), 4) if rewards else 0.0
+        self.reward_scale = round(robust_scale(rewards, 1.0), 4) if rewards else 1.0
+        self.score_floor = round(percentile(scores, 0.25, 0.0), 4) if scores else 0.0
+        self.metrics = {"threshold": self.threshold, "reward_floor": self.reward_floor, "reward_median": self.reward_median, "reward_ceiling": self.reward_ceiling, "reward_scale": self.reward_scale, "score_floor": self.score_floor, "records": len(values), "degradation_threshold": 0.18}
         return self.metrics
 
     def parameters(self):
-        return {"threshold": getattr(self, "threshold", 0.82), "reward_floor": getattr(self, "reward_floor", 0.0), "reward_ceiling": getattr(self, "reward_ceiling", 0.0), "signals": ["confidence", "failure_pressure", "no_action_pressure", "reward_opportunity"], "intelligence_goal": "judge whether training mode is worth entering sleep mode with calibrated confidence and reward opportunity"}
+        return {"threshold": getattr(self, "threshold", 0.82), "reward_floor": getattr(self, "reward_floor", 0.0), "reward_median": getattr(self, "reward_median", 0.0), "reward_ceiling": getattr(self, "reward_ceiling", 0.0), "reward_scale": getattr(self, "reward_scale", 1.0), "score_floor": getattr(self, "score_floor", 0.0), "signals": ["calibrated_confidence", "failure_pressure", "no_action_pressure", "reward_plateau", "negative_trend", "novelty_exhaustion", "elapsed_cost", "uncertainty"], "intelligence_goal": "estimate whether offline sleep training now has higher expected value than continuing online training"}
 
     def predict(self, features):
         features = features or {}
@@ -3228,16 +3251,30 @@ class SleepDecisionModel(TrainableModel):
         reward = safe_float(features.get("reward", 0.0), 0.0)
         failures = safe_int(features.get("consecutive_failures", 0), 0)
         no_actions = safe_int(features.get("consecutive_no_actions", 0), 0)
-        pressure = clamp(failures * 0.15 + no_actions * 0.1, 0.0, 0.5)
+        elapsed = max(0.0, safe_float(features.get("elapsed_seconds", 0.0), 0.0))
+        reward_trend = safe_float(features.get("reward_trend", 0.0), 0.0)
+        novelty = safe_float(features.get("screen_score", features.get("novelty", 50.0)), 50.0)
+        uncertainty = clamp(safe_float(features.get("uncertainty", 1.0 - confidence), 1.0 - confidence), 0.0, 1.0)
         reward_floor = safe_float(getattr(self, "reward_floor", 0.0), 0.0)
-        reward_ceiling = safe_float(getattr(self, "reward_ceiling", reward_floor), reward_floor)
-        opportunity = clamp((reward_ceiling - reward) / max(0.0001, abs(reward_ceiling - reward_floor) + 1.0), 0.0, 0.25)
-        score = confidence + pressure + opportunity
+        reward_median = safe_float(getattr(self, "reward_median", reward_floor), reward_floor)
+        reward_ceiling = safe_float(getattr(self, "reward_ceiling", reward_median), reward_median)
+        reward_scale = max(0.0001, safe_float(getattr(self, "reward_scale", 1.0), 1.0))
+        score_floor = safe_float(getattr(self, "score_floor", 0.0), 0.0)
+        pressure = clamp(failures * 0.13 + no_actions * 0.09, 0.0, 0.45)
+        plateau = clamp((reward_median - reward) / reward_scale, 0.0, 0.28)
+        opportunity = clamp((reward_ceiling - reward) / max(0.0001, abs(reward_ceiling - reward_floor) + reward_scale), 0.0, 0.22)
+        trend_pressure = clamp(-reward_trend / reward_scale, 0.0, 0.18)
+        novelty_exhaustion = clamp((score_floor - novelty) / 100.0, 0.0, 0.16)
+        elapsed_cost = clamp(math.log1p(elapsed / 60.0) * 0.035, 0.0, 0.16)
+        uncertainty_gain = clamp(uncertainty * (0.12 + pressure * 0.2), 0.0, 0.18)
+        score = confidence * 0.72 + pressure + plateau + opportunity + trend_pressure + novelty_exhaustion + elapsed_cost + uncertainty_gain
         threshold = safe_float(getattr(self, "threshold", 0.82), 0.82)
-        return {"sleep": score >= threshold or (failures + no_actions >= 3 and reward <= reward_floor), "score": round(score, 4), "threshold": threshold}
+        hard_plateau = failures + no_actions >= 3 and reward <= reward_floor
+        expected_value = score - threshold
+        return {"sleep": expected_value >= 0.0 or hard_plateau, "score": round(score, 4), "threshold": threshold, "expected_value": round(expected_value, 4), "components": {"confidence": round(confidence * 0.72, 4), "pressure": round(pressure, 4), "plateau": round(plateau, 4), "opportunity": round(opportunity, 4), "trend": round(trend_pressure, 4), "novelty": round(novelty_exhaustion, 4), "elapsed": round(elapsed_cost, 4), "uncertainty": round(uncertainty_gain, 4)}}
 
     def probe_input(self):
-        return {"sleep_confidence": 0.9, "reward": 0.0, "consecutive_failures": 0, "consecutive_no_actions": 0}
+        return {"sleep_confidence": 0.9, "reward": 0.0, "consecutive_failures": 0, "consecutive_no_actions": 0, "elapsed_seconds": 0.0}
 
     @classmethod
     def restore(cls, payload, settings=None):
@@ -3245,9 +3282,11 @@ class SleepDecisionModel(TrainableModel):
         params = payload.get("parameters") if isinstance(payload, dict) else {}
         obj.threshold = safe_float(params.get("threshold", 0.82), 0.82) if isinstance(params, dict) else 0.82
         obj.reward_floor = safe_float(params.get("reward_floor", 0.0), 0.0) if isinstance(params, dict) else 0.0
+        obj.reward_median = safe_float(params.get("reward_median", 0.0), 0.0) if isinstance(params, dict) else 0.0
         obj.reward_ceiling = safe_float(params.get("reward_ceiling", 0.0), 0.0) if isinstance(params, dict) else 0.0
+        obj.reward_scale = safe_float(params.get("reward_scale", 1.0), 1.0) if isinstance(params, dict) else 1.0
+        obj.score_floor = safe_float(params.get("score_floor", 0.0), 0.0) if isinstance(params, dict) else 0.0
         return obj
-
 
 TRAINABLE_MODEL_CLASSES = {cls.key: cls for cls in (ScreenNoveltyScorerModel, MouseHumanlikenessScorerModel, OperationPolicyModel, JudgeModel, RewardModel, RuntimeValueModel, SleepDecisionModel)}
 
@@ -3264,7 +3303,7 @@ def restore_trainable_model(payload, settings=None):
     return model
 
 
-class ModelGroupRuntime:
+class ModelRuntime:
     def __init__(self, models=None, settings=None):
         self.models = models if isinstance(models, dict) else {}
         self.settings = settings
@@ -3319,7 +3358,7 @@ class ModelGroupRuntime:
         parts = reward_breakdown(screen_score, human_score, self.settings, reward_state, event_time)
         parts["total_reward"] = self.reward(screen_score, human_score, event_time, reward_state, commit_state)
         parts["reward_sort_key"] = list(strict_reward_key(screen_score, human_score))
-        parts["basis"] = list(parts.get("basis", [])) + ["model_group_runtime_reward_model"]
+        parts["basis"] = list(parts.get("basis", [])) + ["ai_models_runtime_reward_model"]
         return parts
 
     def should_sleep(self, features):
@@ -3346,11 +3385,11 @@ class ModelGroupRuntime:
         return settings
 
 
-def model_group_complete(model_group, settings=None):
-    models = model_group.get("models") if isinstance(model_group, dict) else None
-    if not isinstance(models, list) or len(models) != len(AI_MODEL_GROUP_SPECS):
+def ai_models_complete(ai_models, settings=None):
+    models = ai_models.get("models") if isinstance(ai_models, dict) else None
+    if not isinstance(models, list) or len(models) != len(AI_MODEL_SPECS):
         return False
-    expected = [spec["key"] for spec in AI_MODEL_GROUP_SPECS]
+    expected = [spec["key"] for spec in AI_MODEL_SPECS]
     if [model.get("key") for model in models if isinstance(model, dict)] != expected:
         return False
     for model_payload in models:
@@ -3364,7 +3403,7 @@ def model_group_complete(model_group, settings=None):
     return True
 
 
-def ai_model_group_snapshot(policy_payload, settings, records):
+def ai_models_snapshot(policy_payload, settings, records):
     policy_payload = policy_payload if isinstance(policy_payload, dict) else {}
     records = records or []
     states = {
@@ -3377,16 +3416,16 @@ def ai_model_group_snapshot(policy_payload, settings, records):
         "runtime_value_model": {"resource_model": policy_payload.get("resource_model") if isinstance(policy_payload.get("resource_model"), dict) else {}}
     }
     models = []
-    for spec in AI_MODEL_GROUP_SPECS:
+    for spec in AI_MODEL_SPECS:
         cls = TRAINABLE_MODEL_CLASSES[spec["key"]]
         model = cls(settings, states.get(spec["key"], {}))
         model.fit(records)
         payload = model.snapshot()
         payload.update({"name": spec["name"], "goal": spec["goal"]})
         models.append(payload)
-    model_group = {"group_version": 4, "trained_at": now_text(), "training_data_digest": training_data_digest(records), "models": models, "intelligence_strategy": "human_current_technology_ceiling: calibrated ensembles, online preference learning, robust statistics, diversity, and resource-adaptive reinforcement"}
-    model_group["complete"] = model_group_complete(model_group, settings)
-    return model_group
+    ai_models = {"schema_version": 4, "trained_at": now_text(), "training_data_digest": training_data_digest(records), "models": models, "intelligence_strategy": "human_current_technology_ceiling: calibrated ensembles, online preference learning, robust statistics, diversity, and resource-adaptive reinforcement"}
+    ai_models["complete"] = ai_models_complete(ai_models, settings)
+    return ai_models
 
 def record_screen_human(record):
     screen = record.get("sleep_novelty", record.get("screen_primary_reward", record.get("novelty", record.get("screen_score", 0.0))))
@@ -3959,12 +3998,12 @@ class DataStore:
             ranked = sorted([record for record in records or [] if record.get("mouse_action")], key=lambda record: (safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), safe_float(record.get("sleep_confidence", 0.0), 0.0)), reverse=True)
             limit = max(1, min(len(ranked) or 1, safe_int(getattr(settings, "global_action_heap_limit", 1), 1), 512))
             model_payload = model.snapshot() if model else None
-            model_group = ai_model_group_snapshot(model_payload, settings, ranked)
-            if not model_group_complete(model_group, settings):
-                raise RuntimeError("AI模型快照不完整：七类模型必须都能独立加载并完成探针推理")
+            ai_models = ai_models_snapshot(model_payload, settings, ranked)
+            if not ai_models_complete(ai_models, settings):
+                raise RuntimeError("AI模型快照不完整：AI模型必须都能独立加载并完成探针推理")
             identity = hashlib.sha256(str(self.root.resolve()).encode("utf-8", "replace")).hexdigest()
             training_digest = hashlib.sha256(json.dumps([record.get("id") for record in ranked[:limit]], ensure_ascii=False).encode("utf-8")).hexdigest()
-            payload = {"schema_version": CONFIG_SCHEMA_VERSION, "model_version": 2, "training_data_version": 1, "data_path_id": identity, "checksum": training_digest, "created_at": now_text(), "status": status, "status_detail": status_detail or {}, "screen_score_total": self.screen_score_total, "reward_state": next((record.get("reward_state") for record in reversed(records or []) if isinstance(record, dict) and isinstance(record.get("reward_state"), dict)), asdict(RewardState())), "experience_count": len(records or []), "policy_limit": limit, "training_sample_ids": [record.get("id") for record in ranked[:limit]], "model_group": model_group, "model": model_payload, "policy": [{"id": record.get("id"), "mode": record.get("mode"), "action_type": (record.get("mouse_action") or {}).get("type") if isinstance(record.get("mouse_action"), dict) else None, "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_model_confidence": safe_float(record.get("sleep_model_confidence", record.get("model_prediction", 0.0)), 0.0), "model_prediction": safe_float(record.get("model_prediction", 0.0), 0.0), "model_target": safe_float(record.get("model_target", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
+            payload = {"schema_version": CONFIG_SCHEMA_VERSION, "model_version": 2, "training_data_version": 1, "data_path_id": identity, "checksum": training_digest, "created_at": now_text(), "status": status, "status_detail": status_detail or {}, "screen_score_total": self.screen_score_total, "reward_state": next((record.get("reward_state") for record in reversed(records or []) if isinstance(record, dict) and isinstance(record.get("reward_state"), dict)), asdict(RewardState())), "experience_count": len(records or []), "policy_limit": limit, "training_sample_ids": [record.get("id") for record in ranked[:limit]], "ai_models": ai_models, "model": model_payload, "policy": [{"id": record.get("id"), "mode": record.get("mode"), "action_type": (record.get("mouse_action") or {}).get("type") if isinstance(record.get("mouse_action"), dict) else None, "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_model_confidence": safe_float(record.get("sleep_model_confidence", record.get("model_prediction", 0.0)), 0.0), "model_prediction": safe_float(record.get("model_prediction", 0.0), 0.0), "model_target": safe_float(record.get("model_target", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
             path = self.model_dir / f"model_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex}.json"
             temporary = path.with_suffix(".tmp")
             with temporary.open("w", encoding="utf-8") as file:
@@ -3995,12 +4034,17 @@ class DataStore:
                 payload = json.load(file)
             self.validate_model_state(payload)
             policy = payload.get("policy") if isinstance(payload.get("policy"), list) else []
-            validation_gain = max([safe_float(item.get("reward", item.get("sleep_policy_reward", 0.0)), 0.0) for item in policy] or [0.0])
+            rewards = [safe_float(item.get("reward", item.get("sleep_policy_reward", 0.0)), 0.0) for item in policy if isinstance(item, dict)]
+            validation_gain = max(rewards or [0.0])
+            mean_gain = sum(rewards) / max(1, len(rewards))
             coverage = min(1.0, safe_float(len({item.get("id") for item in policy if isinstance(item, dict) and item.get("id")}), 0.0) / max(1.0, safe_float(payload.get("experience_count", 1), 1.0)))
-            stability = 1.0 - clamp(safe_float(((payload.get("model") or {}).get("loss")), 1.0), 0.0, 1.0)
+            actions = {item.get("action_type") for item in policy if isinstance(item, dict) and item.get("action_type")}
+            diversity = min(1.0, len(actions) / 6.0) if actions else 0.0
+            loss = safe_float(((payload.get("model") or {}).get("loss")), 1.0)
+            stability = 1.0 - clamp(loss, 0.0, 1.0)
             age_seconds = max(0.0, time.time() - parse_event_timestamp(payload.get("created_at")))
             recent = 1.0 / (1.0 + age_seconds / 86400.0)
-            return validation_gain * max(0.001, coverage) * max(0.001, stability) * max(0.001, recent), True
+            return (validation_gain * 0.55 + mean_gain * 0.45) * max(0.001, coverage) * max(0.001, 0.5 + diversity * 0.5) * max(0.001, stability) * max(0.001, recent), True
         except Exception as exc:
             try:
                 self.log_error("compact_ai_models.score", exc, {"path": str(path)})
@@ -4008,13 +4052,27 @@ class DataStore:
                 pass
             return -1.0, False
 
+    def model_retention_features(self, path):
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+            policy = payload.get("policy") if isinstance(payload.get("policy"), list) else []
+            rewards = [safe_float(item.get("reward", item.get("sleep_policy_reward", 0.0)), 0.0) for item in policy if isinstance(item, dict)]
+            actions = {item.get("action_type") for item in policy if isinstance(item, dict) and item.get("action_type")}
+            coverage = min(1.0, safe_float(len({item.get("id") for item in policy if isinstance(item, dict) and item.get("id")}), 0.0) / max(1.0, safe_float(payload.get("experience_count", 1), 1.0)))
+            loss = safe_float(((payload.get("model") or {}).get("loss")), 1.0)
+            return {"coverage": coverage, "diversity": min(1.0, len(actions) / 6.0) if actions else 0.0, "stability": 1.0 - clamp(loss, 0.0, 1.0), "loss": loss, "size_bytes": path.stat().st_size if path.exists() else 0, "mean_reward": sum(rewards) / max(1, len(rewards)), "best_reward": max(rewards or [0.0])}
+        except Exception:
+            return {"coverage": 0.0, "diversity": 0.0, "stability": 0.0, "loss": 1.0, "size_bytes": path.stat().st_size if path.exists() else 0}
+
     def compact_ai_models(self, max_models, judge_runtime=None, run_guard=None, progress_callback=None):
         limit = max(1, safe_int(max_models, AGENT_SPEC.default_ai_model_limit))
-        judge_runtime = judge_runtime or ModelGroupRuntime(settings=getattr(self, "settings", None))
+        judge_runtime = judge_runtime or ModelRuntime(settings=getattr(self, "settings", None))
         scored = []
         for path in self.model_dir.glob("model_*.json"):
             score, valid = self.model_retention_score(path)
-            features = {"kind": "model_group", "path": path.name, "retention_score": score, "reward": score, "valid": valid, "created_at": self.model_created_key(path), "age_seconds": max(0.0, time.time() - path.stat().st_mtime) if path.exists() else 0.0}
+            extra = self.model_retention_features(path)
+            features = {"kind": "ai_models", "path": path.name, "retention_score": score, "reward": score, "valid": valid, "created_at": self.model_created_key(path), "age_seconds": max(0.0, time.time() - path.stat().st_mtime) if path.exists() else 0.0, **extra}
             delete_score = safe_float(judge_runtime.judge_discard_score(features), 0.0)
             scored.append({"path": path, "score": score, "delete_score": delete_score, "valid": valid, "created": features["created_at"], "judge_features": features})
         ranked_for_delete = sorted(scored, key=lambda item: (item["delete_score"], not item["valid"], item["created"]), reverse=True)
@@ -4035,13 +4093,13 @@ class DataStore:
             if path in keep_paths or remaining <= limit:
                 continue
             try:
-                self.log_judge_cleanup_decision("model_group", item.get("judge_features", {}), item.get("delete_score", 0.0), audit_rank.get(path, 0), "delete_score_high_and_over_limit", path=str(path))
+                self.log_judge_cleanup_decision("ai_models", item.get("judge_features", {}), item.get("delete_score", 0.0), audit_rank.get(path, 0), "delete_score_high_and_over_limit", path=str(path))
                 audit.append({"path": str(path), "delete_score": item.get("delete_score", 0.0), "rank": audit_rank.get(path, 0), "reason": "delete_score_high_and_over_limit"})
                 path.unlink()
                 removed += 1
                 remaining = max(0, remaining - 1)
                 if progress_callback:
-                    progress_callback("清理AI模型", removed, max(1, len(scored) - limit), {"removed": removed, "model_count": remaining, "limit": limit, "current_rank": audit_rank.get(path, 0)})
+                    progress_callback("清理 AI 模型", removed, max(1, len(scored) - limit), {"removed": removed, "model_count": remaining, "limit": limit, "current_rank": audit_rank.get(path, 0)})
             except Exception as exc:
                 error = {"path": str(path), "error": str(exc), "error_type": type(exc).__name__}
                 errors.append(error)
@@ -4080,12 +4138,12 @@ class DataStore:
                 raise ValueError("资源自适应模型状态特征不匹配")
             if tuple(resource_model.get("action_names") or ()) != ResourceAdaptiveRLModel.ACTION_NAMES:
                 raise ValueError("资源自适应模型动作空间不匹配")
-        model_group = payload.get("model_group") if isinstance(payload.get("model_group"), dict) else None
-        if not model_group_complete(model_group, settings):
-            raise ValueError("七模型组无法逐个恢复并推理")
-        restored_models = {item.get("key"): item for item in model_group.get("models", [])}
+        ai_models = payload.get("ai_models") if isinstance(payload.get("ai_models"), dict) else None
+        if not ai_models_complete(ai_models, settings):
+            raise ValueError("AI模型无法逐个恢复并推理")
+        restored_models = {item.get("key"): item for item in ai_models.get("models", [])}
         reward_state = payload.get("reward_state") if isinstance(payload.get("reward_state"), dict) else None
-        return {"weights": clean, "trained_steps": trained_steps, "loss": loss, "resource_model": resource_model, "model_group": model_group, "restored_models": restored_models, "reward_state": reward_state}
+        return {"weights": clean, "trained_steps": trained_steps, "loss": loss, "resource_model": resource_model, "ai_models": ai_models, "restored_models": restored_models, "reward_state": reward_state}
 
     def load_latest_model_state(self, settings=None):
         candidates = sorted(self.model_dir.glob("model_*.json"), key=self.model_created_key, reverse=True)
@@ -4244,7 +4302,7 @@ class DataStore:
         return 1
 
     def experience_delete_score(self, record, line_no, judge_runtime=None):
-        judge_runtime = judge_runtime or ModelGroupRuntime(settings=getattr(self, "settings", None))
+        judge_runtime = judge_runtime or ModelRuntime(settings=getattr(self, "settings", None))
         trainable = self.experience_trainable(record)
         reward = safe_float(self.record_reward_sort_key(record)[0], 0.0) if isinstance(record, dict) else 0.0
         novelty = safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0) if isinstance(record, dict) else 0.0
@@ -4281,7 +4339,7 @@ class DataStore:
             connection.executemany("INSERT OR IGNORE INTO screen_refs(line_no, path) VALUES(?, ?)", [(line_no, path) for path in paths])
 
     def rebuild_experience_index(self, progress_callback=None, judge_runtime=None):
-        judge_runtime = judge_runtime or ModelGroupRuntime(settings=getattr(self, "settings", None))
+        judge_runtime = judge_runtime or ModelRuntime(settings=getattr(self, "settings", None))
         with self.open_experience_index() as connection:
             connection.execute("DELETE FROM screen_refs")
             connection.execute("DELETE FROM experience_meta")
@@ -4409,7 +4467,7 @@ class DataStore:
         return refreshed
 
     def compact_experience_pool(self, limit_gb, judge_runtime=None, run_guard=None, progress_callback=None):
-        judge_runtime = judge_runtime or ModelGroupRuntime(settings=getattr(self, "settings", None))
+        judge_runtime = judge_runtime or ModelRuntime(settings=getattr(self, "settings", None))
         orphan_report = self.cleanup_orphan_screens()
         orphan_failed = bool(orphan_report.get("orphan_cleanup_failed_paths"))
         limit_bytes = max(1, int(max(0.1, safe_float(limit_gb, DEFAULT_EXPERIENCE_POOL_GB)) * 1024 * 1024 * 1024))
@@ -5021,11 +5079,11 @@ class ExperiencePool:
         self.sorted_prefixes = []
         self.profile = HumanProfile(settings)
         self.model = PolicyModel(settings, model_state)
-        group_payload = (model_state or {}).get("model_group") if isinstance(model_state, dict) else None
-        self.model_group_models = {}
-        if isinstance(group_payload, dict) and model_group_complete(group_payload, settings):
-            self.model_group_models = {item.get("key"): restore_trainable_model(item, settings) for item in group_payload.get("models", [])}
-        self.model_runtime = ModelGroupRuntime(self.model_group_models, settings)
+        models_payload = (model_state or {}).get("ai_models") if isinstance(model_state, dict) else None
+        self.restored_ai_models = {}
+        if isinstance(models_payload, dict) and ai_models_complete(models_payload, settings):
+            self.restored_ai_models = {item.get("key"): restore_trainable_model(item, settings) for item in models_payload.get("models", [])}
+        self.model_runtime = ModelRuntime(self.restored_ai_models, settings)
         self.reward_state = reward_state_from((model_state or {}).get("reward_state") if isinstance(model_state, dict) else None)
         self.lock = threading.RLock()
         self.action_cache = []
@@ -6583,7 +6641,7 @@ class ControlPanel(tk.Tk):
             "starting": "正在准备模式。控制面板保持显示，鼠标会被放入雷电模拟器客户区；任何窗口遮挡雷电客户区都会判定为客户区异常。",
             "learning": "学习模式：请只在雷电模拟器客户区内操作。ESC、用户鼠标离开客户区或客户区真实异常会结束并保存数据。",
             "training": "训练模式：AI 鼠标动作会被限制在雷电模拟器客户区内。ESC、用户干预导致鼠标离开客户区或客户区真实异常会结束并保存数据。",
-            "sleep": "睡眠模式：正在检查样本评分、训练一组 AI 模型并清理模型组和经验池；进度条会从 0% 推进到 100%。",
+            "sleep": "睡眠模式：正在检查样本评分、训练 AI 模型并清理 AI 模型和经验池；进度条会从 0% 推进到 100%。",
             "stopping": "正在安全保存与退出当前模式。后台写入完成后会回到空闲并显示控制面板。"
         }
         self.build_ui()
@@ -6741,21 +6799,10 @@ class ControlPanel(tk.Tk):
         self.modify_buttons.append(self.modify_button)
         self.control_buttons = [self.modify_button, self.learning_button, self.training_button, self.sleep_button]
         self.reflow_buttons()
-        scroll_holder = ttk.Frame(root)
-        scroll_holder.pack(fill="both", expand=True)
-        scroll_holder.rowconfigure(0, weight=1)
-        scroll_holder.columnconfigure(0, weight=1)
-        self.scroll_canvas = tk.Canvas(scroll_holder, bg=panel_bg, highlightthickness=0, borderwidth=0)
-        scrollbar = ttk.Scrollbar(scroll_holder, orient="vertical", command=self.scroll_canvas.yview)
-        self.scroll_canvas.configure(yscrollcommand=scrollbar.set)
-        self.scroll_canvas.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        container = ttk.Frame(self.scroll_canvas, padding=0)
-        self.scroll_window = self.scroll_canvas.create_window((0, 0), window=container, anchor="nw")
-        container.bind("<Configure>", self.update_scroll_region)
-        self.scroll_canvas.bind("<Configure>", self.update_scroll_width)
-        self.scroll_canvas.bind("<Enter>", self.bind_mousewheel)
-        self.scroll_canvas.bind("<Leave>", self.unbind_mousewheel)
+        container = ttk.Frame(root, padding=0)
+        container.pack(fill="both", expand=True)
+        self.scroll_canvas = None
+        self.scroll_window = None
         container.columnconfigure(0, weight=1)
         container.rowconfigure(1, weight=0)
         path_frame = ttk.LabelFrame(container, text="路径与容量", padding=section_pad)
@@ -7522,16 +7569,6 @@ class ControlPanel(tk.Tk):
             self.after(max(300, int(self.settings.ui_event_coalesce_seconds * 1000)), lambda: self.update_progress(0.0, force=True))
         return ok
 
-    def bind_mousewheel(self, _event):
-        self.bind_all("<MouseWheel>", self.on_mousewheel)
-
-    def unbind_mousewheel(self, _event):
-        self.unbind_all("<MouseWheel>")
-
-    def on_mousewheel(self, event):
-        if getattr(self, "scroll_canvas", None):
-            self.scroll_canvas.yview_scroll(int(-event.delta / 120), "units")
-
     def load_persistent_settings(self):
         startup = self.app_config_store.load_settings()
         self.ldplayer_var.set(str(startup.get("ldplayer_path", self.ldplayer_var.get())))
@@ -8146,7 +8183,7 @@ class ControlPanel(tk.Tk):
         models_complete = False
         checkpoint = self.store.load_sleep_checkpoint() if self.store else None
         if not checkpoint or checkpoint.get("completed"):
-            checkpoint = {"run_id": uuid.uuid4().hex, "session_seed": uuid.uuid4().hex, "sample_order": [], "stage": "prepare", "task1_model_group_trained": False, "task1_saved": False, "task2_cleanup_completed": False, "task2_saved": False, "created_at": now_text()}
+            checkpoint = {"run_id": uuid.uuid4().hex, "session_seed": uuid.uuid4().hex, "sample_order": [], "stage": "prepare", "task1_ai_models_trained": False, "task1_saved": False, "task2_cleanup_completed": False, "task2_saved": False, "created_at": now_text()}
         def current_session_reason():
             with self.state_lock:
                 return self.active_session.termination_reason if self.active_session and self.active_session.token == token else None
@@ -8183,9 +8220,9 @@ class ControlPanel(tk.Tk):
             futures.add(executor.submit(train_once))
             submitted += 1
             return True
-        if self.store and not checkpoint.get("task1_model_group_trained"):
-            checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task1_model_group_training", task1_model_group_trained=False)
-        if checkpoint.get("task1_model_group_trained"):
+        if self.store and not checkpoint.get("task1_ai_models_trained"):
+            checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task1_ai_models_training", task1_ai_models_trained=False)
+        if checkpoint.get("task1_ai_models_trained"):
             completed = target_training_steps
             completed_normally = True
         else:
@@ -8256,7 +8293,7 @@ class ControlPanel(tk.Tk):
                     for future in futures:
                         future.cancel()
                     if completed_normally and not stop_event.is_set() and self.store:
-                        checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task1_model_group_trained", task1_model_group_trained=True, completed_batches=completed, target_training_steps=target_training_steps)
+                        checkpoint = self.store.save_sleep_checkpoint(checkpoint, stage="task1_ai_models_trained", task1_ai_models_trained=True, completed_batches=completed, target_training_steps=target_training_steps)
             except Exception as exc:
                 completed_normally = False
                 self.log_exception("sleep_task1", exc, {"submitted": submitted, "completed": completed, "target_training_steps": target_training_steps})
@@ -8344,13 +8381,13 @@ class ControlPanel(tk.Tk):
         if not self.store:
             return {"changed": False, "removed": 0, "model_count": 0, "complete": True}, {"changed": False, "size_bytes": 0, "removed": 0, "target_bytes": 0, "complete": True}
         if checkpoint:
-            if not checkpoint.get("task1_model_group_trained") or not checkpoint.get("task1_saved"):
+            if not checkpoint.get("task1_ai_models_trained") or not checkpoint.get("task1_saved"):
                 raise RuntimeError("睡眠模式任务2前置不变量失败：任务1与任务1保存必须全部完成")
         self.ui(lambda: self.progress_label_var.set("睡眠任务2｜清理超额AI模型"))
         self.update_progress(78.0, force=True)
         pool = getattr(self, "experience_pool", None)
         settings = getattr(config, "settings", None) or getattr(self, "settings", derive_runtime_settings())
-        judge_runtime = pool.model_runtime if pool and getattr(pool, "model_runtime", None) else ModelGroupRuntime(settings=settings)
+        judge_runtime = pool.model_runtime if pool and getattr(pool, "model_runtime", None) else ModelRuntime(settings=settings)
         def model_progress(stage, current, total, detail):
             nonlocal checkpoint
             ratio = clamp(safe_float(current, 0.0) / max(1.0, safe_float(total, 1.0)), 0.0, 1.0)
@@ -8361,7 +8398,7 @@ class ControlPanel(tk.Tk):
             if self.store:
                 checkpoint = self.store.save_sleep_checkpoint(checkpoint or {}, stage="task2_model_cleanup_progress", task2_model_cleanup_removed=removed, task2_model_cleanup_count=count, task2_model_cleanup_limit=limit, task2_model_cleanup_rank=safe_int(detail.get("current_rank", 0), 0) if isinstance(detail, dict) else 0)
             self.update_progress(percent, force=True)
-            self.ui(lambda r=removed, c=count, l=limit, p=percent: self.progress_label_var.set(f"睡眠任务2｜清理AI模型：已删除 {r} 个｜当前 {c}/{l}｜{p:.1f}%"))
+            self.ui(lambda r=removed, c=count, l=limit, p=percent: self.progress_label_var.set(f"睡眠任务2｜清理 AI 模型：已删除 {r} 个｜当前 {c}/{l}｜{p:.1f}%"))
         model_result = self.store.compact_ai_models(config.ai_model_limit, judge_runtime, run_guard=run_guard, progress_callback=model_progress)
         if checkpoint and checkpoint.get("task2_model_cleanup_completed"):
             model_result["resumed_rechecked"] = True
@@ -8447,7 +8484,7 @@ class ControlPanel(tk.Tk):
                 checkpoint = self.store.load_sleep_checkpoint() or {}
                 checkpoint_payload = {"current_task": checkpoint_stage, "input_record_version": checkpoint.get("input_record_version", 0), "output_record_version": now_text(), "flushed": True, "model_count": model_count, "experience_pool_size": experience_size, "allowed_next_task": checkpoint_stage in ("task1_saved", "task2_saved")}
                 if checkpoint_stage == "task1_saved":
-                    checkpoint_payload.update({"task1_model_group_trained": True, "task1_saved": True, "allowed_next_task": True})
+                    checkpoint_payload.update({"task1_ai_models_trained": True, "task1_saved": True, "allowed_next_task": True})
                 if checkpoint_stage == "task2_saved":
                     checkpoint_payload.update({"task2_cleanup_completed": True, "task2_saved": True})
                 self.store.save_sleep_checkpoint(checkpoint, stage=checkpoint_stage, **checkpoint_payload)
@@ -9145,7 +9182,7 @@ def run_windows_acceptance():
         if not session:
             return events, False
         events.append("sleep")
-        events.append("task1_train_model_group")
+        events.append("task1_train_ai_models")
         events.append("task1_save")
         events.append("task2_cleanup_models_and_pool")
         events.append("task2_save")
@@ -9176,14 +9213,14 @@ def run_windows_acceptance():
     result["sleep_model_decision"] = "pass" if decision_model.predict({"sleep_confidence": 0.95}).get("sleep") else "fail"
     learning_panel, learning_saved, _, learning_ok = run_real_transition_flow((("begin", "starting", "click_learning"), ("activate", "learning"), ("save", "mode_data"), ("finish", "esc")))
     training_panel, training_saved, _, training_ok = run_real_transition_flow((("begin", "starting", "click_training"), ("activate", "training"), ("transition", "training", "sleep", "sleep_model", None, True), ("save", "mode_data"), ("reject", "sleep", "training", "completed"), ("finish", "completed")))
-    sleep_panel, sleep_saved, _, sleep_ok = run_real_transition_flow((("begin", "sleep", "click_sleep"), ("save", "task1_train_model_group"), ("save", "task1_save"), ("save", "task2_cleanup_models_and_pool"), ("save", "task2_save"), ("finish", "completed")))
+    sleep_panel, sleep_saved, _, sleep_ok = run_real_transition_flow((("begin", "sleep", "click_sleep"), ("save", "task1_train_ai_models"), ("save", "task1_save"), ("save", "task2_cleanup_models_and_pool"), ("save", "task2_save"), ("finish", "completed")))
     esc_panel, esc_saved, _, esc_ok = run_real_transition_flow((("begin", "sleep", "click_sleep"), ("save", "sleep_checkpoint"), ("finish", "esc")))
     stale_panel, _, _, stale_ok = run_real_transition_flow((("begin", "starting", "click_training"), ("reject", "starting", "training", "window_ok", 999)))
     result["flow_tests"]["learning_exit_paths"] = passfail(learning_ok and learning_panel.current_mode() == "idle" and learning_saved == ["mode_data"])
     result["flow_tests"]["training_to_sleep_rejects_direct_restart"] = passfail(training_ok and training_panel.current_mode() == "idle" and training_saved == ["mode_data"])
-    result["flow_tests"]["sleep_tasks_save_chain"] = passfail(sleep_ok and sleep_panel.current_mode() == "idle" and sleep_saved == ["task1_train_model_group", "task1_save", "task2_cleanup_models_and_pool", "task2_save"])
+    result["flow_tests"]["sleep_tasks_save_chain"] = passfail(sleep_ok and sleep_panel.current_mode() == "idle" and sleep_saved == ["task1_train_ai_models", "task1_save", "task2_cleanup_models_and_pool", "task2_save"])
     auto_restart_chain, auto_restart_ok = run_auto_restart_behavior_flow()
-    expected_auto_restart_chain = ["starting", "training", "save_training_data", "sleep", "task1_train_model_group", "task1_save", "task2_cleanup_models_and_pool", "task2_save", "idle", "environment_recheck", "cursor_in_client", "starting", "training"]
+    expected_auto_restart_chain = ["starting", "training", "save_training_data", "sleep", "task1_train_ai_models", "task1_save", "task2_cleanup_models_and_pool", "task2_save", "idle", "environment_recheck", "cursor_in_client", "starting", "training"]
     result["flow_tests"]["auto_restart_training_full_chain"] = passfail(auto_restart_ok and auto_restart_chain == expected_auto_restart_chain)
     result["flow_tests"]["auto_restart_training_flush_before_restart"] = passfail(auto_restart_ok and auto_restart_chain.index("task2_save") < auto_restart_chain.index("environment_recheck"))
     failure_panel, failure_saved, _, failure_ok = run_real_transition_flow((("begin", "starting", "click_training"), ("activate", "training"), ("save", "mode_data"), ("finish", "runtime_error")))
