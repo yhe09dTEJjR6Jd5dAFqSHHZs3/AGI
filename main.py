@@ -1268,6 +1268,12 @@ def run_self_test():
         cancelled_store.save_experience_records([{"id": "kept", "screen_path": "screens/kept.png", "reward": 1.0}])
         cancelled = cancelled_store.compact_experience_pool(0.1, run_guard=lambda: "esc")
         require(cancelled["interrupted"] is True and cancelled["removed"] == 0 and kept_screen.exists(), 'cancelled["interrupted"] is True and cancelled["removed"] == 0 and kept_screen.exists()')
+        orphan_store = DataStore(root / "orphan_pool")
+        orphan_screen = orphan_store.screen_dir / "orphan.png"
+        with orphan_screen.open("wb") as file:
+            file.truncate(1024)
+        orphan_result = orphan_store.compact_experience_pool(0.1)
+        require(orphan_result["complete"] is True and orphan_result["changed"] is True and not orphan_screen.exists() and orphan_result["physical_pool_size_bytes"] <= orphan_result["target_bytes"], 'orphan_result["complete"] is True and orphan_result["changed"] is True and not orphan_screen.exists() and orphan_result["physical_pool_size_bytes"] <= orphan_result["target_bytes"]')
         compacted = store.compact_experience_pool(0.1)
         retained = store.load_experience()
         require(compacted["complete"] is True and compacted["changed"] and shared.exists() and not unique.exists(), 'compacted["complete"] is True and compacted["changed"] and shared.exists() and not unique.exists()')
@@ -1386,6 +1392,27 @@ def run_self_test():
         (store.model_dir / "partial_model_interrupted.json").write_text(json.dumps({"created_at": "2025-01-04T00:00:00.000"}), encoding="utf-8")
         compact_models = store.compact_ai_models(2)
         require(compact_models["removed"] == 1 and compact_models["model_count"] == 2 and not (store.model_dir / "model_old.json").exists() and (store.model_dir / "model_mid.json").exists() and (store.model_dir / "model_new.json").exists() and (store.model_dir / "partial_model_interrupted.json").exists(), 'compact_models["removed"] == 1 and compact_models["model_count"] == 2 and not (store.model_dir / "model_old.json").exists() and (store.model_dir / "model_mid.js')
+        esc_model_store = DataStore(root / "esc_model_cleanup")
+        for index in range(4):
+            (esc_model_store.model_dir / f"model_esc_{index}.json").write_text(json.dumps({"created_at": f"2025-01-0{index + 1}T00:00:00.000", "model": {"type": "bad"}}), encoding="utf-8")
+        def esc_during_model_cleanup():
+            return "esc" if len(list(esc_model_store.model_dir.glob("model_*.json"))) < 4 else None
+        esc_events = []
+        esc_panel = type("EscTask2Panel", (), {})()
+        esc_panel.store = esc_model_store
+        esc_panel.events = type("Events", (), {"publish": lambda self, name, **data: esc_events.append((name, data))})()
+        esc_panel.progress_label_var = SleepDummyVar()
+        esc_panel.progress_value = 0.0
+        esc_panel.ui = lambda fn: fn()
+        esc_panel.update_progress = lambda value, force=False: setattr(esc_panel, "progress_value", value)
+        esc_config = type("EscTask2Config", (), {"ai_model_limit": 1, "experience_pool_gb": 0.1})()
+        esc_raised = False
+        try:
+            ControlPanel.run_sleep_task2(esc_panel, esc_config, run_guard=esc_during_model_cleanup, checkpoint={"task1_model_group_trained": True, "task1_saved": True})
+        except RuntimeError as exc:
+            esc_raised = "AI模型清理" in str(exc) and "中断" in str(exc)
+        esc_checkpoint = esc_model_store.load_sleep_checkpoint() or {}
+        require(esc_raised and len(list(esc_model_store.model_dir.glob("model_*.json"))) > 1 and esc_checkpoint.get("task2_model_cleanup_removed") == 1 and esc_checkpoint.get("stage") in ("task2_model_cleanup_progress", "task2_model_cleanup_saved"), 'esc_raised and len(list(esc_model_store.model_dir.glob("model_*.json"))) > 1 and esc_checkpoint.get("task2_model_cleanup_removed") == 1 and esc_checkpoint.get("stage") in ("task2_model_cleanup_progress", "task2_model_cleanup_saved")')
         original_win32gui, original_win32api, original_win32con = globals().get("win32gui"), globals().get("win32api"), globals().get("win32con")
         class FakeWin32Gui:
             visible = True
@@ -1585,6 +1612,15 @@ def run_self_test():
     time.sleep(0.13)
     actions = recorder.pop_actions()
     require(actions and actions[0]["type"] == "move" and actions[0]["source"] == "user" and len(actions[0]["path"]) >= 2, 'actions and actions[0]["type"] == "move" and actions[0]["source"] == "user" and len(actions[0]["path"]) >= 2')
+    training_recorder = MouseRecorder(lambda: "training", lambda: (0, 0, 100, 100), lambda: None)
+    training_recorder.on_click(20, 20, "Button.left", True)
+    training_recorder.on_click(20, 20, "Button.left", False)
+    training_actions = training_recorder.pop_actions()
+    require(training_actions and training_actions[0]["source"] == "user", 'training_actions and training_actions[0]["source"] == "user"')
+    training_recorder.begin_ai_action()
+    training_recorder.on_move(30, 30)
+    training_recorder.end_ai_action()
+    require(training_recorder.pop_actions() == [], 'training_recorder.pop_actions() == []')
     tiny = replace(settings, async_queue_size=1, persistence_event_wait=settings.sleep_event_wait, persistence_close_seconds=settings.sleep_event_wait)
     persistence = AsyncPersistenceQueue(tiny)
     require(persistence.enqueue({"type": "noop"}, block_when_full=False), 'persistence.enqueue({"type": "noop"}, block_when_full=False)')
@@ -3747,7 +3783,7 @@ class DataStore:
                 pass
             return -1.0, False
 
-    def compact_ai_models(self, max_models, judge_runtime=None):
+    def compact_ai_models(self, max_models, judge_runtime=None, run_guard=None, progress_callback=None):
         limit = max(1, safe_int(max_models, AGENT_SPEC.default_ai_model_limit))
         judge_runtime = judge_runtime or ModelGroupRuntime(settings=getattr(self, "settings", None))
         scored = []
@@ -3767,6 +3803,9 @@ class DataStore:
         errors = []
         audit = []
         for item in ranked_for_delete:
+            if run_guard and run_guard():
+                remaining = len(list(self.model_dir.glob("model_*.json")))
+                return {"changed": removed > 0, "removed": removed, "limit": limit, "target_count": min(remaining, limit), "model_count": remaining, "complete": False, "interrupted": True, "errors": errors, "audit": audit}
             path = item["path"]
             if path in keep_paths or len(list(self.model_dir.glob("model_*.json"))) <= limit:
                 continue
@@ -3775,6 +3814,8 @@ class DataStore:
                 audit.append({"path": str(path), "delete_score": item.get("delete_score", 0.0), "rank": audit_rank.get(path, 0), "reason": "delete_score_high_and_over_limit"})
                 path.unlink()
                 removed += 1
+                if progress_callback:
+                    progress_callback("清理AI模型组", removed, max(1, len(scored) - limit), {"removed": removed, "model_count": len(list(self.model_dir.glob("model_*.json"))), "limit": limit, "current_rank": audit_rank.get(path, 0)})
             except Exception as exc:
                 error = {"path": str(path), "error": str(exc), "error_type": type(exc).__name__}
                 errors.append(error)
@@ -3816,7 +3857,7 @@ class DataStore:
                 raise ValueError("资源自适应模型动作空间不匹配")
         model_group = payload.get("model_group") if isinstance(payload.get("model_group"), dict) else None
         if not model_group_complete(model_group, settings):
-            raise ValueError("六模型组无法逐个恢复并推理")
+            raise ValueError("七模型组无法逐个恢复并推理")
         restored_models = {item.get("key"): item for item in model_group.get("models", [])}
         reward_state = payload.get("reward_state") if isinstance(payload.get("reward_state"), dict) else None
         return {"weights": clean, "trained_steps": trained_steps, "loss": loss, "resource_model": resource_model, "model_group": model_group, "restored_models": restored_models, "reward_state": reward_state}
@@ -4140,6 +4181,8 @@ class DataStore:
 
     def compact_experience_pool(self, limit_gb, judge_runtime=None, run_guard=None, progress_callback=None):
         judge_runtime = judge_runtime or ModelGroupRuntime(settings=getattr(self, "settings", None))
+        orphan_report = self.cleanup_orphan_screens()
+        orphan_failed = bool(orphan_report.get("orphan_cleanup_failed_paths"))
         limit_bytes = max(1, int(max(0.1, safe_float(limit_gb, DEFAULT_EXPERIENCE_POOL_GB)) * 1024 * 1024 * 1024))
         index_result = self.rebuild_experience_index(progress_callback, judge_runtime=judge_runtime)
         with self.open_experience_index() as connection:
@@ -4152,11 +4195,14 @@ class DataStore:
                         path_sizes[relative] = path.stat().st_size
                 except Exception as exc:
                     self.log_error("compact_experience_pool.stat", exc, {"path": str(relative)})
-            current = experience_file_size + sum(path_sizes.values())
+            physical_report = self.experience_pool_size_report()
+            current = max(experience_file_size + sum(path_sizes.values()), safe_int(physical_report.get("physical_pool_size_bytes", 0), 0))
+            if orphan_failed:
+                return {"changed": bool(orphan_report.get("orphan_cleanup_attempted", 0)), "size_bytes": current, "removed": 0, "target_bytes": max(1, limit_bytes // 2), "complete": False, "orphan_cleanup_failed_paths": orphan_report.get("orphan_cleanup_failed_paths", []), **physical_report}
             if progress_callback:
                 progress_callback("统计经验索引", safe_int(index_result.get("records", 0), 0), max(1, safe_int(index_result.get("records", 0), 0)), {"removed": 0, "size_bytes": current, "target_bytes": limit_bytes})
             if current <= limit_bytes:
-                return {"changed": False, "size_bytes": current, "removed": 0, "target_bytes": limit_bytes, "complete": True, "logical_pool_size_bytes": current, "physical_pool_size_bytes": current, "orphan_screen_size_bytes": 0, "orphan_screen_count": 0, "orphan_screen_paths": []}
+                return {"changed": bool(orphan_report.get("orphan_cleanup_attempted", 0)), "size_bytes": current, "removed": 0, "target_bytes": limit_bytes, "complete": True, **physical_report}
             target_bytes = max(1, limit_bytes // 2)
             keep_min = max(1, safe_int(DEFAULT_AI_MODEL_LIMIT, 10))
             protected = set()
@@ -4306,6 +4352,8 @@ class DataStore:
                             current += path.stat().st_size
                     except Exception as exc:
                         self.log_error("compact_experience_pool.final_stat", exc, {"path": str(relative)})
+            final_report = self.experience_pool_size_report()
+            current = max(current, safe_int(final_report.get("physical_pool_size_bytes", 0), 0))
             complete = current <= target_bytes
             checkpoint_path = None
             if not complete:
@@ -4323,6 +4371,7 @@ class DataStore:
                 "target_bytes": target_bytes,
                 "complete": complete,
                 "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
+                **final_report,
                 "deleted_screen_paths": deleted_paths,
                 "orphan_screen_size_bytes": 0,
                 "orphan_screen_count": 0,
@@ -5355,6 +5404,7 @@ class MouseRecorder:
         self.listener = None
         self.wake = threading.Event()
         self.cursor_outside_event = threading.Event()
+        self.ai_action_in_progress = False
 
     def start(self):
         if self.listener or not pynput_mouse:
@@ -5382,7 +5432,18 @@ class MouseRecorder:
             self.cursor_outside_event.clear()
 
     def active(self):
-        return self.get_mode() == "learning"
+        return self.get_mode() in ("learning", "training")
+
+    def begin_ai_action(self):
+        with self.lock:
+            self.ai_action_in_progress = True
+
+    def end_ai_action(self):
+        with self.lock:
+            self.ai_action_in_progress = False
+
+    def current_source(self):
+        return "ai" if self.ai_action_in_progress else "user"
 
     def capture_event(self, kind, x, y, extra=None, allow_current=False):
         if not self.active():
@@ -5401,6 +5462,8 @@ class MouseRecorder:
             if self.move_buffer:
                 self.move_buffer.clear()
                 self.move_action_id = None
+            return None
+        if self.current_source() == "ai":
             return None
         self.on_activity()
         self.wake.set()
@@ -5443,7 +5506,8 @@ class MouseRecorder:
             path.append(last)
         first = path[0]
         last = path[-1]
-        action = {"action_id": self.move_action_id, "type": "move", "button": "none", "source": "user", "started_at": first.get("created_at", now_text()), "ended_at": now_text(), "started_perf": first["t"], "ended_perf": last["t"], "duration": round(max(0.0, last["t"] - first["t"]), 6), "start_abs": [int(first["x"]), int(first["y"])], "end_abs": [int(last["x"]), int(last["y"])], "path": path}
+        source = self.current_source()
+        action = {"action_id": self.move_action_id, "type": "move", "button": "none", "source": source, "started_at": first.get("created_at", now_text()), "ended_at": now_text(), "started_perf": first["t"], "ended_perf": last["t"], "duration": round(max(0.0, last["t"] - first["t"]), 6), "start_abs": [int(first["x"]), int(first["y"])], "end_abs": [int(last["x"]), int(last["y"])], "path": path}
         self.actions.append(action)
         self.move_buffer = []
         self.move_action_id = None
@@ -5474,7 +5538,8 @@ class MouseRecorder:
         if not event:
             return
         action_id = uuid.uuid4().hex
-        action = {"action_id": action_id, "type": "scroll", "button": "scroll", "source": "user", "started_at": now_text(), "ended_at": now_text(), "started_perf": event["t"], "ended_perf": event["t"], "duration": 0.0, "start_abs": [int(x), int(y)], "end_abs": [int(x), int(y)], "path": [event], "scroll": [int(dx), int(dy)]}
+        source = self.current_source()
+        action = {"action_id": action_id, "type": "scroll", "button": "scroll", "source": source, "started_at": now_text(), "ended_at": now_text(), "started_perf": event["t"], "ended_perf": event["t"], "duration": 0.0, "start_abs": [int(x), int(y)], "end_abs": [int(x), int(y)], "path": [event], "scroll": [int(dx), int(dy)]}
         with self.lock:
             self.flush_move_locked(force=True, now_perf=event["t"])
             self.push_start_marker(action_id, event, "scroll")
@@ -5491,7 +5556,8 @@ class MouseRecorder:
             if pressed:
                 self.flush_move_locked(force=True, now_perf=event["t"])
                 action_id = uuid.uuid4().hex
-                self.current_by_button[button_key] = {"action_id": action_id, "type": "click", "button": button_key, "source": "user", "started_at": now_text(), "started_perf": event["t"], "t0": event["t"], "start_abs": [int(x), int(y)], "path": [event]}
+                source = self.current_source()
+                self.current_by_button[button_key] = {"action_id": action_id, "type": "click", "button": button_key, "source": source, "started_at": now_text(), "started_perf": event["t"], "t0": event["t"], "start_abs": [int(x), int(y)], "path": [event]}
                 self.push_start_marker(action_id, event, "click")
             elif button_key in self.current_by_button:
                 current = self.current_by_button.pop(button_key)
@@ -6093,7 +6159,13 @@ class TrainingService:
                 panel.apply_active_stop_reason("training", reason, stop_event)
                 return True
             return False
-        actual = panel.executor.execute(action, rect, stop_event, training_execution_stop, panel.mark_learning_activity)
+        if panel.mouse_recorder:
+            panel.mouse_recorder.begin_ai_action()
+        try:
+            actual = panel.executor.execute(action, rect, stop_event, training_execution_stop, panel.mark_learning_activity)
+        finally:
+            if panel.mouse_recorder:
+                panel.mouse_recorder.end_ai_action()
         panel.events.publish("mouse_action_completed", mode="training", success=bool(actual and not actual.get("execution_error")))
         if not actual:
             panel.log_exception("training.execute", RuntimeError("empty_action_result"))
@@ -7239,7 +7311,7 @@ class ControlPanel(tk.Tk):
         check = self.window_manager.check_window(force=True) if self.window_manager else None
         if not check or not check.ok:
             return "window_invalid"
-        if mode == "learning" and self.mouse_recorder and self.mouse_recorder.cursor_outside():
+        if mode in ("learning", "training") and self.mouse_recorder and self.mouse_recorder.cursor_outside():
             return "cursor_outside"
         if not self.cursor_inside_window():
             return "cursor_outside"
@@ -7781,6 +7853,12 @@ class ControlPanel(tk.Tk):
                 self.finish_run(token, "保存失败：" + str(save_error), self.progress_value, release=False, reason="runtime_error")
                 self.ui(lambda e=str(save_error): messagebox.showerror("保存失败", e))
             return
+        with self.state_lock:
+            latest_session_reason = self.active_session.termination_reason if self.active_session and self.active_session.token == token else None
+        if stop_event.is_set() and latest_session_reason in ("esc", "user_stop"):
+            stopped_reason = latest_session_reason
+        elif self.termination_reason in ("esc", "user_stop"):
+            stopped_reason = self.termination_reason
         final_reason = None
         if (self.is_run_active(token, "sleep") or self.is_run_active(token, "stopping")):
             if completed_normally and not stopped_reason and compaction_complete and models_complete:
@@ -7826,23 +7904,39 @@ class ControlPanel(tk.Tk):
         pool = getattr(self, "experience_pool", None)
         settings = getattr(config, "settings", None) or getattr(self, "settings", derive_runtime_settings())
         judge_runtime = pool.model_runtime if pool and getattr(pool, "model_runtime", None) else ModelGroupRuntime(settings=settings)
-        model_result = self.store.compact_ai_models(config.ai_model_limit, judge_runtime)
+        def model_progress(stage, current, total, detail):
+            nonlocal checkpoint
+            ratio = clamp(safe_float(current, 0.0) / max(1.0, safe_float(total, 1.0)), 0.0, 1.0)
+            percent = ControlPanel.sleep_stage_progress(self, 78.0, 85.0, ratio)
+            removed = safe_int(detail.get("removed", 0), 0) if isinstance(detail, dict) else 0
+            count = safe_int(detail.get("model_count", 0), 0) if isinstance(detail, dict) else 0
+            limit = safe_int(detail.get("limit", 0), 0) if isinstance(detail, dict) else 0
+            if self.store:
+                checkpoint = self.store.save_sleep_checkpoint(checkpoint or {}, stage="task2_model_cleanup_progress", task2_model_cleanup_removed=removed, task2_model_cleanup_count=count, task2_model_cleanup_limit=limit, task2_model_cleanup_rank=safe_int(detail.get("current_rank", 0), 0) if isinstance(detail, dict) else 0)
+            self.update_progress(percent, force=True)
+            self.ui(lambda r=removed, c=count, l=limit, p=percent: self.progress_label_var.set(f"睡眠任务2｜清理AI模型组：已删除 {r} 个｜当前 {c}/{l}｜{p:.1f}%"))
+        model_result = self.store.compact_ai_models(config.ai_model_limit, judge_runtime, run_guard=run_guard, progress_callback=model_progress)
         if checkpoint and checkpoint.get("task2_model_cleanup_completed"):
             model_result["resumed_rechecked"] = True
         self.events.publish("sleep_model_cleanup_completed", removed=model_result.get("removed", 0), model_count=model_result.get("model_count", 0), limit=model_result.get("limit", 0), complete=model_result.get("complete", False))
         checkpoint = self.store.save_sleep_checkpoint(checkpoint or {}, stage="task2_model_cleanup_saved", task2_model_cleanup_completed=bool(model_result.get("complete")))
         if not model_result.get("complete"):
+            if model_result.get("interrupted"):
+                raise RuntimeError("睡眠模式任务2被中断：AI模型清理未完成")
             raise RuntimeError("睡眠模式任务2未完成：AI模型清理未完成")
         self.update_progress(85.0, force=True)
         if run_guard and run_guard():
             raise RuntimeError("睡眠模式任务2被中断：经验池压缩未执行")
         self.ui(lambda: self.progress_label_var.set("睡眠任务2｜压缩经验池至上限50%"))
         def pool_progress(stage, current, total, detail):
+            nonlocal checkpoint
             ratio = clamp(safe_float(current, 0.0) / max(1.0, safe_float(total, 1.0)), 0.0, 1.0)
             percent = ControlPanel.sleep_stage_progress(self, 85.0, 95.0, ratio)
             removed = safe_int(detail.get("removed", 0), 0) if isinstance(detail, dict) else 0
             size_gb = safe_float(detail.get("size_bytes", 0), 0.0) / (1024.0 * 1024.0 * 1024.0) if isinstance(detail, dict) else 0.0
             target_gb = safe_float(detail.get("target_bytes", 0), 0.0) / (1024.0 * 1024.0 * 1024.0) if isinstance(detail, dict) else 0.0
+            if self.store:
+                checkpoint = self.store.save_sleep_checkpoint(checkpoint or {}, stage="task2_pool_compaction_progress", task2_pool_removed=removed, task2_pool_size_bytes=safe_int(detail.get("size_bytes", 0), 0) if isinstance(detail, dict) else 0, task2_pool_target_bytes=safe_int(detail.get("target_bytes", 0), 0) if isinstance(detail, dict) else 0, task2_pool_phase=str(detail.get("phase", stage)) if isinstance(detail, dict) else stage)
             self.update_progress(percent, force=True)
             self.ui(lambda s=stage, r=removed, a=size_gb, b=target_gb, p=percent: self.progress_label_var.set(f"睡眠任务2｜{s}：已删除 {r} 条｜当前 {a:.2f}GB / {b:.2f}GB｜{p:.1f}%"))
         pool_result = self.store.compact_experience_pool(config.experience_pool_gb, judge_runtime, run_guard=run_guard, progress_callback=pool_progress)
@@ -8187,18 +8281,40 @@ class ControlPanel(tk.Tk):
         else:
             self.release_window_and_panel()
 
+    def record_training_user_mouse_events(self, analyzer, session_id, start, pending_snapshots):
+        if not self.mouse_recorder:
+            return 0
+        markers = self.mouse_recorder.pop_start_markers()
+        actions = self.mouse_recorder.pop_actions()
+        count = 0
+        for marker in markers:
+            marker_snapshot = self.capture_snapshot(analyzer, "training", session_id, start, priority="critical")
+            if marker_snapshot:
+                pending_snapshots[marker["action_id"]] = marker_snapshot
+        for action in actions:
+            if action.get("source") == "ai":
+                continue
+            action_snapshot = pending_snapshots.pop(action.get("action_id"), None) or self.capture_snapshot(analyzer, "training", session_id, start, priority="critical")
+            after_snapshot = self.capture_snapshot(analyzer, "training", session_id, start, priority="critical")
+            self.write_record("training", session_id, action_snapshot, action, "user_mouse", action_anchor_perf=action.get("started_perf") or action.get("t0"), after_snapshot=after_snapshot, planned_action=action)
+            count += 1
+        return count
 
     def training_loop(self, token, stop_event, config):
         session_id = uuid.uuid4().hex
         start = time.perf_counter()
         consecutive_failures = 0
         consecutive_no_actions = 0
+        pending_user_snapshots = {}
         last_training_error = None
         self.termination_reason = "completed"
         service = self.training_service
         with ScreenAnalyzer(config.settings.hash_size) as analyzer:
             self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start, priority="critical"), None, "mode_start")
+            if self.mouse_recorder:
+                self.mouse_recorder.clear_cursor_outside()
             while not stop_event.is_set() and self.is_run_active(token, "training"):
+                self.record_training_user_mouse_events(analyzer, session_id, start, pending_user_snapshots)
                 if service.should_stop(config, stop_event):
                     break
                 rect = self.current_rect()
@@ -8221,10 +8337,12 @@ class ControlPanel(tk.Tk):
                         decision = {"reason": "forced_bounded_bootstrap_exploration", "consecutive_no_actions": consecutive_no_actions, "candidate_count": 0, "confidence": 0.0}
                     else:
                         stop_event.wait(max(self.settings.training_event_wait, self.settings.min_action_delay_seconds))
+                        self.record_training_user_mouse_events(analyzer, session_id, start, pending_user_snapshots)
                         continue
                 else:
                     consecutive_no_actions = 0
                 success, record = service.execute_and_record(analyzer, session_id, start, rect, snapshot, action, decision, stop_event, config)
+                self.record_training_user_mouse_events(analyzer, session_id, start, pending_user_snapshots)
                 if not success:
                     consecutive_failures += 1
                     last_training_error = record.get("failure_reason") if isinstance(record, dict) else None
@@ -8249,6 +8367,8 @@ class ControlPanel(tk.Tk):
                         self.apply_active_stop_reason("training", reason, stop_event)
                         break
                     stop_event.wait(min(self.settings.generated_action_complete_wait, deadline - time.perf_counter()))
+                    self.record_training_user_mouse_events(analyzer, session_id, start, pending_user_snapshots)
+            self.record_training_user_mouse_events(analyzer, session_id, start, pending_user_snapshots)
             self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start, priority="critical"), None, "mode_end")
         if self.is_run_active(token, "training") or self.is_run_active(token, "stopping"):
             final_reason = self.termination_reason or ("esc" if self.should_stop_by_escape() else "user_stop")
