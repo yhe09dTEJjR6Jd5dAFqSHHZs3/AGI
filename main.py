@@ -6355,7 +6355,7 @@ class ControlPanel(tk.Tk):
         self.events.subscribe("save_completed", lambda event: self.ui(lambda e=event: self.status_var.set(f"保存完成：{e.get('kind', 'data')}")))
         self.title("雷电模拟器学习训练控制面板")
         self.geometry(f"{self.settings.ui_width}x{self.settings.ui_height}")
-        self.minsize(self.settings.ui_min_width, self.settings.ui_min_height)
+        self.minsize(1, 1)
         self.state_lock = threading.RLock()
         self.mode = "idle"
         self.run_token = 0
@@ -6413,7 +6413,7 @@ class ControlPanel(tk.Tk):
         self.metrics_frame = None
         self.compact_panel_layout = False
         self.panel_size_warning_shown = False
-        self.minimum_supported_screen = (1280, 720)
+        self.minimum_supported_screen = (1, 1)
         self.app_config_store = AppConfigStore()
         self.hint_templates = {
             "idle": "当前处于空闲。可修改允许的四项参数，或启动学习、训练、睡眠模式；启动学习/训练前会自动检查并修复运行环境。",
@@ -6473,6 +6473,22 @@ class ControlPanel(tk.Tk):
         self.experience_pool_gb_var.set(self.format_runtime_value("experience_pool_gb", values["experience_pool_gb"]))
         self.ai_model_limit_var.set(self.format_runtime_value("ai_model_limit", values["ai_model_limit"]))
 
+    def append_user_settings_audit(self, previous_values, current_values, migration_status, validation_result):
+        changes = {}
+        for key in ("ldplayer_path", "data_path", "experience_pool_gb", "ai_model_limit"):
+            before = (previous_values or {}).get(key)
+            after = (current_values or {}).get(key)
+            if before != after:
+                changes[key] = {"before": before, "after": after}
+        if not changes:
+            return
+        data_path = Path(str((current_values or {}).get("data_path") or (previous_values or {}).get("data_path") or DEFAULT_DATA_PATH))
+        audit = {key: {"semantic_goal": "用户通过修改入口保存配置", "reality_conditions": {"migration_status": migration_status, "validation_result": validation_result, "before": value["before"], "after": value["after"]}} for key, value in changes.items()}
+        try:
+            DataStore(data_path).append_runtime_parameter_audit(previous_values, current_values, audit)
+        except Exception as exc:
+            self.log_exception("settings.audit", exc, {"migration_status": migration_status})
+
     def submit_user_settings(self, values):
         old_values = self.pending_user_settings()
         new_ldplayer = str(values.get("ldplayer_path") or DEFAULT_LDPLAYER_PATH)
@@ -6482,15 +6498,18 @@ class ControlPanel(tk.Tk):
             if not ok:
                 messagebox.showerror("雷电路径不合法", reason)
                 self.status_var.set("雷电路径校验失败，未保存")
+                self.append_user_settings_audit(old_values, {**old_values, "ldplayer_path": new_ldplayer}, "not_started", "failed:" + str(reason))
                 self.update_mode_button_states()
                 return False
         normalized = {"ldplayer_path": new_ldplayer, "data_path": str(new_data_path), "experience_pool_gb": max(0.1, safe_float(values.get("experience_pool_gb"), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(values.get("ai_model_limit"), DEFAULT_AI_MODEL_LIMIT))}
         if Path(old_values["data_path"]) != new_data_path:
+            self.append_user_settings_audit(old_values, normalized, "started", "passed")
             return self.start_data_migration(new_data_path, normalized)
         self.ldplayer_var.set(new_ldplayer)
         self.data_var.set(str(new_data_path))
         self.apply_runtime_value_vars(normalized)
         self.save_persistent_settings()
+        self.append_user_settings_audit(old_values, normalized, "not_required", "passed")
         self.refresh_runtime_environment_state()
         self.status_var.set("修改已保存")
         return True
@@ -6536,6 +6555,8 @@ class ControlPanel(tk.Tk):
         style.configure("Hint.TLabel", foreground=muted, background=card_bg)
         root = tk.Frame(self, bg=bg, padx=outer_pad, pady=outer_pad)
         root.pack(fill="both", expand=True)
+        root.rowconfigure(3, weight=1)
+        root.columnconfigure(0, weight=1)
         self.scroll_canvas = None
         self.scroll_window = None
         header = tk.Frame(root, bg=bg)
@@ -6545,10 +6566,34 @@ class ControlPanel(tk.Tk):
         band.pack(fill="x", pady=(max(4, outer_pad // 2), max(6, outer_pad)))
         for color in palette:
             tk.Frame(band, bg=color, height=max(8, int(10 * font_scale))).pack(side="left", fill="both", expand=True, padx=1)
-        container = ttk.Frame(root, padding=0)
-        container.pack(fill="both", expand=True)
+        button_frame = ttk.Frame(root)
+        button_frame.pack(fill="x", pady=(0, max(4, outer_pad // 2)))
+        self.button_frame = button_frame
+        self.modify_button = ttk.Button(button_frame, text="修改", command=self.modify_settings_dialog)
+        self.learning_button = ttk.Button(button_frame, text="学习模式", command=self.learning_mode, style="Learn.TButton")
+        self.training_button = ttk.Button(button_frame, text="训练模式", command=self.training_mode, style="Train.TButton")
+        self.sleep_button = ttk.Button(button_frame, text="睡眠模式", command=self.sleep_mode, style="Sleep.TButton")
+        self.mode_buttons = [self.learning_button, self.training_button, self.sleep_button]
+        self.modify_buttons.append(self.modify_button)
+        self.control_buttons = [self.modify_button, self.learning_button, self.training_button, self.sleep_button]
+        self.reflow_buttons()
+        scroll_holder = ttk.Frame(root)
+        scroll_holder.pack(fill="both", expand=True)
+        scroll_holder.rowconfigure(0, weight=1)
+        scroll_holder.columnconfigure(0, weight=1)
+        self.scroll_canvas = tk.Canvas(scroll_holder, bg=panel_bg, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(scroll_holder, orient="vertical", command=self.scroll_canvas.yview)
+        self.scroll_canvas.configure(yscrollcommand=scrollbar.set)
+        self.scroll_canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        container = ttk.Frame(self.scroll_canvas, padding=0)
+        self.scroll_window = self.scroll_canvas.create_window((0, 0), window=container, anchor="nw")
+        container.bind("<Configure>", self.update_scroll_region)
+        self.scroll_canvas.bind("<Configure>", self.update_scroll_width)
+        self.scroll_canvas.bind("<Enter>", self.bind_mousewheel)
+        self.scroll_canvas.bind("<Leave>", self.unbind_mousewheel)
         container.columnconfigure(0, weight=1)
-        container.rowconfigure(2, weight=1)
+        container.rowconfigure(1, weight=1)
         path_frame = ttk.LabelFrame(container, text="路径与容量", padding=section_pad)
         path_frame.grid(row=0, column=0, sticky="ew")
         for column in (1, 3):
@@ -6561,20 +6606,9 @@ class ControlPanel(tk.Tk):
             variable = self.runtime_value_specs[field][1]
             ttk.Label(path_frame, text=label, foreground=color).grid(row=1, column=index * 2, sticky="w", padx=(0 if index == 0 else 10, 6), pady=3)
             ttk.Entry(path_frame, textvariable=variable, width=10, state="readonly", justify="right").grid(row=1, column=index * 2 + 1, sticky="ew", pady=3)
-        button_frame = ttk.Frame(container)
-        button_frame.grid(row=1, column=0, sticky="ew", pady=(max(4, outer_pad // 2), max(4, outer_pad // 2)))
-        self.button_frame = button_frame
-        self.modify_button = ttk.Button(button_frame, text="修改", command=self.modify_settings_dialog)
-        self.learning_button = ttk.Button(button_frame, text="学习模式", command=self.learning_mode, style="Learn.TButton")
-        self.training_button = ttk.Button(button_frame, text="训练模式", command=self.training_mode, style="Train.TButton")
-        self.sleep_button = ttk.Button(button_frame, text="睡眠模式", command=self.sleep_mode, style="Sleep.TButton")
-        self.mode_buttons = [self.learning_button, self.training_button, self.sleep_button]
-        self.modify_buttons.append(self.modify_button)
-        self.control_buttons = [self.modify_button, self.learning_button, self.training_button, self.sleep_button]
-        self.reflow_buttons()
         self.after_idle(self.fit_complete_panel)
         status_frame = ttk.LabelFrame(container, text="全量状态", padding=section_pad)
-        status_frame.grid(row=2, column=0, sticky="nsew")
+        status_frame.grid(row=1, column=0, sticky="nsew", pady=(max(4, outer_pad // 2), 0))
         status_frame.columnconfigure(0, weight=1)
         status_frame.rowconfigure(0, weight=1)
         self.metrics_frame = ttk.Frame(status_frame)
@@ -6587,11 +6621,11 @@ class ControlPanel(tk.Tk):
         self.hint_label.grid(row=1, column=0, sticky="ew", pady=(max(4, outer_pad // 2), 0))
         progress_frame = ttk.LabelFrame(container, text=self.progress_label_var.get(), padding=section_pad)
         self.progress_label_var.trace_add("write", lambda *args: progress_frame.configure(text=self.progress_label_var.get()))
-        progress_frame.grid(row=3, column=0, sticky="ew", pady=(max(4, outer_pad // 2), 0))
+        progress_frame.grid(row=2, column=0, sticky="ew", pady=(max(4, outer_pad // 2), 0))
         progress_frame.columnconfigure(0, weight=1)
         ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100).grid(row=0, column=0, sticky="ew")
         ttk.Label(progress_frame, textvariable=self.progress_text_var, width=8, anchor="e", foreground="#8B5CF6").grid(row=0, column=1, sticky="e", padx=(10, 0))
-        ttk.Label(container, textvariable=self.status_var, foreground="#06B6D4").grid(row=4, column=0, sticky="w", pady=(max(4, outer_pad // 2), 0))
+        ttk.Label(container, textvariable=self.status_var, foreground="#06B6D4").grid(row=3, column=0, sticky="w", pady=(max(4, outer_pad // 2), 0))
 
     def own_window_handles(self):
         handles = []
@@ -6619,31 +6653,11 @@ class ControlPanel(tk.Tk):
     def fit_complete_panel(self):
         try:
             self.update_idletasks()
-            screen_w = max(1, self.winfo_screenwidth())
-            screen_h = max(1, self.winfo_screenheight())
-            req_w = max(self.settings.ui_min_width, self.winfo_reqwidth())
-            req_h = max(self.settings.ui_min_height, self.winfo_reqheight())
-            width = min(max(self.winfo_width(), req_w), screen_w)
-            height = min(max(self.winfo_height(), req_h), screen_h)
-            self.minsize(min(req_w, screen_w), min(req_h, screen_h))
-            if self.winfo_width() < req_w or self.winfo_height() < req_h:
-                self.geometry(f"{width}x{height}")
-                self.update_idletasks()
-            fits = self.panel_controls_fit_client()
-            if not fits and not self.compact_panel_layout:
+            self.minsize(1, 1)
+            if (self.winfo_width() < max(420, self.settings.ui_width // 2) or self.winfo_height() < max(360, self.settings.ui_height // 2)) and not self.compact_panel_layout:
                 self.compact_panel_layout = True
                 self.apply_compact_panel_layout()
-                self.update_idletasks()
-                req_w = max(self.settings.ui_min_width, self.winfo_reqwidth())
-                req_h = max(self.settings.ui_min_height, self.winfo_reqheight())
-                self.geometry(f"{min(max(self.winfo_width(), req_w), screen_w)}x{min(max(self.winfo_height(), req_h), screen_h)}")
-                self.update_idletasks()
-                fits = self.panel_controls_fit_client()
-            min_w, min_h = self.minimum_supported_screen
-            if (screen_w < min_w or screen_h < min_h or not fits) and not self.panel_size_warning_shown:
-                self.panel_size_warning_shown = True
-                self.status_var.set("当前屏幕尺寸不足以完整显示控制面板")
-                messagebox.showwarning("屏幕尺寸不足", "当前屏幕尺寸不足以完整显示控制面板。最低支持 1280×720 @ 100% DPI；请提高分辨率、降低缩放或扩大可用屏幕区域。")
+            self.update_scroll_width()
             self.update_scroll_region()
         except Exception as exc:
             self.log_exception("ui.fit_complete", exc)
@@ -6705,17 +6719,16 @@ class ControlPanel(tk.Tk):
     def reflow_metrics(self):
         if not self.metrics_frame:
             return
-        width = max(1, self.metrics_frame.winfo_width() or self.winfo_width())
-        min_width = 96 if self.compact_panel_layout else max(120, self.settings.ui_metric_min_column_width)
-        columns = max(1, min(3 if self.compact_panel_layout else 12, width // min_width if width >= min_width else 1))
+        width = max(1, self.winfo_width())
+        columns = 1 if width < 620 else 2 if width < 980 else max(1, min(self.settings.ui_metric_columns, width // max(220, safe_int(self.settings.ui_metric_min_column_width, 240))))
         for column in range(max(1, len(self.metric_items))):
             self.metrics_frame.columnconfigure(column, weight=0)
         for column in range(columns):
-            self.metrics_frame.columnconfigure(column, weight=1)
+            self.metrics_frame.columnconfigure(column, weight=1, uniform="metrics")
         for index, item in enumerate(self.metric_items):
-            row = index // columns
-            column = index % columns
-            item.grid(row=row, column=column, sticky="ew", padx=(0, 12))
+            item.grid_forget()
+            item.grid(row=index // columns, column=index % columns, sticky="ew", padx=3 if width < 620 else 5, pady=3)
+        self.update_scroll_region()
     def reflow_buttons(self):
         if not getattr(self, "button_frame", None):
             return
@@ -6731,11 +6744,14 @@ class ControlPanel(tk.Tk):
             self.button_frame.columnconfigure(column, weight=1)
 
     def on_window_resize(self, _event):
+        if self.winfo_width() < 720 or self.winfo_height() < 520:
+            self.compact_panel_layout = True
         if self.hint_label:
-            width = max(320, self.winfo_width() - self.settings.ui_padding * 4)
+            width = max(160, self.winfo_width() - self.settings.ui_padding * 4)
             self.hint_label.configure(wraplength=width)
         self.reflow_metrics()
         self.reflow_buttons()
+        self.update_scroll_width()
 
     def remember_event(self, event):
         self.event_journal.append(event)
@@ -6954,7 +6970,7 @@ class ControlPanel(tk.Tk):
             return str(safe_int(value, self.runtime_value_specs[field][2]))
         return str(safe_float(value, self.runtime_value_specs[field][2]))
 
-    def modify_runtime_value(self, field):
+    def _legacy_modify_runtime_value(self, field):
         AllowedUserEditPolicy.assert_allowed(field)
         if not self.require_idle_for_user_edit():
             return
@@ -6969,7 +6985,7 @@ class ControlPanel(tk.Tk):
         self.status_var.set(title + "已保存")
         self.update_mode_button_states()
 
-    def choose_ldplayer(self):
+    def _legacy_choose_ldplayer(self):
         if not self.require_idle_for_user_edit():
             return
         path = filedialog.askopenfilename(title="选择 dnplayer.exe", filetypes=[("dnplayer.exe", "dnplayer.exe")])
@@ -6986,7 +7002,7 @@ class ControlPanel(tk.Tk):
         self.status_var.set("雷电路径已校验并保存")
         self.update_mode_button_states()
 
-    def choose_data(self):
+    def _legacy_choose_data(self):
         if not self.require_idle_for_user_edit():
             return
         path = filedialog.askdirectory(title="选择数据存储目录")
@@ -7019,7 +7035,7 @@ class ControlPanel(tk.Tk):
         def run_migration():
             ok = self.migration_service.run(None, old_path, new_path, self.migration_stop_event, migration_values)
             self.ui(lambda result=ok: self.finish_data_migration(result))
-        self.migration_thread = threading.Thread(target=run_migration, name="data-migration", daemon=True)
+        self.migration_thread = threading.Thread(target=run_migration, name="data-migration", daemon=False)
         self.migration_thread.start()
         return True
 
@@ -7185,6 +7201,8 @@ class ControlPanel(tk.Tk):
         reason = "数据迁移完成"
         temp_root = None
         backup_root = None
+        journal_path = None
+        interrupted = False
         try:
             self.persistence_paused.set()
             if self.persistence_queue:
@@ -7199,8 +7217,10 @@ class ControlPanel(tk.Tk):
             if conflicts:
                 raise ValueError("迁移目标包含非本程序文件：" + "，".join(conflicts[:8]))
             new_root.parent.mkdir(parents=True, exist_ok=True)
+            journal_path = new_root.parent / f".{new_root.name}.migration.journal.json"
             temp_root = new_root.parent / f".{new_root.name}.migration.{uuid.uuid4().hex}"
             temp_root.mkdir(parents=True, exist_ok=False)
+            atomic_write_json(journal_path, {"stage": "copying", "old_path": str(old_root), "new_path": str(new_root), "temp_path": str(temp_root), "created_at": now_text(), "recoverable": True}, self.store.lock if self.store else threading.RLock())
             items = self.migration_items(old_root)
             total = max(1, sum(size for _, _, size in items))
             copied = 0
@@ -7208,13 +7228,13 @@ class ControlPanel(tk.Tk):
                 copied, ok = self.copy_migration_file(source, temp_root / relative, copied, total, stop_event, token)
                 if not ok:
                     reason = "数据迁移已终止"
+                    interrupted = True
                     break
                 if size == 0:
                     percent = copied * 100.0 / max(1, total)
                     self.ui(lambda c=copied, t=total, p=percent: (self.update_progress(p, force=True), self.progress_label_var.set(f"数据迁移中｜已迁移 {c}/{t} 字节")))
             if not stop_event.is_set() and (token is None or self.is_run_active(token)):
                 DataStore(temp_root).save_settings({"experience_pool_gb": values["experience_pool_gb"], "ai_model_limit": values["ai_model_limit"]})
-                journal_path = new_root.parent / f".{new_root.name}.migration.journal.json"
                 atomic_write_json(journal_path, {"stage": "prepare", "old_path": str(old_root), "new_path": str(new_root), "temp_path": str(temp_root), "created_at": now_text()}, self.store.lock if self.store else threading.RLock())
                 self.verify_migration(old_root, temp_root)
                 atomic_write_json(journal_path, {"stage": "verify", "old_path": str(old_root), "new_path": str(new_root), "temp_path": str(temp_root), "created_at": now_text()}, self.store.lock if self.store else threading.RLock())
@@ -7262,7 +7282,12 @@ class ControlPanel(tk.Tk):
             return False
         finally:
             self.persistence_paused.clear()
-            if temp_root:
+            if interrupted and journal_path:
+                try:
+                    atomic_write_json(journal_path, {"stage": "interrupted", "old_path": str(old_path), "new_path": str(new_path), "temp_path": str(temp_root) if temp_root else None, "created_at": now_text(), "recoverable": True}, self.store.lock if self.store else threading.RLock())
+                except Exception as exc:
+                    self.log_exception("migration.interrupted_journal", exc, {"old_path": str(old_path), "new_path": str(new_path)})
+            elif temp_root:
                 shutil.rmtree(temp_root, ignore_errors=True)
         return True
 
@@ -8667,6 +8692,21 @@ class ControlPanel(tk.Tk):
         deadline = time.perf_counter() + close_timeout
         with self.state_lock:
             active_mode = self.mode
+        migration_thread = self.migration_thread
+        if getattr(self, "migration_in_progress", False):
+            self.status_var.set("正在安全停止数据迁移，请等待完成")
+            self.update_mode_button_states()
+            self.migration_stop_event.set()
+            if migration_thread and migration_thread.is_alive():
+                while migration_thread.is_alive() and time.perf_counter() < deadline:
+                    migration_thread.join(timeout=max(0.05, min(0.25, deadline - time.perf_counter())))
+            if migration_thread and migration_thread.is_alive():
+                self.status_var.set("数据迁移正在写入可恢复检查点，已阻止立即退出")
+                self.log_exception("close.migration_timeout", RuntimeError("migration_close_timeout"), {"timeout": close_timeout})
+                self.after(1000, self.close)
+                return
+            self.migration_in_progress = False
+            self.update_mode_button_states()
         if active_mode in ["starting", "learning", "training", "sleep"]:
             self.status_var.set("正在保存，请等待完成")
             self.update_mode_button_states()
