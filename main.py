@@ -1558,6 +1558,11 @@ def run_self_test():
         store.pending_state_writes = 2
         require(ControlPanel.sleep_completion_reached(dummy_panel, 3, 3), 'ControlPanel.sleep_completion_reached(dummy_panel, 3, 3)')
         store.pending_state_writes = 0
+        seq_state = RewardState()
+        seq_first = reward_with_state(80, 50, seq_state, 1000.0)
+        seq_second = reward_with_state(20, 50, seq_first["state"], 1005.0)
+        seq_third = reward_with_state(30, 50, seq_second["state"], 1010.0)
+        require(seq_second["cost"] > 0.000001 and seq_third["income_improved"] and seq_third["cost"] == 0.000001 and seq_third["state"]["last_income"] == 30.0, 'seq_second["cost"] > 0.000001 and seq_third["income_improved"] and seq_third["cost"] == 0.000001 and seq_third["state"]["last_income"] == 30.0')
         require(not ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, "failed"), 'not ControlPanel.sleep_completion_reached(dummy_panel, 3, 3, "failed")')
         task3_store = DataStore(root / "task3")
         task3_store.model_dir.mkdir(parents=True, exist_ok=True)
@@ -1585,6 +1590,11 @@ def run_self_test():
         (store.model_dir / "partial_model_interrupted.json").write_text(json.dumps({"created_at": "2025-01-04T00:00:00.000"}), encoding="utf-8")
         compact_models = store.compact_ai_models(2)
         require(compact_models["removed"] == 1 and compact_models["model_count"] == 2 and not (store.model_dir / "model_old.json").exists() and (store.model_dir / "model_mid.json").exists() and (store.model_dir / "model_new.json").exists() and (store.model_dir / "partial_model_interrupted.json").exists(), 'compact_models["removed"] == 1 and compact_models["model_count"] == 2 and not (store.model_dir / "model_old.json").exists() and (store.model_dir / "model_mid.js')
+        counted_model_store = DataStore(root / "counted_model_cleanup")
+        counted_payload = {"created_at": "2025-01-01T00:00:00.000", "ai_models": {"models": [{"key": str(index)} for index in range(7)]}, "model": {"type": "bad"}}
+        (counted_model_store.model_dir / "model_counted.json").write_text(json.dumps(counted_payload), encoding="utf-8")
+        counted_compact = counted_model_store.compact_ai_models(6)
+        require(counted_compact["removed"] == 1 and counted_compact["model_count"] == 0 and counted_compact["complete"] and not (counted_model_store.model_dir / "model_counted.json").exists(), 'counted_compact["removed"] == 1 and counted_compact["model_count"] == 0 and counted_compact["complete"] and not (counted_model_store.model_dir / "model_counted.json").exists()')
         esc_model_store = DataStore(root / "esc_model_cleanup")
         for index in range(4):
             (esc_model_store.model_dir / f"model_esc_{index}.json").write_text(json.dumps({"created_at": f"2025-01-0{index + 1}T00:00:00.000", "model": {"type": "bad"}}), encoding="utf-8")
@@ -1777,8 +1787,8 @@ def run_self_test():
         sleep_task3_panel.update_progress = lambda value, force=False: None
         sleep_task3_config = type("SnapshotTask3Config", (), {"ai_model_limit": 1, "experience_pool_gb": 0.1})()
         ControlPanel.run_sleep_task2(sleep_task3_panel, sleep_task3_config)
-        require(len(list(store.model_dir.glob("model_*.json"))) == 1, 'len(list(store.model_dir.glob("model_*.json"))) == 1')
-        model_path = max(store.model_dir.glob("model_*.json"), key=store.model_created_key)
+        require(sum(store.model_file_ai_model_count(path) for path in store.model_dir.glob("model_*.json")) <= 1, 'sum(store.model_file_ai_model_count(path) for path in store.model_dir.glob("model_*.json")) <= 1')
+        model_path = store.save_ai_model_snapshot(store.load_experience(), settings, 1, "completed")
         model_payload = json.loads(model_path.read_text(encoding="utf-8"))
         require(len(model_payload["ai_models"]["models"]) == 7, 'len(model_payload["ai_models"]["models"]) == 7')
         require([item["key"] for item in model_payload["ai_models"]["models"]] == [item["key"] for item in AI_MODEL_SPECS], '[item["key"] for item in model_payload["ai_models"]["models"]] == [item["key"] for item in AI_MODEL_SPECS]')
@@ -2585,10 +2595,10 @@ def semantic_similarity(vector_a, vector_b):
 
 @dataclass
 class RewardState:
-    best_income: float = 0.0
+    last_income: float = 0.0
     cost: float = 0.000001
-    last_income_improved_at: float = 0.0
-    state_version: int = 1
+    last_event_at: float = 0.0
+    state_version: int = 2
 
 
 def parse_event_timestamp(value):
@@ -2613,24 +2623,26 @@ def reward_income(screen_score, human_similarity):
 
 def reward_state_from(value):
     if isinstance(value, RewardState):
-        return RewardState(value.best_income, value.cost, value.last_income_improved_at, value.state_version)
+        return RewardState(value.last_income, value.cost, value.last_event_at, value.state_version)
     if isinstance(value, dict):
-        return RewardState(safe_float(value.get("best_income", 0.0), 0.0), max(0.000001, safe_float(value.get("cost", 0.000001), 0.000001)), safe_float(value.get("last_income_improved_at", 0.0), 0.0), max(1, safe_int(value.get("state_version", 1), 1)))
+        last_income = value.get("last_income", value.get("best_income", 0.0))
+        last_event_at = value.get("last_event_at", value.get("last_income_improved_at", 0.0))
+        return RewardState(safe_float(last_income, 0.0), max(0.000001, safe_float(value.get("cost", 0.000001), 0.000001)), safe_float(last_event_at, 0.0), max(2, safe_int(value.get("state_version", 2), 2)))
     return RewardState()
 
 
 def reward_with_state(screen_score, human_similarity, state=None, event_time=None):
     state = reward_state_from(state)
     timestamp = parse_event_timestamp(event_time)
-    baseline_time = state.last_income_improved_at or timestamp
+    baseline_time = state.last_event_at or timestamp
     elapsed = max(0.0, timestamp - baseline_time)
     income = reward_income(screen_score, human_similarity)
     cost = max(0.000001, state.cost + elapsed * 0.000001)
-    improved = income > state.best_income
+    improved = income > state.last_income
+    state.last_income = income
+    state.last_event_at = timestamp
     if improved:
-        state.best_income = income
         state.cost = 0.000001
-        state.last_income_improved_at = timestamp
         cost = state.cost
     else:
         state.cost = cost
@@ -3089,7 +3101,7 @@ class RewardModel(TrainableModel):
             screen, human = record_screen_human(record)
             result = reward_with_state(screen, human, self.reward_state, record.get("created_at") or record.get("score_checked_at") or record.get("sleep_evaluated_at"))
             self.reward_state = reward_state_from(result["state"])
-        self.metrics = {"average_reward": round(sum(values) / len(values), 4) if values else 0.0, "records": len(values), "calibrated_screen_scale": self.screen_scale, "calibrated_tie_break_weight": self.human_tie_break_weight, "degradation_threshold": 0.0, "reward_state_version": self.reward_state.state_version, "best_income": round(self.reward_state.best_income, 8), "cost": round(self.reward_state.cost, 8)}
+        self.metrics = {"average_reward": round(sum(values) / len(values), 4) if values else 0.0, "records": len(values), "calibrated_screen_scale": self.screen_scale, "calibrated_tie_break_weight": self.human_tie_break_weight, "degradation_threshold": 0.0, "reward_state_version": self.reward_state.state_version, "last_income": round(self.reward_state.last_income, 8), "cost": round(self.reward_state.cost, 8)}
         return self.metrics
 
     def parameters(self):
@@ -4055,6 +4067,21 @@ class DataStore:
                 pass
             return -1.0, False
 
+    def model_file_ai_model_count(self, path):
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+            ai_models = payload.get("ai_models") if isinstance(payload, dict) else None
+            models = ai_models.get("models") if isinstance(ai_models, dict) else None
+            if isinstance(models, list):
+                return max(0, len(models))
+        except (OSError, json.JSONDecodeError, TypeError, AttributeError) as exc:
+            try:
+                self.log_error("compact_ai_models.count", exc, {"path": str(path)})
+            except Exception:
+                pass
+        return 1
+
     def model_retention_features(self, path):
         try:
             with path.open("r", encoding="utf-8") as file:
@@ -4064,9 +4091,10 @@ class DataStore:
             actions = {item.get("action_type") for item in policy if isinstance(item, dict) and item.get("action_type")}
             coverage = min(1.0, safe_float(len({item.get("id") for item in policy if isinstance(item, dict) and item.get("id")}), 0.0) / max(1.0, safe_float(payload.get("experience_count", 1), 1.0)))
             loss = safe_float(((payload.get("model") or {}).get("loss")), 1.0)
-            return {"coverage": coverage, "diversity": min(1.0, len(actions) / 6.0) if actions else 0.0, "stability": 1.0 - clamp(loss, 0.0, 1.0), "loss": loss, "size_bytes": path.stat().st_size if path.exists() else 0, "mean_reward": sum(rewards) / max(1, len(rewards)), "best_reward": max(rewards or [0.0])}
+            model_count = self.model_file_ai_model_count(path)
+            return {"coverage": coverage, "diversity": min(1.0, len(actions) / 6.0) if actions else 0.0, "stability": 1.0 - clamp(loss, 0.0, 1.0), "loss": loss, "size_bytes": path.stat().st_size if path.exists() else 0, "mean_reward": sum(rewards) / max(1, len(rewards)), "best_reward": max(rewards or [0.0]), "ai_model_count": model_count}
         except Exception:
-            return {"coverage": 0.0, "diversity": 0.0, "stability": 0.0, "loss": 1.0, "size_bytes": path.stat().st_size if path.exists() else 0}
+            return {"coverage": 0.0, "diversity": 0.0, "stability": 0.0, "loss": 1.0, "size_bytes": path.stat().st_size if path.exists() else 0, "ai_model_count": self.model_file_ai_model_count(path)}
 
     def compact_ai_models(self, max_models, judge_runtime=None, run_guard=None, progress_callback=None):
         limit = max(1, safe_int(max_models, AGENT_SPEC.default_ai_model_limit))
@@ -4075,18 +4103,20 @@ class DataStore:
         for path in self.model_dir.glob("model_*.json"):
             score, valid = self.model_retention_score(path)
             extra = self.model_retention_features(path)
+            model_count = max(1, safe_int(extra.get("ai_model_count", 1), 1))
             features = {"kind": "ai_models", "path": path.name, "retention_score": score, "reward": score, "valid": valid, "created_at": self.model_created_key(path), "age_seconds": max(0.0, time.time() - path.stat().st_mtime) if path.exists() else 0.0, **extra}
             delete_score = safe_float(judge_runtime.judge_discard_score(features), 0.0)
-            scored.append({"path": path, "score": score, "delete_score": delete_score, "valid": valid, "created": features["created_at"], "judge_features": features})
+            scored.append({"path": path, "score": score, "delete_score": delete_score, "valid": valid, "created": features["created_at"], "judge_features": features, "model_count": model_count})
         ranked_for_delete = sorted(scored, key=lambda item: (item["delete_score"], not item["valid"], item["created"]), reverse=True)
         audit_rank = {item["path"]: rank for rank, item in enumerate(ranked_for_delete, start=1)}
-        keep_paths = {item["path"] for item in sorted(scored, key=lambda item: (item["valid"], -item["delete_score"], item["score"], item["created"]), reverse=True)[:limit]}
-        if scored and not any(item["valid"] for item in scored if item["path"] in keep_paths):
-            first_valid = next((item for item in sorted(scored, key=lambda item: item["delete_score"]) if item["valid"]), None)
-            if first_valid:
-                keep_paths.add(first_valid["path"])
+        keep_paths = set()
+        kept_total = 0
+        for item in sorted(scored, key=lambda item: (item["valid"], -item["delete_score"], item["score"], item["created"]), reverse=True):
+            if kept_total + item["model_count"] <= limit:
+                keep_paths.add(item["path"])
+                kept_total += item["model_count"]
         removed = 0
-        remaining = len(scored)
+        remaining = sum(item["model_count"] for item in scored)
         errors = []
         audit = []
         for item in ranked_for_delete:
@@ -4100,9 +4130,9 @@ class DataStore:
                 audit.append({"path": str(path), "delete_score": item.get("delete_score", 0.0), "rank": audit_rank.get(path, 0), "reason": "delete_score_high_and_over_limit"})
                 path.unlink()
                 removed += 1
-                remaining = max(0, remaining - 1)
+                remaining = max(0, remaining - item.get("model_count", 1))
                 if progress_callback:
-                    progress_callback("清理 AI 模型", removed, max(1, len(scored) - limit), {"removed": removed, "model_count": remaining, "limit": limit, "current_rank": audit_rank.get(path, 0)})
+                    progress_callback("清理 AI 模型", removed, max(1, sum(entry.get("model_count", 1) for entry in scored) - limit), {"removed": removed, "model_count": remaining, "limit": limit, "current_rank": audit_rank.get(path, 0)})
             except Exception as exc:
                 error = {"path": str(path), "error": str(exc), "error_type": type(exc).__name__}
                 errors.append(error)
@@ -6632,6 +6662,7 @@ class ControlPanel(tk.Tk):
         self.modify_buttons = []
         self.runtime_environment_refresh_id = None
         self.runtime_environment_last_ready = None
+        self.active_mode_environment_cache = None
         self.metric_items = []
         self.hint_label = None
         self.metrics_frame = None
@@ -8002,8 +8033,13 @@ class ControlPanel(tk.Tk):
         self.ensure_storage_runtime(config)
         return result
 
-    def ensure_environment(self, stage, config=None, allow_repair=True, require_attach=False, show_error=True):
+    def ensure_environment(self, stage, config=None, allow_repair=True, require_attach=False, show_error=True, cache_seconds=0.0):
         config = config or self.read_config()
+        if require_attach and cache_seconds > 0.0:
+            cached = getattr(self, "active_mode_environment_cache", None)
+            if cached and cached.get("ok") and cached.get("ldplayer_path") == config.ldplayer_path and cached.get("data_path") == str(config.data_path) and cached.get("settings") == asdict(config.settings) and time.time() - cached.get("checked_at", 0.0) <= cache_seconds:
+                self.runtime_environment_issue = ""
+                return cached.get("result")
         result = ensure_environment(stage, allow_repair, lambda: self.runtime_environment_issues_for_config(config, require_attach=require_attach), lambda actions: self.repair_runtime_environment_for_config(config, actions))
         if self.store:
             try:
@@ -8011,6 +8047,7 @@ class ControlPanel(tk.Tk):
             except Exception:
                 pass
         if not result.ok:
+            self.active_mode_environment_cache = None
             self.runtime_environment_issue = "；".join(result.unrecoverable) or "运行环境不符合要求"
             self.log_exception("runtime.environment", RuntimeError("environment_not_ready"), {"stage": stage, "result": result.detail()})
             if show_error:
@@ -8026,6 +8063,7 @@ class ControlPanel(tk.Tk):
             attached = self.window_manager.launch_or_attach()
             if not attached:
                 result = EnvironmentEnsureResult(False, stage, result.checks, result.repair_actions, ("无法启动或附着雷电模拟器客户区",), ("无法启动或附着雷电模拟器客户区",))
+                self.active_mode_environment_cache = None
                 if show_error:
                     self.ui(lambda r=result: messagebox.showerror("运行环境不符合要求", r.detail()))
                 return result
@@ -8042,11 +8080,13 @@ class ControlPanel(tk.Tk):
                 self.log_exception("runtime.capability_probe", RuntimeError(probe_reason), {"stage": stage})
                 if show_error:
                     self.ui(lambda r=result: messagebox.showerror("运行环境不符合要求", r.detail()))
+                self.active_mode_environment_cache = None
                 return result
+            self.active_mode_environment_cache = {"ok": True, "checked_at": time.time(), "ldplayer_path": config.ldplayer_path, "data_path": str(config.data_path), "settings": asdict(config.settings), "result": result, "window_handle": getattr(self.window_manager, "hwnd", None), "client_rect": tuple(getattr(self.window_manager, "client_rect", ()) or ()), "probe_reason": probe_reason}
         return result
 
-    def ensure_runtime(self, config):
-        return self.ensure_environment("runtime", config, allow_repair=True, require_attach=True).ok
+    def ensure_runtime(self, config, cache_seconds=0.0):
+        return self.ensure_environment("runtime", config, allow_repair=True, require_attach=True, cache_seconds=cache_seconds).ok
 
     def learning_mode(self):
         self.request_active_mode("learning")
@@ -8079,7 +8119,7 @@ class ControlPanel(tk.Tk):
 
     def mode_job(self, token, mode, config, stop_event):
         try:
-            if not self.ensure_runtime(config):
+            if not self.ensure_runtime(config, cache_seconds=max(0.0, config.settings.window_event_wait + 2.0)):
                 if self.is_run_active(token):
                     self.ui(lambda: messagebox.showerror("未找到客户区", "没有找到雷电模拟器客户区，请确认路径正确或手动启动雷电模拟器。"))
                     self.finish_run(token, "未找到雷电模拟器", 0.0, reason="runtime_error")
