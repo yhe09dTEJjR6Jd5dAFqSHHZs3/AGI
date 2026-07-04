@@ -370,34 +370,53 @@ def discover_ldplayer_candidates():
     return list(dict.fromkeys(candidates))
 
 
+class EnvironmentProbe:
+    def __init__(self, ldplayer_path, data_path, settings=None, require_attach=False, offline_only=False):
+        self.ldplayer_path = ldplayer_path
+        self.data_path = data_path
+        self.settings = settings
+        self.require_attach = require_attach
+        self.offline_only = offline_only
+
+    def issues(self):
+        issues = []
+        if sys.version_info < MIN_PYTHON_VERSION:
+            issues.append(f"Python 版本过低：需要 {MIN_PYTHON_VERSION[0]}.{MIN_PYTHON_VERSION[1]} 或更高版本，当前版本为 {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+        if not self.offline_only and sys.platform != "win32":
+            issues.append(f"操作系统不符合要求：需要 Windows 桌面会话，当前平台为 {sys.platform}")
+        if not self.offline_only and sys.platform == "win32":
+            session_name = os.environ.get("SESSIONNAME", "")
+            if not session_name:
+                issues.append("未检测到 Windows 桌面会话")
+            try:
+                if ctypes.windll.user32.GetDesktopWindow() == 0:
+                    issues.append("无法访问 Windows 桌面")
+            except Exception as exc:
+                issues.append(f"无法检查 Windows 桌面权限：{exc}")
+        for name in REQUIRED_MODULES:
+            if name in IMPORT_ERRORS:
+                issues.append(f"依赖无法导入 {name}：{IMPORT_ERRORS[name]}")
+        storage_issue = data_path_write_issue(self.data_path)
+        if storage_issue:
+            issues.append(f"存储路径无效 {self.data_path}：{storage_issue}")
+        if self.offline_only:
+            return issues
+        valid_path, path_reason = validate_ldplayer_executable(self.ldplayer_path, self.settings, require_attach=False)
+        if not valid_path:
+            issues.append(f"雷电模拟器启动路径无效 {self.ldplayer_path}：{path_reason}")
+        report = windows_runtime_report(self.ldplayer_path)
+        if not report.get("ok"):
+            issues.append("Windows 桌面运行环境不可用：" + json.dumps(report, ensure_ascii=False))
+        if self.require_attach and valid_path and sys.platform == "win32" and "WindowManager" in globals():
+            runtime_ok, runtime_reason = attach_and_probe_ldplayer(self.ldplayer_path, self.settings)
+            if not runtime_ok:
+                issues.append(f"雷电运行能力不可用 {self.ldplayer_path}：{runtime_reason}")
+        return issues
+
+
 def startup_environment_issues():
-    issues = []
     ldplayer_path, data_path = startup_config_paths()
-    if sys.version_info < MIN_PYTHON_VERSION:
-        issues.append(f"Python 版本过低：需要 {MIN_PYTHON_VERSION[0]}.{MIN_PYTHON_VERSION[1]} 或更高版本，当前版本为 {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
-    if sys.platform == "win32":
-        session_name = os.environ.get("SESSIONNAME", "")
-        if not session_name:
-            issues.append("未检测到 Windows 桌面会话")
-        try:
-            if ctypes.windll.user32.GetDesktopWindow() == 0:
-                issues.append("无法访问 Windows 桌面")
-        except Exception as exc:
-            issues.append(f"无法检查 Windows 桌面权限：{exc}")
-    for name in REQUIRED_MODULES:
-        if name in IMPORT_ERRORS:
-            issues.append(f"依赖无法导入 {name}：{IMPORT_ERRORS[name]}")
-    valid_path, path_reason = validate_ldplayer_executable(ldplayer_path, require_attach=False)
-    if sys.platform == "win32" and not valid_path:
-        issues.append(f"雷电模拟器启动路径无效 {ldplayer_path}：{path_reason}")
-    elif sys.platform == "win32" and "WindowManager" in globals():
-        runtime_ok, runtime_reason = attach_and_probe_ldplayer(ldplayer_path)
-        if not runtime_ok:
-            issues.append(f"雷电运行能力不可用 {ldplayer_path}：{runtime_reason}")
-    storage_issue = data_path_write_issue(data_path)
-    if storage_issue:
-        issues.append(f"存储路径无效 {data_path}：{storage_issue}")
-    return issues
+    return EnvironmentProbe(ldplayer_path, data_path, require_attach=True).issues()
 
 
 def attach_and_probe_ldplayer(ldplayer_path, settings=None):
@@ -4513,7 +4532,7 @@ class WindowManager:
     def __init__(self, executable_path, settings, ignored_hwnds=None):
         self.executable_path = Path(executable_path)
         self.settings = settings
-        self.ignored_hwnds = set(int(item) for item in (ignored_hwnds or ()) if item)
+        self.ignored_hwnds = set()
         self.process = None
         self.hwnd = None
         self.lock = threading.RLock()
@@ -4637,7 +4656,7 @@ class WindowManager:
         self.foreground()
 
     def set_ignored_hwnds(self, hwnds):
-        self.ignored_hwnds = set(int(item) for item in (hwnds or ()) if item)
+        self.ignored_hwnds = set()
 
 
     def occluded_area_ratio(self, hwnd, rect):
@@ -4645,7 +4664,7 @@ class WindowManager:
         target_area = max(1, rect_area(rect))
         def handler(other, _):
             try:
-                if other == hwnd or other in self.ignored_hwnds or win32gui.IsChild(hwnd, other) or any(win32gui.IsChild(ignored, other) for ignored in self.ignored_hwnds) or not win32gui.IsWindowVisible(other) or win32gui.IsIconic(other):
+                if other == hwnd or win32gui.IsChild(hwnd, other) or not win32gui.IsWindowVisible(other) or win32gui.IsIconic(other):
                     return
                 other_rect = win32gui.GetWindowRect(other)
                 inter = rect_intersection(rect, other_rect)
@@ -4715,7 +4734,7 @@ class WindowManager:
             hits = 0
             for point in points:
                 hit = win32gui.WindowFromPoint(point)
-                if hit == hwnd or win32gui.IsChild(hwnd, hit) or hit in self.ignored_hwnds or any(win32gui.IsChild(ignored, hit) for ignored in self.ignored_hwnds):
+                if hit == hwnd or win32gui.IsChild(hwnd, hit):
                     hits += 1
             cache["occlusion_perf"] = now_perf
             occluded_ratio = self.occluded_area_ratio(hwnd, rect)
@@ -6405,7 +6424,7 @@ class ControlPanel(tk.Tk):
         self.app_config_store = AppConfigStore()
         self.hint_templates = {
             "idle": "当前处于空闲。可修改允许的四项参数，或启动学习、训练、睡眠模式；启动学习/训练前会自动检查并修复运行环境。",
-            "starting": "正在准备模式。控制面板会最小化，鼠标会被放入雷电模拟器客户区；本程序窗口造成的遮挡不会判定为客户区异常。",
+            "starting": "正在准备模式。控制面板保持显示，鼠标会被放入雷电模拟器客户区；任何窗口遮挡雷电客户区都会判定为客户区异常。",
             "learning": "学习模式：请只在雷电模拟器客户区内操作。ESC、用户鼠标离开客户区或客户区真实异常会结束并保存数据。",
             "training": "训练模式：AI 鼠标动作会被限制在雷电模拟器客户区内。ESC、用户干预导致鼠标离开客户区或客户区真实异常会结束并保存数据。",
             "sleep": "睡眠模式：正在检查样本评分、训练一组 AI 模型并清理模型组和经验池；进度条会从 0% 推进到 100%。",
@@ -7552,25 +7571,8 @@ class ControlPanel(tk.Tk):
             self.ui(lambda: self.pool_var.set(str(self.experience_pool.count())))
         return True
 
-    def runtime_environment_issues_for_config(self, config):
-        issues = []
-        if sys.version_info < MIN_PYTHON_VERSION:
-            issues.append(f"Python 版本过低：需要 {MIN_PYTHON_VERSION[0]}.{MIN_PYTHON_VERSION[1]} 或更高版本")
-        if sys.platform != "win32":
-            issues.append(f"操作系统不符合要求：本程序需要 Windows 桌面会话和雷电模拟器，当前平台为 {sys.platform}")
-        for name in REQUIRED_MODULES:
-            if name in IMPORT_ERRORS:
-                issues.append(f"依赖无法导入 {name}：{IMPORT_ERRORS[name]}")
-        storage_issue = data_path_write_issue(config.data_path)
-        if storage_issue:
-            issues.append(f"存储路径无效 {config.data_path}：{storage_issue}")
-        valid_path, path_reason = validate_ldplayer_executable(config.ldplayer_path, config.settings, require_attach=False)
-        if not valid_path:
-            issues.append(f"雷电模拟器启动路径无效 {config.ldplayer_path}：{path_reason}")
-        report = windows_runtime_report(config.ldplayer_path)
-        if not report.get("ok"):
-            issues.append("Windows 桌面运行环境不可用：" + json.dumps(report, ensure_ascii=False))
-        return issues
+    def runtime_environment_issues_for_config(self, config, require_attach=False):
+        return EnvironmentProbe(config.ldplayer_path, config.data_path, config.settings, require_attach=require_attach).issues()
 
     def repair_runtime_environment_for_config(self, config, actions=None):
         actions = actions if actions is not None else []
@@ -7589,16 +7591,7 @@ class ControlPanel(tk.Tk):
 
 
     def offline_data_environment_issues_for_config(self, config):
-        issues = []
-        if sys.version_info < MIN_PYTHON_VERSION:
-            issues.append(f"Python 版本过低：需要 {MIN_PYTHON_VERSION[0]}.{MIN_PYTHON_VERSION[1]} 或更高版本")
-        for name in REQUIRED_MODULES:
-            if name in IMPORT_ERRORS:
-                issues.append(f"依赖无法导入 {name}：{IMPORT_ERRORS[name]}")
-        storage_issue = data_path_write_issue(config.data_path)
-        if storage_issue:
-            issues.append(f"存储路径无效 {config.data_path}：{storage_issue}")
-        return issues
+        return EnvironmentProbe(config.ldplayer_path, config.data_path, config.settings, offline_only=True).issues()
 
     def repair_offline_data_environment_for_config(self, config, actions=None):
         actions = actions if actions is not None else []
@@ -7630,7 +7623,7 @@ class ControlPanel(tk.Tk):
 
     def ensure_environment(self, stage, config=None, allow_repair=True, require_attach=False, show_error=True, ignored_hwnds=None):
         config = config or self.read_config()
-        result = ensure_environment(stage, allow_repair, lambda: self.runtime_environment_issues_for_config(config), lambda actions: self.repair_runtime_environment_for_config(config, actions))
+        result = ensure_environment(stage, allow_repair, lambda: self.runtime_environment_issues_for_config(config, require_attach=require_attach), lambda actions: self.repair_runtime_environment_for_config(config, actions))
         if self.store:
             try:
                 self.store.append_evidence("environment_result", stage=stage, initial=list(result.checks), repair_actions=list(result.repair_actions), recheck=list(result.recheck), ok=result.ok)
@@ -7687,7 +7680,7 @@ class ControlPanel(tk.Tk):
         self.last_active_mode_failure = ""
         config = self.read_config()
         self.status_var.set("正在检查运行环境")
-        ignored_hwnds = self.own_window_handles()
+        ignored_hwnds = ()
         if not self.ensure_environment("自动重启训练" if auto_restart else target_mode, config, allow_repair=True, require_attach=True, ignored_hwnds=ignored_hwnds).ok:
             self.last_active_mode_failure = getattr(self, "runtime_environment_issue", "运行环境不符合要求") or "运行环境不符合要求"
             self.status_var.set("运行环境不符合要求，未进入模式")
