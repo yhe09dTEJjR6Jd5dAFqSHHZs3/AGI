@@ -46,7 +46,7 @@ AGENT_SPEC = AgentSpec(
     default_ldplayer_path=r"D:\LDPlayer9\dnplayer.exe",
     default_data_path=r"C:\Users\Administrator\Desktop\AAA",
     default_experience_pool_gb=10.0,
-    default_ai_model_limit=10,
+    default_ai_model_limit=100,
     editable_fields=("ldplayer_path", "data_path", "experience_pool_gb", "ai_model_limit")
 )
 
@@ -936,6 +936,53 @@ class AdaptivePolicy:
         return derive_runtime_settings(base_settings=base_settings, rect=rect, pool_count=pool_count, capture_ms=capture_ms, cpu_load=cpu_load, execution_ms=execution_ms, window_instability=window_instability, recent_success=recent_success, screen_score_total=screen_score_total, learning_similarity=similarity, hardware=hardware)
 
 
+@dataclass(frozen=True)
+class RuntimeTuningState:
+    version: int = 1
+    ema: dict = None
+    recent_results: tuple = ()
+    last_valid_config: dict = None
+    rollback_point: dict = None
+    sample_count: int = 0
+    updated_at: str = ""
+
+    def payload(self):
+        return {"version": self.version, "ema": dict(self.ema or {}), "recent_results": list(self.recent_results or ()), "last_valid_config": dict(self.last_valid_config or {}), "rollback_point": dict(self.rollback_point or {}), "sample_count": self.sample_count, "updated_at": self.updated_at}
+
+    @classmethod
+    def from_payload(cls, payload):
+        payload = payload if isinstance(payload, dict) else {}
+        return cls(version=safe_int(payload.get("version", 1), 1), ema=dict(payload.get("ema") or {}), recent_results=tuple(payload.get("recent_results") or ()), last_valid_config=dict(payload.get("last_valid_config") or {}), rollback_point=dict(payload.get("rollback_point") or {}), sample_count=safe_int(payload.get("sample_count", 0), 0), updated_at=str(payload.get("updated_at") or ""))
+
+    def update_verified(self, metrics, config, min_samples=3, alpha=0.2):
+        metrics = metrics if isinstance(metrics, dict) else {}
+        completed = bool(metrics.get("completed"))
+        verifiable = bool(metrics.get("verifiable", completed))
+        if not completed or not verifiable:
+            return self, {"updated": False, "reason": "unverified_result"}
+        old_ema = dict(self.ema or {})
+        new_ema = dict(old_ema)
+        for key in ("capture_ms", "execution_success_rate", "flush_success_rate", "window_stability", "sleep_throughput", "validation_return"):
+            if key in metrics:
+                value = safe_float(metrics.get(key), safe_float(old_ema.get(key, 0.0), 0.0))
+                previous = safe_float(old_ema.get(key, value), value)
+                new_ema[key] = round(previous * (1.0 - alpha) + value * alpha, 6)
+        recent = list(self.recent_results or ())[-15:] + [{"metrics": {k: metrics.get(k) for k in sorted(metrics) if k != "raw"}, "created_at": now_text()}]
+        sample_count = self.sample_count + 1
+        rollback_point = dict(self.rollback_point or self.last_valid_config or {})
+        last_valid = dict(config or self.last_valid_config or {})
+        if sample_count >= min_samples:
+            bad = sum(1 for item in recent[-min_samples:] if safe_float((item.get("metrics") or {}).get("validation_return", 0.0), 0.0) < 0.0 or safe_float((item.get("metrics") or {}).get("execution_success_rate", 1.0), 1.0) < 0.2)
+            if bad >= min_samples:
+                last_valid = dict(rollback_point)
+                audit = {"updated": True, "rolled_back": True, "reason": "consecutive_bad_results"}
+            else:
+                audit = {"updated": True, "rolled_back": False, "reason": "verified_result"}
+        else:
+            audit = {"updated": True, "rolled_back": False, "reason": "warming_up"}
+        return RuntimeTuningState(1, new_ema, tuple(recent), last_valid, rollback_point, sample_count, now_text()), audit
+
+
 @dataclass
 class ModeSession:
     token: int
@@ -954,6 +1001,24 @@ class TransitionResult:
     target: str
     reason: str
     error: str = ""
+
+
+@dataclass(frozen=True)
+class ModeState:
+    name: str
+
+
+@dataclass(frozen=True)
+class ModeEvent:
+    name: str
+    token: int
+    payload: tuple = ()
+
+
+@dataclass(frozen=True)
+class FailureReason:
+    code: str
+    detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -1111,8 +1176,13 @@ def run_self_test():
     require(stop_for_failure.is_set(), 'training screenshot failure receives explicit stop_event')
     require(tuple(REQUIREMENT_TEST_MATRIX.keys()) == ("REQ-START-001", "REQ-START-002", "REQ-START-003", "REQ-START-004", "REQ-START-005", "REQ-MODIFY-006", "REQ-PANEL-007", "REQ-MODE-008", "REQ-RECORD-009", "REQ-RECORD-010", "REQ-WINDOW-011", "REQ-SLEEP-012", "REQ-SLEEP-013", "REQ-SLEEP-014", "REQ-MODEL-015"), 'requirement test matrix ids are stable')
     require(all(item.get("requirement") and item.get("test") for item in REQUIREMENT_TEST_MATRIX.values()), 'all requirement matrix entries include requirement and test')
+    require(AGENT_SPEC.default_ai_model_limit == 100 and DEFAULT_AI_MODEL_LIMIT == 100 and default_runtime_settings_payload()["ai_model_limit"] == 100, 'default AI model limit is exactly 100 everywhere')
     require(AGENT_SPEC.editable_fields == ("ldplayer_path", "data_path", "experience_pool_gb", "ai_model_limit"), 'AGENT_SPEC.editable_fields == ("ldplayer_path", "data_path", "experience_pool_gb", "ai_model_limit")')
     require(STARTUP_FAILURE_BUTTON_LABELS == ("选择雷电路径", "选择数据目录", "更多", "重试", "忽略", "退出"), 'startup failure button labels are exact')
+    source_text = Path(__file__).read_text(encoding="utf-8")
+    compact_source = source_text[source_text.index("    def compact_experience_pool"):source_text.index("    def compact_ai_models")]
+    require(("NOT" + " IN") not in compact_source, 'experience cleanup avoids growing exclusion SQL parameter lists')
+    require(("default_ai_model_limit=" + "10,") not in source_text and ("默认模型上限 " + "10") not in source_text, 'no semantic hard-coded default model limit of ten remains')
     require("migration" not in MODE_NAMES and "migration" not in RUNNING_MODES, 'migration is not an exposed mode')
     require(all("migration" not in pair for pair in ALLOWED_TRANSITIONS), 'migration is not a state transition node')
     original_window_manager = globals().get("WindowManager")
@@ -1285,8 +1355,10 @@ def run_self_test():
     brain = ActionBrain(runtime_pool, changed)
     _, decision = brain.choose(a, novelty, batch, 0.0)
     require(isinstance(decision, dict), 'isinstance(decision, dict)')
-    random_action, random_decision = brain.choose(a, novelty, [], 0.0)
-    require(random_action and random_decision["reason"] in {"bounded_bootstrap_exploration", "global_experience"}, 'random_action and random_decision["reason"] in {"bounded_bootstrap_exploration", "global_experience"}')
+    empty_brain = ActionBrain(ExperiencePool(changed, []), changed)
+    random_action, random_decision = empty_brain.choose(a, novelty, [], 0.0)
+    require(random_action is None and random_decision["reason"] == "insufficient_demonstrations_observe_only", 'training without demonstrations observes only and never free-random clicks')
+    require(empty_brain.random_action() is None and empty_brain.bootstrap_action() is None, 'free random and bootstrap coordinate actions are disabled')
     with tempfile.TemporaryDirectory() as folder:
         root = Path(folder)
         executable = root / "dnplayer.exe"
@@ -1297,6 +1369,15 @@ def run_self_test():
         store.state_file.write_text("{bad json}", encoding="utf-8")
         rebuilt_state = store.load_state()
         require(rebuilt_state == {"screen_score_total": 0.0, "penalty": 0.0}, 'rebuilt_state == {"screen_score_total": 0.0, "penalty": 0.0}')
+        tuning = store.load_runtime_tuning_state()
+        tuning, tuning_audit = tuning.update_verified({"completed": True, "verifiable": True, "execution_success_rate": 0.9, "flush_success_rate": 1.0, "validation_return": 1.0}, {"training_event_wait": 0.2}, min_samples=1)
+        store.save_runtime_tuning_state(tuning, tuning_audit)
+        reloaded_tuning = DataStore(folder).load_runtime_tuning_state()
+        require(reloaded_tuning.sample_count == 1 and reloaded_tuning.last_valid_config.get("training_event_wait") == 0.2, 'RuntimeTuningState persists verified history across restart')
+        rollback_state = reloaded_tuning
+        for _ in range(3):
+            rollback_state, rollback_audit = rollback_state.update_verified({"completed": True, "verifiable": True, "execution_success_rate": 0.0, "validation_return": -1.0}, {"training_event_wait": 9.9}, min_samples=3)
+        require(rollback_audit.get("rolled_back") and rollback_state.last_valid_config.get("training_event_wait") == 0.2, 'RuntimeTuningState rolls back after consecutive bad results')
         analyzer = ScreenAnalyzer(settings.hash_size)
         image = Image.new("RGB", (16, 16), (24, 64, 128))
         png_path = root / "screen.png"
@@ -1636,7 +1717,7 @@ def run_self_test():
         modify_panel.experience_pool_gb_var.set("4")
         modify_panel.ai_model_limit_var.set("5")
         modify_panel.settings = settings
-        modify_panel.runtime_value_specs = {"experience_pool_gb": ("经验池 GB", modify_panel.experience_pool_gb_var, DEFAULT_EXPERIENCE_POOL_GB, safe_float, 0.1), "ai_model_limit": ("AI 模型组上限", modify_panel.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, 1)}
+        modify_panel.runtime_value_specs = {"experience_pool_gb": ("经验池 GB", modify_panel.experience_pool_gb_var, DEFAULT_EXPERIENCE_POOL_GB, safe_float, 0.1), "ai_model_limit": ("AI 模型数量上限", modify_panel.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, 1)}
         modify_panel.update_mode_button_states = lambda: setattr(modify_panel, "updated", True)
         modify_panel.refresh_runtime_environment_state = lambda: setattr(modify_panel, "refreshed", True)
         modify_panel.save_persistent_settings = lambda: setattr(modify_panel, "saved", True)
@@ -2587,7 +2668,7 @@ def strict_reward_target(screen_score, human_similarity):
 AI_MODEL_GROUP_SPECS = (
     {"key": "sleep_decision_model", "name": "入睡模型", "goal": "训练模式期间，判断是否值得进入睡眠模式"},
     {"key": "operation_policy", "name": "活动模型", "goal": "训练模式期间，雷电模拟器客户区内，AI输出鼠标操作"},
-    {"key": "judge_model", "name": "法官模型", "goal": "睡眠模式期间，找出最值得删除的AI模型组或经验池数据"},
+    {"key": "judge_model", "name": "法官模型", "goal": "睡眠模式期间，找出最值得删除的AI模型或经验池数据"},
     {"key": "runtime_value_model", "name": "数学模型", "goal": "依据现实条件确定所有未在要求中确定的变量的初始数值，并让它们跟随现实条件的变化而变化"},
     {"key": "screen_novelty_scorer", "name": "画面新颖程度评分模型", "goal": "一个画面与经验池中和它最相似的一批历史画面相似度越高（0%→100%），评分越低"},
     {"key": "mouse_humanlikeness_scorer", "name": "鼠标拟人程度评分模型", "goal": "AI在训练模式期间输出的鼠标操作，与用户在学习模式期间的鼠标操作相似度越高（0%→100%），评分越高"},
@@ -3598,6 +3679,7 @@ class DataStore:
         self.settings_file = self.root / "settings.json"
         self.sleep_checkpoint_file = self.root / "sleep_checkpoint.json"
         self.runtime_audit_file = self.root / "runtime_parameters_audit.jsonl"
+        self.runtime_tuning_file = self.root / "runtime_tuning_state.json"
         self.evidence_file = self.root / "runtime_evidence.jsonl"
         self.error_file = self.root / "errors.jsonl"
         self.lock = threading.RLock()
@@ -3682,6 +3764,23 @@ class DataStore:
 
     def save_state(self):
         atomic_write_json(self.state_file, self.state, self.lock)
+
+    def load_runtime_tuning_state(self):
+        if not self.runtime_tuning_file.exists():
+            return RuntimeTuningState()
+        try:
+            with self.runtime_tuning_file.open("r", encoding="utf-8") as file:
+                return RuntimeTuningState.from_payload(json.load(file))
+        except Exception as exc:
+            self.log_error("runtime_tuning_state.load", exc, {"path": str(self.runtime_tuning_file)})
+            return RuntimeTuningState()
+
+    def save_runtime_tuning_state(self, tuning_state, audit=None):
+        payload = tuning_state.payload() if isinstance(tuning_state, RuntimeTuningState) else RuntimeTuningState.from_payload(tuning_state).payload()
+        atomic_write_json(self.runtime_tuning_file, payload, self.lock)
+        if audit is not None:
+            self.append_evidence("runtime_tuning_update", audit=audit, sample_count=payload.get("sample_count"), updated_at=payload.get("updated_at"))
+        return payload
 
     def write_json_atomic(self, path, payload):
         atomic_write_json(path, payload, self.lock)
@@ -3862,7 +3961,7 @@ class DataStore:
             model_payload = model.snapshot() if model else None
             model_group = ai_model_group_snapshot(model_payload, settings, ranked)
             if not model_group_complete(model_group, settings):
-                raise RuntimeError("AI模型组快照不完整：七类模型必须都能独立加载并完成探针推理")
+                raise RuntimeError("AI模型快照不完整：七类模型必须都能独立加载并完成探针推理")
             identity = hashlib.sha256(str(self.root.resolve()).encode("utf-8", "replace")).hexdigest()
             training_digest = hashlib.sha256(json.dumps([record.get("id") for record in ranked[:limit]], ensure_ascii=False).encode("utf-8")).hexdigest()
             payload = {"schema_version": CONFIG_SCHEMA_VERSION, "model_version": 2, "training_data_version": 1, "data_path_id": identity, "checksum": training_digest, "created_at": now_text(), "status": status, "status_detail": status_detail or {}, "screen_score_total": self.screen_score_total, "reward_state": next((record.get("reward_state") for record in reversed(records or []) if isinstance(record, dict) and isinstance(record.get("reward_state"), dict)), asdict(RewardState())), "experience_count": len(records or []), "policy_limit": limit, "training_sample_ids": [record.get("id") for record in ranked[:limit]], "model_group": model_group, "model": model_payload, "policy": [{"id": record.get("id"), "mode": record.get("mode"), "action_type": (record.get("mouse_action") or {}).get("type") if isinstance(record.get("mouse_action"), dict) else None, "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_model_confidence": safe_float(record.get("sleep_model_confidence", record.get("model_prediction", 0.0)), 0.0), "model_prediction": safe_float(record.get("model_prediction", 0.0), 0.0), "model_target": safe_float(record.get("model_target", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
@@ -3942,7 +4041,7 @@ class DataStore:
                 removed += 1
                 remaining = max(0, remaining - 1)
                 if progress_callback:
-                    progress_callback("清理AI模型组", removed, max(1, len(scored) - limit), {"removed": removed, "model_count": remaining, "limit": limit, "current_rank": audit_rank.get(path, 0)})
+                    progress_callback("清理AI模型", removed, max(1, len(scored) - limit), {"removed": removed, "model_count": remaining, "limit": limit, "current_rank": audit_rank.get(path, 0)})
             except Exception as exc:
                 error = {"path": str(path), "error": str(exc), "error_type": type(exc).__name__}
                 errors.append(error)
@@ -4334,7 +4433,11 @@ class DataStore:
             if current <= limit_bytes:
                 return {"changed": bool(orphan_report.get("orphan_cleanup_attempted", 0)), "size_bytes": current, "removed": 0, "target_bytes": limit_bytes, "complete": True, **physical_report}
             target_bytes = max(1, limit_bytes // 2)
-            keep_min = max(1, safe_int(DEFAULT_AI_MODEL_LIMIT, 10))
+            trainable_count = safe_int(connection.execute("SELECT COUNT(*) FROM experience_meta WHERE trainable=1").fetchone()[0], 0)
+            bucket_count = safe_int(connection.execute("SELECT COUNT(DISTINCT action_type) FROM experience_meta WHERE trainable=1").fetchone()[0], 0) + safe_int(connection.execute("SELECT COUNT(DISTINCT hash_prefix) FROM experience_meta WHERE trainable=1").fetchone()[0], 0) + 5
+            diversity_floor = max(1, min(32, trainable_count // max(1, bucket_count * 4)))
+            keep_min = diversity_floor
+            connection.execute("CREATE TEMP TABLE IF NOT EXISTS cleanup_excluded(line_no INTEGER PRIMARY KEY)")
             protected = set()
             for column in ("hash_prefix", "action_type"):
                 values = [row[0] for row in connection.execute(f"SELECT DISTINCT {column} FROM experience_meta WHERE trainable=1 AND {column} IS NOT NULL AND {column} != ''")]
@@ -4376,12 +4479,9 @@ class DataStore:
                         interrupted = True
                         break
                     excluded = set(phase_keep).union(removed_ids)
-                    placeholders = ",".join("?" for _ in excluded)
-                    if placeholders:
-                        query = f"SELECT line_no, line_bytes, delete_score FROM experience_meta WHERE line_no NOT IN ({placeholders}) ORDER BY trainable ASC, delete_score DESC, line_no ASC LIMIT 500"
-                        rows = connection.execute(query, tuple(excluded)).fetchall()
-                    else:
-                        rows = connection.execute("SELECT line_no, line_bytes, delete_score FROM experience_meta ORDER BY trainable ASC, delete_score DESC, line_no ASC LIMIT 500").fetchall()
+                    connection.execute("DELETE FROM cleanup_excluded")
+                    connection.executemany("INSERT OR IGNORE INTO cleanup_excluded(line_no) VALUES(?)", [(line_no,) for line_no in excluded])
+                    rows = connection.execute("SELECT line_no, line_bytes, delete_score FROM experience_meta AS meta WHERE NOT EXISTS (SELECT 1 FROM cleanup_excluded AS excluded WHERE excluded.line_no=meta.line_no) ORDER BY trainable ASC, delete_score DESC, line_no ASC LIMIT 500").fetchall()
                     if not rows:
                         break
                     for row in rows:
@@ -4410,12 +4510,9 @@ class DataStore:
                         interrupted = True
                         break
                     excluded = set(removed_ids)
-                    placeholders = ",".join("?" for _ in excluded)
-                    if placeholders:
-                        query = f"SELECT line_no, line_bytes, delete_score FROM experience_meta WHERE line_no NOT IN ({placeholders}) ORDER BY delete_score DESC, line_no ASC LIMIT 500"
-                        rows = connection.execute(query, tuple(excluded)).fetchall()
-                    else:
-                        rows = connection.execute("SELECT line_no, line_bytes, delete_score FROM experience_meta ORDER BY delete_score DESC, line_no ASC LIMIT 500").fetchall()
+                    connection.execute("DELETE FROM cleanup_excluded")
+                    connection.executemany("INSERT OR IGNORE INTO cleanup_excluded(line_no) VALUES(?)", [(line_no,) for line_no in excluded])
+                    rows = connection.execute("SELECT line_no, line_bytes, delete_score FROM experience_meta AS meta WHERE NOT EXISTS (SELECT 1 FROM cleanup_excluded AS excluded WHERE excluded.line_no=meta.line_no) ORDER BY delete_score DESC, line_no ASC LIMIT 500").fetchall()
                     if not rows:
                         break
                     for line_no, line_bytes, delete_score in rows:
@@ -5456,40 +5553,16 @@ class ActionBrain:
         return result
 
     def random_action(self, strength=1.0):
-        action_type = random.choice(["click", "drag", "scroll"])
-        start = [round(random.random(), 6), round(random.random(), 6)]
-        if action_type == "scroll":
-            magnitude = random.choice([-1, 1]) * max(1, int(1 + strength * random.uniform(1.0, 6.0)))
-            return {"type": "scroll", "button": "scroll", "source": "ai", "start_rel": start, "end_rel": start, "duration": 0.0, "scroll": [0, magnitude], "path_rel": [[start[0], start[1], 0.0]]}
-        if action_type == "drag":
-            span = clamp(0.08 + 0.28 * strength, 0.08, 0.75)
-            end = self.mutate_point(start, span)
-        else:
-            end = list(start)
-        duration_max = self.settings.action_duration_max if action_type == "drag" else self.settings.random_click_duration_max
-        duration_min = self.settings.action_duration_min if action_type == "drag" else self.settings.random_click_duration_min
-        return {"type": action_type, "button": "Button.left", "source": "ai", "start_rel": start, "end_rel": end, "duration": round(random.uniform(min(duration_min, duration_max), max(duration_min, duration_max)), 6), "path_rel": [[start[0], start[1], 0.0], [end[0], end[1], 1.0]]}
+        return None
 
     def bootstrap_action(self, strength=0.2):
-        action_type = random.choice(["click", "drag", "scroll"])
-        margin = clamp(0.2 + random.random() * 0.1, 0.15, 0.35)
-        start = [round(random.uniform(margin, 1.0 - margin), 6), round(random.uniform(margin, 1.0 - margin), 6)]
-        if action_type == "scroll":
-            magnitude = random.choice([-1, 1])
-            return {"type": "scroll", "button": "scroll", "source": "ai_bootstrap", "start_rel": start, "end_rel": start, "duration": 0.0, "scroll": [0, magnitude], "path_rel": [[start[0], start[1], 0.0]], "exploration_policy": "bounded_bootstrap"}
-        if action_type == "drag":
-            end = self.mutate_point(start, clamp(0.04 + strength * 0.12, 0.04, 0.18))
-        else:
-            end = list(start)
-        duration_max = self.settings.action_duration_max if action_type == "drag" else self.settings.random_click_duration_max
-        duration_min = self.settings.action_duration_min if action_type == "drag" else self.settings.random_click_duration_min
-        return {"type": action_type, "button": "Button.left", "source": "ai_bootstrap", "start_rel": start, "end_rel": end, "duration": round(random.uniform(min(duration_min, duration_max), max(duration_min, duration_max)), 6), "path_rel": [[start[0], start[1], 0.0], [end[0], end[1], 1.0]], "exploration_policy": "bounded_bootstrap"}
+        return None
 
     def fallback_action(self):
         learned = self.pool.best_global_action()
         if learned and random.random() < self.settings.global_action_probability:
             return self.mutate_action(learned, 1.8), "global_experience"
-        return self.bootstrap_action(0.2), "bounded_bootstrap_exploration"
+        return None, "insufficient_demonstrations_observe_only"
 
     def choose(self, hash_value, novelty, batch, screen_score_total):
         rate = clamp(self.exploration_rate(novelty, screen_score_total), self.settings.explore_min_rate, self.settings.explore_max_rate)
@@ -5501,7 +5574,7 @@ class ActionBrain:
             score = self.score_candidate(item)
             policy_score = self.pool.model_runtime.operation_policy_score(item["record"], item.get("similarity", 0.0))
             usable.append((math.exp(clamp(score + policy_score * 0.000001, self.settings.reward_total_min, self.settings.reward_total_max) / self.settings.softmax_temperature), {"item": item, "score": score, "policy_score": policy_score, "action": action}))
-        if random.random() < rate or not usable:
+        if not usable:
             action, reason = self.fallback_action()
             decision = {"reason": reason, "exploration_rate": rate, "candidate_count": len(usable), "confidence": 0.0, "nearest_similarity": round(batch[0]["similarity"], 4) if batch else 0.0}
         else:
@@ -6220,6 +6293,65 @@ class LearningService:
         return self.panel.learning_loop(token, stop_event, config)
 
 
+class SafetyGovernor:
+    def __init__(self, panel):
+        self.panel = panel
+        self.consecutive_rejections = 0
+        self.consecutive_failures = 0
+        self.consecutive_no_change = 0
+
+    def validate(self, snapshot, action, decision, rect, config=None):
+        reasons = []
+        source_id = (decision or {}).get("chosen_record_id")
+        confidence = clamp(safe_float((decision or {}).get("confidence", 0.0), 0.0), 0.0, 1.0)
+        similarity = clamp(safe_float((decision or {}).get("chosen_similarity", (decision or {}).get("nearest_similarity", 0.0)), 0.0), 0.0, 1.0)
+        if not source_id:
+            reasons.append("missing_demonstration_source")
+        if confidence < 0.15:
+            reasons.append("confidence_below_threshold")
+        if similarity < 0.15:
+            reasons.append("similarity_below_threshold")
+        if not action or action.get("source") not in ("ai", "ai_verified"):
+            reasons.append("untrusted_action_source")
+        start = action.get("start_rel") if isinstance(action, dict) else None
+        end = action.get("end_rel") if isinstance(action, dict) else None
+        points = [start, end]
+        for point in points:
+            if not isinstance(point, (list, tuple)) or len(point) < 2 or not (0.0 <= safe_float(point[0], -1.0) <= 1.0 and 0.0 <= safe_float(point[1], -1.0) <= 1.0):
+                reasons.append("point_outside_client_confidence_region")
+                break
+        latest_rect = self.panel.current_rect()
+        if not latest_rect or not rect or latest_rect != rect:
+            reasons.append("window_rect_invalid")
+        check = self.panel.window_manager.check_window(force=True) if getattr(self.panel, "window_manager", None) else None
+        window_check = {"ok": bool(check and check.ok), "reason": getattr(check, "reason", "missing_window_manager"), "rect": list(latest_rect) if latest_rect else []}
+        if not window_check["ok"]:
+            reasons.append("window_check_failed")
+        if getattr(self.panel, "mouse_recorder", None) and self.panel.mouse_recorder.cursor_outside():
+            reasons.append("user_takeover_cursor_outside")
+        allowed = not reasons
+        if allowed:
+            self.consecutive_rejections = 0
+        else:
+            self.consecutive_rejections += 1
+        return {"allowed": allowed, "reasons": tuple(reasons), "source_experience_id": source_id, "similarity": round(similarity, 4), "confidence": round(confidence, 4), "window_check": window_check, "consecutive_rejections": self.consecutive_rejections}
+
+    def observe_execution(self, success, changed=True):
+        if success:
+            self.consecutive_failures = 0
+        else:
+            self.consecutive_failures += 1
+        if changed:
+            self.consecutive_no_change = 0
+        else:
+            self.consecutive_no_change += 1
+        return {"consecutive_failures": self.consecutive_failures, "consecutive_no_change": self.consecutive_no_change, "consecutive_rejections": self.consecutive_rejections}
+
+    def fuse_tripped(self, limit):
+        threshold = max(1, safe_int(limit, 1))
+        return self.consecutive_failures >= threshold or self.consecutive_no_change >= threshold or self.consecutive_rejections >= threshold
+
+
 class TrainingService:
     def __init__(self, panel):
         self.panel = panel
@@ -6269,10 +6401,22 @@ class TrainingService:
         panel = self.panel
         if action.get("end_rel") is None:
             action["end_rel"] = action.get("start_rel", [0.5, 0.5])
+        safety = panel.safety_governor.validate(snapshot, action, decision, rect, config) if getattr(panel, "safety_governor", None) else {"allowed": True, "reasons": (), "source_experience_id": None, "similarity": 0.0, "confidence": 0.0, "window_check": {}}
+        if not safety.get("allowed"):
+            enriched_decision = dict(decision or {})
+            enriched_decision["safety"] = safety
+            panel.write_record("training", session_id, snapshot, None, "ai_mouse_rejected", decision=enriched_decision, planned_action=action, failed_action=True, execution_error=";".join(safety.get("reasons", ())))
+            panel.adaptive_policy.observe_execution(success=False)
+            if panel.safety_governor.fuse_tripped(panel.settings.training_fail_stop_count):
+                panel.termination_reason = "executor_error"
+                stop_event.set()
+            return False, {"failure_reason": "safety_rejected", "safety": safety}
         latest_rect = panel.current_rect()
         if not latest_rect or latest_rect != rect:
             panel.write_record("training", session_id, snapshot, None, "ai_mouse_failed", decision=decision, planned_action=action, failed_action=True, window_rect_changed=True, execution_error="window_rect_changed")
             panel.adaptive_policy.observe_execution(success=False)
+            if getattr(panel, "safety_governor", None):
+                panel.safety_governor.observe_execution(False)
             return False, {"failure_reason": "window_rect_changed"}
         deadline = None
         active_session = getattr(panel, "active_session", None)
@@ -6296,11 +6440,15 @@ class TrainingService:
             panel.log_exception("training.execute", RuntimeError("empty_action_result"))
             panel.write_record("training", session_id, snapshot, None, "ai_mouse_failed", decision=decision, planned_action=action, failed_action=True, execution_error="empty_action_result")
             panel.adaptive_policy.observe_execution(success=False)
+            if getattr(panel, "safety_governor", None):
+                panel.safety_governor.observe_execution(False)
             return False, {"failure_reason": "empty_action_result"}
         if actual.get("execution_error"):
             panel.log_exception("training.execute", RuntimeError(actual.get("execution_error")), {"detail": actual, "decision": decision})
             panel.write_record("training", session_id, snapshot, None, "ai_mouse_failed", decision=decision, planned_action=action, failed_action=True, execution_error=actual.get("execution_error"))
             panel.adaptive_policy.observe_execution(success=False)
+            if getattr(panel, "safety_governor", None):
+                panel.safety_governor.observe_execution(False)
             return False, {"failure_reason": actual.get("execution_error") or "execution_error"}
         latency_ms = safe_float(actual.get("duration", 0.0), 0.0) * 1000.0
         panel.adaptive_policy.observe_execution(latency_ms=latency_ms, success=True)
@@ -6309,8 +6457,16 @@ class TrainingService:
         if not after_snapshot:
             record = panel.write_record("training", session_id, snapshot, actual, "ai_mouse_after_screen_missing", decision=decision, action_anchor_perf=actual.get("started_perf"), after_snapshot=None, planned_action=action, execution_latency_ms=round(latency_ms, 3), execution_error="after_snapshot_missing", screen_result_unknown=True, exclude_from_training=True)
             panel.adaptive_policy.observe_execution(success=False)
+            if getattr(panel, "safety_governor", None):
+                panel.safety_governor.observe_execution(False)
             return False, {"failure_reason": "after_snapshot_missing", "record_id": record.get("id") if record else None}
         record = panel.write_record("training", session_id, snapshot, actual, "ai_mouse", decision=decision, action_anchor_perf=actual.get("started_perf"), after_snapshot=after_snapshot, planned_action=action, execution_latency_ms=round(latency_ms, 3))
+        if isinstance(record, dict):
+            record["ai_action_audit"] = {"source_experience_id": safety.get("source_experience_id"), "demonstration_source": "learning", "similarity": safety.get("similarity"), "confidence": safety.get("confidence"), "safety_decision": "allowed", "rejection_reasons": [], "before_screenshot_id": getattr(snapshot, "relative_path", None), "after_screenshot_id": getattr(after_snapshot, "relative_path", None), "state_delta": record.get("screen_score_delta", 0.0), "window_check": safety.get("window_check"), "actual_trajectory": actual.get("path_rel", []), "user_interrupted": bool(stop_event.is_set())}
+        if getattr(panel, "safety_governor", None):
+            before_hash = getattr(getattr(snapshot, "hash_value", None), "hex", None)
+            after_hash = getattr(getattr(after_snapshot, "hash_value", None), "hex", None)
+            panel.safety_governor.observe_execution(True, changed=before_hash != after_hash)
         return True, record
 
     def run(self, token, stop_event, config):
@@ -6355,6 +6511,7 @@ class ControlPanel(tk.Tk):
         self.metrics_presenter = MetricsPresenter(self)
         self.learning_service = LearningService(self)
         self.training_service = TrainingService(self)
+        self.safety_governor = SafetyGovernor(self)
         self.events.subscribe("window_state_changed", lambda event: self.ui(lambda e=event: self.status_var.set(f"客户区状态事件：{e.get('reason', 'ok')}")))
         self.events.subscribe("sleep_batch_completed", lambda event: self.ui(lambda e=event: self.progress_label_var.set(f"睡眠批次完成｜已完成 {e.get('completed_batches', 0)} 批")))
         self.events.subscribe("experience_pool_compaction_completed", lambda event: self.ui(lambda e=event: self.status_var.set(f"经验池压缩完成：删除 {e.get('removed', 0)} 条")))
@@ -6409,7 +6566,7 @@ class ControlPanel(tk.Tk):
         self.progress_label_var = tk.StringVar(value="进度")
         self.runtime_value_specs = {
             "experience_pool_gb": ("经验池 GB", self.experience_pool_gb_var, DEFAULT_EXPERIENCE_POOL_GB, safe_float, 0.1),
-            "ai_model_limit": ("AI 模型组上限", self.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, 1)
+            "ai_model_limit": ("AI 模型数量上限", self.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, 1)
         }
         self.modify_buttons = []
         self.runtime_environment_refresh_id = None
@@ -6605,7 +6762,7 @@ class ControlPanel(tk.Tk):
         path_frame.grid(row=0, column=0, sticky="ew")
         self.path_frame = path_frame
         self.path_field_widgets = []
-        for field, label, variable, color, width in (("ldplayer_path", "雷电模拟器", self.ldplayer_var, None, 32), ("data_path", "数据存储", self.data_var, None, 32), ("experience_pool_gb", "经验池/GB", self.experience_pool_gb_var, "#EF4444", 10), ("ai_model_limit", "AI模型组/组", self.ai_model_limit_var, "#F97316", 10)):
+        for field, label, variable, color, width in (("ldplayer_path", "雷电模拟器", self.ldplayer_var, None, 32), ("data_path", "数据存储", self.data_var, None, 32), ("experience_pool_gb", "经验池/GB", self.experience_pool_gb_var, "#EF4444", 10), ("ai_model_limit", "AI模型数量/个", self.ai_model_limit_var, "#F97316", 10)):
             label_widget = ttk.Label(path_frame, text=label, foreground=color) if color else ttk.Label(path_frame, text=label)
             entry_widget = ttk.Entry(path_frame, textvariable=variable, width=width, state="readonly", justify="right")
             self.path_field_widgets.append((label_widget, entry_widget))
@@ -8204,7 +8361,7 @@ class ControlPanel(tk.Tk):
             if self.store:
                 checkpoint = self.store.save_sleep_checkpoint(checkpoint or {}, stage="task2_model_cleanup_progress", task2_model_cleanup_removed=removed, task2_model_cleanup_count=count, task2_model_cleanup_limit=limit, task2_model_cleanup_rank=safe_int(detail.get("current_rank", 0), 0) if isinstance(detail, dict) else 0)
             self.update_progress(percent, force=True)
-            self.ui(lambda r=removed, c=count, l=limit, p=percent: self.progress_label_var.set(f"睡眠任务2｜清理AI模型组：已删除 {r} 个｜当前 {c}/{l}｜{p:.1f}%"))
+            self.ui(lambda r=removed, c=count, l=limit, p=percent: self.progress_label_var.set(f"睡眠任务2｜清理AI模型：已删除 {r} 个｜当前 {c}/{l}｜{p:.1f}%"))
         model_result = self.store.compact_ai_models(config.ai_model_limit, judge_runtime, run_guard=run_guard, progress_callback=model_progress)
         if checkpoint and checkpoint.get("task2_model_cleanup_completed"):
             model_result["resumed_rechecked"] = True
@@ -8694,9 +8851,12 @@ class ControlPanel(tk.Tk):
                     consecutive_no_actions += 1
                     self.write_record("training", session_id, snapshot, None, "screen_event", decision=decision)
                     if consecutive_no_actions >= max(1, self.settings.training_fail_stop_count):
-                        action = self.brain.bootstrap_action(0.2)
-                        decision = {"reason": "forced_bounded_bootstrap_exploration", "consecutive_no_actions": consecutive_no_actions, "candidate_count": 0, "confidence": 0.0}
+                        self.termination_reason = "executor_error"
+                        stop_event.set()
+                        self.ui(lambda: self.status_var.set("示范不足，训练模式仅观察，不执行鼠标动作；请先进入学习模式积累经历"))
+                        break
                     else:
+                        self.ui(lambda: self.status_var.set("示范不足，训练模式仅观察，不执行鼠标动作；请先进入学习模式积累经历"))
                         stop_event.wait(max(self.settings.training_event_wait, self.settings.min_action_delay_seconds))
                         self.record_training_user_mouse_events(analyzer, session_id, start, pending_user_snapshots, stop_event)
                         continue
