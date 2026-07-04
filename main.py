@@ -623,7 +623,7 @@ DEFAULT_LDPLAYER_PATH = AGENT_SPEC.default_ldplayer_path
 DEFAULT_DATA_PATH = AGENT_SPEC.default_data_path
 DEFAULT_EXPERIENCE_POOL_GB = AGENT_SPEC.default_experience_pool_gb
 DEFAULT_AI_MODEL_LIMIT = AGENT_SPEC.default_ai_model_limit
-MODE_NAMES = {"idle": "空闲", "starting": "准备中", "learning": "学习模式", "training": "训练模式", "sleep": "睡眠模式", "migration": "数据迁移", "stopping": "正在退出"}
+MODE_NAMES = {"idle": "空闲", "starting": "准备中", "learning": "学习模式", "training": "训练模式", "sleep": "睡眠模式", "stopping": "正在退出"}
 CONFIG_SCHEMA_VERSION = 1
 USER_EDITABLE_STARTUP_FIELDS = ("ldplayer_path", "data_path")
 USER_EDITABLE_RUNTIME_FIELDS = ("experience_pool_gb", "ai_model_limit")
@@ -657,19 +657,26 @@ ALLOWED_TRANSITIONS = {
     ("starting", "learning"): {"window_ok"},
     ("starting", "training"): {"window_ok"},
     ("idle", "sleep"): {"click_sleep"},
-    ("idle", "migration"): {"click_modify_data_path"},
     ("learning", "stopping"): {"user_stop", "esc", "window_invalid", "cursor_outside", "runtime_error"},
     ("training", "stopping"): {"user_stop", "esc", "window_invalid", "cursor_outside", "runtime_error", "executor_error"},
     ("starting", "stopping"): {"user_stop", "esc", "runtime_error", "minimize_failed", "window_invalid", "completed"},
-    ("migration", "stopping"): {"user_stop", "esc", "runtime_error", "migration_error", "completed"},
-    ("stopping", "idle"): {"esc", "window_invalid", "cursor_outside", "user_stop", "runtime_error", "executor_error", "migration_error", "completed"},
+    ("stopping", "idle"): {"esc", "window_invalid", "cursor_outside", "user_stop", "runtime_error", "executor_error", "completed"},
     ("training", "sleep"): {"sleep_model"},
     ("sleep", "stopping"): {"user_stop", "esc", "runtime_error", "completed"}
 }
 
 
-TERMINATION_REASONS = ("window_invalid", "cursor_outside", "rect_changed", "empty_action", "executor_error", "sleep_model", "esc", "user_stop", "migration_error", "completed")
-RUNNING_MODES = {"starting", "learning", "training", "sleep", "migration"}
+TERMINATION_REASONS = ("window_invalid", "cursor_outside", "rect_changed", "empty_action", "executor_error", "sleep_model", "esc", "user_stop", "runtime_error", "completed")
+RUNNING_MODES = {"starting", "learning", "training", "sleep"}
+REQUIREMENT_TEST_MATRIX = OrderedDict((
+    ("REQ-START-001", {"requirement": "初检通过后进入空闲", "test": "startup_initial_ok_to_idle"}),
+    ("REQ-START-002", {"requirement": "初检失败、自愈成功后进入空闲", "test": "startup_repair_success_to_idle"}),
+    ("REQ-START-003", {"requirement": "复检失败后弹窗字段与六按钮完整", "test": "startup_recheck_failure_popup_complete"}),
+    ("REQ-MODIFY-004", {"requirement": "修改数据目录时迁移动作作为修改流程内部动作，不暴露为正式模式和状态机节点", "test": "modify_data_path_migration_internal"}),
+    ("REQ-MODE-005", {"requirement": "学习模式鼠标出界后回空闲并恢复面板", "test": "learning_cursor_outside_to_idle_panel"}),
+    ("REQ-SLEEP-006", {"requirement": "经验池超限后压缩至上限的50%", "test": "experience_pool_compact_to_half_limit"}),
+    ("REQ-MODEL-007", {"requirement": "模型组必须严格包含七类模型", "test": "model_group_exact_seven_models"})
+))
 HUMAN_FEATURE_NAMES = ("duration", "direct", "bend", "points", "speed_mean", "speed_variance", "acceleration_change", "pauses", "hover_before", "drag_curvature", "double_click_interval")
 
 RUNTIME_NUMBER_RULES = {
@@ -1005,6 +1012,10 @@ def run_self_test():
     require(not prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: actions.append("无法自动修复"), startup_events.append), 'not prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: actions.append("无法自动修复"), startup_events.append)')
     require(len(startup_events) == 1 and "初检结果" in startup_events[0] and "初检后进行的自愈尝试" in startup_events[0] and "复检结果" in startup_events[0] and "下一步建议" in startup_events[0], 'len(startup_events) == 1 and "初检结果" in startup_events[0] and "初检后进行的自愈尝试" in startup_events[0] and "复检结果" in startup_events[0] and "下一步建议" in startup_events[0]')
     require(STARTUP_FAILURE_BUTTON_LABELS == ("选择雷电路径", "选择数据目录", "更多", "重试", "忽略", "退出"), 'STARTUP_FAILURE_BUTTON_LABELS == ("选择雷电路径", "选择数据目录", "更多", "重试", "忽略", "退出")')
+    require(tuple(REQUIREMENT_TEST_MATRIX.keys()) == ("REQ-START-001", "REQ-START-002", "REQ-START-003", "REQ-MODIFY-004", "REQ-MODE-005", "REQ-SLEEP-006", "REQ-MODEL-007"), 'requirement test matrix ids are stable')
+    require(all(item.get("requirement") and item.get("test") for item in REQUIREMENT_TEST_MATRIX.values()), 'all requirement matrix entries include requirement and test')
+    require("migration" not in MODE_NAMES and "migration" not in RUNNING_MODES, 'migration is not an exposed mode')
+    require(all("migration" not in pair for pair in ALLOWED_TRANSITIONS), 'migration is not a state transition node')
     original_window_manager = globals().get("WindowManager")
     original_probe = globals().get("runtime_capability_probe")
     attach_events = []
@@ -1131,7 +1142,6 @@ def run_self_test():
     require(("sleep", "starting") not in ALLOWED_TRANSITIONS, '("sleep", "starting") not in ALLOWED_TRANSITIONS')
     require(("sleep", "idle") not in ALLOWED_TRANSITIONS, '("sleep", "idle") not in ALLOWED_TRANSITIONS')
     require("completed" in ALLOWED_TRANSITIONS[("sleep", "stopping")], '"completed" in ALLOWED_TRANSITIONS[("sleep", "stopping")]')
-    require({"completed", "migration_error", "user_stop"}.issubset(ALLOWED_TRANSITIONS[("migration", "stopping")]), '{"completed", "migration_error", "user_stop"}.issubset(ALLOWED_TRANSITIONS[("migration", "stopping")])')
     pool = ExperiencePool(settings)
     pool.add({"id": "t1", "mode": "learning", "mouse_action": {"type": "click", "start_rel": [0.5, 0.5]}, "reward": 12, "screen_hash_hex": "f", "screen_hash_bits": 4, "mouse_source": "user"})
     pool.add({"id": "t2", "mode": "training", "mouse_action": {"type": "click", "start_rel": [0.52, 0.52]}, "reward": 10, "screen_hash_hex": "d", "screen_hash_bits": 4, "mouse_source": "ai"})
@@ -1561,7 +1571,6 @@ def run_self_test():
         require(dummy_panel.progress_value == 100.0 and dummy_panel.progress_var.value == 100.0, 'dummy_panel.progress_value == 100.0 and dummy_panel.progress_var.value == 100.0')
         dummy_panel.mode = "idle"
         require(ControlPanel.idle_progress_value(dummy_panel, "training", 91.0) == 0.0, 'ControlPanel.idle_progress_value(dummy_panel, "training", 91.0) == 0.0')
-        require(ControlPanel.idle_progress_value(dummy_panel, "migration", 91.0) == 0.0, 'ControlPanel.idle_progress_value(dummy_panel, "migration", 91.0) == 0.0')
         store.save_settings({"experience_pool_gb": 4, "ai_model_limit": 5, "forbidden": 6})
         saved_settings = json.loads(store.settings_file.read_text(encoding="utf-8"))
         require("forbidden" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0 and saved_settings["ai_model_limit"] == 5, '"forbidden" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0 and saved_settings["ai_model_limit"] == 5')
@@ -6300,7 +6309,6 @@ class ControlPanel(tk.Tk):
             "learning": "学习模式：请只在雷电模拟器客户区内操作。ESC、用户鼠标离开客户区或客户区真实异常会结束并保存数据。",
             "training": "训练模式：AI 鼠标动作会被限制在雷电模拟器客户区内。ESC、用户干预导致鼠标离开客户区或客户区真实异常会结束并保存数据。",
             "sleep": "睡眠模式：正在检查样本评分、训练一组 AI 模型并清理模型组和经验池；进度条会从 0% 推进到 100%。",
-            "migration": "正在迁移数据目录。请等待复制、校验与保存完成，完成前不要关闭程序。",
             "stopping": "正在安全保存与退出当前模式。后台写入完成后会回到空闲并显示控制面板。"
         }
         self.build_ui()
@@ -6814,6 +6822,9 @@ class ControlPanel(tk.Tk):
         self.start_data_migration(Path(path), self.pending_user_settings())
 
     def start_data_migration(self, new_path, values=None):
+        if self.current_mode() != "idle":
+            self.status_var.set("只能在空闲状态修改数据")
+            return False
         old_path = Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)
         new_path = Path(new_path)
         if old_path == new_path:
@@ -6825,17 +6836,13 @@ class ControlPanel(tk.Tk):
             self.update_mode_button_states()
             self.status_var.set("修改已保存")
             return True
-        token, stop_event = self.begin_run("migration", reason="click_modify_data_path")
-        if not token:
-            self.status_var.set("请先终止当前模式，或等待当前模式结束")
-            return False
-        self.status_var.set("正在迁移数据")
+        self.status_var.set("正在修改数据目录")
         self.update_progress(0.0)
         values = values or self.pending_user_settings()
         migration_values = {"ldplayer_path": str(values.get("ldplayer_path") or DEFAULT_LDPLAYER_PATH), "experience_pool_gb": max(0.1, safe_float(values.get("experience_pool_gb"), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(values.get("ai_model_limit"), DEFAULT_AI_MODEL_LIMIT))}
-        self.mode_thread = threading.Thread(target=self.migration_service.run, args=(token, old_path, new_path, stop_event, migration_values), name="migration-mode", daemon=False)
-        self.mode_thread.start()
-        return True
+        ok = self.migration_service.run(None, old_path, new_path, threading.Event(), migration_values)
+        self.update_mode_button_states()
+        return bool(ok)
 
     def migration_items(self, old_path):
         root = Path(old_path)
@@ -6863,7 +6870,7 @@ class ControlPanel(tk.Tk):
         buffer_size = max(65536, min(1048576, safe_int(total / 200 if total else 65536, 65536)))
         with source.open("rb") as src, target.open("wb") as dst:
             while True:
-                if stop_event.is_set() or not self.is_run_active(token, "migration"):
+                if stop_event.is_set() or (token is not None and not self.is_run_active(token)):
                     return copied, False
                 chunk = src.read(buffer_size)
                 if not chunk:
@@ -7024,7 +7031,7 @@ class ControlPanel(tk.Tk):
                     break
                 if size == 0:
                     self.ui(lambda c=copied, t=total: self.progress_label_var.set(f"数据迁移中｜已迁移 {c}/{t} 字节"))
-            if not stop_event.is_set() and self.is_run_active(token, "migration"):
+            if not stop_event.is_set() and (token is None or self.is_run_active(token)):
                 DataStore(temp_root).save_settings({"experience_pool_gb": values["experience_pool_gb"], "ai_model_limit": values["ai_model_limit"]})
                 journal_path = new_root.parent / f".{new_root.name}.migration.journal.json"
                 atomic_write_json(journal_path, {"stage": "prepare", "old_path": str(old_root), "new_path": str(new_root), "temp_path": str(temp_root), "created_at": now_text()}, self.store.lock if self.store else threading.RLock())
@@ -7048,10 +7055,13 @@ class ControlPanel(tk.Tk):
                 self.experience_pool = ExperiencePool(self.settings, self.store.load_experience(self.settings.experience_load_limit), self.store.load_latest_model_state(self.settings))
                 self.brain = ActionBrain(self.experience_pool, self.settings)
                 self.update_progress(0.0, force=True)
-                self.finish_run(token, reason, 0.0, release=False, reason="completed")
-            elif self.is_run_active(token, "migration"):
+                if token is not None:
+                    self.finish_run(token, reason, 0.0, release=False, reason="completed")
+                else:
+                    self.ui(lambda r=reason: self.status_var.set(r))
+            elif token is not None and self.is_run_active(token):
                 self.finish_run(token, reason, 0.0, release=False, reason="user_stop")
-            elif self.is_run_active(token, "stopping"):
+            elif token is not None and self.is_run_active(token, "stopping"):
                 final_reason = self.termination_reason if self.termination_reason in ("esc", "user_stop") else "user_stop"
                 self.finish_run(token, "数据迁移已终止", 0.0, release=False, reason=final_reason)
         except Exception as exc:
@@ -7064,11 +7074,16 @@ class ControlPanel(tk.Tk):
                     pass
             self.log_exception("migration", exc, {"old_path": str(old_path), "new_path": str(new_path)})
             self.ui(lambda e=str(exc): messagebox.showerror("迁移失败", e))
-            self.finish_run(token, "数据迁移失败", self.progress_value, release=False, reason="migration_error")
+            if token is not None:
+                self.finish_run(token, "数据迁移失败", self.progress_value, release=False, reason="runtime_error")
+            else:
+                self.ui(lambda: self.status_var.set("修改数据目录失败"))
+            return False
         finally:
             self.persistence_paused.clear()
             if temp_root:
                 shutil.rmtree(temp_root, ignore_errors=True)
+        return True
 
     def bind_mousewheel(self, _event):
         self.bind_all("<MouseWheel>", self.on_mousewheel)
@@ -7220,7 +7235,7 @@ class ControlPanel(tk.Tk):
             return token == self.run_token and (mode is None or self.mode == mode)
 
     def begin_run(self, mode, deadline=None, reason=None):
-        session = self.transition("idle", mode, token=None, deadline=deadline, reason=reason or {"starting": "click_learning", "sleep": "click_sleep", "migration": "click_modify_data_path"}.get(mode, "click_learning"))
+        session = self.transition("idle", mode, token=None, deadline=deadline, reason=reason or {"starting": "click_learning", "sleep": "click_sleep"}.get(mode, "click_learning"))
         if not session:
             return None, None
         return session.token, session.stop_event
@@ -7230,7 +7245,7 @@ class ControlPanel(tk.Tk):
         return bool(session)
 
     def idle_progress_value(self, source_mode, progress=0.0):
-        return 0.0 if source_mode in ("starting", "learning", "training", "sleep", "migration", "idle") else progress
+        return 0.0 if source_mode in ("starting", "learning", "training", "sleep", "idle") else progress
 
     def render_sleep_completion_before_idle(self, label, progress=100.0):
         if self.current_mode() == "sleep":
@@ -7270,7 +7285,7 @@ class ControlPanel(tk.Tk):
             mapped_reason = "window_invalid"
         with self.state_lock:
             source_mode = self.mode if token == self.run_token else None
-        if source_mode in ("starting", "learning", "training", "sleep", "migration"):
+        if source_mode in ("starting", "learning", "training", "sleep"):
             if not self.transition(source_mode, "stopping", reason=mapped_reason, token=token):
                 return False
             flushed, _ = self.flush_mode_data()
@@ -7594,7 +7609,7 @@ class ControlPanel(tk.Tk):
         with self.state_lock:
             mode = self.mode
             token = self.run_token
-            if mode not in ["starting", "learning", "training", "sleep", "migration"]:
+            if mode not in ["starting", "learning", "training", "sleep"]:
                 self.ui(lambda: self.status_var.set("当前没有正在运行的模式"))
                 return
             self.stop_event.set()
@@ -8400,7 +8415,7 @@ class ControlPanel(tk.Tk):
         deadline = time.perf_counter() + close_timeout
         with self.state_lock:
             active_mode = self.mode
-        if active_mode in ["starting", "learning", "training", "sleep", "migration"]:
+        if active_mode in ["starting", "learning", "training", "sleep"]:
             self.status_var.set("正在保存，请等待完成")
             self.update_mode_button_states()
             self.request_stop("user_stop")
@@ -8602,7 +8617,6 @@ def run_windows_acceptance():
     training_panel, training_saved, _, training_ok = run_real_transition_flow((("begin", "starting", "click_training"), ("activate", "training"), ("transition", "training", "sleep", "sleep_model", None, True), ("save", "mode_data"), ("reject", "sleep", "training", "completed"), ("finish", "completed")))
     sleep_panel, sleep_saved, _, sleep_ok = run_real_transition_flow((("begin", "sleep", "click_sleep"), ("save", "task1_train_model_group"), ("save", "task1_save"), ("save", "task2_cleanup_models_and_pool"), ("save", "task2_save"), ("finish", "completed")))
     esc_panel, esc_saved, _, esc_ok = run_real_transition_flow((("begin", "sleep", "click_sleep"), ("save", "sleep_checkpoint"), ("finish", "esc")))
-    migration_panel, migration_saved, _, migration_ok = run_real_transition_flow((("begin", "migration", "click_modify_data_path"), ("save", "migration_checkpoint"), ("finish", "migration_error")))
     stale_panel, _, _, stale_ok = run_real_transition_flow((("begin", "starting", "click_training"), ("reject", "starting", "training", "window_ok", 999)))
     result["flow_tests"]["learning_exit_paths"] = passfail(learning_ok and learning_panel.current_mode() == "idle" and learning_saved == ["mode_data"])
     result["flow_tests"]["training_to_sleep_rejects_direct_restart"] = passfail(training_ok and training_panel.current_mode() == "idle" and training_saved == ["mode_data"])
@@ -8615,7 +8629,6 @@ def run_windows_acceptance():
     result["flow_tests"]["auto_restart_training_rejects_stale_token"] = passfail(stale_ok and stale_panel.last_transition_result.error == "stale_token")
     result["flow_tests"]["auto_restart_training_queue_window_esc_guards"] = passfail(True)
     result["flow_tests"]["sleep_esc_checkpoint_panel"] = passfail(esc_ok and esc_panel.current_mode() == "idle" and esc_saved == ["sleep_checkpoint"])
-    result["flow_tests"]["migration_resume_verify"] = passfail(migration_ok and migration_panel.current_mode() == "idle" and migration_saved == ["migration_checkpoint"])
     result["flow_tests"]["transition_rejection_reasons"] = passfail(stale_ok and stale_panel.last_transition_result.error == "stale_token")
     result["auto_restart_training"] = result["flow_tests"]["auto_restart_training_full_chain"]
     result["sleep_resume"] = result["flow_tests"]["sleep_tasks_save_chain"]
