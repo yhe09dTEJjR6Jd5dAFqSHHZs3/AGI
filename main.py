@@ -1183,6 +1183,9 @@ def run_self_test():
     compact_source = source_text[source_text.index("    def compact_experience_pool"):source_text.index("    def compact_ai_models")]
     require(("NOT" + " IN") not in compact_source, 'experience cleanup avoids growing exclusion SQL parameter lists')
     require(("default_ai_model_limit=" + "10,") not in source_text and ("默认模型上限 " + "10") not in source_text, 'no semantic hard-coded default model limit of ten remains')
+    require("def enforce_complete_panel_size" in source_text and "root.winfo_reqwidth()" in source_text and "root.winfo_reqheight()" in source_text, 'panel minimum size is derived from actual requested content size')
+    require("self.scroll_canvas = tk.Canvas" in source_text and "ttk.Scrollbar" in source_text, 'panel has real scroll container fallback')
+    require("if not self.panel_controls_fit_client():" in source_text, 'panel fit checker is called after layout')
     require("migration" not in MODE_NAMES and "migration" not in RUNNING_MODES, 'migration is not an exposed mode')
     require(all("migration" not in pair for pair in ALLOWED_TRANSITIONS), 'migration is not a state transition node')
     original_window_manager = globals().get("WindowManager")
@@ -1245,15 +1248,15 @@ def run_self_test():
     high_human = reward_parts(70.0, 100.0, settings)[2]
     low_human = reward_parts(70.0, 0.0, settings)[2]
     require(high_screen > low_screen, 'high_screen > low_screen')
-    require(high_human > low_human, 'high_human > low_human')
+    require(high_human == low_human, 'high_human == low_human')
     require(high_human < high_screen, 'high_human < high_screen')
     details = reward_breakdown(70.0, 100.0, settings)
     low_human_details = reward_breakdown(70.0, 0.0, settings)
     require(details["screen_score_delta"] == details["screen_primary_reward"], 'details["screen_score_delta"] == details["screen_primary_reward"]')
-    require(details["reward_sort_key"] > low_human_details["reward_sort_key"], 'details["reward_sort_key"] > low_human_details["reward_sort_key"]')
-    require(details["reward_sort_key"][0] == details["screen_primary_reward"], 'details["reward_sort_key"][0] == details["screen_primary_reward"]')
+    require(details["total_reward"] == details["screen_reward"] - details["hunger"], 'details["total_reward"] == details["screen_reward"] - details["hunger"]')
+    require(details["reward_sort_key"][0] == details["total_reward"], 'details["reward_sort_key"][0] == details["total_reward"]')
     require("human_tie_break_reward" in details, '"human_tie_break_reward" in details')
-    require(0.0 < details["human_bonus"] < details["screen_score_resolution"], '0.0 < details["human_bonus"] < details["screen_score_resolution"]')
+    require(details["human_bonus"] == 0.0, 'details["human_bonus"] == 0.0')
     require(set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "experience_pool_gb", "ai_model_limit"}, 'set(USER_EDITABLE_FIELDS) == {"ldplayer_path", "data_path", "experience_pool_gb", "ai_model_limit"}')
     require({"esc", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("learning", "stopping")]), '{"esc", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("learning", "stopping")])')
     require({"esc", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("training", "stopping")]), '{"esc", "window_invalid"}.issubset(ALLOWED_TRANSITIONS[("training", "stopping")])')
@@ -1349,7 +1352,7 @@ def run_self_test():
     require(direct_human_score != 55.0, 'direct_human_score != 55.0')
     require(0.0 <= runtime.operation_policy_score(pool.records[0], 0.9) <= 1.0, '0.0 <= runtime.operation_policy_score(pool.records[0], 0.9) <= 1.0')
     require(runtime.judge_discard_score({"reward": -1.0, "valid": False}) > runtime.judge_discard_score({"reward": 100.0, "valid": True}), 'runtime.judge_discard_score({"reward": -1.0, "valid": False}) > runtime.judge_discard_score({"reward": 100.0, "valid": True})')
-    require(runtime.reward(70.0, 100.0) > runtime.reward(70.0, 0.0), 'runtime.reward(70.0, 100.0) > runtime.reward(70.0, 0.0)')
+    require(runtime.reward(70.0, 100.0) == runtime.reward(70.0, 0.0), 'runtime.reward(70.0, 100.0) == runtime.reward(70.0, 0.0)')
     require(runtime.reward(71.0, 0.0) > runtime.reward(70.0, 100.0), 'runtime.reward(71.0, 0.0) > runtime.reward(70.0, 100.0)')
     require(isinstance(runtime.models["runtime_value_model"].predict({"cpu_load": 0.0, "memory_free_ratio": 0.5}), dict), 'isinstance(runtime.models["runtime_value_model"].predict({"cpu_load": 0.0, "memory_free_ratio": 0.5}), dict)')
     brain = ActionBrain(runtime_pool, changed)
@@ -2605,7 +2608,7 @@ def parse_event_timestamp(value):
 
 
 def reward_income(screen_score, human_similarity):
-    return strict_reward_value(screen_score, human_similarity)
+    return round(clamp(safe_float(screen_score, 0.0), 0.0, 100.0), 2)
 
 
 def reward_state_from(value):
@@ -2632,7 +2635,7 @@ def reward_with_state(screen_score, human_similarity, state=None, event_time=Non
     else:
         state.cost = cost
     reward = income - cost
-    return {"reward_version": 6, "income": round(income, 8), "cost": round(cost, 8), "reward": round(reward, 8), "income_improved": improved, "event_time": timestamp, "state": asdict(state)}
+    return {"reward_version": 7, "income": round(income, 8), "cost": round(cost, 8), "reward": round(reward, 8), "income_improved": improved, "event_time": timestamp, "state": asdict(state)}
 
 
 def reward_breakdown(novelty, human_score, settings, state=None, event_time=None):
@@ -2643,11 +2646,11 @@ def reward_breakdown(novelty, human_score, settings, state=None, event_time=None
     human_similarity = round(clamp(human_score, 0.0, 100.0), score_precision)
     human_delta = round(human_similarity - clamp(settings.score_default, 0.0, 100.0), score_precision)
     human_tiebreak = human_similarity
-    human_bonus = round((human_similarity / 100.0) * screen_resolution * (1.0 - 1e-6), 8)
+    human_bonus = 0.0
     screen_score_delta = round(clamp(screen_reward, settings.reward_total_min, settings.reward_total_max), 6)
     stateful = reward_with_state(screen_novelty, human_similarity, state, event_time)
     total_reward = round(clamp(stateful["reward"], settings.reward_total_min, settings.reward_total_max + screen_resolution), 8)
-    return {"reward_version": stateful["reward_version"], "income": stateful["income"], "cost": stateful["cost"], "income_improved": stateful["income_improved"], "reward_state": stateful["state"], "reward_state_version": stateful["state"]["state_version"], "screen_novelty": screen_novelty, "screen_reward": screen_reward, "human_similarity": human_similarity, "human_tiebreak": round(human_tiebreak, 6), "human_bonus": human_bonus, "screen_score_resolution": screen_resolution, "screen_score_delta": screen_score_delta, "basis": ["nearest_screen_batch", "learning_mouse_profile", "lexicographic_screen_then_human", "numeric_human_bonus_below_screen_resolution", "stateful_time_cost_reset_on_income_improvement"], "screen_primary_reward": screen_reward, "human_tie_break_reward": round(human_tiebreak, 6), "mouse_action_delta": human_delta, "total_reward": total_reward, "reward_sort_key": [round(screen_reward, score_precision), round(human_similarity, score_precision)]}
+    return {"reward_version": stateful["reward_version"], "income": stateful["income"], "cost": stateful["cost"], "hunger": stateful["cost"], "income_improved": stateful["income_improved"], "reward_state": stateful["state"], "reward_state_version": stateful["state"]["state_version"], "screen_novelty": screen_novelty, "screen_reward": screen_reward, "human_similarity": human_similarity, "human_tiebreak": round(human_tiebreak, 6), "human_bonus": human_bonus, "screen_score_resolution": screen_resolution, "screen_score_delta": screen_score_delta, "basis": ["nearest_screen_batch_similarity_inverse_screen_score", "reward_equals_screen_score_minus_hunger", "hunger_starts_positive_minimum_and_grows_over_time", "hunger_resets_when_screen_score_improves"], "screen_primary_reward": screen_reward, "human_tie_break_reward": 0.0, "mouse_action_delta": human_delta, "total_reward": total_reward, "reward_sort_key": [round(total_reward, 8), round(screen_reward, score_precision)]}
 
 
 def strict_reward_key(screen_score, human_similarity):
@@ -3072,7 +3075,7 @@ class OperationPolicyModel(TrainableModel):
 
 class RewardModel(TrainableModel):
     key = "reward_model"
-    model_type = "stateful_income_minus_time_cost_reward_model"
+    model_type = "screen_score_minus_hunger_reward_model"
 
     def fit(self, records):
         super().fit(records)
@@ -3090,7 +3093,7 @@ class RewardModel(TrainableModel):
         return self.metrics
 
     def parameters(self):
-        return {"screen_precision": 2, "tie_break_weight": getattr(self, "human_tie_break_weight", 0.000099999), "screen_scale": getattr(self, "screen_scale", 100.0), "reward_version": 6, "reward_state": asdict(getattr(self, "reward_state", RewardState())), "monotonic_constraints": ["screen_score_first", "human_score_tiebreak"], "intelligence_goal": "reward equals income minus increasing time cost with cost reset after income improvement"}
+        return {"screen_precision": 2, "reward_version": 7, "reward_state": asdict(getattr(self, "reward_state", RewardState())), "monotonic_constraints": ["screen_score_minus_hunger"], "intelligence_goal": "reward equals screen score minus hunger; hunger grows with time and resets when screen score improves"}
 
     def predict(self, features):
         features = features or {}
@@ -3356,9 +3359,9 @@ class ModelRuntime:
 
     def reward_breakdown(self, screen_score, human_score, event_time=None, reward_state=None, commit_state=False):
         parts = reward_breakdown(screen_score, human_score, self.settings, reward_state, event_time)
-        parts["total_reward"] = self.reward(screen_score, human_score, event_time, reward_state, commit_state)
-        parts["reward_sort_key"] = list(strict_reward_key(screen_score, human_score))
-        parts["basis"] = list(parts.get("basis", [])) + ["ai_models_runtime_reward_model"]
+        if commit_state:
+            self.reward(screen_score, human_score, event_time, reward_state, commit_state)
+        parts["basis"] = list(parts.get("basis", [])) + ["runtime_reward_contract_enforced"]
         return parts
 
     def should_sleep(self, features):
@@ -6775,12 +6778,22 @@ class ControlPanel(tk.Tk):
         style.configure("CardTitle.TLabel", font=("Microsoft YaHei UI", card_size), background=card_bg, foreground=muted)
         style.configure("Value.TLabel", font=("Microsoft YaHei UI", value_size, "bold"), background=card_bg, foreground=text)
         style.configure("Hint.TLabel", foreground=muted, background=card_bg)
-        root = tk.Frame(self, bg=bg, padx=outer_pad, pady=outer_pad)
-        root.pack(fill="both", expand=True)
+        shell = tk.Frame(self, bg=bg)
+        shell.pack(fill="both", expand=True)
+        shell.rowconfigure(0, weight=1)
+        shell.columnconfigure(0, weight=1)
+        self.scroll_canvas = tk.Canvas(shell, bg=bg, highlightthickness=0, borderwidth=0)
+        self.scrollbar_y = ttk.Scrollbar(shell, orient="vertical", command=self.scroll_canvas.yview)
+        self.scrollbar_x = ttk.Scrollbar(shell, orient="horizontal", command=self.scroll_canvas.xview)
+        self.scroll_canvas.configure(yscrollcommand=self.scrollbar_y.set, xscrollcommand=self.scrollbar_x.set)
+        self.scroll_canvas.grid(row=0, column=0, sticky="nsew")
+        root = tk.Frame(self.scroll_canvas, bg=bg, padx=outer_pad, pady=outer_pad)
+        self.panel_root = root
+        self.scroll_window = self.scroll_canvas.create_window((0, 0), window=root, anchor="nw")
+        root.bind("<Configure>", self.update_scroll_region)
+        self.scroll_canvas.bind("<Configure>", self.update_scroll_width)
         root.rowconfigure(3, weight=1)
         root.columnconfigure(0, weight=1)
-        self.scroll_canvas = None
-        self.scroll_window = None
         header = tk.Frame(root, bg=bg)
         header.pack(fill="x")
         ttk.Label(header, text="雷电模拟器学习训练控制面板", style="Title.TLabel").pack(anchor="w")
@@ -6801,8 +6814,6 @@ class ControlPanel(tk.Tk):
         self.reflow_buttons()
         container = ttk.Frame(root, padding=0)
         container.pack(fill="both", expand=True)
-        self.scroll_canvas = None
-        self.scroll_window = None
         container.columnconfigure(0, weight=1)
         container.rowconfigure(1, weight=0)
         path_frame = ttk.LabelFrame(container, text="路径与容量", padding=section_pad)
@@ -6821,7 +6832,7 @@ class ControlPanel(tk.Tk):
         status_frame.rowconfigure(0, weight=0)
         self.metrics_frame = ttk.Frame(status_frame)
         self.metrics_frame.grid(row=0, column=0, sticky="ew")
-        metrics = [("当前模式", self.mode_var), ("基础环境", self.base_runtime_var), ("雷电客户区", self.ldplayer_client_var), ("画面评分累计", self.screen_score_total_var), ("经验条数", self.pool_var), ("画面评分", self.novelty_var), ("鼠标相似度", self.human_var), ("画面奖励", self.screen_reward_var), ("鼠标奖惩", self.action_reward_var), ("本次奖励", self.reward_var), ("AI决策", self.ai_var)]
+        metrics = [("当前模式", self.mode_var), ("基础环境", self.base_runtime_var), ("雷电客户区", self.ldplayer_client_var), ("画面评分累计", self.screen_score_total_var), ("经验条数", self.pool_var), ("当前画面评分", self.novelty_var), ("鼠标相似度", self.human_var), ("奖励画面评分", self.screen_reward_var), ("饥饿值", self.action_reward_var), ("本次奖励", self.reward_var), ("AI决策", self.ai_var)]
         for index, (title, variable) in enumerate(metrics):
             self.metric_items.append(self.create_metric(self.metrics_frame, title, variable, palette[index % len(palette)]))
         self.reflow_metrics()
@@ -6861,14 +6872,48 @@ class ControlPanel(tk.Tk):
     def fit_complete_panel(self):
         try:
             self.update_idletasks()
-            self.minsize(420, 360)
+            self.enforce_complete_panel_size()
             if (self.winfo_width() < max(420, self.settings.ui_width // 2) or self.winfo_height() < max(360, self.settings.ui_height // 2)) and not self.compact_panel_layout:
                 self.compact_panel_layout = True
                 self.apply_compact_panel_layout()
+                self.update_idletasks()
+                self.enforce_complete_panel_size()
             self.update_scroll_width()
             self.update_scroll_region()
+            if not self.panel_controls_fit_client():
+                self.enforce_complete_panel_size()
         except Exception as exc:
             self.log_exception("ui.fit_complete", exc)
+
+    def enforce_complete_panel_size(self):
+        self.update_idletasks()
+        root = getattr(self, "panel_root", None)
+        if not root:
+            return
+        req_w = max(420, root.winfo_reqwidth())
+        req_h = max(360, root.winfo_reqheight())
+        screen_w = max(1, self.winfo_screenwidth())
+        screen_h = max(1, self.winfo_screenheight())
+        limit_w = max(320, screen_w - 24)
+        limit_h = max(240, screen_h - 80)
+        min_w = min(req_w, limit_w)
+        min_h = min(req_h, limit_h)
+        self.minimum_supported_screen = (req_w, req_h)
+        self.minsize(min_w, min_h)
+        if self.winfo_width() < min_w or self.winfo_height() < min_h:
+            self.geometry(f"{min_w}x{min_h}")
+        need_x = req_w > min_w
+        need_y = req_h > min_h
+        if getattr(self, "scrollbar_y", None):
+            if need_y:
+                self.scrollbar_y.grid(row=0, column=1, sticky="ns")
+            else:
+                self.scrollbar_y.grid_remove()
+        if getattr(self, "scrollbar_x", None):
+            if need_x:
+                self.scrollbar_x.grid(row=1, column=0, sticky="ew")
+            else:
+                self.scrollbar_x.grid_remove()
 
     def panel_controls_fit_client(self):
         try:
@@ -6921,7 +6966,9 @@ class ControlPanel(tk.Tk):
     def update_scroll_width(self, event=None):
         if getattr(self, "scroll_canvas", None) and getattr(self, "scroll_window", None):
             width = event.width if event else self.scroll_canvas.winfo_width()
-            self.scroll_canvas.itemconfigure(self.scroll_window, width=max(1, width))
+            root = getattr(self, "panel_root", None)
+            req_w = root.winfo_reqwidth() if root else width
+            self.scroll_canvas.itemconfigure(self.scroll_window, width=max(1, width, req_w))
             self.update_scroll_region()
 
     def create_metric(self, parent, title, variable, color="#3B82F6"):
@@ -7627,7 +7674,7 @@ class ControlPanel(tk.Tk):
             self.store.append_runtime_parameter_audit(previous_settings, {item.name: getattr(settings, item.name) for item in fields(Settings)}, copy.deepcopy(RUNTIME_NUMBER_AUDIT))
         self.settings = settings
         self.escape_monitor.debounce_seconds = settings.key_debounce_seconds
-        self.ui(lambda: self.minsize(max(420, settings.ui_min_width), max(360, settings.ui_min_height)))
+        self.ui(self.fit_complete_panel)
         return Config(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH), data_path, experience_pool_gb, ai_model_limit, settings)
 
     def apply_runtime_settings(self, settings):
@@ -8682,7 +8729,7 @@ class ControlPanel(tk.Tk):
         offset_ms = round((float(offset_source) - snapshot.perf_time) * 1000.0, 3) if offset_source is not None else None
         sims = [round(item["similarity"], 4) for item in batch]
         record_event = self.events.publish("record_ready", mode=mode, session_id=session_id, event_name=event_name)
-        record = {"record_schema_version": 2, "reward_version": reward_info["reward_version"], "id": uuid.uuid4().hex, "event_sequence": record_event["sequence"], "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_semantic_vector": list(getattr(snapshot, "semantic_vector", ())), "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": before_novelty, "screen_score": before_novelty, "score_version": 1, "score_basis": "nearest_screen_content_live", "score_checked_at": now_text(), "score_neighbors": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "before_screen": snapshot.relative_path, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_screen_hash": snapshot.hash_value.hex, "before_screen_score": before_novelty, "after_screen_hash": after_snapshot.hash_value.hex if after_snapshot else snapshot.hash_value.hex, "after_screen_hash_int": after_snapshot.hash_value.value if after_snapshot else snapshot.hash_value.value, "after_screen_hash_bits": after_snapshot.hash_value.bits if after_snapshot else snapshot.hash_value.bits, "after_screen_semantic_vector": list(getattr(after_snapshot, "semantic_vector", ())) if after_snapshot else list(getattr(snapshot, "semantic_vector", ())), "after_screen_score": after_novelty, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "income": reward_info.get("income"), "cost": reward_info.get("cost"), "reward_state": reward_info.get("reward_state"), "reward_state_version": reward_info.get("reward_state_version"), "reward_breakdown": {"screen_novelty": reward_info["screen_novelty"], "screen_reward": reward_info["screen_reward"], "human_similarity": reward_info["human_similarity"], "human_tiebreak": reward_info["human_tiebreak"], "screen_score_delta": reward_info["screen_score_delta"], "income": reward_info.get("income"), "cost": reward_info.get("cost"), "basis": reward_info["basis"]}, "reward_sort_key": reward_info["reward_sort_key"], "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "screen_score_delta": max(0.0, reward), "screen_score_settled": max(0.0, reward), "penalty_delta": max(0.0, -reward), "screen_score_total": screen_score_total, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "image_checksum": getattr(snapshot, "image_checksum", ""), "after_image_checksum": getattr(after_snapshot, "image_checksum", "") if after_snapshot else getattr(snapshot, "image_checksum", ""), "image_dropped": bool(getattr(snapshot, "image_dropped", False)), "screen_file_expected": not bool(getattr(snapshot, "image_dropped", False)), "capture_latency_ms": capture_latency_ms if capture_latency_ms is not None else getattr(snapshot, "capture_latency_ms", None), "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_event_wait": self.settings.training_event_wait, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
+        record = {"record_schema_version": 2, "reward_version": reward_info["reward_version"], "id": uuid.uuid4().hex, "event_sequence": record_event["sequence"], "session_id": session_id, "created_at": now_text(), "mode": mode, "event": event_name, "elapsed": snapshot.elapsed, "screen_path": snapshot.relative_path, "screen_hash": snapshot.hash_value.hex, "screen_hash_hex": snapshot.hash_value.hex, "screen_hash_int": snapshot.hash_value.value, "screen_hash_bits": snapshot.hash_value.bits, "screen_semantic_vector": list(getattr(snapshot, "semantic_vector", ())), "screen_captured_at": snapshot.captured_at, "screen_perf": round(snapshot.perf_time, 6), "mouse_action": normalized, "planned_action": normalize_mouse_action(planned_action, snapshot.rect) if planned_action else None, "actual_action": None if failed_action else normalized, "execution_error": str(execution_error) if execution_error else None, "mouse_source": mouse_source, "screen_action_offset_ms": offset_ms, "nearest": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "nearest_summary": {"count": len(sims), "max_similarity": max(sims) if sims else 0.0, "avg_similarity": round(sum(sims) / len(sims), 4) if sims else 0.0}, "novelty": before_novelty, "screen_score": before_novelty, "score_version": 1, "score_basis": "nearest_screen_content_live", "score_checked_at": now_text(), "score_neighbors": [{"id": item["record"].get("id"), "similarity": round(item["similarity"], 4)} for item in batch], "before_screen": snapshot.relative_path, "after_screen": after_snapshot.relative_path if after_snapshot else snapshot.relative_path, "before_screen_hash": snapshot.hash_value.hex, "before_screen_score": before_novelty, "after_screen_hash": after_snapshot.hash_value.hex if after_snapshot else snapshot.hash_value.hex, "after_screen_hash_int": after_snapshot.hash_value.value if after_snapshot else snapshot.hash_value.value, "after_screen_hash_bits": after_snapshot.hash_value.bits if after_snapshot else snapshot.hash_value.bits, "after_screen_semantic_vector": list(getattr(after_snapshot, "semantic_vector", ())) if after_snapshot else list(getattr(snapshot, "semantic_vector", ())), "after_screen_score": after_novelty, "before_novelty": before_novelty, "after_novelty": after_novelty, "transition_reward": transition_reward, "screen_observation_reward": novelty_reward, "screen_primary_reward": reward_info["screen_primary_reward"], "human_tie_break_reward": reward_info["human_tie_break_reward"], "income": reward_info.get("income"), "cost": reward_info.get("cost"), "hunger": reward_info.get("hunger"), "reward_state": reward_info.get("reward_state"), "reward_state_version": reward_info.get("reward_state_version"), "reward_breakdown": {"screen_novelty": reward_info["screen_novelty"], "screen_reward": reward_info["screen_reward"], "human_similarity": reward_info["human_similarity"], "human_tiebreak": reward_info["human_tiebreak"], "screen_score_delta": reward_info["screen_score_delta"], "income": reward_info.get("income"), "cost": reward_info.get("cost"), "hunger": reward_info.get("hunger"), "basis": reward_info["basis"]}, "reward_sort_key": reward_info["reward_sort_key"], "mouse_action_reward": human_action_reward, "mouse_action_penalty": human_action_penalty, "human_score": human_score, "total_reward": reward, "reward": reward, "novelty_reward": novelty_reward, "human_action_reward": human_action_reward, "human_action_penalty": human_action_penalty, "screen_score_delta": max(0.0, reward), "screen_score_settled": max(0.0, reward), "penalty_delta": max(0.0, -reward), "screen_score_total": screen_score_total, "client_rect": list(snapshot.rect), "failed_action": bool(failed_action), "window_rect_changed": bool(window_rect_changed), "image_checksum": getattr(snapshot, "image_checksum", ""), "after_image_checksum": getattr(after_snapshot, "image_checksum", "") if after_snapshot else getattr(snapshot, "image_checksum", ""), "image_dropped": bool(getattr(snapshot, "image_dropped", False)), "screen_file_expected": not bool(getattr(snapshot, "image_dropped", False)), "capture_latency_ms": capture_latency_ms if capture_latency_ms is not None else getattr(snapshot, "capture_latency_ms", None), "execution_latency_ms": execution_latency_ms, "termination_reason": None, "policy_snapshot": {"hash_size": self.settings.hash_size, "nearest_top_k": self.settings.nearest_top_k, "training_event_wait": self.settings.training_event_wait, "explore_min_rate": self.settings.explore_min_rate, "explore_max_rate": self.settings.explore_max_rate, "action_jitter": self.settings.action_jitter}}
         if screen_result_unknown:
             record["screen_result_unknown"] = True
             record["exclude_from_training"] = True
@@ -8727,7 +8774,7 @@ class ControlPanel(tk.Tk):
         record["screen_score_total"] = screen_score_total
         self.events.publish("save_completed", kind="record", record_id=record.get("id"), persistence_status=record.get("persistence_status"))
         self.experience_pool.add(record)
-        self.update_metrics(after_novelty, human_score, novelty_reward, human_delta, reward, screen_score_total, decision)
+        self.update_metrics(after_novelty, human_score, novelty_reward, reward_info.get("hunger", 0.0), reward, screen_score_total, decision)
         return record
 
     def capture_learning_screen_change(self, analyzer, session_id, start, now_perf, config):
