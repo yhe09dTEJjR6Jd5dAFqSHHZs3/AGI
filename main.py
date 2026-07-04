@@ -6253,6 +6253,7 @@ class ControlPanel(tk.Tk):
         self.hardware_last_light_refresh_perf = now_perf
         self.last_training_runtime_update_perf = 0.0
         self.last_training_runtime_metrics = None
+        self.consecutive_recording_failures = defaultdict(int)
         self.settings = derive_runtime_settings(rect=self.screen_rect(), pool_count=0, capture_ms=initial_capture_ms, cpu_load=safe_float(self.hardware_state.get("cpu_load", 0.0), 0.0), hardware=self.hardware_state)
         self.event_journal = deque(maxlen=max(128, self.settings.async_queue_size * max(1, self.settings.ui_metric_columns)))
         self.events.subscribe("*", self.remember_event)
@@ -8121,6 +8122,7 @@ class ControlPanel(tk.Tk):
             checksum = image_content_checksum(image)
             snapshot = ScreenSnapshot(path=path, relative_path=self.store.relative_path(path), hash_value=hash_value, captured_at=now_text(), perf_time=perf_time, elapsed=round(perf_time - session_start, 3), rect=tuple(rect), capture_latency_ms=round((captured_perf - perf_time) * 1000.0, 3), image_priority=priority, image_checksum=checksum, semantic_vector=semantic_vector)
             self.events.publish("screenshot_completed", mode=mode, path=str(path), latency_ms=snapshot.capture_latency_ms)
+            self.consecutive_recording_failures[mode] = 0
             return snapshot, image
         except Exception as exc:
             self.log_exception("capture_snapshot", exc, {"mode": mode, "rect": list(rect)})
@@ -8151,8 +8153,47 @@ class ControlPanel(tk.Tk):
                     self.mark_snapshot_image_result(snapshot, self.persistence_queue.enqueue_image(analyzer, image, snapshot.path, self.store, priority=priority))
             except Exception as exc:
                 self.log_exception("capture_snapshot.save", exc, {"path": str(snapshot.path)})
+                self.write_recording_failure(mode, session_id, action=None, failure_reason="screenshot_save_failed", rect=getattr(snapshot, "rect", rect), detail=str(exc), snapshot=snapshot)
                 return None
         return snapshot
+
+    def mouse_action_summary(self, action, rect=None):
+        if not action:
+            return None
+        normalized = normalize_mouse_action(action, rect or self.current_rect() or (0, 0, 1, 1))
+        return {"type": normalized.get("type"), "source": normalized.get("source"), "start_rel": normalized.get("start_rel"), "end_rel": normalized.get("end_rel"), "duration": normalized.get("duration"), "button": normalized.get("button"), "wheel": normalized.get("wheel"), "path_points": len(normalized.get("path_rel") or [])}
+
+    def client_status_snapshot(self, rect=None):
+        status = {"rect": list(rect) if rect else None, "ok": False, "reason": "window_manager_unavailable"}
+        if not self.window_manager:
+            return status
+        try:
+            check = self.window_manager.check_window(force=True)
+            status.update({"ok": bool(getattr(check, "ok", False)), "reason": str(getattr(check, "reason", "unknown")), "rect": list(getattr(check, "rect", rect) or rect or [])})
+        except Exception as exc:
+            status.update({"reason": str(exc)})
+        return status
+
+    def write_recording_failure(self, mode, session_id, action=None, failure_reason="recording_unavailable", rect=None, detail=None, snapshot=None, stop_event=None):
+        if not self.store:
+            return None
+        rect = rect or getattr(snapshot, "rect", None) or self.current_rect()
+        self.consecutive_recording_failures[mode] += 1
+        record = {"record_schema_version": 2, "id": uuid.uuid4().hex, "session_id": session_id, "created_at": now_text(), "mode": mode, "event": "recording_failure", "elapsed": round(time.perf_counter() - safe_float(getattr(getattr(self, "active_session", None), "started_at", time.perf_counter()), time.perf_counter()), 3), "failure_reason": str(failure_reason), "failure_detail": str(detail) if detail else None, "mouse_action_summary": self.mouse_action_summary(action, rect), "client_status": self.client_status_snapshot(rect), "client_rect": list(rect) if rect else [], "screen_path": getattr(snapshot, "relative_path", None), "screen_hash_hex": getattr(getattr(snapshot, "hash_value", None), "hex", None), "screen_captured_at": getattr(snapshot, "captured_at", None), "capture_latency_ms": getattr(snapshot, "capture_latency_ms", None), "exclude_from_training": True, "score_status": "recording_unavailable", "screen_result_unknown": True, "consecutive_recording_failures": self.consecutive_recording_failures[mode]}
+        try:
+            self.store.append_experience(record)
+            self.events.publish("recording_failure", mode=mode, session_id=session_id, reason=record["failure_reason"], consecutive=record["consecutive_recording_failures"])
+        except Exception as exc:
+            self.log_exception("recording_failure.persist", exc, {"mode": mode, "reason": failure_reason})
+            return None
+        threshold = max(1, safe_int(getattr(self.settings, "training_fail_stop_count", 3), 3))
+        if record["consecutive_recording_failures"] >= threshold and mode in ("learning", "training"):
+            with self.state_lock:
+                self.termination_reason = "runtime_error"
+            if stop_event:
+                stop_event.set()
+            self.ui(lambda: (self.status_var.set("连续截图或保存失败，已退出到空闲"), self.deiconify()))
+        return record
 
     def write_record(self, mode, session_id, snapshot, action, event_name, decision=None, action_anchor_perf=None, after_snapshot=None, planned_action=None, failed_action=False, window_rect_changed=False, capture_latency_ms=None, execution_latency_ms=None, execution_error=None, screen_result_unknown=False, exclude_from_training=False):
         if not self.store or not snapshot:
@@ -8298,7 +8339,10 @@ class ControlPanel(tk.Tk):
                         action_snapshot = pending_snapshots.pop(action.get("action_id"), None) or self.capture_snapshot(analyzer, "learning", session_id, start, priority="critical")
                         after_snapshot = self.capture_snapshot(analyzer, "learning", session_id, start, priority="critical")
                         learning_screens += 2
-                        self.write_record("learning", session_id, action_snapshot, action, "user_mouse", action_anchor_perf=action.get("started_perf") or action.get("t0"), after_snapshot=after_snapshot, planned_action=action)
+                        if action_snapshot and after_snapshot:
+                            self.write_record("learning", session_id, action_snapshot, action, "user_mouse", action_anchor_perf=action.get("started_perf") or action.get("t0"), after_snapshot=after_snapshot, planned_action=action)
+                        else:
+                            self.write_recording_failure("learning", session_id, action=action, failure_reason="screenshot_unavailable_for_mouse_event", rect=self.current_rect(), detail="before_or_after_snapshot_missing", stop_event=stop_event)
                     if not event_seen:
                         while not stop_event.is_set():
                             reason = self.active_mode_stop_reason("learning", stop_event, config)
@@ -8345,7 +8389,10 @@ class ControlPanel(tk.Tk):
                 continue
             action_snapshot = pending_snapshots.pop(action.get("action_id"), None) or self.capture_snapshot(analyzer, "training", session_id, start, priority="critical")
             after_snapshot = self.capture_snapshot(analyzer, "training", session_id, start, priority="critical")
-            self.write_record("training", session_id, action_snapshot, action, "user_mouse", action_anchor_perf=action.get("started_perf") or action.get("t0"), after_snapshot=after_snapshot, planned_action=action)
+            if action_snapshot and after_snapshot:
+                self.write_record("training", session_id, action_snapshot, action, "user_mouse", action_anchor_perf=action.get("started_perf") or action.get("t0"), after_snapshot=after_snapshot, planned_action=action)
+            else:
+                self.write_recording_failure("training", session_id, action=action, failure_reason="screenshot_unavailable_for_mouse_event", rect=self.current_rect(), detail="before_or_after_snapshot_missing", stop_event=stop_event)
             count += 1
         return count
 
