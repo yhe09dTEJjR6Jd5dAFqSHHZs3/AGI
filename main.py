@@ -3065,7 +3065,7 @@ class SleepDecisionModel(TrainableModel):
 
     def fit(self, records):
         super().fit(records)
-        values = [safe_float(record.get("sleep_model_confidence", record.get("sleep_confidence", 0.0)), 0.0) for record in records or [] if isinstance(record, dict)]
+        values = [safe_float(record.get("sleep_input_confidence", record.get("sleep_model_confidence", record.get("sleep_confidence", 0.0))), 0.0) for record in records or [] if isinstance(record, dict)]
         rewards = [safe_float(record.get("reward", record.get("sleep_policy_reward", 0.0)), 0.0) for record in records or [] if isinstance(record, dict)]
         self.threshold = round(percentile(values, 0.75, 0.8), 4) if values else 0.8
         self.reward_floor = round(percentile(rewards, 0.25, 0.0), 4) if rewards else 0.0
@@ -3843,22 +3843,23 @@ class DataStore:
             if first_valid:
                 keep_paths.add(first_valid["path"])
         removed = 0
+        remaining = len(scored)
         errors = []
         audit = []
         for item in ranked_for_delete:
             if run_guard and run_guard():
-                remaining = len(list(self.model_dir.glob("model_*.json")))
                 return {"changed": removed > 0, "removed": removed, "limit": limit, "target_count": min(remaining, limit), "model_count": remaining, "complete": False, "interrupted": True, "errors": errors, "audit": audit}
             path = item["path"]
-            if path in keep_paths or len(list(self.model_dir.glob("model_*.json"))) <= limit:
+            if path in keep_paths or remaining <= limit:
                 continue
             try:
                 self.log_judge_cleanup_decision("model_group", item.get("judge_features", {}), item.get("delete_score", 0.0), audit_rank.get(path, 0), "delete_score_high_and_over_limit", path=str(path))
                 audit.append({"path": str(path), "delete_score": item.get("delete_score", 0.0), "rank": audit_rank.get(path, 0), "reason": "delete_score_high_and_over_limit"})
                 path.unlink()
                 removed += 1
+                remaining = max(0, remaining - 1)
                 if progress_callback:
-                    progress_callback("清理AI模型组", removed, max(1, len(scored) - limit), {"removed": removed, "model_count": len(list(self.model_dir.glob("model_*.json"))), "limit": limit, "current_rank": audit_rank.get(path, 0)})
+                    progress_callback("清理AI模型组", removed, max(1, len(scored) - limit), {"removed": removed, "model_count": remaining, "limit": limit, "current_rank": audit_rank.get(path, 0)})
             except Exception as exc:
                 error = {"path": str(path), "error": str(exc), "error_type": type(exc).__name__}
                 errors.append(error)
@@ -3866,7 +3867,6 @@ class DataStore:
                     self.log_error("compact_ai_models.unlink", exc, error)
                 except Exception:
                     pass
-        remaining = len(list(self.model_dir.glob("model_*.json")))
         return {"changed": removed > 0, "removed": removed, "limit": limit, "target_count": min(remaining, limit), "model_count": remaining, "complete": remaining <= limit, "errors": errors, "audit": audit}
 
 
@@ -6292,6 +6292,9 @@ class ControlPanel(tk.Tk):
         self.active_session = ModeSession(0, "idle", time.perf_counter(), None, self.stop_event)
         self.termination_reason = None
         self.mode_thread = None
+        self.migration_thread = None
+        self.migration_stop_event = threading.Event()
+        self.migration_in_progress = False
         self.window_manager = None
         self.store = None
         self.experience_pool = ExperiencePool(self.settings)
@@ -6715,9 +6718,10 @@ class ControlPanel(tk.Tk):
         self.ldplayer_client_var.set("雷电客户区：" + client_reason)
         sleep_enabled = self.offline_sleep_environment_ready()
         mode = self.current_mode()
-        online_state = "normal" if online_enabled and mode == "idle" else "disabled"
-        sleep_state = "normal" if sleep_enabled and mode == "idle" else "disabled"
-        modify_state = "normal" if mode == "idle" else "disabled"
+        busy = bool(getattr(self, "migration_in_progress", False))
+        online_state = "normal" if online_enabled and mode == "idle" and not busy else "disabled"
+        sleep_state = "normal" if sleep_enabled and mode == "idle" and not busy else "disabled"
+        modify_state = "normal" if mode == "idle" and not busy else "disabled"
         for button in (getattr(self, "learning_button", None), getattr(self, "training_button", None)):
             if button:
                 try:
@@ -6857,8 +6861,8 @@ class ControlPanel(tk.Tk):
         self.start_data_migration(Path(path), self.pending_user_settings())
 
     def start_data_migration(self, new_path, values=None):
-        if self.current_mode() != "idle":
-            self.status_var.set("只能在空闲状态修改数据")
+        if self.current_mode() != "idle" or getattr(self, "migration_in_progress", False):
+            self.status_var.set("只能在空闲且无迁移任务时修改数据")
             return False
         old_path = Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)
         new_path = Path(new_path)
@@ -6872,12 +6876,18 @@ class ControlPanel(tk.Tk):
             self.status_var.set("修改已保存")
             return True
         self.status_var.set("正在修改数据目录")
-        self.update_progress(0.0)
+        self.update_progress(0.0, force=True)
         values = values or self.pending_user_settings()
         migration_values = {"ldplayer_path": str(values.get("ldplayer_path") or DEFAULT_LDPLAYER_PATH), "experience_pool_gb": max(0.1, safe_float(values.get("experience_pool_gb"), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(values.get("ai_model_limit"), DEFAULT_AI_MODEL_LIMIT))}
-        ok = self.migration_service.run(None, old_path, new_path, threading.Event(), migration_values)
+        self.migration_in_progress = True
+        self.migration_stop_event = threading.Event()
         self.update_mode_button_states()
-        return bool(ok)
+        def run_migration():
+            ok = self.migration_service.run(None, old_path, new_path, self.migration_stop_event, migration_values)
+            self.ui(lambda result=ok: self.finish_data_migration(result))
+        self.migration_thread = threading.Thread(target=run_migration, name="data-migration", daemon=True)
+        self.migration_thread.start()
+        return True
 
     def migration_items(self, old_path):
         root = Path(old_path)
@@ -6912,8 +6922,9 @@ class ControlPanel(tk.Tk):
                     break
                 dst.write(chunk)
                 copied += len(chunk)
-                self.events.publish("migration_chunk_completed", source=str(source), target=str(target), copied=copied, total=total)
-                self.ui(lambda c=copied, t=total: self.progress_label_var.set(f"数据迁移中｜已迁移 {c}/{t} 字节"))
+                percent = copied * 100.0 / max(1, total)
+                self.events.publish("migration_chunk_completed", source=str(source), target=str(target), copied=copied, total=total, progress=percent)
+                self.ui(lambda c=copied, t=total, p=percent: (self.update_progress(p, force=True), self.progress_label_var.set(f"数据迁移中｜已迁移 {c}/{t} 字节")))
         try:
             shutil.copystat(source, target)
         except Exception:
@@ -7065,7 +7076,8 @@ class ControlPanel(tk.Tk):
                     reason = "数据迁移已终止"
                     break
                 if size == 0:
-                    self.ui(lambda c=copied, t=total: self.progress_label_var.set(f"数据迁移中｜已迁移 {c}/{t} 字节"))
+                    percent = copied * 100.0 / max(1, total)
+                    self.ui(lambda c=copied, t=total, p=percent: (self.update_progress(p, force=True), self.progress_label_var.set(f"数据迁移中｜已迁移 {c}/{t} 字节")))
             if not stop_event.is_set() and (token is None or self.is_run_active(token)):
                 DataStore(temp_root).save_settings({"experience_pool_gb": values["experience_pool_gb"], "ai_model_limit": values["ai_model_limit"]})
                 journal_path = new_root.parent / f".{new_root.name}.migration.journal.json"
@@ -7089,7 +7101,7 @@ class ControlPanel(tk.Tk):
                 self.store = DataStore(new_root)
                 self.experience_pool = ExperiencePool(self.settings, self.store.load_experience(self.settings.experience_load_limit), self.store.load_latest_model_state(self.settings))
                 self.brain = ActionBrain(self.experience_pool, self.settings)
-                self.update_progress(0.0, force=True)
+                self.update_progress(100.0, force=True)
                 if token is not None:
                     self.finish_run(token, reason, 0.0, release=False, reason="completed")
                 else:
@@ -7119,6 +7131,13 @@ class ControlPanel(tk.Tk):
             if temp_root:
                 shutil.rmtree(temp_root, ignore_errors=True)
         return True
+
+    def finish_data_migration(self, ok):
+        self.migration_in_progress = False
+        self.update_mode_button_states()
+        if ok:
+            self.after(max(300, int(self.settings.ui_event_coalesce_seconds * 1000)), lambda: self.update_progress(0.0, force=True))
+        return ok
 
     def bind_mousewheel(self, _event):
         self.bind_all("<MouseWheel>", self.on_mousewheel)
@@ -8235,6 +8254,7 @@ class ControlPanel(tk.Tk):
             record["exclude_from_training"] = True
         if decision:
             record["ai_decision"] = decision
+            record["sleep_input_confidence"] = round(clamp(safe_float(decision.get("confidence", 0.0), 0.0), 0.0, 1.0), 4)
         record["persistence_status"] = "prepared"
         if record.get("image_dropped") or not record.get("screen_file_expected", True):
             record["exclude_from_training"] = True
@@ -8449,7 +8469,13 @@ class ControlPanel(tk.Tk):
                         self.ui(lambda e=last_training_error: self.status_var.set(f"训练模式结束：连续执行失败：{e}"))
                     continue
                 consecutive_failures = 0
-                sleep_decision = self.experience_pool.model_runtime.should_sleep({"sleep_confidence": safe_float(record.get("sleep_model_confidence", record.get("sleep_confidence", 0.0)), 0.0) if isinstance(record, dict) else 0.0, "reward": safe_float(record.get("reward", 0.0), 0.0) if isinstance(record, dict) else 0.0, "consecutive_failures": consecutive_failures, "consecutive_no_actions": consecutive_no_actions, "elapsed_seconds": time.perf_counter() - start})
+                sleep_input_confidence = clamp(safe_float((decision or {}).get("confidence", record.get("sleep_input_confidence", record.get("sleep_model_confidence", record.get("sleep_confidence", 0.0))) if isinstance(record, dict) else 0.0), 0.0), 0.0, 1.0)
+                sleep_features = {"sleep_confidence": sleep_input_confidence, "model_confidence": sleep_input_confidence, "reward": safe_float(record.get("reward", 0.0), 0.0) if isinstance(record, dict) else 0.0, "consecutive_failures": consecutive_failures, "consecutive_no_actions": consecutive_no_actions, "elapsed_seconds": time.perf_counter() - start}
+                sleep_decision = self.experience_pool.model_runtime.should_sleep(sleep_features)
+                if isinstance(record, dict):
+                    record["sleep_input_confidence"] = round(sleep_input_confidence, 4)
+                    record["sleep_decision"] = sleep_decision
+                    record["sleep_model_score"] = safe_float(sleep_decision.get("score", 0.0), 0.0)
                 if sleep_decision.get("sleep"):
                     self.termination_reason = "sleep_model"
                     stop_event.set()
@@ -8775,12 +8801,22 @@ def run_windows_acceptance():
     else:
         result["client_abnormal_scenarios"] = {"occluded": "skipped_non_windows_or_unattached", "minimized": "skipped_non_windows_or_unattached", "out_of_screen": "skipped_non_windows_or_unattached", "dpi_scale": "skipped_non_windows_or_unattached"}
         result["cursor_gate"] = "skipped_non_windows_or_unattached"
+    critical = []
+    def collect_failures(prefix, value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                collect_failures(f"{prefix}.{key}" if prefix else str(key), child)
+        elif value in ("fail", "skipped_non_windows_or_unattached"):
+            critical.append(prefix)
+    collect_failures("", result)
+    result["acceptance_passed"] = not critical
+    result["acceptance_failures"] = critical
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if not critical else 1
 
 if __name__ == "__main__":
     if "--windows-acceptance" in sys.argv:
-        run_windows_acceptance()
-        sys.exit(0)
+        sys.exit(run_windows_acceptance())
     if "--self-test" in sys.argv:
         run_self_test()
         sys.exit(0)
