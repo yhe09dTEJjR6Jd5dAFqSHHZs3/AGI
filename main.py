@@ -28,7 +28,8 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 MIN_PYTHON_VERSION = (3, 10)
 
 DEPENDENCY_INSTALL_MAP = {"mss": "mss", "PIL": "pillow", "psutil": "psutil", "pywin32": "pywin32", "pynput.mouse": "pynput", "pynput.keyboard": "pynput"}
-REQUIRED_MODULES = ("mss", "PIL", "pywin32", "pynput.mouse", "psutil")
+REQUIRED_MODULES_BY_PLATFORM = {"win32": ("mss", "PIL", "pywin32", "pynput.mouse", "psutil"), "default": ("mss", "PIL", "pynput.mouse", "psutil")}
+REQUIRED_MODULES = REQUIRED_MODULES_BY_PLATFORM["win32"] if sys.platform == "win32" else REQUIRED_MODULES_BY_PLATFORM["default"]
 OPTIONAL_MODULES = ("pynput.keyboard",)
 
 
@@ -329,10 +330,13 @@ def data_path_write_issue(path, create=False):
             return "存储路径不存在"
         if not candidate.is_dir():
             return "存储路径不是文件夹"
-        probe = candidate / f".agi_startup_write_{uuid.uuid4().hex}.tmp"
-        with probe.open("wb") as file:
-            file.write(b"")
-        probe.unlink()
+        if not os.access(candidate, os.W_OK | os.R_OK | os.X_OK):
+            return "存储路径权限不足"
+        if create:
+            probe = candidate / f".agi_startup_write_{uuid.uuid4().hex}.tmp"
+            with probe.open("wb") as file:
+                file.write(b"")
+            probe.unlink()
         return None
     except Exception as exc:
         return f"存储路径不可写：{exc}"
@@ -371,9 +375,7 @@ def startup_environment_issues():
     ldplayer_path, data_path = startup_config_paths()
     if sys.version_info < MIN_PYTHON_VERSION:
         issues.append(f"Python 版本过低：需要 {MIN_PYTHON_VERSION[0]}.{MIN_PYTHON_VERSION[1]} 或更高版本，当前版本为 {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
-    if sys.platform != "win32":
-        issues.append(f"操作系统不符合要求：本程序需要 Windows 桌面会话和雷电模拟器，当前平台为 {sys.platform}")
-    else:
+    if sys.platform == "win32":
         session_name = os.environ.get("SESSIONNAME", "")
         if not session_name:
             issues.append("未检测到 Windows 桌面会话")
@@ -386,7 +388,7 @@ def startup_environment_issues():
         if name in IMPORT_ERRORS:
             issues.append(f"依赖无法导入 {name}：{IMPORT_ERRORS[name]}")
     valid_path, path_reason = validate_ldplayer_executable(ldplayer_path, require_attach=False)
-    if not valid_path:
+    if sys.platform == "win32" and not valid_path:
         issues.append(f"雷电模拟器启动路径无效 {ldplayer_path}：{path_reason}")
     elif sys.platform == "win32" and "WindowManager" in globals():
         runtime_ok, runtime_reason = attach_and_probe_ldplayer(ldplayer_path)
@@ -517,9 +519,17 @@ def startup_failure_detail(initial_issues, repair_actions, repair_error, remaini
     return "\n".join(sections)
 
 
-def check_environment(check_environment=None):
+def inspect_environment(check_environment=None):
     probe = check_environment or startup_environment_issues
     return tuple(probe())
+
+
+def verify_environment(check_environment=None):
+    return inspect_environment(check_environment)
+
+
+def check_environment(check_environment=None):
+    return inspect_environment(check_environment)
 
 
 def repair_environment(repair_environment=None):
@@ -534,25 +544,25 @@ def repair_environment(repair_environment=None):
 
 
 def recheck_environment(check_environment=None):
-    return globals()["check_environment"](check_environment)
+    return verify_environment(check_environment)
 
 
 def ensure_environment(stage, allow_repair=True, check_environment=None, repair_environment=None):
-    initial_issues = globals()["check_environment"](check_environment)
+    initial_issues = inspect_environment(check_environment)
     if not initial_issues:
         return EnvironmentEnsureResult(True, stage, initial_issues, tuple(), tuple(), tuple())
     if allow_repair:
         repair_actions, repair_error = globals()["repair_environment"](repair_environment)
     else:
         repair_actions, repair_error = ("当前阶段禁止自动修复",), None
-    remaining_issues = recheck_environment(check_environment)
+    remaining_issues = verify_environment(check_environment)
     unrecoverable = tuple([repair_error] if repair_error else ()) + remaining_issues
     return EnvironmentEnsureResult(not remaining_issues, stage, initial_issues, tuple(repair_actions), remaining_issues, unrecoverable)
 
 
 def ensure_retry_environment_result(check_environment=None, repair_environment=None):
     repair_actions, repair_error = globals()["repair_environment"](repair_environment)
-    remaining_issues = recheck_environment(check_environment)
+    remaining_issues = verify_environment(check_environment)
     unrecoverable = tuple([repair_error] if repair_error else ()) + remaining_issues
     retry_initial = ("重试动作已关闭弹窗，并按要求在检查前直接执行自愈。",)
     return EnvironmentEnsureResult(not remaining_issues, "retry", retry_initial, tuple(repair_actions), remaining_issues, unrecoverable)
@@ -1016,7 +1026,7 @@ def validate_ldplayer_executable(path, settings=None, require_attach=False):
     if not candidate.is_file():
         return False, "雷电模拟器路径不是文件"
     if sys.platform != "win32":
-        return True, "self_test"
+        return True, "platform_supported_without_windows_attach"
     report = windows_runtime_report(candidate)
     if not report.get("ok"):
         return False, "当前 Windows 桌面运行环境无法启动或附着雷电模拟器：" + json.dumps(report, ensure_ascii=False)
@@ -3563,6 +3573,7 @@ class DataStore:
         self.settings_file = self.root / "settings.json"
         self.sleep_checkpoint_file = self.root / "sleep_checkpoint.json"
         self.runtime_audit_file = self.root / "runtime_parameters_audit.jsonl"
+        self.evidence_file = self.root / "runtime_evidence.jsonl"
         self.error_file = self.root / "errors.jsonl"
         self.lock = threading.RLock()
         try:
@@ -3666,6 +3677,10 @@ class DataStore:
         payload.update(updates)
         payload["updated_at"] = now_text()
         self.write_json_atomic(self.sleep_checkpoint_file, payload)
+        try:
+            self.append_evidence("sleep_checkpoint", checkpoint=payload)
+        except Exception:
+            pass
         return payload
 
     def clear_sleep_checkpoint(self):
@@ -3674,6 +3689,13 @@ class DataStore:
                 self.sleep_checkpoint_file.unlink(missing_ok=True)
             except Exception as exc:
                 self.log_error("clear_sleep_checkpoint", exc, {"path": str(self.sleep_checkpoint_file)})
+
+    def append_evidence(self, event, **payload):
+        item = {"schema_version": CONFIG_SCHEMA_VERSION, "evidence_version": 1, "created_at": now_text(), "event": str(event), **payload}
+        with self.lock:
+            with self.evidence_file.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(item, ensure_ascii=False) + "\n")
+        return item
 
     def append_runtime_parameter_audit(self, previous_values, current_values, audit):
         payload = {"schema_version": CONFIG_SCHEMA_VERSION, "audit_version": 1, "created_at": now_text(), "previous_values": previous_values or {}, "current_values": current_values or {}, "changes": [], "runtime_generated_numbers": audit or {}}
@@ -4117,6 +4139,10 @@ class DataStore:
 
     def log_judge_cleanup_decision(self, target, features, delete_score, rank, reason, **extra):
         payload = {"target": target, "features": features, "delete_score": safe_float(delete_score, 0.0), "rank": safe_int(rank, 0), "reason": reason, **extra}
+        try:
+            self.append_evidence("judge_cleanup_decision", **payload)
+        except Exception:
+            pass
         try:
             self.log_error("judge_cleanup_decision", RuntimeError("judge_cleanup_decision"), payload)
         except Exception:
@@ -6646,6 +6672,11 @@ class ControlPanel(tk.Tk):
 
     def remember_event(self, event):
         self.event_journal.append(event)
+        try:
+            if self.store:
+                self.store.append_evidence("event", **event)
+        except Exception:
+            pass
 
     def ui(self, func):
         if getattr(self, "shutdown_requested", False):
@@ -7295,7 +7326,7 @@ class ControlPanel(tk.Tk):
                     self.active_session.termination_reason = transition_reason
                 self.termination_reason = transition_reason
                 self.mode = "idle"
-                event = self.events.publish("mode_transition", source=source, target=target, reason=transition_reason, token=self.run_token)
+                event = self.events.publish("mode_transition", from_mode=source, to_mode=target, source=source, target=target, reason=transition_reason, token=self.run_token)
                 self.active_session = ModeSession(self.run_token, "idle", time.perf_counter(), None, self.stop_event, transition_reason, event["sequence"])
                 session = self.active_session
             else:
@@ -7304,7 +7335,7 @@ class ControlPanel(tk.Tk):
                 stop_event = threading.Event() if fresh_stop_event else (self.stop_event if token is not None else threading.Event())
                 self.stop_event = stop_event
                 self.mode = target
-                event = self.events.publish("mode_transition", source=source, target=target, reason=transition_reason, token=session_token)
+                event = self.events.publish("mode_transition", from_mode=source, to_mode=target, source=source, target=target, reason=transition_reason, token=session_token)
                 if target in RUNNING_MODES:
                     self.termination_reason = None
                     session_reason = None
@@ -7434,13 +7465,19 @@ class ControlPanel(tk.Tk):
         return True
 
     def cursor_position(self):
-        if not win32api:
-            return None
-        try:
-            x, y = win32api.GetCursorPos()
-            return int(x), int(y)
-        except Exception:
-            return None
+        if win32api:
+            try:
+                x, y = win32api.GetCursorPos()
+                return int(x), int(y)
+            except Exception:
+                return None
+        if pynput_mouse:
+            try:
+                x, y = pynput_mouse.Controller().position
+                return int(x), int(y)
+            except Exception:
+                return None
+        return None
 
     def observe_cursor_activity(self):
         pos = self.cursor_position()
@@ -7463,7 +7500,11 @@ class ControlPanel(tk.Tk):
             self.observe_cursor_activity()
         return inside
 
-    def ensure_cursor_inside_window(self, rect=None):
+    def ensure_cursor_inside_window(self, rect=None, token=None, stop_event=None, mode=None, check=None):
+        if stop_event and stop_event.is_set():
+            return False
+        if token is not None and not self.is_run_active(token, mode):
+            return False
         rect = rect or self.current_rect()
         if not rect:
             return False
@@ -7473,6 +7514,9 @@ class ControlPanel(tk.Tk):
             return True
         left, top, right, bottom = rect
         target = (int((left + right) / 2), int((top + bottom) / 2))
+        safety = {"token_active": token is None or self.is_run_active(token, mode), "stop_clear": not (stop_event and stop_event.is_set()), "window_ok": bool(getattr(check, "ok", True)), "rect": list(rect), "before": list(pos) if pos else None, "target": list(target), "mode": mode}
+        if not all((safety["token_active"], safety["stop_clear"], safety["window_ok"])):
+            return False
         try:
             if self.executor:
                 self.executor.controller.position = target
@@ -7481,6 +7525,13 @@ class ControlPanel(tk.Tk):
             else:
                 win32api.SetCursorPos(target)
             self.mark_learning_activity()
+            after = self.cursor_position()
+            safety["after"] = list(after) if after else None
+            try:
+                if self.store:
+                    self.store.append_evidence("auto_cursor_move", trigger_mode=mode, safety=safety)
+            except Exception:
+                pass
             return True
         except Exception as exc:
             self.log_exception("cursor.ensure_inside", exc, {"rect": list(rect), "target": list(target)})
@@ -7562,6 +7613,11 @@ class ControlPanel(tk.Tk):
     def ensure_offline_data_environment(self, config=None, allow_repair=True, show_error=True):
         config = config or self.read_config()
         result = ensure_environment("sleep_data", allow_repair, lambda: self.offline_data_environment_issues_for_config(config), lambda actions: self.repair_offline_data_environment_for_config(config, actions))
+        if self.store:
+            try:
+                self.store.append_evidence("environment_result", stage="sleep_data", initial=list(result.checks), repair_actions=list(result.repair_actions), recheck=list(result.recheck), ok=result.ok)
+            except Exception:
+                pass
         if not result.ok:
             self.runtime_environment_issue = "；".join(result.unrecoverable) or "睡眠模式数据环境不符合要求"
             self.log_exception("sleep.environment", RuntimeError("offline_data_environment_not_ready"), {"result": result.detail()})
@@ -7575,6 +7631,11 @@ class ControlPanel(tk.Tk):
     def ensure_environment(self, stage, config=None, allow_repair=True, require_attach=False, show_error=True, ignored_hwnds=None):
         config = config or self.read_config()
         result = ensure_environment(stage, allow_repair, lambda: self.runtime_environment_issues_for_config(config), lambda actions: self.repair_runtime_environment_for_config(config, actions))
+        if self.store:
+            try:
+                self.store.append_evidence("environment_result", stage=stage, initial=list(result.checks), repair_actions=list(result.repair_actions), recheck=list(result.recheck), ok=result.ok)
+            except Exception:
+                pass
         if not result.ok:
             self.runtime_environment_issue = "；".join(result.unrecoverable) or "运行环境不符合要求"
             self.log_exception("runtime.environment", RuntimeError("environment_not_ready"), {"stage": stage, "result": result.detail()})
@@ -7598,6 +7659,12 @@ class ControlPanel(tk.Tk):
                     self.ui(lambda r=result: messagebox.showerror("运行环境不符合要求", r.detail()))
                 return result
             probe_ok, probe_reason = runtime_capability_probe(self.window_manager)
+            try:
+                if self.store:
+                    window_check = self.window_manager.check_window(force=True)
+                    self.store.append_evidence("window_probe", stage=stage, ok=probe_ok, reason=probe_reason, rect=list(getattr(window_check, "rect", ()) or ()), virtual_screen=virtual_screen_rect(), occlusion=getattr(window_check, "occlusion", None))
+            except Exception:
+                pass
             if not probe_ok:
                 result = EnvironmentEnsureResult(False, stage, result.checks, result.repair_actions, ("运行能力探测失败：" + probe_reason,), ("运行能力探测失败：" + probe_reason,))
                 self.runtime_environment_issue = probe_reason
@@ -7667,12 +7734,17 @@ class ControlPanel(tk.Tk):
                 self.finish_run(token, "当前模式已终止", 0.0, reason="user_stop")
                 return
             self.window_manager.foreground()
-            stop_event.wait(config.settings.window_event_wait)
+            if stop_event.wait(config.settings.window_event_wait):
+                return
+            if stop_event.is_set() or not self.is_run_active(token, "starting"):
+                return
             check = self.window_manager.check_window(force=True)
             if not check.ok:
                 self.finish_run(token, f"雷电模拟器客户区异常：{check.reason}", 0.0, reason=f"window_{check.reason}")
                 return
-            if not self.ensure_cursor_inside_window(check.rect):
+            if stop_event.is_set() or not self.is_run_active(token, "starting"):
+                return
+            if not self.ensure_cursor_inside_window(check.rect, token=token, stop_event=stop_event, mode="starting", check=check):
                 self.finish_run(token, "无法确保鼠标位于雷电模拟器客户区内", 0.0, reason="window_invalid")
                 return
             if not self.activate_run(token, mode):
