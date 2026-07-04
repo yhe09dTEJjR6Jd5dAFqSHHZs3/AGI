@@ -4529,10 +4529,9 @@ class WindowCheck:
 
 
 class WindowManager:
-    def __init__(self, executable_path, settings, ignored_hwnds=None):
+    def __init__(self, executable_path, settings):
         self.executable_path = Path(executable_path)
         self.settings = settings
-        self.ignored_hwnds = set()
         self.process = None
         self.hwnd = None
         self.lock = threading.RLock()
@@ -4654,10 +4653,6 @@ class WindowManager:
 
     def topmost(self):
         self.foreground()
-
-    def set_ignored_hwnds(self, hwnds):
-        self.ignored_hwnds = set()
-
 
     def occluded_area_ratio(self, hwnd, rect):
         front = []
@@ -6244,7 +6239,7 @@ class TrainingService:
         return settings
 
     def observe_screen(self, analyzer, session_id, start, rect):
-        return self.panel.capture_snapshot(analyzer, "training", session_id, start, rect=rect, priority="critical")
+        return self.panel.capture_required_snapshot(analyzer, "training", session_id, start, "training_screen_event", rect=rect, priority="critical")
 
     def decide_action(self, snapshot):
         panel = self.panel
@@ -6304,12 +6299,7 @@ class TrainingService:
         latency_ms = safe_float(actual.get("duration", 0.0), 0.0) * 1000.0
         panel.adaptive_policy.observe_execution(latency_ms=latency_ms, success=True)
         panel.mark_learning_activity()
-        after_snapshot = None
-        for attempt in range(3):
-            after_snapshot = panel.capture_snapshot(analyzer, "training", session_id, start, rect=rect, priority="critical")
-            if after_snapshot:
-                break
-            stop_event.wait(min(0.2, max(0.01, panel.settings.training_event_wait)))
+        after_snapshot = panel.capture_required_snapshot(analyzer, "training", session_id, start, "ai_mouse_after", rect=rect, priority="critical", action=actual, stop_event=stop_event, retries=3)
         if not after_snapshot:
             record = panel.write_record("training", session_id, snapshot, actual, "ai_mouse_after_screen_missing", decision=decision, action_anchor_perf=actual.get("started_perf"), after_snapshot=None, planned_action=action, execution_latency_ms=round(latency_ms, 3), execution_error="after_snapshot_missing", screen_result_unknown=True, exclude_from_training=True)
             panel.adaptive_policy.observe_execution(success=False)
@@ -6421,6 +6411,9 @@ class ControlPanel(tk.Tk):
         self.metric_items = []
         self.hint_label = None
         self.metrics_frame = None
+        self.compact_panel_layout = False
+        self.panel_size_warning_shown = False
+        self.minimum_supported_screen = (1280, 720)
         self.app_config_store = AppConfigStore()
         self.hint_templates = {
             "idle": "当前处于空闲。可修改允许的四项参数，或启动学习、训练、睡眠模式；启动学习/训练前会自动检查并修复运行环境。",
@@ -6530,7 +6523,7 @@ class ControlPanel(tk.Tk):
         scale = max(0.75, min(2.0, float(self.winfo_fpixels("1i")) / 96.0))
         screen_w = max(1, self.winfo_screenwidth())
         screen_h = max(1, self.winfo_screenheight())
-        compact = screen_h < 850 or screen_w < 1500
+        compact = self.compact_panel_layout or screen_h < 850 or screen_w < 1500
         font_scale = max(0.72, min(1.35, scale * (0.86 if compact else 1.0)))
         title_size = max(11, int(round(16 * font_scale)))
         value_size = max(9, int(round(11 * font_scale)))
@@ -6579,6 +6572,7 @@ class ControlPanel(tk.Tk):
         self.modify_buttons.append(self.modify_button)
         self.control_buttons = [self.modify_button, self.learning_button, self.training_button, self.sleep_button]
         self.reflow_buttons()
+        self.after_idle(self.fit_complete_panel)
         status_frame = ttk.LabelFrame(container, text="全量状态", padding=section_pad)
         status_frame.grid(row=2, column=0, sticky="nsew")
         status_frame.columnconfigure(0, weight=1)
@@ -6625,18 +6619,69 @@ class ControlPanel(tk.Tk):
     def fit_complete_panel(self):
         try:
             self.update_idletasks()
-            req_w = max(self.settings.ui_min_width, self.winfo_reqwidth())
-            req_h = max(self.settings.ui_min_height, self.winfo_reqheight())
             screen_w = max(1, self.winfo_screenwidth())
             screen_h = max(1, self.winfo_screenheight())
+            req_w = max(self.settings.ui_min_width, self.winfo_reqwidth())
+            req_h = max(self.settings.ui_min_height, self.winfo_reqheight())
             width = min(max(self.winfo_width(), req_w), screen_w)
             height = min(max(self.winfo_height(), req_h), screen_h)
             self.minsize(min(req_w, screen_w), min(req_h, screen_h))
             if self.winfo_width() < req_w or self.winfo_height() < req_h:
                 self.geometry(f"{width}x{height}")
+                self.update_idletasks()
+            fits = self.panel_controls_fit_client()
+            if not fits and not self.compact_panel_layout:
+                self.compact_panel_layout = True
+                self.apply_compact_panel_layout()
+                self.update_idletasks()
+                req_w = max(self.settings.ui_min_width, self.winfo_reqwidth())
+                req_h = max(self.settings.ui_min_height, self.winfo_reqheight())
+                self.geometry(f"{min(max(self.winfo_width(), req_w), screen_w)}x{min(max(self.winfo_height(), req_h), screen_h)}")
+                self.update_idletasks()
+                fits = self.panel_controls_fit_client()
+            min_w, min_h = self.minimum_supported_screen
+            if (screen_w < min_w or screen_h < min_h or not fits) and not self.panel_size_warning_shown:
+                self.panel_size_warning_shown = True
+                self.status_var.set("当前屏幕尺寸不足以完整显示控制面板")
+                messagebox.showwarning("屏幕尺寸不足", "当前屏幕尺寸不足以完整显示控制面板。最低支持 1280×720 @ 100% DPI；请提高分辨率、降低缩放或扩大可用屏幕区域。")
             self.update_scroll_region()
         except Exception as exc:
             self.log_exception("ui.fit_complete", exc)
+
+    def panel_controls_fit_client(self):
+        try:
+            self.update_idletasks()
+            client_w = max(1, self.winfo_width())
+            client_h = max(1, self.winfo_height())
+            for widget in self.winfo_children():
+                if not self.widget_tree_fits(widget, client_w, client_h):
+                    return False
+            return True
+        except Exception as exc:
+            self.log_exception("ui.panel_fit_check", exc)
+            return False
+
+    def widget_tree_fits(self, widget, client_w, client_h):
+        if not widget.winfo_ismapped():
+            return True
+        x1 = widget.winfo_rootx() - self.winfo_rootx()
+        y1 = widget.winfo_rooty() - self.winfo_rooty()
+        x2 = x1 + widget.winfo_width()
+        y2 = y1 + widget.winfo_height()
+        if x1 < 0 or y1 < 0 or x2 > client_w or y2 > client_h:
+            return False
+        return all(self.widget_tree_fits(child, client_w, client_h) for child in widget.winfo_children())
+
+    def apply_compact_panel_layout(self):
+        style = ttk.Style(self)
+        style.configure("TButton", padding=(8, 5), font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("Learn.TButton", padding=(8, 5), font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("Train.TButton", padding=(8, 5), font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("Sleep.TButton", padding=(8, 5), font=("Microsoft YaHei UI", 9, "bold"))
+        if self.hint_label:
+            self.hint_label.configure(wraplength=max(280, self.winfo_width() - 32))
+        self.reflow_buttons()
+        self.reflow_metrics()
 
     def update_scroll_region(self, _event=None):
         if getattr(self, "scroll_canvas", None):
@@ -6661,8 +6706,8 @@ class ControlPanel(tk.Tk):
         if not self.metrics_frame:
             return
         width = max(1, self.metrics_frame.winfo_width() or self.winfo_width())
-        min_width = max(120, self.settings.ui_metric_min_column_width)
-        columns = max(1, width // min_width if width >= min_width else 1)
+        min_width = 96 if self.compact_panel_layout else max(120, self.settings.ui_metric_min_column_width)
+        columns = max(1, min(3 if self.compact_panel_layout else 12, width // min_width if width >= min_width else 1))
         for column in range(max(1, len(self.metric_items))):
             self.metrics_frame.columnconfigure(column, weight=0)
         for column in range(columns):
@@ -6675,8 +6720,8 @@ class ControlPanel(tk.Tk):
         if not getattr(self, "button_frame", None):
             return
         width = max(1, self.button_frame.winfo_width() or self.winfo_width())
-        min_width = max(120, int(max(120, self.settings.ui_metric_min_column_width * 0.7)))
-        columns = max(1, width // min_width if width >= min_width else 1)
+        min_width = 92 if self.compact_panel_layout else max(120, int(max(120, self.settings.ui_metric_min_column_width * 0.7)))
+        columns = max(1, min(4, width // min_width if width >= min_width else 1))
         for index, button in enumerate(self.control_buttons):
             row = index // columns
             column = index % columns
@@ -7624,7 +7669,7 @@ class ControlPanel(tk.Tk):
         self.ensure_storage_runtime(config)
         return result
 
-    def ensure_environment(self, stage, config=None, allow_repair=True, require_attach=False, show_error=True, ignored_hwnds=None):
+    def ensure_environment(self, stage, config=None, allow_repair=True, require_attach=False, show_error=True):
         config = config or self.read_config()
         result = ensure_environment(stage, allow_repair, lambda: self.runtime_environment_issues_for_config(config, require_attach=require_attach), lambda actions: self.repair_runtime_environment_for_config(config, actions))
         if self.store:
@@ -7641,11 +7686,8 @@ class ControlPanel(tk.Tk):
         self.runtime_environment_issue = ""
         self.ensure_storage_runtime(config)
         if require_attach:
-            ignored_hwnds = tuple(ignored_hwnds or ())
             if not self.window_manager or self.window_manager.executable_path != config.ldplayer_path or self.window_manager.settings != config.settings:
-                self.window_manager = WindowManager(config.ldplayer_path, config.settings, ignored_hwnds)
-            else:
-                self.window_manager.set_ignored_hwnds(ignored_hwnds)
+                self.window_manager = WindowManager(config.ldplayer_path, config.settings)
             if not self.executor or self.executor.window_manager is not self.window_manager or self.executor.settings != config.settings:
                 self.executor = HumanMouseExecutor(self.window_manager, config.settings)
             attached = self.window_manager.launch_or_attach()
@@ -7670,8 +7712,8 @@ class ControlPanel(tk.Tk):
                 return result
         return result
 
-    def ensure_runtime(self, config, ignored_hwnds=None):
-        return self.ensure_environment("runtime", config, allow_repair=True, require_attach=True, ignored_hwnds=ignored_hwnds).ok
+    def ensure_runtime(self, config):
+        return self.ensure_environment("runtime", config, allow_repair=True, require_attach=True).ok
 
     def learning_mode(self):
         self.request_active_mode("learning")
@@ -7683,8 +7725,7 @@ class ControlPanel(tk.Tk):
         self.last_active_mode_failure = ""
         config = self.read_config()
         self.status_var.set("正在检查运行环境")
-        ignored_hwnds = ()
-        if not self.ensure_environment("自动重启训练" if auto_restart else target_mode, config, allow_repair=True, require_attach=True, ignored_hwnds=ignored_hwnds).ok:
+        if not self.ensure_environment("自动重启训练" if auto_restart else target_mode, config, allow_repair=True, require_attach=True).ok:
             self.last_active_mode_failure = getattr(self, "runtime_environment_issue", "运行环境不符合要求") or "运行环境不符合要求"
             self.status_var.set("运行环境不符合要求，未进入模式")
             if auto_restart:
@@ -7699,13 +7740,13 @@ class ControlPanel(tk.Tk):
             return False
         self.update_progress(0.0)
         self.status_var.set("正在启动或连接雷电模拟器")
-        self.mode_thread = threading.Thread(target=self.mode_job, args=(token, target_mode, config, stop_event, ignored_hwnds), name=f"{target_mode}-mode", daemon=False)
+        self.mode_thread = threading.Thread(target=self.mode_job, args=(token, target_mode, config, stop_event), name=f"{target_mode}-mode", daemon=False)
         self.mode_thread.start()
         return True
 
-    def mode_job(self, token, mode, config, stop_event, ignored_hwnds=()):
+    def mode_job(self, token, mode, config, stop_event):
         try:
-            if not self.ensure_runtime(config, ignored_hwnds=ignored_hwnds):
+            if not self.ensure_runtime(config):
                 if self.is_run_active(token):
                     self.ui(lambda: messagebox.showerror("未找到客户区", "没有找到雷电模拟器客户区，请确认路径正确或手动启动雷电模拟器。"))
                     self.finish_run(token, "未找到雷电模拟器", 0.0, reason="runtime_error")
@@ -8264,6 +8305,20 @@ class ControlPanel(tk.Tk):
                 return None
         return snapshot
 
+    def capture_required_snapshot(self, analyzer, mode, session_id, session_start, stage, rect=None, priority="critical", action=None, stop_event=None, retries=1):
+        attempts = max(1, safe_int(retries, 1))
+        last_snapshot = None
+        for attempt in range(attempts):
+            snapshot = self.capture_snapshot(analyzer, mode, session_id, session_start, rect=rect, priority=priority)
+            if snapshot:
+                return snapshot
+            last_snapshot = snapshot
+            if attempt + 1 < attempts:
+                time.sleep(max(0.02, min(0.2, getattr(self.settings, "window_event_wait", 0.1))))
+        detail = {"stage": stage, "priority": priority, "attempts": attempts, "client_status": self.client_status_snapshot(rect), "timestamp": now_text()}
+        self.write_recording_failure(mode, session_id, action=action, failure_reason="required_screenshot_unavailable", rect=rect or self.current_rect(), detail=json.dumps(detail, ensure_ascii=False), snapshot=last_snapshot, stop_event=stop_event)
+        return None
+
     def mouse_action_summary(self, action, rect=None):
         if not action:
             return None
@@ -8384,6 +8439,7 @@ class ControlPanel(tk.Tk):
     def capture_learning_screen_change(self, analyzer, session_id, start, now_perf, config):
         snapshot, image = self.capture_snapshot_image(analyzer, "learning", start, priority="low")
         if not snapshot:
+            self.write_recording_failure("learning", session_id, failure_reason="periodic_screen_sample_unavailable", rect=self.current_rect(), detail=json.dumps({"stage": "periodic_screen_event", "timestamp": now_text()}, ensure_ascii=False))
             return
         if self.last_learning_event_hash:
             similarity = hash_similarity(snapshot.hash_value, self.last_learning_event_hash)
@@ -8398,8 +8454,10 @@ class ControlPanel(tk.Tk):
                 saved = self.mark_snapshot_image_result(snapshot, self.persistence_queue.enqueue_image(analyzer, image, snapshot.path, self.store, priority="low"))
         except Exception as exc:
             self.log_exception("learning_screen_event.save", exc, {"path": str(snapshot.path)})
+            self.write_recording_failure("learning", session_id, failure_reason="periodic_screen_sample_save_exception", rect=getattr(snapshot, "rect", None), detail=json.dumps({"stage": "periodic_screen_event", "error": str(exc), "timestamp": now_text()}, ensure_ascii=False), snapshot=snapshot)
             return
         if not saved:
+            self.write_recording_failure("learning", session_id, failure_reason="periodic_screen_sample_save_failed", rect=getattr(snapshot, "rect", None), detail=json.dumps({"stage": "periodic_screen_event", "timestamp": now_text()}, ensure_ascii=False), snapshot=snapshot)
             return
         self.adaptive_policy.observe_capture(getattr(snapshot, "capture_latency_ms", 0.0))
         self.last_learning_event_perf = now_perf
@@ -8419,7 +8477,7 @@ class ControlPanel(tk.Tk):
         self.last_learning_event_perf = time.perf_counter()
         self.last_learning_event_hash = None
         with ScreenAnalyzer(config.settings.hash_size) as analyzer:
-            self.write_record("learning", session_id, self.capture_snapshot(analyzer, "learning", session_id, start, priority="critical"), None, "mode_start")
+            self.write_record("learning", session_id, self.capture_required_snapshot(analyzer, "learning", session_id, start, "mode_start", priority="critical", stop_event=stop_event), None, "mode_start")
             while not stop_event.is_set() and self.is_run_active(token, "learning"):
                 reason = self.active_mode_stop_reason("learning", stop_event, config)
                 if reason:
@@ -8438,19 +8496,20 @@ class ControlPanel(tk.Tk):
                         learning_events += len(markers) + len(actions)
                         learning_screens += 1
                         self.capture_learning_screen_change(analyzer, session_id, start, now_perf, config)
+                    elif now_perf - self.last_learning_event_perf >= safe_float(getattr(self.settings, "learning_periodic_sample_seconds", 2.0), 2.0):
+                        learning_screens += 1
+                        self.capture_learning_screen_change(analyzer, session_id, start, now_perf, config)
                     for marker in markers:
-                        marker_snapshot = self.capture_snapshot(analyzer, "learning", session_id, start, priority="critical")
+                        marker_snapshot = self.capture_required_snapshot(analyzer, "learning", session_id, start, "mouse_start", priority="critical", stop_event=stop_event)
                         if marker_snapshot:
                             learning_screens += 1
                             pending_snapshots[marker["action_id"]] = marker_snapshot
                     for action in actions:
-                        action_snapshot = pending_snapshots.pop(action.get("action_id"), None) or self.capture_snapshot(analyzer, "learning", session_id, start, priority="critical")
-                        after_snapshot = self.capture_snapshot(analyzer, "learning", session_id, start, priority="critical")
+                        action_snapshot = pending_snapshots.pop(action.get("action_id"), None) or self.capture_required_snapshot(analyzer, "learning", session_id, start, "mouse_before", priority="critical", action=action, stop_event=stop_event)
+                        after_snapshot = self.capture_required_snapshot(analyzer, "learning", session_id, start, "mouse_after", priority="critical", action=action, stop_event=stop_event) if action_snapshot else None
                         learning_screens += 2
                         if action_snapshot and after_snapshot:
                             self.write_record("learning", session_id, action_snapshot, action, "user_mouse", action_anchor_perf=action.get("started_perf") or action.get("t0"), after_snapshot=after_snapshot, planned_action=action)
-                        else:
-                            self.write_recording_failure("learning", session_id, action=action, failure_reason="screenshot_unavailable_for_mouse_event", rect=self.current_rect(), detail="before_or_after_snapshot_missing", stop_event=stop_event)
                     if not event_seen:
                         while not stop_event.is_set():
                             reason = self.active_mode_stop_reason("learning", stop_event, config)
@@ -8467,7 +8526,7 @@ class ControlPanel(tk.Tk):
                             self.apply_active_stop_reason("learning", reason, stop_event)
                             break
                         stop_event.wait(0.1)
-            self.write_record("learning", session_id, self.capture_snapshot(analyzer, "learning", session_id, start, priority="critical"), None, "mode_end")
+            self.write_record("learning", session_id, self.capture_required_snapshot(analyzer, "learning", session_id, start, "mode_end", priority="critical", stop_event=stop_event), None, "mode_end")
         if self.is_run_active(token, "learning") or self.is_run_active(token, "stopping"):
             saved, save_error = self.flush_mode_data()
             if not saved:
@@ -8489,18 +8548,16 @@ class ControlPanel(tk.Tk):
         actions = self.mouse_recorder.pop_actions()
         count = 0
         for marker in markers:
-            marker_snapshot = self.capture_snapshot(analyzer, "training", session_id, start, priority="critical")
+            marker_snapshot = self.capture_required_snapshot(analyzer, "training", session_id, start, "mouse_start", priority="critical", stop_event=stop_event)
             if marker_snapshot:
                 pending_snapshots[marker["action_id"]] = marker_snapshot
         for action in actions:
             if action.get("source") == "ai":
                 continue
-            action_snapshot = pending_snapshots.pop(action.get("action_id"), None) or self.capture_snapshot(analyzer, "training", session_id, start, priority="critical")
-            after_snapshot = self.capture_snapshot(analyzer, "training", session_id, start, priority="critical")
+            action_snapshot = pending_snapshots.pop(action.get("action_id"), None) or self.capture_required_snapshot(analyzer, "training", session_id, start, "mouse_before", priority="critical", action=action, stop_event=stop_event)
+            after_snapshot = self.capture_required_snapshot(analyzer, "training", session_id, start, "mouse_after", priority="critical", action=action, stop_event=stop_event) if action_snapshot else None
             if action_snapshot and after_snapshot:
                 self.write_record("training", session_id, action_snapshot, action, "user_mouse", action_anchor_perf=action.get("started_perf") or action.get("t0"), after_snapshot=after_snapshot, planned_action=action)
-            else:
-                self.write_recording_failure("training", session_id, action=action, failure_reason="screenshot_unavailable_for_mouse_event", rect=self.current_rect(), detail="before_or_after_snapshot_missing", stop_event=stop_event)
             count += 1
         return count
 
@@ -8514,7 +8571,7 @@ class ControlPanel(tk.Tk):
         self.termination_reason = "completed"
         service = self.training_service
         with ScreenAnalyzer(config.settings.hash_size) as analyzer:
-            self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start, priority="critical"), None, "mode_start")
+            self.write_record("training", session_id, self.capture_required_snapshot(analyzer, "training", session_id, start, "mode_start", priority="critical", stop_event=stop_event), None, "mode_start")
             if self.mouse_recorder:
                 self.mouse_recorder.clear_cursor_outside()
             while not stop_event.is_set() and self.is_run_active(token, "training"):
@@ -8579,7 +8636,7 @@ class ControlPanel(tk.Tk):
                     stop_event.wait(min(self.settings.generated_action_complete_wait, deadline - time.perf_counter()))
                     self.record_training_user_mouse_events(analyzer, session_id, start, pending_user_snapshots, stop_event)
             self.record_training_user_mouse_events(analyzer, session_id, start, pending_user_snapshots, stop_event)
-            self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start, priority="critical"), None, "mode_end")
+            self.write_record("training", session_id, self.capture_required_snapshot(analyzer, "training", session_id, start, "mode_end", priority="critical", stop_event=stop_event), None, "mode_end")
         if self.is_run_active(token, "training") or self.is_run_active(token, "stopping"):
             final_reason = self.termination_reason or ("esc" if self.should_stop_by_escape() else "user_stop")
             if final_reason == "sleep_model":
