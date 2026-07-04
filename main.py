@@ -690,7 +690,7 @@ ALLOWED_TRANSITIONS = {
     ("idle", "sleep"): {"click_sleep"},
     ("learning", "stopping"): {"user_stop", "esc", "window_invalid", "cursor_outside", "runtime_error"},
     ("training", "stopping"): {"user_stop", "esc", "window_invalid", "cursor_outside", "runtime_error", "executor_error"},
-    ("starting", "stopping"): {"user_stop", "esc", "runtime_error", "minimize_failed", "window_invalid", "completed"},
+    ("starting", "stopping"): {"user_stop", "esc", "runtime_error", "window_invalid", "completed"},
     ("stopping", "idle"): {"esc", "window_invalid", "cursor_outside", "user_stop", "runtime_error", "executor_error", "completed"},
     ("training", "sleep"): {"sleep_model"},
     ("sleep", "stopping"): {"user_stop", "esc", "runtime_error", "completed"}
@@ -7701,27 +7701,11 @@ class ControlPanel(tk.Tk):
             if auto_restart:
                 self.restore_panel()
             return False
-        if not self.minimize_panel_for_active_mode(config):
-            self.last_active_mode_failure = "控制面板最小化失败"
-            self.finish_run(token, "控制面板最小化失败", 0.0, reason="minimize_failed")
-            if auto_restart:
-                self.restore_panel()
-            return False
         self.update_progress(0.0)
         self.status_var.set("正在启动或连接雷电模拟器")
         self.mode_thread = threading.Thread(target=self.mode_job, args=(token, target_mode, config, stop_event, ignored_hwnds), name=f"{target_mode}-mode", daemon=False)
         self.mode_thread.start()
         return True
-
-    def minimize_panel_for_active_mode(self, config):
-        def apply():
-            try:
-                self.iconify()
-                self.update_idletasks()
-                return self.state() == "iconic"
-            except Exception:
-                return False
-        return bool(self.ui_sync(apply, config.settings.window_event_wait))
 
     def mode_job(self, token, mode, config, stop_event, ignored_hwnds=()):
         try:
@@ -8842,7 +8826,7 @@ def run_windows_acceptance():
         if not panel.transition("stopping", "idle", reason="completed", token=session.token):
             return events, False
         events.append("idle")
-        for method_name in ("environment_recheck", "panel_minimized", "cursor_in_client"):
+        for method_name in ("environment_recheck", "cursor_in_client"):
             getattr(type("RestartGate", (), {method_name: lambda self, n=method_name: events.append(n) or True})(), method_name)()
         token2, stop_event2 = panel.begin_run("starting", reason="click_training")
         if token2 is None:
@@ -8871,7 +8855,7 @@ def run_windows_acceptance():
     result["flow_tests"]["training_to_sleep_rejects_direct_restart"] = passfail(training_ok and training_panel.current_mode() == "idle" and training_saved == ["mode_data"])
     result["flow_tests"]["sleep_tasks_save_chain"] = passfail(sleep_ok and sleep_panel.current_mode() == "idle" and sleep_saved == ["task1_train_model_group", "task1_save", "task2_cleanup_models_and_pool", "task2_save"])
     auto_restart_chain, auto_restart_ok = run_auto_restart_behavior_flow()
-    expected_auto_restart_chain = ["starting", "training", "save_training_data", "sleep", "task1_train_model_group", "task1_save", "task2_cleanup_models_and_pool", "task2_save", "idle", "environment_recheck", "panel_minimized", "cursor_in_client", "starting", "training"]
+    expected_auto_restart_chain = ["starting", "training", "save_training_data", "sleep", "task1_train_model_group", "task1_save", "task2_cleanup_models_and_pool", "task2_save", "idle", "environment_recheck", "cursor_in_client", "starting", "training"]
     result["flow_tests"]["auto_restart_training_full_chain"] = passfail(auto_restart_ok and auto_restart_chain == expected_auto_restart_chain)
     result["flow_tests"]["auto_restart_training_flush_before_restart"] = passfail(auto_restart_ok and auto_restart_chain.index("task2_save") < auto_restart_chain.index("environment_recheck"))
     failure_panel, failure_saved, _, failure_ok = run_real_transition_flow((("begin", "starting", "click_training"), ("activate", "training"), ("save", "mode_data"), ("finish", "runtime_error")))
