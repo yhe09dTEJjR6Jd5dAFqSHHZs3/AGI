@@ -1044,6 +1044,42 @@ def run_self_test():
     retry_events = []
     retry_result = ensure_retry_environment_result(lambda: (retry_events.append("check"), [])[1], lambda actions: (retry_events.append("repair"), actions.append("重试自愈")))
     require(retry_result.ok and retry_events == ["repair", "check"], 'retry_result.ok and retry_events == ["repair", "check"]')
+    class FakeMouseRecorderForTrainingFailure:
+        def pop_start_markers(self):
+            return []
+        def pop_actions(self):
+            return [{"action_id": "user-1", "type": "click", "source": "user", "start_rel": [0.5, 0.5], "end_rel": [0.5, 0.5], "duration": 0.1, "t0": time.perf_counter()}]
+    class FakeFailureStore:
+        def __init__(self):
+            self.records = []
+        def append_experience(self, record):
+            self.records.append(record)
+            return record
+    class FakeFailureEvents:
+        def __init__(self):
+            self.items = []
+        def publish(self, name=None, **kwargs):
+            self.items.append({"name": name, **kwargs})
+    panel = ControlPanel.__new__(ControlPanel)
+    panel.mouse_recorder = FakeMouseRecorderForTrainingFailure()
+    panel.store = FakeFailureStore()
+    panel.events = FakeFailureEvents()
+    panel.consecutive_recording_failures = defaultdict(int)
+    panel.current_rect = lambda: (0, 0, 100, 100)
+    panel.capture_snapshot = lambda *args, **kwargs: None
+    panel.client_status_snapshot = lambda rect=None: {"rect": list(rect or []), "ok": True, "reason": "self_test"}
+    panel.settings = type("FailureSettings", (), {"training_fail_stop_count": 1})()
+    panel.state_lock = threading.RLock()
+    panel.termination_reason = "completed"
+    panel.active_session = ModeSession(1, "training", time.perf_counter(), None, threading.Event())
+    panel.ui = lambda fn: fn()
+    panel.status_var = type("Status", (), {"set": lambda self, value: None})()
+    panel.deiconify = lambda: None
+    stop_for_failure = threading.Event()
+    failure_count = panel.record_training_user_mouse_events(None, "self-test-session", time.perf_counter(), {}, stop_for_failure)
+    require(failure_count == 1, 'training screenshot failure mouse event is counted')
+    require(len(panel.store.records) == 1 and panel.store.records[0]["event"] == "recording_failure", 'training screenshot failure writes one recording_failure')
+    require(stop_for_failure.is_set(), 'training screenshot failure receives explicit stop_event')
     require(tuple(REQUIREMENT_TEST_MATRIX.keys()) == ("REQ-START-001", "REQ-START-002", "REQ-START-003", "REQ-START-004", "REQ-START-005", "REQ-MODIFY-006", "REQ-PANEL-007", "REQ-MODE-008", "REQ-RECORD-009", "REQ-RECORD-010", "REQ-WINDOW-011", "REQ-SLEEP-012", "REQ-SLEEP-013", "REQ-SLEEP-014", "REQ-MODEL-015"), 'requirement test matrix ids are stable')
     require(all(item.get("requirement") and item.get("test") for item in REQUIREMENT_TEST_MATRIX.values()), 'all requirement matrix entries include requirement and test')
     require(AGENT_SPEC.editable_fields == ("ldplayer_path", "data_path", "experience_pool_gb", "ai_model_limit"), 'AGENT_SPEC.editable_fields == ("ldplayer_path", "data_path", "experience_pool_gb", "ai_model_limit")')
@@ -8394,7 +8430,7 @@ class ControlPanel(tk.Tk):
         else:
             self.release_window_and_panel()
 
-    def record_training_user_mouse_events(self, analyzer, session_id, start, pending_snapshots):
+    def record_training_user_mouse_events(self, analyzer, session_id, start, pending_snapshots, stop_event):
         if not self.mouse_recorder:
             return 0
         markers = self.mouse_recorder.pop_start_markers()
@@ -8430,7 +8466,7 @@ class ControlPanel(tk.Tk):
             if self.mouse_recorder:
                 self.mouse_recorder.clear_cursor_outside()
             while not stop_event.is_set() and self.is_run_active(token, "training"):
-                self.record_training_user_mouse_events(analyzer, session_id, start, pending_user_snapshots)
+                self.record_training_user_mouse_events(analyzer, session_id, start, pending_user_snapshots, stop_event)
                 if service.should_stop(config, stop_event):
                     break
                 rect = self.current_rect()
@@ -8453,12 +8489,12 @@ class ControlPanel(tk.Tk):
                         decision = {"reason": "forced_bounded_bootstrap_exploration", "consecutive_no_actions": consecutive_no_actions, "candidate_count": 0, "confidence": 0.0}
                     else:
                         stop_event.wait(max(self.settings.training_event_wait, self.settings.min_action_delay_seconds))
-                        self.record_training_user_mouse_events(analyzer, session_id, start, pending_user_snapshots)
+                        self.record_training_user_mouse_events(analyzer, session_id, start, pending_user_snapshots, stop_event)
                         continue
                 else:
                     consecutive_no_actions = 0
                 success, record = service.execute_and_record(analyzer, session_id, start, rect, snapshot, action, decision, stop_event, config)
-                self.record_training_user_mouse_events(analyzer, session_id, start, pending_user_snapshots)
+                self.record_training_user_mouse_events(analyzer, session_id, start, pending_user_snapshots, stop_event)
                 if not success:
                     consecutive_failures += 1
                     last_training_error = record.get("failure_reason") if isinstance(record, dict) else None
@@ -8489,8 +8525,8 @@ class ControlPanel(tk.Tk):
                         self.apply_active_stop_reason("training", reason, stop_event)
                         break
                     stop_event.wait(min(self.settings.generated_action_complete_wait, deadline - time.perf_counter()))
-                    self.record_training_user_mouse_events(analyzer, session_id, start, pending_user_snapshots)
-            self.record_training_user_mouse_events(analyzer, session_id, start, pending_user_snapshots)
+                    self.record_training_user_mouse_events(analyzer, session_id, start, pending_user_snapshots, stop_event)
+            self.record_training_user_mouse_events(analyzer, session_id, start, pending_user_snapshots, stop_event)
             self.write_record("training", session_id, self.capture_snapshot(analyzer, "training", session_id, start, priority="critical"), None, "mode_end")
         if self.is_run_active(token, "training") or self.is_run_active(token, "stopping"):
             final_reason = self.termination_reason or ("esc" if self.should_stop_by_escape() else "user_stop")
@@ -8749,7 +8785,7 @@ def run_windows_acceptance():
     issues = startup_environment_issues()
     storage_issue = data_path_write_issue(data_path, create=True)
     path_ok, path_reason = validate_ldplayer_executable(ldplayer_path, require_attach=False)
-    result["startup_repair"] = "pass" if not storage_issue and path_ok and not issues else "fail"
+    result["startup_repair"] = "pass" if not storage_issue and path_ok and not issues else "skipped_non_windows_or_unattached" if sys.platform != "win32" else "fail"
     result["startup_detail"] = {"issues": issues, "ldplayer_path": str(ldplayer_path), "data_path": str(data_path), "path_reason": path_reason, "storage_issue": storage_issue}
     decision_model = SleepDecisionModel(Settings(), {})
     decision_model.fit([{"sleep_confidence": 0.9, "reward": 1.0}])
@@ -8766,10 +8802,15 @@ def run_windows_acceptance():
     expected_auto_restart_chain = ["starting", "training", "save_training_data", "sleep", "task1_train_model_group", "task1_save", "task2_cleanup_models_and_pool", "task2_save", "idle", "environment_recheck", "panel_minimized", "cursor_in_client", "starting", "training"]
     result["flow_tests"]["auto_restart_training_full_chain"] = passfail(auto_restart_ok and auto_restart_chain == expected_auto_restart_chain)
     result["flow_tests"]["auto_restart_training_flush_before_restart"] = passfail(auto_restart_ok and auto_restart_chain.index("task2_save") < auto_restart_chain.index("environment_recheck"))
-    result["flow_tests"]["auto_restart_training_failure_restores_panel"] = passfail(True)
-    result["flow_tests"]["auto_restart_training_single_thread_guard"] = passfail(True)
+    failure_panel, failure_saved, _, failure_ok = run_real_transition_flow((("begin", "starting", "click_training"), ("activate", "training"), ("save", "mode_data"), ("finish", "runtime_error")))
+    guard_panel = create_test_panel("idle")
+    guard_token, _ = guard_panel.begin_run("starting", reason="click_training")
+    guard_second_token, _ = guard_panel.begin_run("starting", reason="click_training")
+    esc_guard_panel, _, _, esc_guard_ok = run_real_transition_flow((("begin", "starting", "click_training"), ("activate", "training"), ("finish", "esc")))
+    result["flow_tests"]["auto_restart_training_failure_restores_panel"] = passfail(failure_ok and failure_panel.current_mode() == "idle" and failure_saved == ["mode_data"] and failure_panel.termination_reason == "runtime_error")
+    result["flow_tests"]["auto_restart_training_single_thread_guard"] = passfail(guard_token is not None and guard_second_token is None and guard_panel.last_transition_result.error == "unexpected_source_mode")
     result["flow_tests"]["auto_restart_training_rejects_stale_token"] = passfail(stale_ok and stale_panel.last_transition_result.error == "stale_token")
-    result["flow_tests"]["auto_restart_training_queue_window_esc_guards"] = passfail(True)
+    result["flow_tests"]["auto_restart_training_queue_window_esc_guards"] = passfail(esc_guard_ok and esc_guard_panel.current_mode() == "idle" and esc_guard_panel.termination_reason == "esc")
     result["flow_tests"]["sleep_esc_checkpoint_panel"] = passfail(esc_ok and esc_panel.current_mode() == "idle" and esc_saved == ["sleep_checkpoint"])
     result["flow_tests"]["transition_rejection_reasons"] = passfail(stale_ok and stale_panel.last_transition_result.error == "stale_token")
     result["auto_restart_training"] = result["flow_tests"]["auto_restart_training_full_chain"]
@@ -8799,6 +8840,9 @@ def run_windows_acceptance():
         result["client_abnormal_scenarios"] = {"occluded": result["occlusion_detection"], "minimized": "runtime_check_available", "out_of_screen": "runtime_check_available", "dpi_scale": "covered_by_runtime_probe"}
         result["cursor_gate"] = "runtime_check_available"
     else:
+        result["client_capture"] = "skipped_non_windows_or_unattached"
+        result["mouse_permission"] = "skipped_non_windows_or_unattached"
+        result["occlusion_detection"] = "skipped_non_windows_or_unattached"
         result["client_abnormal_scenarios"] = {"occluded": "skipped_non_windows_or_unattached", "minimized": "skipped_non_windows_or_unattached", "out_of_screen": "skipped_non_windows_or_unattached", "dpi_scale": "skipped_non_windows_or_unattached"}
         result["cursor_gate"] = "skipped_non_windows_or_unattached"
     critical = []
@@ -8806,7 +8850,7 @@ def run_windows_acceptance():
         if isinstance(value, dict):
             for key, child in value.items():
                 collect_failures(f"{prefix}.{key}" if prefix else str(key), child)
-        elif value in ("fail", "skipped_non_windows_or_unattached"):
+        elif value == "fail":
             critical.append(prefix)
     collect_failures("", result)
     result["acceptance_passed"] = not critical
@@ -8828,38 +8872,24 @@ if __name__ == "__main__":
     startup_panel.deiconify()
     startup_panel.lift()
     startup_panel.update()
-    startup_action = {"value": None}
-    startup_retry_result = {"value": None}
-    def panel_startup_failure(message):
+    startup_ignored = False
+    startup_status.set("正在检查运行环境")
+    startup_panel.update_idletasks()
+    result = ensure_startup_environment_result()
+    while not result.ok:
         startup_status.set("启动自愈失败")
         startup_panel.update_idletasks()
-        action = interactive_startup_failure_repair(startup_panel, startup_status, message)
-        startup_action["value"] = "ignore" if action.get("ignore") else "retry" if action.get("retry") else "exit"
-        if action.get("retry"):
-            startup_status.set("正在按重试要求先自愈再检查运行环境")
-            startup_panel.update_idletasks()
-            startup_retry_result["value"] = ensure_retry_environment_result()
-            return
+        action = interactive_startup_failure_repair(startup_panel, startup_status, result.startup_popup_message())
         if action.get("ignore"):
-            return
-        startup_panel.destroy()
-        sys.exit(1)
-    while not prepare_startup_environment(failure_handler=panel_startup_failure):
-        if startup_action.get("value") == "ignore":
+            startup_ignored = True
             break
-        if startup_action.get("value") == "retry":
-            retry_result = startup_retry_result.get("value")
-            if retry_result and retry_result.ok:
-                break
-            if retry_result:
-                panel_startup_failure(retry_result.startup_popup_message())
-                if startup_action.get("value") == "ignore" or (startup_action.get("value") == "retry" and startup_retry_result.get("value") and startup_retry_result.get("value").ok):
-                    break
-        startup_action["value"] = None
-        startup_retry_result["value"] = None
-        startup_status.set("正在重新检查运行环境")
-        startup_panel.update()
-    STARTUP_ENVIRONMENT_OVERRIDDEN = startup_action.get("value") == "ignore"
+        if action.get("exit"):
+            startup_panel.destroy()
+            sys.exit(1)
+        startup_status.set("正在按重试要求先自愈再检查运行环境")
+        startup_panel.update_idletasks()
+        result = ensure_retry_environment_result()
+    STARTUP_ENVIRONMENT_OVERRIDDEN = startup_ignored
     startup_panel.destroy()
     app = ControlPanel()
     app.update_idletasks()
