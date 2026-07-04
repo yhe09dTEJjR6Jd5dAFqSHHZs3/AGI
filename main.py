@@ -17,6 +17,7 @@ import threading
 import time
 import tempfile
 import uuid
+import traceback
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, asdict, fields, replace
 from typing import Optional
@@ -132,6 +133,18 @@ def atomic_write_json(path, payload, lock=None):
         finally:
             os.close(fd)
 
+def log_suppressed_exception(where, error=None, context=None):
+    exc_type, exc_value, exc_tb = sys.exc_info()
+    error = error or exc_value
+    payload = {"id": uuid.uuid4().hex, "time": datetime.now().astimezone().isoformat(timespec="milliseconds"), "where": str(where), "error_type": type(error).__name__ if error else str(exc_type), "error": str(error) if error else "", "traceback_summary": "".join(traceback.format_exception(exc_type, exc_value, exc_tb, limit=6)).strip() if exc_value else "", "mode_continuable": True}
+    if context:
+        payload["context"] = context
+    try:
+        sys.stderr.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except BaseException:
+        return payload["id"]
+    return payload["id"]
+
 def fail_and_exit(message):
     try:
         root = tk.Tk()
@@ -139,7 +152,7 @@ def fail_and_exit(message):
         messagebox.showerror("启动失败", f"{message}\n\n点击确定后退出。")
         root.destroy()
     except Exception:
-        pass
+        log_suppressed_exception("suppressed_exception")
     sys.exit(1)
 
 
@@ -180,7 +193,7 @@ def write_startup_install_log(command, result=None, error=None):
         with (log_dir / "startup_install.log").open("a", encoding="utf-8") as file:
             file.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except Exception:
-        pass
+        log_suppressed_exception("suppressed_exception")
 
 
 def verify_installed_modules():
@@ -366,7 +379,7 @@ def discover_ldplayer_candidates():
                 if str((proc.info or {}).get("name", "")).lower() == "dnplayer.exe" and (proc.info or {}).get("exe"):
                     candidates.append(str(proc.info["exe"]))
         except Exception:
-            pass
+            log_suppressed_exception("suppressed_exception")
     return list(dict.fromkeys(candidates))
 
 
@@ -479,7 +492,7 @@ def runtime_capability_probe(window_manager):
             if left < screen_left or top < screen_top or right > screen_right or bottom > screen_bottom:
                 return False, "雷电客户区截图坐标与屏幕/DPI 范围不一致"
     except Exception:
-        pass
+        log_suppressed_exception("suppressed_exception")
     return True, "ok"
 
 def attempt_startup_environment_repair(actions=None):
@@ -733,7 +746,7 @@ REQUIREMENT_TEST_MATRIX = OrderedDict((
     ("REQ-SLEEP-012", {"requirement": "睡眠ESC中断后回空闲并恢复面板", "test": "sleep_esc_checkpoint_panel"}),
     ("REQ-SLEEP-013", {"requirement": "经验池超限后压缩至上限的50%", "test": "experience_pool_compact_to_half_limit"}),
     ("REQ-SLEEP-014", {"requirement": "自动重训真实调用任务1任务2环境面板鼠标链路", "test": "auto_restart_training_behavior_chain"}),
-    ("REQ-MODEL-015", {"requirement": "AI模型快照必须严格包含全部AI模型", "test": "ai_models_exact_seven_models"})
+    ("REQ-MODEL-015", {"requirement": "AI模型快照必须严格包含六类AI模型", "test": "ai_models_exact_required_models"})
 ))
 HUMAN_FEATURE_NAMES = ("duration", "direct", "bend", "points", "speed_mean", "speed_variance", "acceleration_change", "pauses", "hover_before", "drag_curvature", "double_click_interval")
 
@@ -1067,7 +1080,7 @@ def enable_dpi_awareness():
         try:
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
-            pass
+            log_suppressed_exception("suppressed_exception")
 
 
 def can_access_input_desktop():
@@ -1082,7 +1095,7 @@ def can_access_input_desktop():
             try:
                 ctypes.windll.user32.CloseDesktop(handle)
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
 
 
 def windows_runtime_report(ldplayer_path=None):
@@ -1347,14 +1360,12 @@ def run_self_test():
     topk_model = ScreenNoveltyScorerModel(changed_for_topk)
     require(topk_model.predict({"similarities": [1.0, 0.8, 0.8]}) == 14.67, 'topk_model.predict({"similarities": [1.0, 0.8, 0.8]}) == 14.67')
     matching_mouse_action = {"type": "click", "start_rel": [0.5, 0.5]}
-    direct_human_score = runtime.models["mouse_humanlikeness_scorer"].predict({"mouse_action": matching_mouse_action, "human_score": 55.0})
-    require(runtime.mouse_humanlikeness(matching_mouse_action, 55.0) == direct_human_score, 'runtime.mouse_humanlikeness(matching_mouse_action, 55.0) == direct_human_score')
-    require(direct_human_score != 55.0, 'direct_human_score != 55.0')
+    require(runtime.mouse_humanlikeness(matching_mouse_action, 55.0) == 55.0, 'runtime.mouse_humanlikeness falls back to observed human score')
     require(0.0 <= runtime.operation_policy_score(pool.records[0], 0.9) <= 1.0, '0.0 <= runtime.operation_policy_score(pool.records[0], 0.9) <= 1.0')
     require(runtime.judge_discard_score({"reward": -1.0, "valid": False}) > runtime.judge_discard_score({"reward": 100.0, "valid": True}), 'runtime.judge_discard_score({"reward": -1.0, "valid": False}) > runtime.judge_discard_score({"reward": 100.0, "valid": True})')
     require(runtime.reward(70.0, 100.0) == runtime.reward(70.0, 0.0), 'runtime.reward(70.0, 100.0) == runtime.reward(70.0, 0.0)')
     require(runtime.reward(71.0, 0.0) > runtime.reward(70.0, 100.0), 'runtime.reward(71.0, 0.0) > runtime.reward(70.0, 100.0)')
-    require(isinstance(runtime.models["runtime_value_model"].predict({"cpu_load": 0.0, "memory_free_ratio": 0.5}), dict), 'isinstance(runtime.models["runtime_value_model"].predict({"cpu_load": 0.0, "memory_free_ratio": 0.5}), dict)')
+    require(set(runtime.models) == {item["key"] for item in AI_MODEL_SPECS}, 'runtime contains only required AI models')
     brain = ActionBrain(runtime_pool, changed)
     _, decision = brain.choose(a, novelty, batch, 0.0)
     require(isinstance(decision, dict), 'isinstance(decision, dict)')
@@ -1790,8 +1801,16 @@ def run_self_test():
         require(sum(store.model_file_ai_model_count(path) for path in store.model_dir.glob("model_*.json")) <= 1, 'sum(store.model_file_ai_model_count(path) for path in store.model_dir.glob("model_*.json")) <= 1')
         model_path = store.save_ai_model_snapshot(store.load_experience(), settings, 1, "completed")
         model_payload = json.loads(model_path.read_text(encoding="utf-8"))
-        require(len(model_payload["ai_models"]["models"]) == 7, 'len(model_payload["ai_models"]["models"]) == 7')
+        require(len(model_payload["ai_models"]["models"]) == 6, 'len(model_payload["ai_models"]["models"]) == 6')
         require([item["key"] for item in model_payload["ai_models"]["models"]] == [item["key"] for item in AI_MODEL_SPECS], '[item["key"] for item in model_payload["ai_models"]["models"]] == [item["key"] for item in AI_MODEL_SPECS]')
+        require(len(model_payload.get("model_objects", [])) == 6 and all(item.get("retention_status") == "keep" for item in model_payload.get("model_objects", [])), 'AI model objects are independently scoreable and retainable')
+        object_dirs = [path for path in store.model_object_dir.glob("model_*") if path.is_dir()]
+        require(object_dirs and sum(1 for path in object_dirs[-1].glob("*.json")) == 6, 'AI model objects persist as separate JSON files')
+        corrupt_index_store = DataStore(root / "corrupt_index_recovery")
+        corrupt_index_store.experience_index_file.write_bytes(b"not sqlite")
+        with corrupt_index_store.open_experience_index() as connection:
+            ok_text = connection.execute("PRAGMA integrity_check").fetchone()[0]
+        require(ok_text == "ok" and list(corrupt_index_store.root.glob("experience.corrupt.*.sqlite3")), 'corrupt sqlite experience index is quarantined and rebuilt')
         model_path.write_bytes(model_path.read_bytes() + (b"m" * 2048))
         require(store.storage_size_bytes() > store.experience_pool_size_bytes(), 'store.storage_size_bytes() > store.experience_pool_size_bytes()')
         compact = store.compact_experience_pool(0.1)
@@ -1994,7 +2013,7 @@ def read_hardware_state():
                     gpu_count += 1
                     gpu_memory_total += float(number)
         except Exception:
-            pass
+            log_suppressed_exception("suppressed_exception")
     return {"cpu_count": max(1, cpu_count), "cpu_load": clamp(cpu_load, 0.0, 100.0), "memory_free_ratio": memory_free_ratio, "gpu_count": gpu_count, "gpu_memory_total": max(0.0, gpu_memory_total)}
 
 
@@ -2523,7 +2542,7 @@ def parse_hash_value(record):
             width = max(1, math.ceil(bits / 4))
             return HashValue(value, bits, f"{value:0{width}x}"[-width:])
         except Exception:
-            pass
+            log_suppressed_exception("suppressed_exception")
     text = record.get("screen_hash_hex") or record.get("screen_hash") or record.get("hash")
     if not text:
         return None
@@ -2681,13 +2700,12 @@ def strict_reward_target(screen_score, human_similarity):
 
 
 AI_MODEL_SPECS = (
-    {"key": "sleep_decision_model", "name": "入睡模型", "goal": "训练模式期间，判断是否值得进入睡眠模式"},
-    {"key": "operation_policy", "name": "活动模型", "goal": "训练模式期间，雷电模拟器客户区内，AI输出鼠标操作"},
-    {"key": "judge_model", "name": "法官模型", "goal": "睡眠模式期间，找出最值得删除的AI模型或经验池数据"},
-    {"key": "runtime_value_model", "name": "数学模型", "goal": "依据现实条件确定所有未在要求中确定的变量的初始数值，并让它们跟随现实条件的变化而变化"},
-    {"key": "screen_novelty_scorer", "name": "画面新颖程度评分模型", "goal": "一个画面与经验池中和它最相似的一批历史画面相似度越高（0%→100%），评分越低"},
-    {"key": "mouse_humanlikeness_scorer", "name": "鼠标拟人程度评分模型", "goal": "AI在训练模式期间输出的鼠标操作，与用户在学习模式期间的鼠标操作相似度越高（0%→100%），评分越高"},
-    {"key": "reward_model", "name": "奖励模型", "goal": "奖励=收入（画面评分不同的样本，画面评分越高，收入越高；画面评分相同的样本，鼠标评分越高，收入越高）-支出（支出一开始为正极小值，随时间推移逐渐变大，并在收入变高时重置为正极小值）"},
+    {"key": "screen_novelty_scorer", "name": "画面表征与相似度模型", "goal": "表征画面并计算当前画面与经验池历史画面的相似度，越相似评分越低"},
+    {"key": "operation_policy", "name": "行为策略模型", "goal": "训练模式期间在雷电模拟器客户区内输出鼠标行为策略"},
+    {"key": "reward_model", "name": "价值评估模型", "goal": "按奖励=画面评分-饥饿值评估样本价值，画面评分改善时重置饥饿值"},
+    {"key": "sleep_decision_model", "name": "睡眠决策模型", "goal": "训练模式期间判断是否值得进入睡眠模式"},
+    {"key": "ai_model_quality_judge_model", "name": "AI模型质量评估与淘汰模型", "goal": "逐个评分AI模型持久化对象并决定淘汰或保留"},
+    {"key": "experience_pool_judge_model", "name": "经验池价值评估与淘汰模型", "goal": "逐条评分经验池数据并决定淘汰或保留"},
 )
 
 
@@ -2972,7 +2990,7 @@ class ScreenNoveltyScorerModel(TrainableModel):
 
 
 class MouseHumanlikenessScorerModel(TrainableModel):
-    key = "mouse_humanlikeness_scorer"
+    key = "disabled_mouse_similarity"
     model_type = "learned_mouse_humanlikeness_model"
 
     def fit(self, records):
@@ -3126,8 +3144,8 @@ class RewardModel(TrainableModel):
 
 
 class JudgeModel(TrainableModel):
-    key = "judge_model"
-    model_type = "multi_objective_retention_deletion_judge_model"
+    key = "disabled_combined_judge"
+    model_type = "retention_deletion_judge_model"
 
     def fit(self, records):
         super().fit(records)
@@ -3195,8 +3213,8 @@ class JudgeModel(TrainableModel):
         return obj
 
 class RuntimeValueModel(TrainableModel):
-    key = "runtime_value_model"
-    model_type = "resource_adaptive_runtime_value_model"
+    key = "disabled_resource_adapter"
+    model_type = "resource_adaptive_disabled"
 
     def fit(self, records):
         super().fit(records)
@@ -3303,7 +3321,8 @@ class SleepDecisionModel(TrainableModel):
         obj.score_floor = safe_float(params.get("score_floor", 0.0), 0.0) if isinstance(params, dict) else 0.0
         return obj
 
-TRAINABLE_MODEL_CLASSES = {cls.key: cls for cls in (ScreenNoveltyScorerModel, MouseHumanlikenessScorerModel, OperationPolicyModel, JudgeModel, RewardModel, RuntimeValueModel, SleepDecisionModel)}
+TRAINABLE_MODEL_CLASSES = {cls.key: cls for cls in (ScreenNoveltyScorerModel, OperationPolicyModel, RewardModel, SleepDecisionModel)}
+TRAINABLE_MODEL_CLASSES.update({"ai_model_quality_judge_model": JudgeModel, "experience_pool_judge_model": JudgeModel})
 
 
 def restore_trainable_model(payload, settings=None):
@@ -3329,7 +3348,7 @@ class ModelRuntime:
             try:
                 model.settings = settings
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
 
     def screen_novelty(self, similarities):
         model = self.models.get("screen_novelty_scorer")
@@ -3342,11 +3361,8 @@ class ModelRuntime:
         density = sum(1 for item in top if item >= 0.95) / len(top)
         return clamp((1.0 - (top[0] * 0.5 + sum(top) / len(top) * 0.35 + density * 0.15)) * 100.0, 0.0, 100.0)
 
-    def mouse_humanlikeness(self, action, fallback_score):
-        model = self.models.get("mouse_humanlikeness_scorer")
-        if model:
-            return model.predict({"mouse_action": action, "human_score": fallback_score})
-        return fallback_score
+    def mouse_humanlikeness(self, action, fallback=50.0):
+        return clamp(safe_float(fallback, 50.0), 0.0, 100.0)
 
     def operation_policy_score(self, record, similarity):
         model = self.models.get("operation_policy")
@@ -3357,7 +3373,7 @@ class ModelRuntime:
         return 0.0
 
     def judge_discard_score(self, features):
-        model = self.models.get("judge_model")
+        model = self.models.get("ai_model_quality_judge_model") or self.models.get("experience_pool_judge_model")
         if model:
             return model.predict(features or {})
         data = features or {}
@@ -3387,14 +3403,6 @@ class ModelRuntime:
         return {"sleep": score >= 0.85 or failures + no_actions >= 3, "score": round(score, 4), "threshold": 0.85}
 
     def apply_runtime_values(self, settings, features, fallback_model=None):
-        model = self.models.get("runtime_value_model")
-        if model:
-            factors = model.predict(features)
-            values = {item.name: getattr(settings, item.name) for item in fields(Settings)}
-            for name, low, high, integer in (("sleep_batch_size", 8, 4096, True), ("sleep_worker_count", 1, 64, True), ("nearest_candidate_limit", 256, 20000, True), ("explore_max_rate", 0.2, 0.95, False), ("training_event_wait", 0.01, 0.9, False), ("generated_sleep_event_wait", 0.02, 1.2, False)):
-                value = clamp(safe_float(values.get(name, low), low) * safe_float(factors.get(name, 1.0), 1.0), low, high)
-                values[name] = int(value) if integer else value
-            return Settings(**values)
         if fallback_model:
             return fallback_model.apply_settings(settings, features)
         return settings
@@ -3423,12 +3431,11 @@ def ai_models_snapshot(policy_payload, settings, records):
     records = records or []
     states = {
         "screen_novelty_scorer": {},
-        "mouse_humanlikeness_scorer": {},
         "operation_policy": {"policy": policy_payload},
-        "sleep_decision_model": {},
-        "judge_model": {},
         "reward_model": {},
-        "runtime_value_model": {"resource_model": policy_payload.get("resource_model") if isinstance(policy_payload.get("resource_model"), dict) else {}}
+        "sleep_decision_model": {},
+        "ai_model_quality_judge_model": {"scope": "ai_models"},
+        "experience_pool_judge_model": {"scope": "experience_pool"}
     }
     models = []
     for spec in AI_MODEL_SPECS:
@@ -3436,7 +3443,7 @@ def ai_models_snapshot(policy_payload, settings, records):
         model = cls(settings, states.get(spec["key"], {}))
         model.fit(records)
         payload = model.snapshot()
-        payload.update({"name": spec["name"], "goal": spec["goal"]})
+        payload.update({"key": spec["key"], "name": spec["name"], "goal": spec["goal"]})
         models.append(payload)
     ai_models = {"schema_version": 4, "trained_at": now_text(), "training_data_digest": training_data_digest(records), "models": models, "intelligence_strategy": "human_current_technology_ceiling: calibrated ensembles, online preference learning, robust statistics, diversity, and resource-adaptive reinforcement"}
     ai_models["complete"] = ai_models_complete(ai_models, settings)
@@ -3601,7 +3608,7 @@ class EventBus:
             try:
                 handler(event)
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
         return event
 
 
@@ -3727,6 +3734,7 @@ class DataStore:
         self.root = Path(root)
         self.screen_dir = self.root / "screens"
         self.model_dir = self.root / "models"
+        self.model_object_dir = self.model_dir / "objects"
         self.experience_file = self.root / "experience.jsonl"
         self.experience_index_file = self.root / "experience.sqlite3"
         self.state_file = self.root / "state.json"
@@ -3741,6 +3749,7 @@ class DataStore:
             self.root.mkdir(parents=True, exist_ok=True)
             self.screen_dir.mkdir(parents=True, exist_ok=True)
             self.model_dir.mkdir(parents=True, exist_ok=True)
+            self.model_object_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
             configuration_failure("创建数据配置目录失败 " + str(self.root), exc)
         self.state = self.load_state()
@@ -3763,7 +3772,7 @@ class DataStore:
             messagebox.showwarning("状态文件已重建", message)
             root.destroy()
         except Exception:
-            pass
+            log_suppressed_exception("suppressed_exception")
 
     def rebuild_bad_state(self, error):
         default = self.default_state_payload()
@@ -3780,7 +3789,7 @@ class DataStore:
         try:
             self.log_error("load_state.rebuilt", error, {"state_file": str(self.state_file), "backup_file": backup_text})
         except Exception:
-            pass
+            log_suppressed_exception("suppressed_exception")
         detail = f"状态文件损坏，已重建。\n原文件: {self.state_file}\n备份文件: {backup_text}\n错误详情: {error}"
         self.notify_state_rebuilt(detail)
         return default
@@ -3805,12 +3814,12 @@ class DataStore:
         try:
             os.fsync(fd)
         except Exception:
-            pass
+            log_suppressed_exception("suppressed_exception")
         finally:
             try:
                 os.close(fd)
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
 
     def replace_atomic_synced(self, temporary, target):
         temporary.replace(target)
@@ -3858,7 +3867,7 @@ class DataStore:
         try:
             self.append_evidence("sleep_checkpoint", checkpoint=payload)
         except Exception:
-            pass
+            log_suppressed_exception("suppressed_exception")
         return payload
 
     def clear_sleep_checkpoint(self):
@@ -4018,7 +4027,12 @@ class DataStore:
                 raise RuntimeError("AI模型快照不完整：AI模型必须都能独立加载并完成探针推理")
             identity = hashlib.sha256(str(self.root.resolve()).encode("utf-8", "replace")).hexdigest()
             training_digest = hashlib.sha256(json.dumps([record.get("id") for record in ranked[:limit]], ensure_ascii=False).encode("utf-8")).hexdigest()
-            payload = {"schema_version": CONFIG_SCHEMA_VERSION, "model_version": 2, "training_data_version": 1, "data_path_id": identity, "checksum": training_digest, "created_at": now_text(), "status": status, "status_detail": status_detail or {}, "screen_score_total": self.screen_score_total, "reward_state": next((record.get("reward_state") for record in reversed(records or []) if isinstance(record, dict) and isinstance(record.get("reward_state"), dict)), asdict(RewardState())), "experience_count": len(records or []), "policy_limit": limit, "training_sample_ids": [record.get("id") for record in ranked[:limit]], "ai_models": ai_models, "model": model_payload, "policy": [{"id": record.get("id"), "mode": record.get("mode"), "action_type": (record.get("mouse_action") or {}).get("type") if isinstance(record.get("mouse_action"), dict) else None, "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_model_confidence": safe_float(record.get("sleep_model_confidence", record.get("model_prediction", 0.0)), 0.0), "model_prediction": safe_float(record.get("model_prediction", 0.0), 0.0), "model_target": safe_float(record.get("model_target", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
+            model_objects = []
+            for model_item in ai_models.get("models", []):
+                object_id = uuid.uuid4().hex
+                retention_score = safe_float(model_item.get("fit_quality", model_item.get("threshold", model_item.get("positive_rate", 0.0))), 0.0)
+                model_objects.append({"object_id": object_id, "key": model_item.get("key"), "name": model_item.get("name"), "score": retention_score, "retention_status": "keep", "trained_at": ai_models.get("trained_at"), "training_data_digest": ai_models.get("training_data_digest")})
+            payload = {"schema_version": CONFIG_SCHEMA_VERSION, "model_version": 3, "training_data_version": 1, "data_path_id": identity, "checksum": training_digest, "created_at": now_text(), "status": status, "status_detail": status_detail or {}, "screen_score_total": self.screen_score_total, "reward_state": next((record.get("reward_state") for record in reversed(records or []) if isinstance(record, dict) and isinstance(record.get("reward_state"), dict)), asdict(RewardState())), "experience_count": len(records or []), "policy_limit": limit, "training_sample_ids": [record.get("id") for record in ranked[:limit]], "ai_models": ai_models, "model_objects": model_objects, "model": model_payload, "policy": [{"id": record.get("id"), "mode": record.get("mode"), "action_type": (record.get("mouse_action") or {}).get("type") if isinstance(record.get("mouse_action"), dict) else None, "reward": safe_float(record.get("reward", 0.0), 0.0), "sleep_policy_reward": safe_float(record.get("sleep_policy_reward", record.get("reward", 0.0)), 0.0), "sleep_confidence": safe_float(record.get("sleep_confidence", 0.0), 0.0), "sleep_model_confidence": safe_float(record.get("sleep_model_confidence", record.get("model_prediction", 0.0)), 0.0), "model_prediction": safe_float(record.get("model_prediction", 0.0), 0.0), "model_target": safe_float(record.get("model_target", 0.0), 0.0), "sleep_novelty": safe_float(record.get("sleep_novelty", record.get("novelty", 0.0)), 0.0), "human_score": safe_float(record.get("sleep_human_score", record.get("human_score", 0.0)), 0.0)} for record in ranked[:limit]]}
             path = self.model_dir / f"model_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex}.json"
             temporary = path.with_suffix(".tmp")
             with temporary.open("w", encoding="utf-8") as file:
@@ -4029,9 +4043,14 @@ class DataStore:
                 try:
                     temporary.unlink(missing_ok=True)
                 except Exception:
-                    pass
+                    log_suppressed_exception("suppressed_exception")
                 return None
             self.replace_atomic_synced(temporary, path)
+            object_parent = self.model_object_dir / path.stem
+            object_parent.mkdir(parents=True, exist_ok=True)
+            for model_item, object_meta in zip(ai_models.get("models", []), model_objects):
+                object_payload = {"schema_version": CONFIG_SCHEMA_VERSION, "object_version": 1, "snapshot_path": self.relative_path(path), "score": object_meta["score"], "retention_status": object_meta["retention_status"], "model": model_item, **object_meta}
+                self.write_json_atomic(object_parent / f"{object_meta['key']}_{object_meta['object_id']}.json", object_payload)
             return path
 
     def model_created_key(self, path):
@@ -4064,7 +4083,7 @@ class DataStore:
             try:
                 self.log_error("compact_ai_models.score", exc, {"path": str(path)})
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
             return -1.0, False
 
     def model_file_ai_model_count(self, path):
@@ -4079,7 +4098,7 @@ class DataStore:
             try:
                 self.log_error("compact_ai_models.count", exc, {"path": str(path)})
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
         return 1
 
     def model_retention_features(self, path):
@@ -4139,7 +4158,7 @@ class DataStore:
                 try:
                     self.log_error("compact_ai_models.unlink", exc, error)
                 except Exception:
-                    pass
+                    log_suppressed_exception("suppressed_exception")
         return {"changed": removed > 0, "removed": removed, "limit": limit, "target_count": min(remaining, limit), "model_count": remaining, "complete": remaining <= limit, "errors": errors, "audit": audit}
 
 
@@ -4191,7 +4210,7 @@ class DataStore:
                 try:
                     self.log_error("load_latest_model_state", exc, {"path": str(path)})
                 except Exception:
-                    pass
+                    log_suppressed_exception("suppressed_exception")
         return None
 
     def load_settings(self):
@@ -4292,7 +4311,18 @@ class DataStore:
         return max(1, self.count_experience_lines())
 
     def open_experience_index(self):
-        connection = sqlite3.connect(str(self.experience_index_file))
+        try:
+            connection = sqlite3.connect(str(self.experience_index_file))
+            connection.execute("PRAGMA integrity_check").fetchone()
+        except sqlite3.DatabaseError as exc:
+            self.log_error("experience_index.open_corrupt", exc, {"path": str(self.experience_index_file), "mode_continuable": True})
+            corrupt = self.experience_index_file.with_name(f"experience.corrupt.{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.sqlite3")
+            try:
+                if self.experience_index_file.exists():
+                    shutil.move(str(self.experience_index_file), str(corrupt))
+            except Exception as move_error:
+                self.log_error("experience_index.quarantine_failed", move_error, {"path": str(self.experience_index_file), "backup": str(corrupt)})
+            connection = sqlite3.connect(str(self.experience_index_file))
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=NORMAL")
         connection.execute("CREATE TABLE IF NOT EXISTS experience_meta(line_no INTEGER PRIMARY KEY, record_id TEXT, reward REAL, created_at TEXT, action_type TEXT, hash_prefix TEXT, trainable INTEGER, line_bytes INTEGER, delete_score REAL)")
@@ -4357,11 +4387,11 @@ class DataStore:
         try:
             self.append_evidence("judge_cleanup_decision", **payload)
         except Exception:
-            pass
+            log_suppressed_exception("suppressed_exception")
         try:
             self.log_error("judge_cleanup_decision", RuntimeError("judge_cleanup_decision"), payload)
         except Exception:
-            pass
+            log_suppressed_exception("suppressed_exception")
         return payload
 
     def upsert_experience_index_record(self, line_no, record, line_bytes):
@@ -4418,7 +4448,7 @@ class DataStore:
                 try:
                     total += (Path(file_root) / filename).stat().st_size
                 except Exception:
-                    pass
+                    log_suppressed_exception("suppressed_exception")
         return total
 
     def experience_record_paths(self, records):
@@ -4435,7 +4465,7 @@ class DataStore:
                     if path.is_file() and self.root.resolve() in (path, *path.parents):
                         paths.add(path)
                 except Exception:
-                    pass
+                    log_suppressed_exception("suppressed_exception")
         return paths
 
     def experience_pool_size_bytes(self, records=None):
@@ -4444,14 +4474,14 @@ class DataStore:
             try:
                 total += self.experience_file.stat().st_size
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
         if records is None:
             records = self.load_experience()
         for path in self.experience_record_paths(records):
             try:
                 total += path.stat().st_size
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
         return total
 
     def screen_file_paths(self):
@@ -4476,7 +4506,7 @@ class DataStore:
             try:
                 orphan_size += path.stat().st_size
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
         return {"logical_pool_size_bytes": logical, "physical_pool_size_bytes": logical + orphan_size, "orphan_screen_size_bytes": orphan_size, "orphan_screen_count": len(orphans), "orphan_screen_paths": [str(path) for path in sorted(orphans)]}
 
     def cleanup_orphan_screens(self, records=None):
@@ -4493,7 +4523,7 @@ class DataStore:
                 try:
                     self.log_error("cleanup_orphan_screens.unlink", exc, {"path": text})
                 except Exception:
-                    pass
+                    log_suppressed_exception("suppressed_exception")
         refreshed = self.experience_pool_size_report(records)
         refreshed["orphan_cleanup_failed_paths"] = failed
         refreshed["orphan_cleanup_attempted"] = attempted
@@ -4702,7 +4732,9 @@ class DataStore:
             "time": now_text(),
             "where": str(where),
             "error_type": type(error).__name__,
-            "error": str(error)
+            "error": str(error),
+            "traceback_summary": "".join(traceback.format_exception(type(error), error, error.__traceback__, limit=8)).strip(),
+            "mode_continuable": not str(where).startswith(("startup", "configuration", "migration", "capture_snapshot.save"))
         }
         if context:
             payload["context"] = context
@@ -4756,7 +4788,7 @@ class WindowManager:
                 if name == target or exe_name == target:
                     pids.add(proc.info["pid"])
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
         if self.process:
             try:
                 root = psutil.Process(self.process.pid)
@@ -4764,7 +4796,7 @@ class WindowManager:
                 for child in root.children(recursive=True):
                     pids.add(child.pid)
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
         return pids
 
     def find_window(self):
@@ -4792,7 +4824,7 @@ class WindowManager:
                 elif matched_title:
                     title_candidates.append(candidate)
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
         try:
             win32gui.EnumWindows(handler, None)
         except Exception:
@@ -4840,10 +4872,10 @@ class WindowManager:
                 ctypes.windll.user32.keybd_event(win32con.VK_MENU, 0, 0, 0)
                 ctypes.windll.user32.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
             win32gui.SetForegroundWindow(hwnd)
         except Exception:
-            pass
+            log_suppressed_exception("suppressed_exception")
 
     def topmost(self):
         self.foreground()
@@ -4860,7 +4892,7 @@ class WindowManager:
                 if inter:
                     front.append((other, inter))
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
         win32gui.EnumWindows(handler, None)
         ordered = []
         current = win32gui.GetTopWindow(0)
@@ -5034,7 +5066,7 @@ class ScreenAnalyzer:
             try:
                 self.sct.close()
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
             self.sct = None
 
 
@@ -5707,7 +5739,7 @@ class MouseRecorder:
         try:
             self.listener.stop()
         except Exception:
-            pass
+            log_suppressed_exception("suppressed_exception")
         self.listener = None
 
     def clear(self):
@@ -6032,7 +6064,7 @@ class HumanMouseExecutor:
                 try:
                     self.controller.release(button)
                 except Exception:
-                    pass
+                    log_suppressed_exception("suppressed_exception")
         if stop_event.is_set():
             return None
         actual = {"type": action_type if action_type in ["click", "drag", "scroll"] else "click", "button": str(button), "source": "ai", "started_at": started_at, "ended_at": now_text(), "started_perf": action_t, "ended_perf": time.perf_counter(), "duration": round(max(0.0, time.perf_counter() - action_t), 6), "start_abs": [int(start_abs[0]), int(start_abs[1])], "end_abs": [int(end_abs[0]), int(end_abs[1])], "path": actual_path}
@@ -6065,7 +6097,7 @@ class EscapeMonitor:
             try:
                 self.listener.stop()
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
             self.listener = None
 
     def trigger(self):
@@ -6082,7 +6114,7 @@ class EscapeMonitor:
             if key == pynput_keyboard.Key.esc:
                 self.trigger()
         except Exception:
-            pass
+            log_suppressed_exception("suppressed_exception")
 
     def esc_event_pending(self):
         if not win32api:
@@ -6141,7 +6173,7 @@ class AsyncPersistenceQueue:
                 try:
                     store.log_error("async_persistence_queue_full", RuntimeError("image_job_dropped_before_copy"), {"path": str(path)})
                 except Exception:
-                    pass
+                    log_suppressed_exception("suppressed_exception")
             self.image_dropped += 1
             return False
         prepared_image = image.copy() if image else None
@@ -6185,7 +6217,7 @@ class AsyncPersistenceQueue:
                         try:
                             store.log_error("async_persistence_queue_full", RuntimeError("image_job_dropped"), {"path": str(job.get("path"))})
                         except Exception:
-                            pass
+                            log_suppressed_exception("suppressed_exception")
                     self.image_dropped += 1
                     return False
                 waited = time.perf_counter() - started
@@ -6243,7 +6275,7 @@ class AsyncPersistenceQueue:
                     try:
                         store.log_error("async_persistence", exc, {"type": job.get("type"), "persistence_sequence": sequence})
                     except Exception:
-                        pass
+                        log_suppressed_exception("suppressed_exception")
             finally:
                 self.jobs.task_done()
 
@@ -6285,7 +6317,7 @@ class AsyncPersistenceQueue:
                         try:
                             image.close()
                         except Exception:
-                            pass
+                            log_suppressed_exception("suppressed_exception")
                     record = job.get("record")
                     if isinstance(record, dict):
                         record["image_dropped"] = True
@@ -6295,7 +6327,7 @@ class AsyncPersistenceQueue:
                         try:
                             store.log_error("async_persistence_close", RuntimeError("image_dropped"), {"path": str(job.get("path")), "persistence_sequence": sequence})
                         except Exception:
-                            pass
+                            log_suppressed_exception("suppressed_exception")
                 else:
                     kept.append(job)
             self.jobs.queue.extend(kept)
@@ -6609,7 +6641,9 @@ class ControlPanel(tk.Tk):
         self.events.subscribe("save_completed", lambda event: self.ui(lambda e=event: self.status_var.set(f"保存完成：{e.get('kind', 'data')}")))
         self.title("雷电模拟器学习训练控制面板")
         self.geometry(f"{self.settings.ui_width}x{self.settings.ui_height}")
-        self.minsize(420, 360)
+        self.resizable(True, True)
+        self.minsize(260, 180)
+        self.attributes("-alpha", 0.98)
         self.state_lock = threading.RLock()
         self.mode = "idle"
         self.run_token = 0
@@ -6680,6 +6714,7 @@ class ControlPanel(tk.Tk):
         }
         self.build_ui()
         self.load_persistent_settings()
+        ttk.Sizegrip(self).place(relx=1.0, rely=1.0, anchor="se")
         self.after_idle(self.fit_complete_panel)
         self.bind("<Configure>", self.on_window_resize)
         self.bind("<Escape>", lambda event: self.request_escape())
@@ -6885,7 +6920,7 @@ class ControlPanel(tk.Tk):
                 if handle:
                     handles.append(handle)
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
         return tuple(dict.fromkeys(handles))
 
     def hint_text(self):
@@ -6932,7 +6967,7 @@ class ControlPanel(tk.Tk):
         self.minimum_supported_screen = (req_w, req_h)
         self.minsize(min_w, min_h)
         if self.winfo_width() < min_w or self.winfo_height() < min_h:
-            self.geometry(f"{min_w}x{min_h}")
+            self.compact_panel_layout = True
         need_x = req_w > min_w
         need_y = req_h > min_h
         if getattr(self, "scrollbar_y", None):
@@ -7083,7 +7118,7 @@ class ControlPanel(tk.Tk):
             if self.store:
                 self.store.append_evidence("event", **event)
         except Exception:
-            pass
+            log_suppressed_exception("suppressed_exception")
 
     def ui_latest(self, key, func):
         if getattr(self, "shutdown_requested", False):
@@ -7161,7 +7196,7 @@ class ControlPanel(tk.Tk):
             try:
                 sys.stderr.write(json.dumps({"time": now_text(), "where": str(where), "error": str(error), "context": context}, ensure_ascii=False) + "\n")
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
 
     def runtime_environment_ready(self):
         if self.required_import_error():
@@ -7212,17 +7247,17 @@ class ControlPanel(tk.Tk):
                 try:
                     button.configure(state=online_state)
                 except Exception:
-                    pass
+                    log_suppressed_exception("suppressed_exception")
         if getattr(self, "sleep_button", None):
             try:
                 self.sleep_button.configure(state=sleep_state)
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
         for button in getattr(self, "modify_buttons", []):
             try:
                 button.configure(state=modify_state)
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
         if not online_enabled and mode == "idle":
             self.status_var.set("雷电运行环境未就绪：" + (getattr(self, "runtime_environment_issue", "") or "学习/训练需 Windows 桌面、雷电路径与可写存储路径"))
         self.runtime_environment_last_ready = online_enabled
@@ -7273,13 +7308,13 @@ class ControlPanel(tk.Tk):
             try:
                 self.after(1, self.process_main_thread_events)
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
 
     def start_ui_pump(self):
         try:
             self.after(16, self.process_ui_events)
         except Exception:
-            pass
+            log_suppressed_exception("suppressed_exception")
 
     def process_ui_events(self):
         if getattr(self, "shutdown_requested", False):
@@ -7288,7 +7323,7 @@ class ControlPanel(tk.Tk):
         try:
             self.after(16, self.process_ui_events)
         except Exception:
-            pass
+            log_suppressed_exception("suppressed_exception")
 
     def refresh_runtime_environment_state(self):
         try:
@@ -7401,7 +7436,7 @@ class ControlPanel(tk.Tk):
                             relative = file_path.relative_to(root)
                             items.append((relative, file_path, max(0, file_path.stat().st_size)))
                         except Exception:
-                            pass
+                            log_suppressed_exception("suppressed_exception")
             elif source.exists():
                 try:
                     items.append((Path(name), source, max(0, source.stat().st_size)))
@@ -7427,7 +7462,7 @@ class ControlPanel(tk.Tk):
         try:
             shutil.copystat(source, target)
         except Exception:
-            pass
+            log_suppressed_exception("suppressed_exception")
         return copied, True
 
     def migration_known_names(self):
@@ -7461,7 +7496,7 @@ class ControlPanel(tk.Tk):
                     for _ in file:
                         lines += 1
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
         runtime_audit = root / "runtime_parameters_audit.jsonl"
         if runtime_audit.exists():
             try:
@@ -7469,7 +7504,7 @@ class ControlPanel(tk.Tk):
                     for _ in file:
                         audit_lines += 1
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
         checkpoint = root / "sleep_checkpoint.json"
         checkpoint_stage = None
         if checkpoint.exists():
@@ -7598,7 +7633,7 @@ class ControlPanel(tk.Tk):
                 try:
                     journal_path.unlink(missing_ok=True)
                 except Exception:
-                    pass
+                    log_suppressed_exception("suppressed_exception")
                 self.ui(lambda path=str(new_root), v=dict(values): (self.ldplayer_var.set(v["ldplayer_path"]), self.data_var.set(path), self.apply_runtime_value_vars(v)))
                 self.app_config_store.save_settings({"ldplayer_path": values["ldplayer_path"], "data_path": str(new_root)})
                 self.store = DataStore(new_root)
@@ -7621,7 +7656,7 @@ class ControlPanel(tk.Tk):
                         shutil.rmtree(new_path)
                     shutil.copytree(backup_root, new_path)
                 except Exception:
-                    pass
+                    log_suppressed_exception("suppressed_exception")
             self.log_exception("migration", exc, {"old_path": str(old_path), "new_path": str(new_path)})
             self.ui(lambda e=str(exc): messagebox.showerror("迁移失败", e))
             if token is not None:
@@ -7962,7 +7997,7 @@ class ControlPanel(tk.Tk):
                 if self.store:
                     self.store.append_evidence("auto_cursor_move", trigger_mode=mode, safety=safety)
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
             return True
         except Exception as exc:
             self.log_exception("cursor.ensure_inside", exc, {"rect": list(rect), "target": list(target)})
@@ -8022,7 +8057,7 @@ class ControlPanel(tk.Tk):
             try:
                 self.store.append_evidence("environment_result", stage="sleep_data", initial=list(result.checks), repair_actions=list(result.repair_actions), recheck=list(result.recheck), ok=result.ok)
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
         if not result.ok:
             self.runtime_environment_issue = "；".join(result.unrecoverable) or "睡眠模式数据环境不符合要求"
             self.log_exception("sleep.environment", RuntimeError("offline_data_environment_not_ready"), {"result": result.detail()})
@@ -8045,7 +8080,7 @@ class ControlPanel(tk.Tk):
             try:
                 self.store.append_evidence("environment_result", stage=stage, initial=list(result.checks), repair_actions=list(result.repair_actions), recheck=list(result.recheck), ok=result.ok)
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
         if not result.ok:
             self.active_mode_environment_cache = None
             self.runtime_environment_issue = "；".join(result.unrecoverable) or "运行环境不符合要求"
@@ -8073,7 +8108,7 @@ class ControlPanel(tk.Tk):
                     window_check = self.window_manager.check_window(force=True)
                     self.store.append_evidence("window_probe", stage=stage, ok=probe_ok, reason=probe_reason, rect=list(getattr(window_check, "rect", ()) or ()), virtual_screen=virtual_screen_rect(), occlusion=getattr(window_check, "occlusion", None))
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
             if not probe_ok:
                 result = EnvironmentEnsureResult(False, stage, result.checks, result.repair_actions, ("运行能力探测失败：" + probe_reason,), ("运行能力探测失败：" + probe_reason,))
                 self.runtime_environment_issue = probe_reason
@@ -8590,7 +8625,7 @@ class ControlPanel(tk.Tk):
                 self.deiconify()
                 self.lift()
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
         self.ui(apply)
 
     def update_progress(self, percent, force=False):
@@ -9119,7 +9154,7 @@ class ControlPanel(tk.Tk):
             try:
                 self.after_cancel(self.runtime_environment_refresh_id)
             except Exception:
-                pass
+                log_suppressed_exception("suppressed_exception")
             self.runtime_environment_refresh_id = None
         if self.mouse_recorder:
             self.mouse_recorder.stop()
@@ -9167,7 +9202,7 @@ class ControlPanel(tk.Tk):
         try:
             self.destroy()
         except Exception:
-            pass
+            log_suppressed_exception("suppressed_exception")
 
     def refresh_hardware_state(self, force=False):
         event_perf = time.perf_counter()
