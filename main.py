@@ -1596,21 +1596,22 @@ def run_self_test():
         require(model_result["complete"] and pool_result["complete"], 'model_result["complete"] and pool_result["complete"]')
         require(task3_events.index("sleep_model_cleanup_completed") < task3_events.index("experience_pool_compaction_completed"), 'task3_events.index("sleep_model_cleanup_completed") < task3_events.index("experience_pool_compaction_completed")')
         require(WindowCheck(True, "ok", (0, 0, 10, 10), 9, 9, 0.0).occluded_ratio == 0.0, 'WindowCheck(True, "ok", (0, 0, 10, 10), 9, 9, 0.0).occluded_ratio == 0.0')
+        cleanup_limit_store = DataStore(root / "cleanup_min_limit")
         for name, created in (("model_new.json", "2025-01-02T00:00:00.000"), ("model_old.json", "2025-01-01T00:00:00.000"), ("model_mid.json", "2025-01-01T12:00:00.000")):
-            (store.model_dir / name).write_text(json.dumps({"created_at": created, "model": {"type": "bad"}}), encoding="utf-8")
-        (store.model_dir / "partial_model_interrupted.json").write_text(json.dumps({"created_at": "2025-01-04T00:00:00.000"}), encoding="utf-8")
-        compact_models = store.compact_ai_models(2)
-        require(compact_models["removed"] == 1 and compact_models["model_count"] == 2 and not (store.model_dir / "model_old.json").exists() and (store.model_dir / "model_mid.json").exists() and (store.model_dir / "model_new.json").exists() and (store.model_dir / "partial_model_interrupted.json").exists(), 'compact_models["removed"] == 1 and compact_models["model_count"] == 2 and not (store.model_dir / "model_old.json").exists() and (store.model_dir / "model_mid.js')
+            (cleanup_limit_store.model_dir / name).write_text(json.dumps({"created_at": created, "model": {"type": "bad"}}), encoding="utf-8")
+        (cleanup_limit_store.model_dir / "partial_model_interrupted.json").write_text(json.dumps({"created_at": "2025-01-04T00:00:00.000"}), encoding="utf-8")
+        compact_models = cleanup_limit_store.compact_ai_models(2)
+        require(compact_models["removed"] == 0 and compact_models["model_count"] == 3 and compact_models["limit"] == MIN_AI_MODEL_LIMIT and all((cleanup_limit_store.model_dir / name).exists() for name in ("model_old.json", "model_mid.json", "model_new.json", "partial_model_interrupted.json")), 'compact_models respects MIN_AI_MODEL_LIMIT and keeps existing snapshots under the effective limit')
         counted_model_store = DataStore(root / "counted_model_cleanup")
         counted_payload = {"created_at": "2025-01-01T00:00:00.000", "ai_models": {"models": [{"key": str(index)} for index in range(7)]}, "model": {"type": "bad"}}
         (counted_model_store.model_dir / "model_counted.json").write_text(json.dumps(counted_payload), encoding="utf-8")
         counted_compact = counted_model_store.compact_ai_models(6)
         require(counted_compact["removed"] == 1 and counted_compact["model_count"] == 0 and counted_compact["complete"] and not (counted_model_store.model_dir / "model_counted.json").exists(), 'counted_compact["removed"] == 1 and counted_compact["model_count"] == 0 and counted_compact["complete"] and not (counted_model_store.model_dir / "model_counted.json").exists()')
         esc_model_store = DataStore(root / "esc_model_cleanup")
-        for index in range(4):
+        for index in range(8):
             (esc_model_store.model_dir / f"model_esc_{index}.json").write_text(json.dumps({"created_at": f"2025-01-0{index + 1}T00:00:00.000", "model": {"type": "bad"}}), encoding="utf-8")
         def esc_during_model_cleanup():
-            return "esc" if len(list(esc_model_store.model_dir.glob("model_*.json"))) < 4 else None
+            return "esc" if len(list(esc_model_store.model_dir.glob("model_*.json"))) < 8 else None
         esc_events = []
         esc_panel = type("EscTask2Panel", (), {})()
         esc_panel.store = esc_model_store
@@ -1741,7 +1742,7 @@ def run_self_test():
         modify_panel.experience_pool_gb_var.set("4")
         modify_panel.ai_model_limit_var.set("5")
         modify_panel.settings = settings
-        modify_panel.runtime_value_specs = {"experience_pool_gb": ("经验池 GB", modify_panel.experience_pool_gb_var, DEFAULT_EXPERIENCE_POOL_GB, safe_float, 0.1), "ai_model_limit": ("AI 模型数量上限", modify_panel.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, 1)}
+        modify_panel.runtime_value_specs = {"experience_pool_gb": ("经验池 GB", modify_panel.experience_pool_gb_var, DEFAULT_EXPERIENCE_POOL_GB, safe_float, 0.1), "ai_model_limit": ("AI 模型数量上限", modify_panel.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, MIN_AI_MODEL_LIMIT)}
         modify_panel.update_mode_button_states = lambda: setattr(modify_panel, "updated", True)
         modify_panel.refresh_runtime_environment_state = lambda: setattr(modify_panel, "refreshed", True)
         modify_panel.save_persistent_settings = lambda: setattr(modify_panel, "saved", True)
@@ -1777,7 +1778,7 @@ def run_self_test():
         require(ControlPanel.idle_progress_value(dummy_panel, "training", 91.0) == 0.0, 'ControlPanel.idle_progress_value(dummy_panel, "training", 91.0) == 0.0')
         store.save_settings({"experience_pool_gb": 4, "ai_model_limit": 5, "forbidden": 6})
         saved_settings = json.loads(store.settings_file.read_text(encoding="utf-8"))
-        require("forbidden" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0 and saved_settings["ai_model_limit"] == 5, '"forbidden" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0 and saved_settings["ai_model_limit"] == 5')
+        require("forbidden" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0 and saved_settings["ai_model_limit"] == MIN_AI_MODEL_LIMIT, '"forbidden" not in saved_settings and saved_settings["experience_pool_gb"] == 4.0 and saved_settings["ai_model_limit"] == MIN_AI_MODEL_LIMIT')
         store.experience_file.write_text("{bad json}\n" + json.dumps({"id": "ok"}) + "\n", encoding="utf-8")
         loaded = store.load_experience()
         require(len(loaded) == 1 and loaded[0]["id"] == "ok", 'len(loaded) == 1 and loaded[0]["id"] == "ok"')
@@ -1798,7 +1799,7 @@ def run_self_test():
         sleep_task3_panel.update_progress = lambda value, force=False: None
         sleep_task3_config = type("SnapshotTask3Config", (), {"ai_model_limit": 1, "experience_pool_gb": 0.1})()
         ControlPanel.run_sleep_task2(sleep_task3_panel, sleep_task3_config)
-        require(sum(store.model_file_ai_model_count(path) for path in store.model_dir.glob("model_*.json")) <= 1, 'sum(store.model_file_ai_model_count(path) for path in store.model_dir.glob("model_*.json")) <= 1')
+        require(sum(store.model_file_ai_model_count(path) for path in store.model_dir.glob("model_*.json")) <= MIN_AI_MODEL_LIMIT, 'sum(store.model_file_ai_model_count(path) for path in store.model_dir.glob("model_*.json")) <= MIN_AI_MODEL_LIMIT')
         model_path = store.save_ai_model_snapshot(store.load_experience(), settings, 1, "completed")
         model_payload = json.loads(model_path.read_text(encoding="utf-8"))
         require(len(model_payload["ai_models"]["models"]) == 6, 'len(model_payload["ai_models"]["models"]) == 6')
@@ -1818,7 +1819,7 @@ def run_self_test():
         old_root = store.root
         new_root = Path(folder) / "new_data"
         migration_panel = type("MigrationPanel", (), {"settings": settings})()
-        for name in ("migration_known_names", "migration_items", "migration_counts", "migration_sample_files", "file_digest", "verify_migration"):
+        for name in ("migration_known_names", "migration_items", "migration_counts", "migration_sample_files", "file_digest", "migration_manifest", "verify_migration"):
             setattr(migration_panel, name, getattr(ControlPanel, name).__get__(migration_panel, type(migration_panel)))
         require("models" in migration_panel.migration_known_names(), '"models" in migration_panel.migration_known_names()')
         require(any(item[0].parts[0] == "models" for item in migration_panel.migration_items(old_root)), 'any(item[0].parts[0] == "models" for item in migration_panel.migration_items(old_root))')
@@ -2707,6 +2708,7 @@ AI_MODEL_SPECS = (
     {"key": "ai_model_quality_judge_model", "name": "AI模型质量评估与淘汰模型", "goal": "逐个评分AI模型持久化对象并决定淘汰或保留"},
     {"key": "experience_pool_judge_model", "name": "经验池价值评估与淘汰模型", "goal": "逐条评分经验池数据并决定淘汰或保留"},
 )
+MIN_AI_MODEL_LIMIT = len(AI_MODEL_SPECS)
 
 
 def training_data_digest(records):
@@ -3928,6 +3930,9 @@ class DataStore:
         except Exception:
             return str(path)
 
+    def persistent_artifacts(self):
+        return (self.screen_dir.name, self.model_dir.name, self.experience_file.name, self.experience_index_file.name, self.state_file.name, self.settings_file.name, self.error_file.name, self.sleep_checkpoint_file.name, self.runtime_audit_file.name, self.runtime_tuning_file.name, self.evidence_file.name, "startup_install.log")
+
     def ensure_experience_newline(self):
         if not self.experience_file.exists() or self.experience_file.stat().st_size <= 0:
             return
@@ -4101,6 +4106,15 @@ class DataStore:
                 log_suppressed_exception("suppressed_exception")
         return 1
 
+    def model_file_complete(self, path):
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+            self.validate_model_state(payload)
+            return ai_models_complete(payload.get("ai_models"), getattr(self, "settings", None))
+        except Exception:
+            return False
+
     def model_retention_features(self, path):
         try:
             with path.open("r", encoding="utf-8") as file:
@@ -4116,21 +4130,29 @@ class DataStore:
             return {"coverage": 0.0, "diversity": 0.0, "stability": 0.0, "loss": 1.0, "size_bytes": path.stat().st_size if path.exists() else 0, "ai_model_count": self.model_file_ai_model_count(path)}
 
     def compact_ai_models(self, max_models, judge_runtime=None, run_guard=None, progress_callback=None):
-        limit = max(1, safe_int(max_models, AGENT_SPEC.default_ai_model_limit))
+        limit = max(MIN_AI_MODEL_LIMIT, safe_int(max_models, AGENT_SPEC.default_ai_model_limit))
         judge_runtime = judge_runtime or ModelRuntime(settings=getattr(self, "settings", None))
         scored = []
         for path in self.model_dir.glob("model_*.json"):
             score, valid = self.model_retention_score(path)
             extra = self.model_retention_features(path)
             model_count = max(1, safe_int(extra.get("ai_model_count", 1), 1))
+            complete_snapshot = self.model_file_complete(path)
             features = {"kind": "ai_models", "path": path.name, "retention_score": score, "reward": score, "valid": valid, "created_at": self.model_created_key(path), "age_seconds": max(0.0, time.time() - path.stat().st_mtime) if path.exists() else 0.0, **extra}
             delete_score = safe_float(judge_runtime.judge_discard_score(features), 0.0)
-            scored.append({"path": path, "score": score, "delete_score": delete_score, "valid": valid, "created": features["created_at"], "judge_features": features, "model_count": model_count})
+            scored.append({"path": path, "score": score, "delete_score": delete_score, "valid": valid, "complete": complete_snapshot, "created": features["created_at"], "judge_features": features, "model_count": model_count})
         ranked_for_delete = sorted(scored, key=lambda item: (item["delete_score"], not item["valid"], item["created"]), reverse=True)
         audit_rank = {item["path"]: rank for rank, item in enumerate(ranked_for_delete, start=1)}
         keep_paths = set()
         kept_total = 0
-        for item in sorted(scored, key=lambda item: (item["valid"], -item["delete_score"], item["score"], item["created"]), reverse=True):
+        complete_items = [item for item in scored if item.get("complete")]
+        if complete_items:
+            protected = sorted(complete_items, key=lambda item: (item["valid"], item["score"], -item["delete_score"], item["created"]), reverse=True)[0]
+            keep_paths.add(protected["path"])
+            kept_total += protected["model_count"]
+        for item in sorted(scored, key=lambda item: (item["complete"], item["valid"], -item["delete_score"], item["score"], item["created"]), reverse=True):
+            if item["path"] in keep_paths:
+                continue
             if kept_total + item["model_count"] <= limit:
                 keep_paths.add(item["path"])
                 kept_total += item["model_count"]
@@ -4227,7 +4249,7 @@ class DataStore:
 
     def save_settings(self, settings):
         source = AllowedUserEditPolicy.filter(settings, "runtime")
-        payload = {"schema_version": CONFIG_SCHEMA_VERSION, "experience_pool_gb": max(0.1, safe_float(source.get("experience_pool_gb", AGENT_SPEC.default_experience_pool_gb), AGENT_SPEC.default_experience_pool_gb)), "ai_model_limit": max(1, safe_int(source.get("ai_model_limit", AGENT_SPEC.default_ai_model_limit), AGENT_SPEC.default_ai_model_limit)), "runtime_generated_numbers": RUNTIME_NUMBER_AUDIT}
+        payload = {"schema_version": CONFIG_SCHEMA_VERSION, "experience_pool_gb": max(0.1, safe_float(source.get("experience_pool_gb", AGENT_SPEC.default_experience_pool_gb), AGENT_SPEC.default_experience_pool_gb)), "ai_model_limit": max(MIN_AI_MODEL_LIMIT, safe_int(source.get("ai_model_limit", AGENT_SPEC.default_ai_model_limit), AGENT_SPEC.default_ai_model_limit)), "runtime_generated_numbers": RUNTIME_NUMBER_AUDIT}
         try:
             atomic_write_json(self.settings_file, payload, self.lock)
         except Exception as exc:
@@ -6691,7 +6713,7 @@ class ControlPanel(tk.Tk):
         self.progress_label_var = tk.StringVar(value="进度")
         self.runtime_value_specs = {
             "experience_pool_gb": ("经验池 GB", self.experience_pool_gb_var, DEFAULT_EXPERIENCE_POOL_GB, safe_float, 0.1),
-            "ai_model_limit": ("AI 模型数量上限", self.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, 1)
+            "ai_model_limit": ("AI 模型数量上限", self.ai_model_limit_var, DEFAULT_AI_MODEL_LIMIT, safe_int, MIN_AI_MODEL_LIMIT)
         }
         self.modify_buttons = []
         self.runtime_environment_refresh_id = None
@@ -6750,12 +6772,15 @@ class ControlPanel(tk.Tk):
         self.submit_user_settings(values)
 
     def pending_user_settings(self):
-        return {"ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH, "data_path": self.data_var.get().strip() or DEFAULT_DATA_PATH, "experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))}
+        return {"ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH, "data_path": self.data_var.get().strip() or DEFAULT_DATA_PATH, "experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(MIN_AI_MODEL_LIMIT, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))}
 
     def ask_runtime_value(self, field, current_value):
         AllowedUserEditPolicy.assert_allowed(field)
         title, _, default, parser, minimum = self.runtime_value_specs[field]
-        answer = simpledialog.askstring("修改" + title, "请输入" + title, initialvalue=self.format_runtime_value(field, current_value), parent=self)
+        prompt = "请输入" + title
+        if field == "ai_model_limit":
+            prompt += f"\nAI 模型上限不能低于 {MIN_AI_MODEL_LIMIT}"
+        answer = simpledialog.askstring("修改" + title, prompt, initialvalue=self.format_runtime_value(field, current_value), parent=self)
         if answer is None:
             return None
         return max(minimum, parser(answer, default))
@@ -6792,7 +6817,7 @@ class ControlPanel(tk.Tk):
                 self.append_user_settings_audit(old_values, {**old_values, "ldplayer_path": new_ldplayer}, "not_started", "failed:" + str(reason))
                 self.update_mode_button_states()
                 return False
-        normalized = {"ldplayer_path": new_ldplayer, "data_path": str(new_data_path), "experience_pool_gb": max(0.1, safe_float(values.get("experience_pool_gb"), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(values.get("ai_model_limit"), DEFAULT_AI_MODEL_LIMIT))}
+        normalized = {"ldplayer_path": new_ldplayer, "data_path": str(new_data_path), "experience_pool_gb": max(0.1, safe_float(values.get("experience_pool_gb"), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(MIN_AI_MODEL_LIMIT, safe_int(values.get("ai_model_limit"), DEFAULT_AI_MODEL_LIMIT))}
         if Path(old_values["data_path"]) != new_data_path:
             self.append_user_settings_audit(old_values, normalized, "started", "passed")
             return self.start_data_migration(new_data_path, normalized)
@@ -7412,7 +7437,7 @@ class ControlPanel(tk.Tk):
         self.status_var.set("正在修改数据目录")
         self.update_progress(0.0, force=True)
         values = values or self.pending_user_settings()
-        migration_values = {"ldplayer_path": str(values.get("ldplayer_path") or DEFAULT_LDPLAYER_PATH), "experience_pool_gb": max(0.1, safe_float(values.get("experience_pool_gb"), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(values.get("ai_model_limit"), DEFAULT_AI_MODEL_LIMIT))}
+        migration_values = {"ldplayer_path": str(values.get("ldplayer_path") or DEFAULT_LDPLAYER_PATH), "experience_pool_gb": max(0.1, safe_float(values.get("experience_pool_gb"), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(MIN_AI_MODEL_LIMIT, safe_int(values.get("ai_model_limit"), DEFAULT_AI_MODEL_LIMIT))}
         self.migration_in_progress = True
         self.migration_stop_event = threading.Event()
         self.update_mode_button_states()
@@ -7426,7 +7451,7 @@ class ControlPanel(tk.Tk):
     def migration_items(self, old_path):
         root = Path(old_path)
         items = []
-        for name in ("screens", "models", "experience.jsonl", "state.json", "settings.json", "errors.jsonl", "sleep_checkpoint.json", "runtime_parameters_audit.jsonl", "startup_install.log"):
+        for name in DataStore(root).persistent_artifacts():
             source = root / name
             if source.is_dir():
                 for file_root, _, filenames in os.walk(source):
@@ -7466,7 +7491,9 @@ class ControlPanel(tk.Tk):
         return copied, True
 
     def migration_known_names(self):
-        return {"screens", "models", "experience.jsonl", "state.json", "settings.json", "errors.jsonl", "sleep_checkpoint.json", "runtime_parameters_audit.jsonl", "startup_install.log"}
+        data_var = getattr(self, "data_var", None)
+        data_path = data_var.get().strip() if data_var is not None else DEFAULT_DATA_PATH
+        return set(DataStore(data_path or DEFAULT_DATA_PATH).persistent_artifacts())
 
     def migration_target_conflicts(self, target):
         path = Path(target)
@@ -7541,17 +7568,32 @@ class ControlPanel(tk.Tk):
         return files[::step][:max(1, self.settings.nearest_top_k)]
 
     def file_digest(self, path):
-        h = 0
+        h = hashlib.sha256()
         with Path(path).open("rb") as file:
             while True:
                 chunk = file.read(max(65536, self.settings.local_action_heap_limit * self.settings.hash_prefix_bits))
                 if not chunk:
                     break
-                for value in chunk:
-                    h = ((h << 5) - h + value) & 0xffffffffffffffff
-        return h
+                h.update(chunk)
+        return h.hexdigest()
+
+    def migration_manifest(self, root):
+        root = Path(root)
+        manifest = {}
+        for relative, source, _ in self.migration_items(root):
+            if source.is_file():
+                manifest[str(relative.as_posix())] = {"size": source.stat().st_size, "sha256": self.file_digest(source)}
+        return manifest
 
     def verify_migration(self, source, target):
+        source_manifest = self.migration_manifest(source)
+        target_manifest = self.migration_manifest(target)
+        missing = [name for name in source_manifest if name not in target_manifest]
+        if missing:
+            raise ValueError("迁移校验失败：文件缺失 " + "，".join(missing[:8]))
+        mismatched = [name for name, item in source_manifest.items() if target_manifest.get(name) != item]
+        if mismatched:
+            raise ValueError("迁移校验失败：SHA-256 manifest 不一致 " + "，".join(mismatched[:8]))
         source_counts = self.migration_counts(source)
         target_counts = self.migration_counts(target)
         if target_counts["experience_lines"] < source_counts["experience_lines"]:
@@ -7690,13 +7732,13 @@ class ControlPanel(tk.Tk):
         if not data_settings:
             DataStore(Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)).save_settings({"experience_pool_gb": DEFAULT_EXPERIENCE_POOL_GB, "ai_model_limit": DEFAULT_AI_MODEL_LIMIT})
         self.experience_pool_gb_var.set(str(max(0.1, safe_float(data_settings.get("experience_pool_gb", self.experience_pool_gb_var.get()), DEFAULT_EXPERIENCE_POOL_GB))))
-        self.ai_model_limit_var.set(str(max(1, safe_int(data_settings.get("ai_model_limit", self.ai_model_limit_var.get()), DEFAULT_AI_MODEL_LIMIT))))
+        self.ai_model_limit_var.set(str(max(MIN_AI_MODEL_LIMIT, safe_int(data_settings.get("ai_model_limit", self.ai_model_limit_var.get()), DEFAULT_AI_MODEL_LIMIT))))
         self.update_mode_button_states()
 
     def save_persistent_settings(self):
         data_path = Path(self.data_var.get().strip() or DEFAULT_DATA_PATH)
         self.app_config_store.save_settings({"ldplayer_path": self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH, "data_path": str(data_path)})
-        DataStore(data_path).save_settings({"experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))})
+        DataStore(data_path).save_settings({"experience_pool_gb": max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB)), "ai_model_limit": max(MIN_AI_MODEL_LIMIT, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))})
 
     def screen_rect(self):
         width = safe_int(getattr(win32api, "GetSystemMetrics", lambda _: self.winfo_screenwidth())(0), self.winfo_screenwidth())
@@ -7721,7 +7763,7 @@ class ControlPanel(tk.Tk):
     def read_config(self):
         AllowedUserEditPolicy.assert_allowed("ldplayer_path", "data_path", "experience_pool_gb", "ai_model_limit")
         experience_pool_gb = max(0.1, safe_float(self.experience_pool_gb_var.get(), DEFAULT_EXPERIENCE_POOL_GB))
-        ai_model_limit = max(1, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))
+        ai_model_limit = max(MIN_AI_MODEL_LIMIT, safe_int(self.ai_model_limit_var.get(), DEFAULT_AI_MODEL_LIMIT))
         self.experience_pool_gb_var.set(str(experience_pool_gb))
         self.ai_model_limit_var.set(str(ai_model_limit))
         self.save_persistent_settings()
@@ -8601,7 +8643,7 @@ class ControlPanel(tk.Tk):
             model_count = len(list(self.store.model_dir.glob("model_*.json")))
             target_bytes = max(1, safe_int(compact.get("target_bytes", 0), 0))
             experience_size = max(0, safe_int(compact.get("size_bytes", 0), 0))
-            report = {"model_count": model_count, "experience_size": experience_size, "target_bytes": target_bytes, "compaction_complete": bool(compact.get("complete", experience_size <= target_bytes)), "models_complete": model_count <= max(1, safe_int(config.ai_model_limit, AGENT_SPEC.default_ai_model_limit)), "compact": compact, "model_compact": model_compact}
+            report = {"model_count": model_count, "experience_size": experience_size, "target_bytes": target_bytes, "compaction_complete": bool(compact.get("complete", experience_size <= target_bytes)), "models_complete": model_count <= max(MIN_AI_MODEL_LIMIT, safe_int(config.ai_model_limit, AGENT_SPEC.default_ai_model_limit)), "compact": compact, "model_compact": model_compact}
             if checkpoint_stage:
                 checkpoint = self.store.load_sleep_checkpoint() or {}
                 checkpoint_payload = {"current_task": checkpoint_stage, "input_record_version": checkpoint.get("input_record_version", 0), "output_record_version": now_text(), "flushed": True, "model_count": model_count, "experience_pool_size": experience_size, "allowed_next_task": checkpoint_stage in ("task1_saved", "task2_saved")}
