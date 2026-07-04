@@ -6506,98 +6506,98 @@ class ControlPanel(tk.Tk):
         style = ttk.Style(self)
         try:
             style.theme_use("clam")
-        except Exception:
-            pass
-        bg = "#eef3f8"
+        except Exception as exc:
+            self.log_exception("ui.theme", exc)
+        palette = ["#EF4444", "#F97316", "#EAB308", "#22C55E", "#06B6D4", "#3B82F6", "#8B5CF6"]
+        bg = "#0f172a"
         card_bg = "#ffffff"
-        accent = "#2563eb"
+        panel_bg = "#f8fafc"
         text = "#172033"
         muted = "#5b677a"
         self.configure(bg=bg)
-        style.configure(".", font=("Microsoft YaHei UI", 10), background=bg, foreground=text)
-        style.configure("TFrame", background=bg)
+        style.configure(".", font=("Microsoft YaHei UI", 10), background=panel_bg, foreground=text)
+        style.configure("TFrame", background=panel_bg)
         style.configure("Card.TFrame", background=card_bg, relief="flat")
-        style.configure("TLabelframe", background=bg, bordercolor="#cbd5e1", relief="solid")
-        style.configure("TLabelframe.Label", background=bg, foreground=text, font=("Microsoft YaHei UI", 10, "bold"))
+        style.configure("TLabelframe", background=panel_bg, bordercolor="#cbd5e1", relief="solid")
+        style.configure("TLabelframe.Label", background=panel_bg, foreground=text, font=("Microsoft YaHei UI", 10, "bold"))
         style.configure("TButton", padding=(14, 8), font=("Microsoft YaHei UI", 10, "bold"))
+        style.configure("Learn.TButton", padding=(14, 8), font=("Microsoft YaHei UI", 10, "bold"), background="#22C55E")
+        style.configure("Train.TButton", padding=(14, 8), font=("Microsoft YaHei UI", 10, "bold"), background="#3B82F6")
+        style.configure("Sleep.TButton", padding=(14, 8), font=("Microsoft YaHei UI", 10, "bold"), background="#8B5CF6")
         style.map("TButton", background=[("active", "#dbeafe")], foreground=[("disabled", "#94a3b8")])
         style.configure("TEntry", fieldbackground="#f8fafc", bordercolor="#cbd5e1", padding=4)
-        style.configure("Horizontal.TProgressbar", troughcolor="#dbeafe", background=accent)
-        scale = max(0.8, min(2.2, float(self.winfo_fpixels("1i")) / 96.0))
-        pane_h = max(1, self.winfo_height() or self.settings.ui_height)
-        font_scale = max(0.8, min(2.1, (pane_h / max(1, self.settings.ui_min_height)) ** 0.5 * scale))
-        title_size = max(11, int(round(14 * font_scale)))
-        value_size = max(10, int(round(12 * font_scale)))
+        style.configure("Horizontal.TProgressbar", troughcolor="#e0f2fe", background="#8B5CF6")
+        scale = max(0.75, min(2.0, float(self.winfo_fpixels("1i")) / 96.0))
+        screen_w = max(1, self.winfo_screenwidth())
+        screen_h = max(1, self.winfo_screenheight())
+        compact = screen_h < 850 or screen_w < 1500
+        font_scale = max(0.72, min(1.35, scale * (0.86 if compact else 1.0)))
+        title_size = max(11, int(round(16 * font_scale)))
+        value_size = max(9, int(round(11 * font_scale)))
         card_size = max(8, int(round(9 * font_scale)))
-        style.configure("Title.TLabel", font=("Microsoft YaHei UI", title_size, "bold"))
-        style.configure("CardTitle.TLabel", font=("Microsoft YaHei UI", card_size))
-        style.configure("Value.TLabel", font=("Microsoft YaHei UI", value_size, "bold"))
+        section_pad = max(4, int(round(self.settings.ui_section_padding * (0.45 if compact else 0.7))))
+        outer_pad = max(6, int(round(self.settings.ui_padding * (0.45 if compact else 0.7))))
+        style.configure("Title.TLabel", font=("Microsoft YaHei UI", title_size, "bold"), background=bg, foreground="#ffffff")
+        style.configure("CardTitle.TLabel", font=("Microsoft YaHei UI", card_size), background=card_bg, foreground=muted)
+        style.configure("Value.TLabel", font=("Microsoft YaHei UI", value_size, "bold"), background=card_bg, foreground=text)
         style.configure("Hint.TLabel", foreground=muted, background=card_bg)
-        root = ttk.Frame(self, padding=self.settings.ui_padding)
+        root = tk.Frame(self, bg=bg, padx=outer_pad, pady=outer_pad)
         root.pack(fill="both", expand=True)
-        self.scroll_canvas = tk.Canvas(root, highlightthickness=0, borderwidth=0)
-        scrollbar = ttk.Scrollbar(root, orient="vertical", command=self.scroll_canvas.yview)
-        self.scroll_canvas.configure(yscrollcommand=scrollbar.set)
-        self.scroll_canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        self.scroll_canvas.configure(background=bg)
-        container = ttk.Frame(self.scroll_canvas)
-        self.scroll_window = self.scroll_canvas.create_window((0, 0), window=container, anchor="nw")
-        container.bind("<Configure>", self.update_scroll_region)
-        self.scroll_canvas.bind("<Configure>", self.update_scroll_width)
-        self.scroll_canvas.bind("<Enter>", self.bind_mousewheel)
-        self.scroll_canvas.bind("<Leave>", self.unbind_mousewheel)
-        ttk.Label(container, text="雷电模拟器学习训练控制面板", style="Title.TLabel").pack(anchor="w")
-        path_frame = ttk.LabelFrame(container, text="路径与容量", padding=self.settings.ui_section_padding)
-        path_frame.pack(fill="x", pady=(16, 10))
-        path_frame.columnconfigure(1, weight=1)
-        ttk.Label(path_frame, text="雷电模拟器").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Entry(path_frame, textvariable=self.ldplayer_var, justify="right", state="readonly").grid(row=0, column=1, sticky="ew", pady=6)
-        path_frame.columnconfigure(2, weight=0)
-        ttk.Label(path_frame, text="数据存储").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Entry(path_frame, textvariable=self.data_var, justify="right", state="readonly").grid(row=1, column=1, sticky="ew", pady=6)
-        ttk.Label(path_frame, text="").grid(row=1, column=2, padx=(8, 0), pady=6)
-        time_frame = ttk.Frame(path_frame)
-        time_frame.grid(row=2, column=1, columnspan=2, sticky="w", pady=6)
-        ttk.Label(path_frame, text="容量设置").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=6)
-        for field, label in (("experience_pool_gb", "经验池/GB"), ("ai_model_limit", "AI模型组/组")):
+        self.scroll_canvas = None
+        self.scroll_window = None
+        header = tk.Frame(root, bg=bg)
+        header.pack(fill="x")
+        ttk.Label(header, text="雷电模拟器学习训练控制面板", style="Title.TLabel").pack(anchor="w")
+        band = tk.Frame(root, bg=bg, height=max(8, int(10 * font_scale)))
+        band.pack(fill="x", pady=(max(4, outer_pad // 2), max(6, outer_pad)))
+        for color in palette:
+            tk.Frame(band, bg=color, height=max(8, int(10 * font_scale))).pack(side="left", fill="both", expand=True, padx=1)
+        container = ttk.Frame(root, padding=0)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(2, weight=1)
+        path_frame = ttk.LabelFrame(container, text="路径与容量", padding=section_pad)
+        path_frame.grid(row=0, column=0, sticky="ew")
+        for column in (1, 3):
+            path_frame.columnconfigure(column, weight=1)
+        ttk.Label(path_frame, text="雷电模拟器").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=3)
+        ttk.Entry(path_frame, textvariable=self.ldplayer_var, justify="right", state="readonly").grid(row=0, column=1, sticky="ew", pady=3)
+        ttk.Label(path_frame, text="数据存储").grid(row=0, column=2, sticky="w", padx=(10, 6), pady=3)
+        ttk.Entry(path_frame, textvariable=self.data_var, justify="right", state="readonly").grid(row=0, column=3, sticky="ew", pady=3)
+        for index, (field, label, color) in enumerate((("experience_pool_gb", "经验池/GB", "#EF4444"), ("ai_model_limit", "AI模型组/组", "#F97316"))):
             variable = self.runtime_value_specs[field][1]
-            item_frame = ttk.Frame(time_frame)
-            item_frame.pack(side="left", padx=(0, 12))
-            ttk.Label(item_frame, text=label).pack(side="left")
-            ttk.Entry(item_frame, textvariable=variable, width=10, state="readonly", justify="right").pack(side="left", padx=(6, 4))
-            ttk.Label(item_frame, text="").pack(side="left")
+            ttk.Label(path_frame, text=label, foreground=color).grid(row=1, column=index * 2, sticky="w", padx=(0 if index == 0 else 10, 6), pady=3)
+            ttk.Entry(path_frame, textvariable=variable, width=10, state="readonly", justify="right").grid(row=1, column=index * 2 + 1, sticky="ew", pady=3)
         button_frame = ttk.Frame(container)
-        button_frame.pack(fill="x", pady=(4, 12))
+        button_frame.grid(row=1, column=0, sticky="ew", pady=(max(4, outer_pad // 2), max(4, outer_pad // 2)))
         self.button_frame = button_frame
         self.modify_button = ttk.Button(button_frame, text="修改", command=self.modify_settings_dialog)
-        self.learning_button = ttk.Button(button_frame, text="学习模式", command=self.learning_mode)
-        self.training_button = ttk.Button(button_frame, text="训练模式", command=self.training_mode)
-        self.sleep_button = ttk.Button(button_frame, text="睡眠模式", command=self.sleep_mode)
+        self.learning_button = ttk.Button(button_frame, text="学习模式", command=self.learning_mode, style="Learn.TButton")
+        self.training_button = ttk.Button(button_frame, text="训练模式", command=self.training_mode, style="Train.TButton")
+        self.sleep_button = ttk.Button(button_frame, text="睡眠模式", command=self.sleep_mode, style="Sleep.TButton")
         self.mode_buttons = [self.learning_button, self.training_button, self.sleep_button]
         self.modify_buttons.append(self.modify_button)
         self.control_buttons = [self.modify_button, self.learning_button, self.training_button, self.sleep_button]
         self.reflow_buttons()
-        status_frame = ttk.LabelFrame(container, text="状态", padding=self.settings.ui_section_padding)
-        status_frame.pack(fill="both", expand=True)
+        status_frame = ttk.LabelFrame(container, text="全量状态", padding=section_pad)
+        status_frame.grid(row=2, column=0, sticky="nsew")
+        status_frame.columnconfigure(0, weight=1)
+        status_frame.rowconfigure(0, weight=1)
         self.metrics_frame = ttk.Frame(status_frame)
         self.metrics_frame.grid(row=0, column=0, sticky="nsew")
-        status_frame.columnconfigure(0, weight=1)
         metrics = [("当前模式", self.mode_var), ("基础环境", self.base_runtime_var), ("雷电客户区", self.ldplayer_client_var), ("画面评分累计", self.screen_score_total_var), ("经验条数", self.pool_var), ("画面评分", self.novelty_var), ("鼠标相似度", self.human_var), ("画面奖励", self.screen_reward_var), ("鼠标奖惩", self.action_reward_var), ("本次奖励", self.reward_var), ("AI决策", self.ai_var)]
-        for title, variable in metrics:
-            self.metric_items.append(self.create_metric(self.metrics_frame, title, variable))
+        for index, (title, variable) in enumerate(metrics):
+            self.metric_items.append(self.create_metric(self.metrics_frame, title, variable, palette[index % len(palette)]))
         self.reflow_metrics()
-        ttk.Label(status_frame, text="快捷键", style="CardTitle.TLabel").grid(row=1, column=0, sticky="w", pady=(18, 6), padx=(0, 12))
-        self.hint_label = ttk.Label(status_frame, text=self.hint_text(), wraplength=max(320, self.settings.ui_width - 120), style="Hint.TLabel")
-        self.hint_label.grid(row=2, column=0, sticky="ew", pady=6)
-        progress_frame = ttk.LabelFrame(container, text=self.progress_label_var.get(), padding=self.settings.ui_section_padding)
+        self.hint_label = ttk.Label(status_frame, text=self.hint_text(), wraplength=max(320, screen_w - 160), style="Hint.TLabel")
+        self.hint_label.grid(row=1, column=0, sticky="ew", pady=(max(4, outer_pad // 2), 0))
+        progress_frame = ttk.LabelFrame(container, text=self.progress_label_var.get(), padding=section_pad)
         self.progress_label_var.trace_add("write", lambda *args: progress_frame.configure(text=self.progress_label_var.get()))
-        progress_frame.pack(fill="x", pady=(12, 0))
+        progress_frame.grid(row=3, column=0, sticky="ew", pady=(max(4, outer_pad // 2), 0))
         progress_frame.columnconfigure(0, weight=1)
         ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100).grid(row=0, column=0, sticky="ew")
-        ttk.Label(progress_frame, textvariable=self.progress_text_var, width=8, anchor="e").grid(row=0, column=1, sticky="e", padx=(10, 0))
-        ttk.Label(container, textvariable=self.status_var).pack(anchor="w", pady=(10, 0))
-
+        ttk.Label(progress_frame, textvariable=self.progress_text_var, width=8, anchor="e", foreground="#8B5CF6").grid(row=0, column=1, sticky="e", padx=(10, 0))
+        ttk.Label(container, textvariable=self.status_var, foreground="#06B6D4").grid(row=4, column=0, sticky="w", pady=(max(4, outer_pad // 2), 0))
 
     def own_window_handles(self):
         handles = []
@@ -6648,10 +6648,13 @@ class ControlPanel(tk.Tk):
             self.scroll_canvas.itemconfigure(self.scroll_window, width=max(1, width))
             self.update_scroll_region()
 
-    def create_metric(self, parent, title, variable):
-        frame = ttk.Frame(parent)
-        ttk.Label(frame, text=title, style="CardTitle.TLabel").pack(anchor="w", pady=(8, 4))
-        ttk.Label(frame, textvariable=variable, style="Value.TLabel").pack(anchor="w", pady=(0, 8))
+    def create_metric(self, parent, title, variable, color="#3B82F6"):
+        frame = tk.Frame(parent, bg="#ffffff", highlightthickness=1, highlightbackground="#e2e8f0")
+        tk.Frame(frame, bg=color, width=6).pack(side="left", fill="y")
+        body = tk.Frame(frame, bg="#ffffff", padx=8, pady=5)
+        body.pack(side="left", fill="both", expand=True)
+        ttk.Label(body, text=title, style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(body, textvariable=variable, style="Value.TLabel").pack(anchor="w", pady=(2, 0))
         return frame
 
     def reflow_metrics(self):
@@ -8889,21 +8892,31 @@ def run_windows_acceptance():
         result["client_abnormal_scenarios"] = {"occluded": result["occlusion_detection"], "minimized": "runtime_check_available", "out_of_screen": "runtime_check_available", "dpi_scale": "covered_by_runtime_probe"}
         result["cursor_gate"] = "runtime_check_available"
     else:
-        result["client_capture"] = "skipped_non_windows_or_unattached"
-        result["mouse_permission"] = "skipped_non_windows_or_unattached"
-        result["occlusion_detection"] = "skipped_non_windows_or_unattached"
-        result["client_abnormal_scenarios"] = {"occluded": "skipped_non_windows_or_unattached", "minimized": "skipped_non_windows_or_unattached", "out_of_screen": "skipped_non_windows_or_unattached", "dpi_scale": "skipped_non_windows_or_unattached"}
-        result["cursor_gate"] = "skipped_non_windows_or_unattached"
+        result["client_capture"] = "not_verified"
+        result["mouse_permission"] = "not_verified"
+        result["occlusion_detection"] = "not_verified"
+        result["client_abnormal_scenarios"] = {"occluded": "not_verified", "minimized": "not_verified", "out_of_screen": "not_verified", "dpi_scale": "not_verified"}
+        result["cursor_gate"] = "not_verified"
+        result["esc_global_listener"] = "not_verified"
+        result["ai_mouse_boundary"] = "not_verified"
     critical = []
+    not_verified = []
+    verification_required = {"client_capture", "mouse_permission", "occlusion_detection", "client_abnormal_scenarios.occluded", "client_abnormal_scenarios.minimized", "client_abnormal_scenarios.out_of_screen", "cursor_gate", "esc_global_listener", "ai_mouse_boundary"}
     def collect_failures(prefix, value):
         if isinstance(value, dict):
             for key, child in value.items():
                 collect_failures(f"{prefix}.{key}" if prefix else str(key), child)
         elif value == "fail":
             critical.append(prefix)
+        elif value == "not_verified":
+            not_verified.append(prefix)
+            if prefix in verification_required:
+                critical.append(prefix)
     collect_failures("", result)
-    result["acceptance_passed"] = not critical
+    result["acceptance_status"] = "pass" if not critical else "not_verified" if not_verified and all(item in not_verified for item in critical) else "fail"
+    result["acceptance_passed"] = result["acceptance_status"] == "pass"
     result["acceptance_failures"] = critical
+    result["acceptance_not_verified"] = not_verified
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if not critical else 1
 
