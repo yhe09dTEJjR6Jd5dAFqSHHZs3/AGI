@@ -2960,12 +2960,12 @@ class OperationPolicyModel(TrainableModel):
         learner = PolicyModel(self.settings, self.policy)
         train_metrics = learner.train(records or [])
         refinement_rounds = 0
-        while safe_int(train_metrics.get("trained", 0), 0) > 0 and safe_float(train_metrics.get("confidence", 0.0), 0.0) < 0.992 and refinement_rounds < 3:
+        while safe_int(train_metrics.get("trained", 0), 0) > 0 and safe_float(train_metrics.get("confidence", 0.0), 0.0) < 0.997 and refinement_rounds < 7:
             extra = learner.train(records or [])
             refinement_rounds += 1
             train_metrics = {**train_metrics, "trained": safe_int(train_metrics.get("trained", 0), 0) + safe_int(extra.get("trained", 0), 0), "loss": min(safe_float(train_metrics.get("loss", 1.0), 1.0), safe_float(extra.get("loss", 1.0), 1.0)), "confidence": max(safe_float(train_metrics.get("confidence", 0.0), 0.0), safe_float(extra.get("confidence", 0.0), 0.0)), "extra_refinement_rounds": refinement_rounds}
         self.policy = learner.snapshot()
-        self.metrics = {"loss": safe_float(self.policy.get("loss", train_metrics.get("loss", 1.0)), 1.0), "trained_steps": safe_int(self.policy.get("trained_steps", 0), 0), "batch_trained": train_metrics.get("trained", 0), "confidence": train_metrics.get("confidence", 0.0)}
+        self.metrics = {"loss": safe_float(self.policy.get("loss", train_metrics.get("loss", 1.0)), 1.0), "trained_steps": safe_int(self.policy.get("trained_steps", 0), 0), "batch_trained": train_metrics.get("trained", 0), "confidence": train_metrics.get("confidence", 0.0), "extra_refinement_rounds": refinement_rounds, "degradation_threshold": 0.12}
         return self.metrics
 
     def parameters(self):
@@ -3132,13 +3132,14 @@ class SleepDecisionModel(TrainableModel):
         super().fit(records)
         values = [safe_float(record.get("sleep_input_confidence", record.get("sleep_model_confidence", record.get("sleep_confidence", 0.0))), 0.0) for record in records or [] if isinstance(record, dict)]
         rewards = [safe_float(record.get("reward", record.get("sleep_policy_reward", 0.0)), 0.0) for record in records or [] if isinstance(record, dict)]
-        self.threshold = round(percentile(values, 0.75, 0.8), 4) if values else 0.8
-        self.reward_floor = round(percentile(rewards, 0.25, 0.0), 4) if rewards else 0.0
-        self.metrics = {"threshold": self.threshold, "reward_floor": self.reward_floor, "records": len(values)}
+        self.threshold = round(clamp(percentile(values, 0.72, 0.82), 0.55, 0.95), 4) if values else 0.82
+        self.reward_floor = round(percentile(rewards, 0.30, 0.0), 4) if rewards else 0.0
+        self.reward_ceiling = round(percentile(rewards, 0.80, 0.0), 4) if rewards else 0.0
+        self.metrics = {"threshold": self.threshold, "reward_floor": self.reward_floor, "reward_ceiling": self.reward_ceiling, "records": len(values), "degradation_threshold": 0.18}
         return self.metrics
 
     def parameters(self):
-        return {"threshold": getattr(self, "threshold", 0.8), "reward_floor": getattr(self, "reward_floor", 0.0), "intelligence_goal": "judge whether training mode is worth entering sleep mode"}
+        return {"threshold": getattr(self, "threshold", 0.82), "reward_floor": getattr(self, "reward_floor", 0.0), "reward_ceiling": getattr(self, "reward_ceiling", 0.0), "signals": ["confidence", "failure_pressure", "no_action_pressure", "reward_opportunity"], "intelligence_goal": "judge whether training mode is worth entering sleep mode with calibrated confidence and reward opportunity"}
 
     def predict(self, features):
         features = features or {}
@@ -3147,8 +3148,12 @@ class SleepDecisionModel(TrainableModel):
         failures = safe_int(features.get("consecutive_failures", 0), 0)
         no_actions = safe_int(features.get("consecutive_no_actions", 0), 0)
         pressure = clamp(failures * 0.15 + no_actions * 0.1, 0.0, 0.5)
-        score = confidence + pressure
-        return {"sleep": score >= safe_float(getattr(self, "threshold", 0.8), 0.8) or (failures + no_actions >= 3 and reward <= safe_float(getattr(self, "reward_floor", 0.0), 0.0)), "score": round(score, 4), "threshold": safe_float(getattr(self, "threshold", 0.8), 0.8)}
+        reward_floor = safe_float(getattr(self, "reward_floor", 0.0), 0.0)
+        reward_ceiling = safe_float(getattr(self, "reward_ceiling", reward_floor), reward_floor)
+        opportunity = clamp((reward_ceiling - reward) / max(0.0001, abs(reward_ceiling - reward_floor) + 1.0), 0.0, 0.25)
+        score = confidence + pressure + opportunity
+        threshold = safe_float(getattr(self, "threshold", 0.82), 0.82)
+        return {"sleep": score >= threshold or (failures + no_actions >= 3 and reward <= reward_floor), "score": round(score, 4), "threshold": threshold}
 
     def probe_input(self):
         return {"sleep_confidence": 0.9, "reward": 0.0, "consecutive_failures": 0, "consecutive_no_actions": 0}
@@ -3157,8 +3162,9 @@ class SleepDecisionModel(TrainableModel):
     def restore(cls, payload, settings=None):
         obj = cls(settings, payload)
         params = payload.get("parameters") if isinstance(payload, dict) else {}
-        obj.threshold = safe_float(params.get("threshold", 0.8), 0.8) if isinstance(params, dict) else 0.8
+        obj.threshold = safe_float(params.get("threshold", 0.82), 0.82) if isinstance(params, dict) else 0.82
         obj.reward_floor = safe_float(params.get("reward_floor", 0.0), 0.0) if isinstance(params, dict) else 0.0
+        obj.reward_ceiling = safe_float(params.get("reward_ceiling", 0.0), 0.0) if isinstance(params, dict) else 0.0
         return obj
 
 
@@ -6355,7 +6361,7 @@ class ControlPanel(tk.Tk):
         self.events.subscribe("save_completed", lambda event: self.ui(lambda e=event: self.status_var.set(f"保存完成：{e.get('kind', 'data')}")))
         self.title("雷电模拟器学习训练控制面板")
         self.geometry(f"{self.settings.ui_width}x{self.settings.ui_height}")
-        self.minsize(1, 1)
+        self.minsize(420, 360)
         self.state_lock = threading.RLock()
         self.mode = "idle"
         self.run_token = 0
@@ -6439,6 +6445,7 @@ class ControlPanel(tk.Tk):
         if not pynput_keyboard:
             self.status_var.set("全局键盘监听不可用，已启用 Windows ESC 轮询兜底")
         self.protocol("WM_DELETE_WINDOW", self.close)
+        self.start_ui_pump()
         self.refresh_runtime_environment_state()
 
     def modify_settings_dialog(self):
@@ -6593,26 +6600,23 @@ class ControlPanel(tk.Tk):
         self.scroll_canvas.bind("<Enter>", self.bind_mousewheel)
         self.scroll_canvas.bind("<Leave>", self.unbind_mousewheel)
         container.columnconfigure(0, weight=1)
-        container.rowconfigure(1, weight=1)
+        container.rowconfigure(1, weight=0)
         path_frame = ttk.LabelFrame(container, text="路径与容量", padding=section_pad)
         path_frame.grid(row=0, column=0, sticky="ew")
-        for column in (1, 3):
-            path_frame.columnconfigure(column, weight=1)
-        ttk.Label(path_frame, text="雷电模拟器").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=3)
-        ttk.Entry(path_frame, textvariable=self.ldplayer_var, justify="right", state="readonly").grid(row=0, column=1, sticky="ew", pady=3)
-        ttk.Label(path_frame, text="数据存储").grid(row=0, column=2, sticky="w", padx=(10, 6), pady=3)
-        ttk.Entry(path_frame, textvariable=self.data_var, justify="right", state="readonly").grid(row=0, column=3, sticky="ew", pady=3)
-        for index, (field, label, color) in enumerate((("experience_pool_gb", "经验池/GB", "#EF4444"), ("ai_model_limit", "AI模型组/组", "#F97316"))):
-            variable = self.runtime_value_specs[field][1]
-            ttk.Label(path_frame, text=label, foreground=color).grid(row=1, column=index * 2, sticky="w", padx=(0 if index == 0 else 10, 6), pady=3)
-            ttk.Entry(path_frame, textvariable=variable, width=10, state="readonly", justify="right").grid(row=1, column=index * 2 + 1, sticky="ew", pady=3)
+        self.path_frame = path_frame
+        self.path_field_widgets = []
+        for field, label, variable, color, width in (("ldplayer_path", "雷电模拟器", self.ldplayer_var, None, 32), ("data_path", "数据存储", self.data_var, None, 32), ("experience_pool_gb", "经验池/GB", self.experience_pool_gb_var, "#EF4444", 10), ("ai_model_limit", "AI模型组/组", self.ai_model_limit_var, "#F97316", 10)):
+            label_widget = ttk.Label(path_frame, text=label, foreground=color) if color else ttk.Label(path_frame, text=label)
+            entry_widget = ttk.Entry(path_frame, textvariable=variable, width=width, state="readonly", justify="right")
+            self.path_field_widgets.append((label_widget, entry_widget))
+        self.reflow_path_fields()
         self.after_idle(self.fit_complete_panel)
         status_frame = ttk.LabelFrame(container, text="全量状态", padding=section_pad)
-        status_frame.grid(row=1, column=0, sticky="nsew", pady=(max(4, outer_pad // 2), 0))
+        status_frame.grid(row=1, column=0, sticky="ew", pady=(max(4, outer_pad // 2), 0))
         status_frame.columnconfigure(0, weight=1)
-        status_frame.rowconfigure(0, weight=1)
+        status_frame.rowconfigure(0, weight=0)
         self.metrics_frame = ttk.Frame(status_frame)
-        self.metrics_frame.grid(row=0, column=0, sticky="nsew")
+        self.metrics_frame.grid(row=0, column=0, sticky="ew")
         metrics = [("当前模式", self.mode_var), ("基础环境", self.base_runtime_var), ("雷电客户区", self.ldplayer_client_var), ("画面评分累计", self.screen_score_total_var), ("经验条数", self.pool_var), ("画面评分", self.novelty_var), ("鼠标相似度", self.human_var), ("画面奖励", self.screen_reward_var), ("鼠标奖惩", self.action_reward_var), ("本次奖励", self.reward_var), ("AI决策", self.ai_var)]
         for index, (title, variable) in enumerate(metrics):
             self.metric_items.append(self.create_metric(self.metrics_frame, title, variable, palette[index % len(palette)]))
@@ -6653,7 +6657,7 @@ class ControlPanel(tk.Tk):
     def fit_complete_panel(self):
         try:
             self.update_idletasks()
-            self.minsize(1, 1)
+            self.minsize(420, 360)
             if (self.winfo_width() < max(420, self.settings.ui_width // 2) or self.winfo_height() < max(360, self.settings.ui_height // 2)) and not self.compact_panel_layout:
                 self.compact_panel_layout = True
                 self.apply_compact_panel_layout()
@@ -6686,16 +6690,25 @@ class ControlPanel(tk.Tk):
             return False
         return all(self.widget_tree_fits(child, client_w, client_h) for child in widget.winfo_children())
 
-    def apply_compact_panel_layout(self):
+    def is_compact_layout(self):
+        return self.winfo_width() < 720 or self.winfo_height() < 520
+
+    def apply_responsive_layout(self):
         style = ttk.Style(self)
-        style.configure("TButton", padding=(8, 5), font=("Microsoft YaHei UI", 9, "bold"))
-        style.configure("Learn.TButton", padding=(8, 5), font=("Microsoft YaHei UI", 9, "bold"))
-        style.configure("Train.TButton", padding=(8, 5), font=("Microsoft YaHei UI", 9, "bold"))
-        style.configure("Sleep.TButton", padding=(8, 5), font=("Microsoft YaHei UI", 9, "bold"))
+        compact = bool(self.compact_panel_layout)
+        padding = (8, 5) if compact else (14, 8)
+        font = ("Microsoft YaHei UI", 9 if compact else 10, "bold")
+        for name in ("TButton", "Learn.TButton", "Train.TButton", "Sleep.TButton"):
+            style.configure(name, padding=padding, font=font)
         if self.hint_label:
-            self.hint_label.configure(wraplength=max(280, self.winfo_width() - 32))
+            self.hint_label.configure(wraplength=max(220 if compact else 320, self.winfo_width() - 32))
         self.reflow_buttons()
+        self.reflow_path_fields()
         self.reflow_metrics()
+
+    def apply_compact_panel_layout(self):
+        self.compact_panel_layout = True
+        self.apply_responsive_layout()
 
     def update_scroll_region(self, _event=None):
         if getattr(self, "scroll_canvas", None):
@@ -6719,15 +6732,38 @@ class ControlPanel(tk.Tk):
     def reflow_metrics(self):
         if not self.metrics_frame:
             return
-        width = max(1, self.winfo_width())
+        width = max(1, getattr(self, "scroll_canvas", None).winfo_width() if getattr(self, "scroll_canvas", None) else self.winfo_width())
         columns = 1 if width < 620 else 2 if width < 980 else max(1, min(self.settings.ui_metric_columns, width // max(220, safe_int(self.settings.ui_metric_min_column_width, 240))))
+        rows = max(1, math.ceil(len(self.metric_items) / columns))
         for column in range(max(1, len(self.metric_items))):
-            self.metrics_frame.columnconfigure(column, weight=0)
+            self.metrics_frame.columnconfigure(column, weight=0, uniform="")
+        for row in range(max(1, len(self.metric_items))):
+            self.metrics_frame.rowconfigure(row, weight=0, uniform="")
         for column in range(columns):
             self.metrics_frame.columnconfigure(column, weight=1, uniform="metrics")
+        for row in range(rows):
+            self.metrics_frame.rowconfigure(row, weight=0, uniform="")
         for index, item in enumerate(self.metric_items):
             item.grid_forget()
             item.grid(row=index // columns, column=index % columns, sticky="ew", padx=3 if width < 620 else 5, pady=3)
+        self.update_scroll_region()
+
+    def reflow_path_fields(self):
+        if not getattr(self, "path_frame", None) or not getattr(self, "path_field_widgets", None):
+            return
+        width = max(1, self.winfo_width())
+        fields_per_row = 1 if width < 720 else 2 if width < 1100 else 2
+        for child in self.path_frame.winfo_children():
+            child.grid_forget()
+        for column in range(4):
+            self.path_frame.columnconfigure(column, weight=0, uniform="")
+        for index, (label_widget, entry_widget) in enumerate(self.path_field_widgets):
+            row = index // fields_per_row
+            base_column = (index % fields_per_row) * 2
+            label_widget.grid(row=row, column=base_column, sticky="w", padx=(0 if base_column == 0 else 10, 6), pady=3)
+            entry_widget.grid(row=row, column=base_column + 1, sticky="ew", pady=3)
+        for column in range(fields_per_row * 2):
+            self.path_frame.columnconfigure(column, weight=1 if column % 2 else 0, uniform="path_values" if column % 2 else "")
         self.update_scroll_region()
     def reflow_buttons(self):
         if not getattr(self, "button_frame", None):
@@ -6743,14 +6779,20 @@ class ControlPanel(tk.Tk):
         for column in range(columns):
             self.button_frame.columnconfigure(column, weight=1)
 
-    def on_window_resize(self, _event):
-        if self.winfo_width() < 720 or self.winfo_height() < 520:
-            self.compact_panel_layout = True
+    def on_window_resize(self, _event=None):
+        compact = self.is_compact_layout()
+        if compact != self.compact_panel_layout:
+            self.compact_panel_layout = compact
+            self.apply_responsive_layout()
         if self.hint_label:
             width = max(160, self.winfo_width() - self.settings.ui_padding * 4)
             self.hint_label.configure(wraplength=width)
+        self.after_idle(self.refresh_responsive_layout)
+
+    def refresh_responsive_layout(self):
         self.reflow_metrics()
         self.reflow_buttons()
+        self.reflow_path_fields()
         self.update_scroll_width()
 
     def remember_event(self, event):
@@ -6760,6 +6802,17 @@ class ControlPanel(tk.Tk):
                 self.store.append_evidence("event", **event)
         except Exception:
             pass
+
+    def ui_latest(self, key, func):
+        if getattr(self, "shutdown_requested", False):
+            return
+        if threading.current_thread() is threading.main_thread():
+            try:
+                func()
+            except Exception as exc:
+                self.log_exception("ui.latest", exc)
+            return
+        self.enqueue_main_thread_event({"type": "ui_call", "func": func, "coalesce_key": key}, block=False)
 
     def ui(self, func):
         if getattr(self, "shutdown_requested", False):
@@ -6940,9 +6993,23 @@ class ControlPanel(tk.Tk):
             except Exception:
                 pass
 
+    def start_ui_pump(self):
+        try:
+            self.after(16, self.process_ui_events)
+        except Exception:
+            pass
+
+    def process_ui_events(self):
+        if getattr(self, "shutdown_requested", False):
+            return
+        self.process_main_thread_events()
+        try:
+            self.after(16, self.process_ui_events)
+        except Exception:
+            pass
+
     def refresh_runtime_environment_state(self):
         try:
-            self.process_main_thread_events()
             self.update_mode_button_states()
         finally:
             try:
@@ -7366,7 +7433,7 @@ class ControlPanel(tk.Tk):
             self.store.append_runtime_parameter_audit(previous_settings, {item.name: getattr(settings, item.name) for item in fields(Settings)}, copy.deepcopy(RUNTIME_NUMBER_AUDIT))
         self.settings = settings
         self.escape_monitor.debounce_seconds = settings.key_debounce_seconds
-        self.ui(lambda: self.minsize(settings.ui_min_width, settings.ui_min_height))
+        self.ui(lambda: self.minsize(max(420, settings.ui_min_width), max(360, settings.ui_min_height)))
         return Config(Path(self.ldplayer_var.get().strip() or DEFAULT_LDPLAYER_PATH), data_path, experience_pool_gb, ai_model_limit, settings)
 
     def apply_runtime_settings(self, settings):
@@ -8258,7 +8325,11 @@ class ControlPanel(tk.Tk):
         def apply():
             self.progress_var.set(percent)
             self.progress_text_var.set(f"{percent:.1f}%")
-        self.ui(apply)
+        dispatcher = getattr(self, "ui_latest", None)
+        if callable(dispatcher):
+            dispatcher("progress", apply)
+        else:
+            self.ui(apply)
 
     def update_metrics(self, novelty, human_score, screen_reward, action_reward, reward, screen_score_total, decision=None):
         payload = (round(float(novelty), 2), round(float(human_score), 2), round(float(screen_reward), 2), round(float(action_reward), 2), round(float(reward), 2), round(float(screen_score_total), 2), decision.get("reason") if decision else None, round(safe_float(decision.get("confidence", 0.0), 0.0), 3) if decision else None)
@@ -8277,7 +8348,11 @@ class ControlPanel(tk.Tk):
             if decision:
                 confidence = round(safe_float(decision.get("confidence", 0.0), 0.0) * 100.0, 1)
                 self.ai_var.set(f"{decision.get('reason', 'AI')} {confidence}%")
-        self.ui(apply)
+        dispatcher = getattr(self, "ui_latest", None)
+        if callable(dispatcher):
+            dispatcher("metrics", apply)
+        else:
+            self.ui(apply)
 
     def capture_snapshot_image(self, analyzer, mode, session_start, rect=None, priority="normal"):
         if not self.store:
