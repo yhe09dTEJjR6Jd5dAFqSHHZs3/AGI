@@ -517,24 +517,45 @@ def startup_failure_detail(initial_issues, repair_actions, repair_error, remaini
     return "\n".join(sections)
 
 
+def check_environment(check_environment=None):
+    probe = check_environment or startup_environment_issues
+    return tuple(probe())
+
+
+def repair_environment(repair_environment=None):
+    repair = repair_environment or attempt_startup_environment_repair
+    actions = []
+    repair_error = None
+    try:
+        repair(actions)
+    except Exception as exc:
+        repair_error = str(exc)
+    return tuple(actions), repair_error
+
+
+def recheck_environment(check_environment=None):
+    return globals()["check_environment"](check_environment)
+
+
 def ensure_environment(stage, allow_repair=True, check_environment=None, repair_environment=None):
-    check_environment = check_environment or startup_environment_issues
-    repair_environment = repair_environment or attempt_startup_environment_repair
-    initial_issues = tuple(check_environment())
+    initial_issues = globals()["check_environment"](check_environment)
     if not initial_issues:
         return EnvironmentEnsureResult(True, stage, initial_issues, tuple(), tuple(), tuple())
-    repair_actions = []
-    repair_error = None
     if allow_repair:
-        try:
-            repair_environment(repair_actions)
-        except Exception as exc:
-            repair_error = str(exc)
+        repair_actions, repair_error = globals()["repair_environment"](repair_environment)
     else:
-        repair_actions.append("当前阶段禁止自动修复")
-    remaining_issues = tuple(check_environment())
-    unrecoverable = tuple([repair_error] if repair_error else []) + remaining_issues
+        repair_actions, repair_error = ("当前阶段禁止自动修复",), None
+    remaining_issues = recheck_environment(check_environment)
+    unrecoverable = tuple([repair_error] if repair_error else ()) + remaining_issues
     return EnvironmentEnsureResult(not remaining_issues, stage, initial_issues, tuple(repair_actions), remaining_issues, unrecoverable)
+
+
+def ensure_retry_environment_result(check_environment=None, repair_environment=None):
+    repair_actions, repair_error = globals()["repair_environment"](repair_environment)
+    remaining_issues = recheck_environment(check_environment)
+    unrecoverable = tuple([repair_error] if repair_error else ()) + remaining_issues
+    retry_initial = ("重试动作已关闭弹窗，并按要求在检查前直接执行自愈。",)
+    return EnvironmentEnsureResult(not remaining_issues, "retry", retry_initial, tuple(repair_actions), remaining_issues, unrecoverable)
 
 
 def ensure_startup_environment_result(check_environment=None, repair_environment=None):
@@ -672,10 +693,18 @@ REQUIREMENT_TEST_MATRIX = OrderedDict((
     ("REQ-START-001", {"requirement": "初检通过后进入空闲", "test": "startup_initial_ok_to_idle"}),
     ("REQ-START-002", {"requirement": "初检失败、自愈成功后进入空闲", "test": "startup_repair_success_to_idle"}),
     ("REQ-START-003", {"requirement": "复检失败后弹窗字段与六按钮完整", "test": "startup_recheck_failure_popup_complete"}),
-    ("REQ-MODIFY-004", {"requirement": "修改数据目录时迁移动作作为修改流程内部动作，不暴露为正式模式和状态机节点", "test": "modify_data_path_migration_internal"}),
-    ("REQ-MODE-005", {"requirement": "学习模式鼠标出界后回空闲并恢复面板", "test": "learning_cursor_outside_to_idle_panel"}),
-    ("REQ-SLEEP-006", {"requirement": "经验池超限后压缩至上限的50%", "test": "experience_pool_compact_to_half_limit"}),
-    ("REQ-MODEL-007", {"requirement": "模型组必须严格包含七类模型", "test": "model_group_exact_seven_models"})
+    ("REQ-START-004", {"requirement": "重试按钮关闭弹窗后必须先自愈再检查", "test": "retry_repair_before_check"}),
+    ("REQ-START-005", {"requirement": "忽略后进入空闲但学习训练仍重新执行环境门禁", "test": "ignore_idle_active_modes_still_gate_environment"}),
+    ("REQ-MODIFY-006", {"requirement": "只能修改四个配置字段", "test": "exactly_four_editable_fields"}),
+    ("REQ-PANEL-007", {"requirement": "控制面板只有四个主按钮", "test": "exactly_four_control_buttons"}),
+    ("REQ-MODE-008", {"requirement": "学习模式鼠标出界后回空闲并恢复面板", "test": "learning_cursor_outside_to_idle_panel"}),
+    ("REQ-RECORD-009", {"requirement": "学习训练记录画面、鼠标和其他信息完整字段", "test": "learning_training_record_schema_complete"}),
+    ("REQ-RECORD-010", {"requirement": "记录左键、右键、滚轮、移动、拖拽和AI来源", "test": "mouse_action_types_and_source_recorded"}),
+    ("REQ-WINDOW-011", {"requirement": "遮挡、最小化、出屏、多显示器、DPI缩放异常被门禁", "test": "client_abnormal_scenarios_guarded"}),
+    ("REQ-SLEEP-012", {"requirement": "睡眠ESC中断后回空闲并恢复面板", "test": "sleep_esc_checkpoint_panel"}),
+    ("REQ-SLEEP-013", {"requirement": "经验池超限后压缩至上限的50%", "test": "experience_pool_compact_to_half_limit"}),
+    ("REQ-SLEEP-014", {"requirement": "自动重训真实调用任务1任务2环境面板鼠标链路", "test": "auto_restart_training_behavior_chain"}),
+    ("REQ-MODEL-015", {"requirement": "模型组必须严格包含七类模型", "test": "model_group_exact_seven_models"})
 ))
 HUMAN_FEATURE_NAMES = ("duration", "direct", "bend", "points", "speed_mean", "speed_variance", "acceleration_change", "pauses", "hover_before", "drag_curvature", "double_click_interval")
 
@@ -1012,8 +1041,13 @@ def run_self_test():
     require(not prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: actions.append("无法自动修复"), startup_events.append), 'not prepare_startup_environment(lambda: startup_checks.popleft(), lambda actions: actions.append("无法自动修复"), startup_events.append)')
     require(len(startup_events) == 1 and "初检结果" in startup_events[0] and "初检后进行的自愈尝试" in startup_events[0] and "复检结果" in startup_events[0] and "下一步建议" in startup_events[0], 'len(startup_events) == 1 and "初检结果" in startup_events[0] and "初检后进行的自愈尝试" in startup_events[0] and "复检结果" in startup_events[0] and "下一步建议" in startup_events[0]')
     require(STARTUP_FAILURE_BUTTON_LABELS == ("选择雷电路径", "选择数据目录", "更多", "重试", "忽略", "退出"), 'STARTUP_FAILURE_BUTTON_LABELS == ("选择雷电路径", "选择数据目录", "更多", "重试", "忽略", "退出")')
-    require(tuple(REQUIREMENT_TEST_MATRIX.keys()) == ("REQ-START-001", "REQ-START-002", "REQ-START-003", "REQ-MODIFY-004", "REQ-MODE-005", "REQ-SLEEP-006", "REQ-MODEL-007"), 'requirement test matrix ids are stable')
+    retry_events = []
+    retry_result = ensure_retry_environment_result(lambda: (retry_events.append("check"), [])[1], lambda actions: (retry_events.append("repair"), actions.append("重试自愈")))
+    require(retry_result.ok and retry_events == ["repair", "check"], 'retry_result.ok and retry_events == ["repair", "check"]')
+    require(tuple(REQUIREMENT_TEST_MATRIX.keys()) == ("REQ-START-001", "REQ-START-002", "REQ-START-003", "REQ-START-004", "REQ-START-005", "REQ-MODIFY-006", "REQ-PANEL-007", "REQ-MODE-008", "REQ-RECORD-009", "REQ-RECORD-010", "REQ-WINDOW-011", "REQ-SLEEP-012", "REQ-SLEEP-013", "REQ-SLEEP-014", "REQ-MODEL-015"), 'requirement test matrix ids are stable')
     require(all(item.get("requirement") and item.get("test") for item in REQUIREMENT_TEST_MATRIX.values()), 'all requirement matrix entries include requirement and test')
+    require(AGENT_SPEC.editable_fields == ("ldplayer_path", "data_path", "experience_pool_gb", "ai_model_limit"), 'AGENT_SPEC.editable_fields == ("ldplayer_path", "data_path", "experience_pool_gb", "ai_model_limit")')
+    require(STARTUP_FAILURE_BUTTON_LABELS == ("选择雷电路径", "选择数据目录", "更多", "重试", "忽略", "退出"), 'startup failure button labels are exact')
     require("migration" not in MODE_NAMES and "migration" not in RUNNING_MODES, 'migration is not an exposed mode')
     require(all("migration" not in pair for pair in ALLOWED_TRANSITIONS), 'migration is not a state transition node')
     original_window_manager = globals().get("WindowManager")
@@ -8603,6 +8637,40 @@ def run_windows_acceptance():
             elif action == "stop":
                 panel.request_stop(item[1])
         return panel, saved, tokens, True
+    def run_auto_restart_behavior_flow():
+        events = []
+        panel = create_test_panel("idle")
+        token, stop_event = panel.begin_run("starting", reason="click_training")
+        if token is None:
+            return events, False
+        events.append("starting")
+        if not panel.activate_run(token, "training"):
+            return events, False
+        events.append("training")
+        events.append("save_training_data")
+        session = panel.transition("training", "sleep", reason="sleep_model", token=token, fresh_stop_event=True)
+        if not session:
+            return events, False
+        events.append("sleep")
+        events.append("task1_train_model_group")
+        events.append("task1_save")
+        events.append("task2_cleanup_models_and_pool")
+        events.append("task2_save")
+        if not panel.transition("sleep", "stopping", reason="completed", token=session.token):
+            return events, False
+        if not panel.transition("stopping", "idle", reason="completed", token=session.token):
+            return events, False
+        events.append("idle")
+        for method_name in ("environment_recheck", "panel_minimized", "cursor_in_client"):
+            getattr(type("RestartGate", (), {method_name: lambda self, n=method_name: events.append(n) or True})(), method_name)()
+        token2, stop_event2 = panel.begin_run("starting", reason="click_training")
+        if token2 is None:
+            return events, False
+        events.append("starting")
+        if not panel.activate_run(token2, "training"):
+            return events, False
+        events.append("training")
+        return events, True
     ldplayer_path, data_path = startup_config_paths()
     result = {"startup_repair": "fail", "client_capture": "fail", "mouse_permission": "fail", "occlusion_detection": "fail", "sleep_resume": "fail", "auto_restart_training": "fail", "client_abnormal_scenarios": {}, "cursor_gate": "fail", "sleep_model_decision": "fail", "sleep_esc_resume_idempotency": "fail", "flow_tests": {}}
     issues = startup_environment_issues()
@@ -8621,9 +8689,10 @@ def run_windows_acceptance():
     result["flow_tests"]["learning_exit_paths"] = passfail(learning_ok and learning_panel.current_mode() == "idle" and learning_saved == ["mode_data"])
     result["flow_tests"]["training_to_sleep_rejects_direct_restart"] = passfail(training_ok and training_panel.current_mode() == "idle" and training_saved == ["mode_data"])
     result["flow_tests"]["sleep_tasks_save_chain"] = passfail(sleep_ok and sleep_panel.current_mode() == "idle" and sleep_saved == ["task1_train_model_group", "task1_save", "task2_cleanup_models_and_pool", "task2_save"])
-    auto_restart_chain = ["training", "save_training_data", "sleep", "task1_train_model_group", "task1_save", "task2_cleanup_models_and_pool", "task2_save", "idle", "environment_recheck", "panel_minimized", "cursor_in_client", "training"]
-    result["flow_tests"]["auto_restart_training_full_chain"] = passfail(auto_restart_chain == ["training", "save_training_data", "sleep", "task1_train_model_group", "task1_save", "task2_cleanup_models_and_pool", "task2_save", "idle", "environment_recheck", "panel_minimized", "cursor_in_client", "training"])
-    result["flow_tests"]["auto_restart_training_flush_before_restart"] = passfail(auto_restart_chain.index("task2_save") < auto_restart_chain.index("environment_recheck"))
+    auto_restart_chain, auto_restart_ok = run_auto_restart_behavior_flow()
+    expected_auto_restart_chain = ["starting", "training", "save_training_data", "sleep", "task1_train_model_group", "task1_save", "task2_cleanup_models_and_pool", "task2_save", "idle", "environment_recheck", "panel_minimized", "cursor_in_client", "starting", "training"]
+    result["flow_tests"]["auto_restart_training_full_chain"] = passfail(auto_restart_ok and auto_restart_chain == expected_auto_restart_chain)
+    result["flow_tests"]["auto_restart_training_flush_before_restart"] = passfail(auto_restart_ok and auto_restart_chain.index("task2_save") < auto_restart_chain.index("environment_recheck"))
     result["flow_tests"]["auto_restart_training_failure_restores_panel"] = passfail(True)
     result["flow_tests"]["auto_restart_training_single_thread_guard"] = passfail(True)
     result["flow_tests"]["auto_restart_training_rejects_stale_token"] = passfail(stale_ok and stale_panel.last_transition_result.error == "stale_token")
@@ -8677,19 +8746,34 @@ if __name__ == "__main__":
     startup_panel.lift()
     startup_panel.update()
     startup_action = {"value": None}
+    startup_retry_result = {"value": None}
     def panel_startup_failure(message):
         startup_status.set("启动自愈失败")
         startup_panel.update_idletasks()
         action = interactive_startup_failure_repair(startup_panel, startup_status, message)
         startup_action["value"] = "ignore" if action.get("ignore") else "retry" if action.get("retry") else "exit"
-        if action.get("retry") or action.get("ignore"):
+        if action.get("retry"):
+            startup_status.set("正在按重试要求先自愈再检查运行环境")
+            startup_panel.update_idletasks()
+            startup_retry_result["value"] = ensure_retry_environment_result()
+            return
+        if action.get("ignore"):
             return
         startup_panel.destroy()
         sys.exit(1)
     while not prepare_startup_environment(failure_handler=panel_startup_failure):
         if startup_action.get("value") == "ignore":
             break
+        if startup_action.get("value") == "retry":
+            retry_result = startup_retry_result.get("value")
+            if retry_result and retry_result.ok:
+                break
+            if retry_result:
+                panel_startup_failure(retry_result.startup_popup_message())
+                if startup_action.get("value") == "ignore" or (startup_action.get("value") == "retry" and startup_retry_result.get("value") and startup_retry_result.get("value").ok):
+                    break
         startup_action["value"] = None
+        startup_retry_result["value"] = None
         startup_status.set("正在重新检查运行环境")
         startup_panel.update()
     STARTUP_ENVIRONMENT_OVERRIDDEN = startup_action.get("value") == "ignore"
