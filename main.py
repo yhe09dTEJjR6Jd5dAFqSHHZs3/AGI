@@ -85,7 +85,7 @@ class BITMAPINFOHEADER(ctypes.Structure):
     _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG), ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD), ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD), ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG), ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD), ("biClrImportant", wintypes.DWORD)]
 
 class RGBQUAD(ctypes.Structure):
-    _fields_ = [("rgbBlue", ctypes.c_byte), ("rgbGreen", ctypes.c_byte), ("rgbRed", ctypes.c_byte), ("rgbReserved", ctypes.c_byte)]
+    _fields_ = [("rgbBlue", ctypes.c_ubyte), ("rgbGreen", ctypes.c_ubyte), ("rgbRed", ctypes.c_ubyte), ("rgbReserved", ctypes.c_ubyte)]
 
 class BITMAPINFO(ctypes.Structure):
     _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", RGBQUAD)]
@@ -1066,7 +1066,6 @@ class Controller:
         return self.mouse_queue.empty() and not self.writer_busy.is_set()
 
     def on_mouse(self, event_type, button, wheel, x, y, created, source):
-        outside = False
         with self.lock:
             if self.state not in ("learning", "training") or not self.session_id or not self.target_rect:
                 return
@@ -1074,12 +1073,8 @@ class Controller:
             rect = self.target_rect
             outside = not point_inside((x, y), rect)
             previous = self.last_mouse
-            if not outside:
-                self.last_mouse = (x, y, created)
-                self.mouse_count += 1
-        if outside:
-            self.request_idle("鼠标已离开雷电模拟器客户区")
-            return
+            self.last_mouse = (x, y, created)
+            self.mouse_count += 1
         dx = 0.0
         dy = 0.0
         direction = 0.0
@@ -1112,6 +1107,8 @@ class Controller:
             self.mouse_queue.put_nowait(record)
         except queue.Full:
             pass
+        if outside:
+            self.request_idle("鼠标已离开雷电模拟器客户区")
 
     def _is_current(self, token, states=None):
         with self.lock:
@@ -1161,7 +1158,11 @@ class Controller:
         if rect is None:
             self.emit("notice", "雷电模拟器客户区状态异常。")
             return False
-        session_id = self.store.create_session(mode)
+        try:
+            session_id = self.store.create_session(mode)
+        except Exception as error:
+            self.emit("notice", "无法创建会话记录：" + str(error))
+            return False
         with self.lock:
             self.epoch += 1
             token = self.epoch
@@ -1206,7 +1207,7 @@ class Controller:
                 mode = self.session_mode
             rect = valid_client(hwnd, True) if hwnd else None
             if rect is None:
-                self.request_idle("雷电模拟器客户区异常或鼠标已离开客户区")
+                self.request_idle("雷电模拟器客户区异常或鼠标已离开客户区", token)
                 return
             observation_due = False
             now_observation = time.monotonic()
@@ -1229,7 +1230,7 @@ class Controller:
                         self.capture_failures += 1
                         failures = self.capture_failures
                     if failures >= 3:
-                        self.request_idle("连续无法记录雷电模拟器画面")
+                        self.request_idle("连续无法记录雷电模拟器画面", token)
                         return
                     sample = self.resources.sample()
                     self.emit("state", {"state": self.current_state(), "detail": "暂时无法记录画面，正在重试", "cpu": sample["cpu"], "memory": sample["memory"]})
@@ -1259,7 +1260,7 @@ class Controller:
                             self.capture_failures += 1
                             failures = self.capture_failures
                         if failures >= 3:
-                            self.request_idle("连续无法写入经验池：" + str(error))
+                            self.request_idle("连续无法写入经验池：" + str(error), token)
                             return
                         sample = self.resources.sample()
                         self.emit("state", {"state": self.current_state(), "detail": "记录已限速：" + str(error), "cpu": sample["cpu"], "memory": sample["memory"]})
@@ -1268,13 +1269,13 @@ class Controller:
     def _monitor_loop(self, token):
         while self._is_current(token, ("learning", "training")):
             if user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000:
-                self.request_idle("检测到 ESC 键")
+                self.request_idle("检测到 ESC 键", token)
                 return
             with self.lock:
                 hwnd = self.target_hwnd
             rect = valid_client(hwnd, True) if hwnd else None
             if rect is None:
-                self.request_idle("雷电模拟器客户区异常或鼠标已离开客户区")
+                self.request_idle("雷电模拟器客户区异常或鼠标已离开客户区", token)
                 return
             with self.lock:
                 self.target_rect = rect
@@ -1332,11 +1333,11 @@ class Controller:
                 hwnd = self.target_hwnd
             rect = valid_client(hwnd, True) if hwnd else None
             if rect is None:
-                self.request_idle("雷电模拟器客户区异常或鼠标已离开客户区")
+                self.request_idle("雷电模拟器客户区异常或鼠标已离开客户区", token)
                 return
             x, y, hotspot = self._ai_target(rect)
             if not point_inside((x, y), rect) or not ai_move_to(x, y):
-                self.request_idle("AI 鼠标操作无法确认位于雷电模拟器客户区内")
+                self.request_idle("AI 鼠标操作无法确认位于雷电模拟器客户区内", token)
                 return
             time.sleep(0.05)
             rect = valid_client(hwnd, True) if hwnd else None
@@ -1345,10 +1346,10 @@ class Controller:
             except (TypeError, ValueError):
                 should_click = False
             if rect is None or not point_inside(cursor_position(), rect):
-                self.request_idle("雷电模拟器客户区异常或鼠标已离开客户区")
+                self.request_idle("雷电模拟器客户区异常或鼠标已离开客户区", token)
                 return
             if should_click and self.resources.allow_compute() and not ai_left_click():
-                self.request_idle("AI 鼠标点击无法执行")
+                self.request_idle("AI 鼠标点击无法执行", token)
                 return
             time.sleep(max(0.7, self.resources.interval()))
 
@@ -1366,10 +1367,12 @@ class Controller:
             except Exception:
                 pass
 
-    def request_idle(self, reason):
+    def request_idle(self, reason, token=None):
         with self.lock:
+            if token is not None and token != self.epoch:
+                return False
             if self.state == "idle":
-                return
+                return False
             self.cancel_event.set()
             self.epoch += 1
             previous = self.state
@@ -1377,6 +1380,7 @@ class Controller:
         self._close_active_session(reason)
         self.emit("progress", 0.0)
         self.post_state(reason if previous != "sleep" else "睡眠模式已中止：" + reason)
+        return True
 
     def start_sleep(self):
         with self.lock:
@@ -1402,16 +1406,19 @@ class Controller:
         with self.lock:
             if token != self.epoch or self.state != "training":
                 return
+            self.epoch += 1
+            sleep_token = self.epoch
+            self.cancel_event = threading.Event()
             self.state = "sleep"
         self._close_active_session("AI 判断进入睡眠模式")
         self.post_state("AI 判断当前值得进入睡眠模式")
-        threading.Thread(target=self._sleep_monitor, args=(token,), name="AutoSleepMonitor", daemon=True).start()
-        threading.Thread(target=self._sleep_worker, args=(token, True), name="AutoSleepWorker", daemon=True).start()
+        threading.Thread(target=self._sleep_monitor, args=(sleep_token,), name="AutoSleepMonitor", daemon=True).start()
+        threading.Thread(target=self._sleep_worker, args=(sleep_token, True), name="AutoSleepWorker", daemon=True).start()
 
     def _sleep_monitor(self, token):
         while self._is_current(token, ("sleep",)):
             if user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000:
-                self.request_idle("检测到 ESC 键")
+                self.request_idle("检测到 ESC 键", token)
                 return
             time.sleep(0.08)
 
@@ -1600,6 +1607,7 @@ class Panel:
         self.mode_buttons = []
         self.configuration_buttons = []
         self.scroll_canvas = None
+        self.panel_hidden_for_mode = False
         self.build()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(90, self.drain)
@@ -1620,6 +1628,7 @@ class Panel:
     def build(self):
         self.root.title("雷电智能学习与训练控制面板")
         self.root.geometry("960x660")
+        self.root.minsize(760, 560)
         self.root.resizable(True, True)
         self.root.configure(bg="#101826")
         self.root.grid_columnconfigure(0, weight=1)
@@ -1690,8 +1699,8 @@ class Panel:
         for index in range(4):
             actions.grid_columnconfigure(index, weight=1)
         info_button = self.button(actions, "更多信息", self.more_info, "#06b6d4", row=0, column=0, sticky="ew", padx=(0, 7))
-        learn = self.button(actions, "学习模式", lambda: self.controller.start_session("learning"), "#3b82f6", row=0, column=1, sticky="ew", padx=7)
-        train = self.button(actions, "训练模式", lambda: self.controller.start_session("training"), "#a855f7", row=0, column=2, sticky="ew", padx=7)
+        learn = self.button(actions, "学习模式", lambda: self.start_mode("learning"), "#3b82f6", row=0, column=1, sticky="ew", padx=7)
+        train = self.button(actions, "训练模式", lambda: self.start_mode("training"), "#a855f7", row=0, column=2, sticky="ew", padx=7)
         sleep = self.button(actions, "睡眠模式", self.controller.start_sleep, "#ef4444", row=0, column=3, sticky="ew", padx=(7, 0))
         self.mode_buttons = [learn, train, sleep]
         Label(body, text="任务进度", bg="#f8fafc", fg="#334155", font=("Microsoft YaHei UI", 10, "bold"), anchor="w").grid(row=6, column=0, sticky="w", pady=(17, 6))
@@ -1723,6 +1732,35 @@ class Panel:
             return "break"
         except Exception:
             return None
+
+    def restore_panel(self):
+        if not self.panel_hidden_for_mode:
+            return
+        self.panel_hidden_for_mode = False
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.update_idletasks()
+        except Exception:
+            pass
+
+    def start_mode(self, mode):
+        if self.controller.busy():
+            self.controller.start_session(mode)
+            return False
+        self.panel_hidden_for_mode = True
+        try:
+            self.root.withdraw()
+            self.root.update()
+            time.sleep(0.08)
+        except Exception:
+            self.restore_panel()
+            self.controller.enqueue("notice", "控制面板无法临时隐藏，未进入模式。")
+            return False
+        started = self.controller.start_session(mode)
+        if not started:
+            self.restore_panel()
+        return started
 
     def protect_configuration(self):
         if self.controller.busy():
@@ -1827,6 +1865,8 @@ class Panel:
                     detail = payload.get("detail", "")
                     self.status_var.set(detail or "控制面板已就绪。")
                     self.performance_var.set("CPU {:.1f}% · 内存 {:.1f}%".format(payload.get("cpu", 0.0), payload.get("memory", 0.0)))
+                    if state == "idle":
+                        self.restore_panel()
                     normal = "normal" if state == "idle" else "disabled"
                     for button in self.mode_buttons:
                         button.configure(state=normal)
