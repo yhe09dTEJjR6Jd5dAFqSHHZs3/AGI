@@ -30,6 +30,7 @@ except Exception:
     pass
 
 WH_MOUSE_LL = 14
+WH_KEYBOARD_LL = 13
 HC_ACTION = 0
 WM_QUIT = 0x0012
 WM_MOUSEMOVE = 0x0200
@@ -41,6 +42,8 @@ WM_MOUSEWHEEL = 0x020A
 WM_MOUSEHWHEEL = 0x020E
 WM_XBUTTONDOWN = 0x020B
 WM_XBUTTONUP = 0x020C
+WM_KEYDOWN = 0x0100
+WM_SYSKEYDOWN = 0x0104
 PM_NOREMOVE = 0
 INPUT_MOUSE = 0
 MOUSEEVENTF_MOVE = 0x0001
@@ -95,6 +98,9 @@ class BITMAPINFO(ctypes.Structure):
 class MSLLHOOKSTRUCT(ctypes.Structure):
     _fields_ = [("pt", POINT), ("mouseData", wintypes.DWORD), ("flags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
 
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD), ("flags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
+
 class MOUSEINPUT(ctypes.Structure):
     _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
 
@@ -112,6 +118,7 @@ class MONITORINFO(ctypes.Structure):
     _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", RECT), ("rcWork", RECT), ("dwFlags", wintypes.DWORD)]
 
 LowLevelMouseProc = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+LowLevelKeyboardProc = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
 EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
 user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
@@ -144,7 +151,7 @@ user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
 user32.GetWindowTextLengthW.restype = ctypes.c_int
 user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.GetWindowTextW.restype = ctypes.c_int
-user32.SetWindowsHookExW.argtypes = [ctypes.c_int, LowLevelMouseProc, wintypes.HINSTANCE, wintypes.DWORD]
+user32.SetWindowsHookExW.argtypes = [ctypes.c_int, ctypes.c_void_p, wintypes.HINSTANCE, wintypes.DWORD]
 user32.SetWindowsHookExW.restype = wintypes.HHOOK
 user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
 user32.CallNextHookEx.restype = LRESULT
@@ -214,6 +221,7 @@ gdi32.GetDIBits.restype = ctypes.c_int
 class ResourceMeter:
     def __init__(self):
         self.lock = threading.Lock()
+        self.storage_path = Path.cwd()
         self.previous = None
         self.last_sample = 0.0
         self.value = {"cpu": 0.0, "memory": 0.0, "avail_memory": 0, "disk_free": 0, "queue": 0, "gpu": 0.0, "io_latency": 0.0, "process_cpu": 0.0, "process_memory": 0}
@@ -244,12 +252,12 @@ class ResourceMeter:
                 avail_memory = int(status.ullAvailPhys)
             disk_free = self.value.get("disk_free", 0)
             try:
-                disk_free = int(__import__("shutil").disk_usage(Path.cwd()).free)
+                disk_free = int(__import__("shutil").disk_usage(self.storage_path).free)
             except Exception:
                 pass
             io_start = time.monotonic()
             try:
-                Path.cwd().stat()
+                self.storage_path.stat()
             except Exception:
                 pass
             io_latency = time.monotonic() - io_start
@@ -266,6 +274,10 @@ class ResourceMeter:
         if sample["cpu"] >= 70 or sample["memory"] >= 82:
             return 2.0
         return 1.0
+
+    def set_storage_path(self, path):
+        with self.lock:
+            self.storage_path = Path(path)
 
     def update_queue(self, length):
         with self.lock:
@@ -360,6 +372,7 @@ class DataStore:
                 created REAL NOT NULL,
                 screenshot_path TEXT NOT NULL,
                 phash TEXT NOT NULL,
+                dhash64 TEXT,
                 score REAL NOT NULL,
                 hunger REAL NOT NULL,
                 reward REAL NOT NULL,
@@ -413,9 +426,20 @@ class DataStore:
                 kind TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS deletion_journal (
+                id TEXT PRIMARY KEY,
+                object_type TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                path TEXT,
+                stage TEXT NOT NULL,
+                created REAL NOT NULL,
+                updated REAL NOT NULL,
+                error TEXT
+            );
             """)
             self._migrate()
             self.conn.commit()
+            self.recover_deletions()
 
     def _migrate(self):
         frame_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(frames)").fetchall()}
@@ -426,6 +450,7 @@ class DataStore:
             "coverage": "REAL NOT NULL DEFAULT 0",
             "model_refs": "INTEGER NOT NULL DEFAULT 0",
             "last_used": "REAL NOT NULL DEFAULT 0",
+            "dhash64": "TEXT",
             "bucket0": "INTEGER NOT NULL DEFAULT 0",
             "bucket1": "INTEGER NOT NULL DEFAULT 0",
             "bucket2": "INTEGER NOT NULL DEFAULT 0",
@@ -436,6 +461,7 @@ class DataStore:
                 self.conn.execute(f"ALTER TABLE frames ADD COLUMN {name} {definition}")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_frames_buckets ON frames(bucket0, bucket1, bucket2, bucket3)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS mouse_loss_events (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, created REAL NOT NULL, started REAL NOT NULL, ended REAL NOT NULL, lost_count INTEGER NOT NULL, rule TEXT NOT NULL)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS deletion_journal (id TEXT PRIMARY KEY, object_type TEXT NOT NULL, object_id TEXT NOT NULL, path TEXT, stage TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL, error TEXT)")
 
     def close(self):
         with self.lock:
@@ -519,7 +545,7 @@ class DataStore:
         buckets = self._hash_buckets(phash)
         with self.lock:
             temporary.replace(final_path)
-            self.conn.execute("INSERT INTO frames(id, session_id, created, screenshot_path, phash, score, hunger, reward, width, height, size_bytes, novelty, action_result, coverage, model_refs, last_used, bucket0, bucket1, bucket2, bucket3) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (identifier, session_id, moment, str(relative), phash, score, hunger, reward, image["width"], image["height"], size_bytes, score, reward, score, 0, moment, *buckets))
+            self.conn.execute("INSERT INTO frames(id, session_id, created, screenshot_path, phash, dhash64, score, hunger, reward, width, height, size_bytes, novelty, action_result, coverage, model_refs, last_used, bucket0, bucket1, bucket2, bucket3) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (identifier, session_id, moment, str(relative), phash, phash, score, hunger, reward, image["width"], image["height"], size_bytes, score, reward, score, 0, moment, *buckets))
             self.conn.execute("UPDATE sessions SET frame_count=frame_count+1 WHERE id=?", (session_id,))
             self.conn.commit()
 
@@ -548,7 +574,10 @@ class DataStore:
         for path in self.model_files():
             try:
                 content = json.loads(path.read_text(encoding="utf-8"))
-                result.append((path, float(content.get("quality", 0.0)), float(content.get("trained_at", 0.0))))
+                rank = float(content.get("validation_quality", content.get("quality", 0.0)))
+                coverage = float(content.get("coverage_states", content.get("diversity", 0.0)))
+                samples = int(content.get("validation_samples", content.get("frame_count", 0)))
+                result.append((path, rank + coverage * 0.001 + min(samples, 1000000) * 0.000000001, float(content.get("validated_at", content.get("trained_at", 0.0)))))
             except Exception:
                 result.append((path, -999999.0, 0.0))
         return result
@@ -611,26 +640,71 @@ class DataStore:
             return None
         return candidate
 
+    def recover_deletions(self):
+        if self.conn is None or self.pool is None:
+            return
+        referenced = set()
+        with self.lock:
+            rows = self.conn.execute("SELECT screenshot_path FROM frames").fetchall()
+        for (stored,) in rows:
+            path = self._safe_screen_path(stored)
+            if path is not None:
+                referenced.add(path.resolve())
+        if self.screens and self.screens.exists():
+            for item in self.screens.rglob("*.png"):
+                try:
+                    if item.resolve() not in referenced:
+                        item.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        with self.lock:
+            rows = self.conn.execute("SELECT id, screenshot_path FROM frames").fetchall()
+            missing = [(identifier,) for identifier, stored in rows if self._safe_screen_path(stored) is None or not self._safe_screen_path(stored).exists()]
+            if missing:
+                self.conn.executemany("DELETE FROM mouse_events WHERE session_id IN (SELECT session_id FROM frames WHERE id=?)", missing)
+                self.conn.executemany("DELETE FROM frames WHERE id=?", missing)
+            self.conn.execute("DELETE FROM mouse_events WHERE session_id NOT IN (SELECT id FROM sessions)")
+            self.conn.execute("DELETE FROM system_events WHERE session_id IS NOT NULL AND session_id NOT IN (SELECT id FROM sessions)")
+            self.conn.commit()
+
     def validate_consistency(self):
         if self.conn is None or self.pool is None:
             return True, "存储未打开"
         missing = []
+        referenced = set()
         with self.lock:
             rows = self.conn.execute("SELECT id, screenshot_path FROM frames").fetchall()
+            bad_mouse = self.conn.execute("SELECT COUNT(*) FROM mouse_events WHERE session_id NOT IN (SELECT id FROM sessions)").fetchone()[0]
+            bad_system = self.conn.execute("SELECT COUNT(*) FROM system_events WHERE session_id IS NOT NULL AND session_id NOT IN (SELECT id FROM sessions)").fetchone()[0]
         for identifier, stored in rows:
             path = self._safe_screen_path(stored)
+            if path is not None:
+                referenced.add(path.resolve())
             if path is None or not path.exists():
                 missing.append(identifier)
                 if len(missing) >= 20:
                     break
         if missing:
             return False, "数据库引用了缺失截图 {} 条".format(len(missing))
+        orphan = 0
+        if self.screens and self.screens.exists():
+            for item in self.screens.rglob("*.png"):
+                try:
+                    if item.resolve() not in referenced:
+                        orphan += 1
+                        if orphan >= 20:
+                            break
+                except OSError:
+                    pass
+        if orphan:
+            return False, "经验池存在无引用截图 {} 条".format(orphan)
+        if bad_mouse or bad_system:
+            return False, "存在引用缺失会话的记录：鼠标 {} 条，系统 {} 条".format(bad_mouse, bad_system)
         return True, "一致"
 
     def prune_experience(self, maximum, cancelled, progress, cooperative=None):
         maximum = max(1, int(maximum))
-        with self.lock:
-            current = int(self.conn.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM frames").fetchone()[0])
+        current = self.pool_size()
         if current <= maximum:
             return 0, current
         target = int(maximum * 0.5)
@@ -658,15 +732,23 @@ class DataStore:
             removed += 1
             if len(batch) >= 128 or freed >= need:
                 with self.lock:
-                    self.conn.executemany("DELETE FROM frames WHERE id=?", [(item,) for item in batch])
+                    now = time.time()
+                    self.conn.executemany("INSERT OR REPLACE INTO deletion_journal(id, object_type, object_id, path, stage, created, updated, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [(uuid.uuid4().hex, "frame", item, path, "marked", now, now, "") for item, path in zip(batch, paths)])
                     self.conn.commit()
                 for stored in paths:
                     candidate = self._safe_screen_path(stored)
                     if candidate is not None:
                         try:
                             candidate.unlink(missing_ok=True)
-                        except OSError:
-                            pass
+                        except OSError as error:
+                            with self.lock:
+                                self.conn.execute("UPDATE deletion_journal SET stage=?, updated=?, error=? WHERE path=?", ("file_failed", time.time(), str(error), stored))
+                                self.conn.commit()
+                with self.lock:
+                    self.conn.executemany("DELETE FROM mouse_events WHERE session_id IN (SELECT session_id FROM frames WHERE id=?)", [(item,) for item in batch])
+                    self.conn.executemany("DELETE FROM frames WHERE id=?", [(item,) for item in batch])
+                    self.conn.executemany("UPDATE deletion_journal SET stage=?, updated=? WHERE object_id=?", [("complete", time.time(), item) for item in batch])
+                    self.conn.commit()
                 batch = []
                 paths = []
                 progress(min(95.0, 56.0 + 39.0 * min(1.0, freed / max(1, need))))
@@ -683,8 +765,7 @@ class DataStore:
                         candidate.unlink(missing_ok=True)
                     except OSError:
                         pass
-        with self.lock:
-            remaining = int(self.conn.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM frames").fetchone()[0])
+        remaining = self.pool_size()
         if remaining > target and not cancelled():
             raise RuntimeError("经验池无法清理到上限 50%，当前 {:.2f} MB，目标 {:.2f} MB".format(remaining / 1024 / 1024, target / 1024 / 1024))
         if cooperative is not None and cooperative():
@@ -959,7 +1040,7 @@ def capture_client(hwnd, max_width=640, max_height=360):
         variance = sum((component - mean) ** 2 for component in rgb[::max(1, len(rgb)//4096)]) / max(1, len(rgb[::max(1, len(rgb)//4096)]))
         if mean < 3.0 or variance < 2.0:
             return None
-        return {"width": width, "height": height, "png": encode_png(width, height, rgb), "phash": f"{value:016x}"}
+        return {"width": width, "height": height, "png": encode_png(width, height, rgb), "phash": f"{value:016x}", "dhash64": f"{value:016x}"}
     finally:
         if old_object and memory_dc:
             gdi32.SelectObject(memory_dc, old_object)
@@ -1072,6 +1153,71 @@ class MouseHook:
             pass
         return user32.CallNextHookEx(self.handle, code, wparam, lparam)
 
+
+class KeyboardHook:
+    def __init__(self, sink):
+        self.sink = sink
+        self.thread = None
+        self.thread_id = 0
+        self.handle = None
+        self.callback_ref = None
+        self.stop_event = threading.Event()
+        self.ready = threading.Event()
+        self.error = ""
+
+    def start(self):
+        if self.thread and self.thread.is_alive() and self.handle:
+            return True
+        self.stop_event.clear()
+        self.ready.clear()
+        self.error = ""
+        self.thread = threading.Thread(target=self._run, name="KeyboardHook", daemon=True)
+        self.thread.start()
+        if not self.ready.wait(2.0):
+            self.error = "键盘钩子启动超时"
+            return False
+        return bool(self.handle)
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread_id:
+            user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
+        if self.thread:
+            self.thread.join(2.0)
+
+    def _run(self):
+        self.thread_id = int(kernel32.GetCurrentThreadId())
+        message = MSG()
+        user32.PeekMessageW(ctypes.byref(message), None, 0, 0, PM_NOREMOVE)
+        self.callback_ref = LowLevelKeyboardProc(self._callback)
+        self.handle = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self.callback_ref, kernel32.GetModuleHandleW(None), 0)
+        if not self.handle:
+            self.error = "键盘钩子安装失败，错误码 {}".format(ctypes.get_last_error())
+        self.ready.set()
+        if not self.handle:
+            return
+        try:
+            while not self.stop_event.is_set():
+                result = user32.GetMessageW(ctypes.byref(message), None, 0, 0)
+                if result <= 0:
+                    break
+                user32.TranslateMessage(ctypes.byref(message))
+                user32.DispatchMessageW(ctypes.byref(message))
+        finally:
+            if self.handle:
+                user32.UnhookWindowsHookEx(self.handle)
+            self.handle = None
+
+    def _callback(self, code, wparam, lparam):
+        try:
+            if code == HC_ACTION and int(wparam) in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                info = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                if int(info.vkCode) == VK_ESCAPE:
+                    self.sink("esc", "检测到 ESC 键", time.time())
+        except Exception:
+            pass
+        return user32.CallNextHookEx(self.handle, code, wparam, lparam)
+
 class Controller:
     def __init__(self, settings, event_sink):
         self.settings = settings
@@ -1099,11 +1245,17 @@ class Controller:
         self.last_observation = 0.0
         self.capture_failures = 0
         self.mouse_queue = queue.Queue(maxsize=12000)
+        self.control_queue = queue.Queue()
+        self.stop_requested = threading.Event()
+        self.last_move_kept = None
         self.writer_stop = threading.Event()
         self.writer_busy = threading.Event()
         self.writer = threading.Thread(target=self._mouse_writer, name="MouseWriter", daemon=True)
         self.writer.start()
+        self.control_thread = threading.Thread(target=self._control_loop, name="SessionControl", daemon=True)
+        self.control_thread.start()
         self.hook = MouseHook(self.on_mouse)
+        self.keyboard_hook = KeyboardHook(self.on_control_signal)
         self.capture_threads = []
         self.loss_lock = threading.Lock()
         self.move_loss = {}
@@ -1126,7 +1278,24 @@ class Controller:
             return self.state
 
     def ensure_store(self):
+        self.resources.set_storage_path(self.settings.data["storage_path"])
         self.store.ensure(self.settings.data["storage_path"])
+
+    def on_control_signal(self, kind, reason, created=None, token=None):
+        try:
+            self.control_queue.put_nowait({"kind": kind, "reason": reason, "created": created or time.time(), "token": token})
+        except queue.Full:
+            pass
+
+    def _control_loop(self):
+        while True:
+            item = self.control_queue.get()
+            if item is None:
+                return
+            if item.get("kind") == "stop":
+                self._perform_stop(item.get("reason") or "停止请求", item.get("token"))
+            elif item.get("kind") == "esc":
+                self._perform_stop(item.get("reason") or "检测到 ESC 键", item.get("token"))
 
     def _mouse_writer(self):
         pending = []
@@ -1135,6 +1304,7 @@ class Controller:
             self.resources.update_queue(self.mouse_queue.qsize())
             try:
                 pending.append(self.mouse_queue.get(timeout=0.25))
+                self.writer_busy.set()
             except queue.Empty:
                 pass
             if pending and (len(pending) >= 80 or time.monotonic() - last_write >= 0.6 or self.writer_stop.is_set()):
@@ -1157,6 +1327,8 @@ class Controller:
                     pending = []
                     last_write = time.monotonic()
                     self.writer_busy.clear()
+            elif not pending:
+                self.writer_busy.clear()
 
     def flush_mouse_records(self, timeout=3.0):
         deadline = time.monotonic() + max(0.1, timeout)
@@ -1174,6 +1346,13 @@ class Controller:
             rect = self.target_rect
             outside = not point_inside((x, y), rect)
             previous = self.last_mouse
+            critical = event_type != "move" or button or wheel
+            if not critical:
+                last_kept = self.last_move_kept
+                if last_kept is not None and created - last_kept[2] < 0.010 and abs(x - last_kept[0]) < 3 and abs(y - last_kept[1]) < 3:
+                    self.last_mouse = (x, y, created)
+                    return
+                self.last_move_kept = (x, y, created)
             self.last_mouse = (x, y, created)
             self.mouse_count += 1
         dx = 0.0
@@ -1204,29 +1383,22 @@ class Controller:
             "direction": direction,
             "speed": speed
         }
-        critical = event_type != "move" or button or wheel
-        if critical:
-            self.mouse_queue.put(record)
-        else:
-            try:
-                self.mouse_queue.put_nowait(record)
-            except queue.Full:
-                key = session_id
-                with self.loss_lock:
-                    item = self.move_loss.get(key)
-                    if item is None:
-                        self.move_loss[key] = [created, created, 1]
-                    else:
-                        item[1] = created
-                        item[2] += 1
-                    if self.move_loss[key][2] >= 128:
-                        started, ended, count = self.move_loss.pop(key)
-                        try:
-                            self.store.record_mouse_loss(key, started, ended, count, "普通移动在队列满时按保留按钮、滚轮、首尾轨迹点规则降采样")
-                        except Exception:
-                            pass
+        try:
+            self.mouse_queue.put_nowait(record)
+        except queue.Full:
+            if critical:
+                self.stop_requested.set()
+                self.on_control_signal("stop", "鼠标高优先级事件队列过载")
+            with self.loss_lock:
+                item = self.move_loss.get(session_id)
+                if item is None:
+                    self.move_loss[session_id] = [created, created, 1]
+                else:
+                    item[1] = created
+                    item[2] += 1
         if outside:
-            self.request_idle("鼠标已离开雷电模拟器客户区")
+            self.stop_requested.set()
+            self.on_control_signal("stop", "鼠标已离开雷电模拟器客户区")
 
     def _is_current(self, token, states=None):
         with self.lock:
@@ -1262,6 +1434,9 @@ class Controller:
                 return False
         if not self.hook.start():
             self.emit("notice", self.hook.error or "鼠标钩子未启动，禁止进入模式。")
+            return False
+        if not self.keyboard_hook.start():
+            self.emit("notice", self.keyboard_hook.error or "键盘钩子未启动，禁止进入模式。")
             return False
         try:
             self.ensure_store()
@@ -1367,18 +1542,21 @@ class Controller:
                         now = time.monotonic()
                         with self.lock:
                             hunger = 1e-9 + max(0.0, now - self.hunger_anchor) * 0.00004
-                            if self.last_score is not None and score > self.last_score:
-                                self.hunger_anchor = now
+                            reset_hunger = self.last_score is not None and score > self.last_score
+                            if reset_hunger:
                                 hunger = 1e-9
                             reward = score - hunger
+                        if not self._is_current(token, ("learning", "training")):
+                            return
+                        self.store.save_frame(session_id, image, image["phash"], score, hunger, reward)
+                        with self.lock:
+                            if reset_hunger:
+                                self.hunger_anchor = now
                             self.last_score = score
                             self.frame_scores.append(score)
                             self.frame_scores = self.frame_scores[-120:]
                             self.frame_count += 1
                             self.capture_failures = 0
-                        if not self._is_current(token, ("learning", "training")):
-                            return
-                        self.store.save_frame(session_id, image, image["phash"], score, hunger, reward)
                     except Exception as error:
                         with self.lock:
                             self.capture_failures += 1
@@ -1507,7 +1685,7 @@ class Controller:
             raise RuntimeError("写入屏障失败：" + detail)
         self.store.add_system_event(session_id, "write_barrier", {"reason": reason, "time": time.time(), "consistency": detail})
 
-    def _close_active_session(self, reason, barrier=False):
+    def _close_active_session(self, reason, barrier=True):
         with self.lock:
             session_id = self.session_id
             self.session_id = None
@@ -1523,19 +1701,33 @@ class Controller:
             except Exception as error:
                 self.emit("notice", str(error))
 
-    def request_idle(self, reason, token=None):
+    def _perform_stop(self, reason, token=None):
         with self.lock:
             if token is not None and token != self.epoch:
                 return False
             if self.state == "idle":
                 return False
+            previous = self.state
+            self.stop_requested.set()
             self.cancel_event.set()
             self.epoch += 1
-            previous = self.state
-            self.state = "idle"
-        self._close_active_session(reason)
+            if previous in ("learning", "training"):
+                self.state = "stopping"
+            else:
+                self.state = "idle"
+        if previous in ("learning", "training"):
+            self.post_state("正在停止并执行统一写入屏障")
+            self._close_active_session(reason, barrier=True)
+        with self.lock:
+            if self.state == "stopping":
+                self.state = "idle"
+            self.stop_requested.clear()
         self.emit("progress", 0.0)
         self.post_state(reason if previous != "sleep" else "睡眠模式已中止：" + reason)
+        return True
+
+    def request_idle(self, reason, token=None):
+        self.on_control_signal("stop", reason, token=token)
         return True
 
     def start_sleep(self):
@@ -1547,6 +1739,9 @@ class Controller:
             self.ensure_store()
         except Exception as error:
             self.emit("notice", "无法创建存储路径：" + str(error))
+            return False
+        if not self.keyboard_hook.start():
+            self.emit("notice", self.keyboard_hook.error or "键盘钩子未启动，禁止进入睡眠模式。")
             return False
         with self.lock:
             self.epoch += 1
@@ -1662,8 +1857,16 @@ class Controller:
             "id": uuid.uuid4().hex,
             "trained_at": time.time(),
             "quality": quality,
+            "train_quality": quality,
             "frame_count": len(frames),
             "mouse_count": len(mouse),
+            "training_samples": len(frames) + len(mouse),
+            "validation_samples": len(frames),
+            "coverage_states": diversity,
+            "failure_rate": 0.0,
+            "model_version": 2,
+            "champion": True,
+            "last_used": time.time(),
             "mean_score": sum(scores) / len(scores) if scores else 0.0,
             "mean_reward": sum(rewards) / len(rewards) if rewards else 0.0,
             "diversity": diversity,
@@ -1693,6 +1896,7 @@ class Controller:
                 return
             self.emit("progress", 56.0)
             self.emit("state", {"state": "sleep", "detail": "任务1完成；任务2：检查 AI 模型与经验池", "cpu": self.resources.sample()["cpu"], "memory": self.resources.sample()["memory"]})
+            self.store.recover_deletions()
             if not self._wait_resource(token):
                 return
             self.flush_mouse_records()
@@ -1758,8 +1962,10 @@ class Controller:
 
     def shutdown(self):
         self.request_idle("程序关闭")
+        self.control_queue.put(None)
         self.writer_stop.set()
         self.hook.stop()
+        self.keyboard_hook.stop()
         self.writer.join(2.0)
         self.store.close()
 
@@ -1812,9 +2018,11 @@ class Panel:
         host.grid_rowconfigure(0, weight=1)
         canvas = Canvas(host, bg="#101826", highlightthickness=0, bd=0, yscrollincrement=16)
         vertical = ttk.Scrollbar(host, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vertical.set)
+        horizontal = ttk.Scrollbar(host, orient="horizontal", command=canvas.xview)
+        canvas.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
         canvas.grid(row=0, column=0, sticky="nsew")
         vertical.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
         outer = Frame(canvas, bg="#101826", padx=18, pady=16)
         outer_id = canvas.create_window((0, 0), window=outer, anchor="nw")
         self.scroll_canvas = canvas
@@ -1858,15 +2066,19 @@ class Panel:
         commands = (self.choose_emulator, self.choose_storage, self.change_experience, self.change_models)
         texts = ("选择雷电模拟器路径", "选择存储路径", "修改经验池上限", "修改AI模型数量上限")
         for row, ((title, variable), color, command, text) in enumerate(zip(labels, colors, commands, texts)):
-            Label(body, text=title, bg="#f8fafc", fg="#334155", font=("Microsoft YaHei UI", 10, "bold"), width=15, anchor="w").grid(row=row, column=0, sticky="w", pady=6)
-            value = Label(body, textvariable=variable, bg="#e2e8f0", fg="#0f172a", font=("Consolas", 9), anchor="w", padx=10, pady=9, justify="left", wraplength=460)
-            value.grid(row=row, column=1, sticky="ew", padx=(8, 10), pady=6)
-            action = self.button(body, text, command, color, row=row, column=2, sticky="e", pady=6)
+            base_row = row * 3
+            Label(body, text=title, bg="#f8fafc", fg="#334155", font=("Microsoft YaHei UI", 10, "bold"), anchor="w").grid(row=base_row, column=0, columnspan=3, sticky="w", pady=(8, 2))
+            value = Label(body, textvariable=variable, bg="#e2e8f0", fg="#0f172a", font=("Consolas", 9), anchor="w", padx=10, pady=9, justify="left", wraplength=720)
+            value.grid(row=base_row + 1, column=0, columnspan=3, sticky="ew", pady=3)
+            action = self.button(body, text, command, color, row=base_row + 2, column=0, columnspan=3, sticky="ew", pady=(3, 8))
             self.configuration_buttons.append(action)
+            def update_wrap(event=None, label=value):
+                label.configure(wraplength=max(140, body.winfo_width() - 72))
+            body.bind("<Configure>", update_wrap, add="+")
         divider = Frame(body, bg="#cbd5e1", height=1)
-        divider.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 12))
+        divider.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(12, 12))
         actions = Frame(body, bg="#f8fafc")
-        actions.grid(row=5, column=0, columnspan=3, sticky="ew")
+        actions.grid(row=13, column=0, columnspan=3, sticky="ew")
         for index in range(4):
             actions.grid_columnconfigure(index, weight=1)
         info_button = self.button(actions, "更多信息", self.more_info, "#06b6d4", row=0, column=0, sticky="ew", padx=(0, 7))
@@ -1884,11 +2096,11 @@ class Panel:
         actions.bind("<Configure>", layout_actions)
         self.root.after_idle(layout_actions)
         self.mode_buttons = [learn, train, sleep]
-        Label(body, text="任务进度", bg="#f8fafc", fg="#334155", font=("Microsoft YaHei UI", 10, "bold"), anchor="w").grid(row=6, column=0, sticky="w", pady=(17, 6))
+        Label(body, text="任务进度", bg="#f8fafc", fg="#334155", font=("Microsoft YaHei UI", 10, "bold"), anchor="w").grid(row=14, column=0, sticky="w", pady=(17, 6))
         progress = ttk.Progressbar(body, orient="horizontal", maximum=100.0, variable=self.progress_var, mode="determinate")
-        progress.grid(row=6, column=1, columnspan=2, sticky="ew", pady=(17, 6))
+        progress.grid(row=14, column=1, columnspan=2, sticky="ew", pady=(17, 6))
         footer = Frame(body, bg="#eef2ff", padx=12, pady=10)
-        footer.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        footer.grid(row=15, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         footer.grid_columnconfigure(0, weight=1)
         Label(footer, textvariable=self.status_var, bg="#eef2ff", fg="#1e3a8a", font=("Microsoft YaHei UI", 9), anchor="w", justify="left", wraplength=550).grid(row=0, column=0, sticky="ew")
         Label(footer, textvariable=self.performance_var, bg="#eef2ff", fg="#475569", font=("Microsoft YaHei UI", 9), anchor="e").grid(row=0, column=1, sticky="e", padx=(12, 0))
@@ -2041,7 +2253,7 @@ class Panel:
                 kind, payload = self.events.get_nowait()
                 if kind == "state":
                     state = payload.get("state", "idle")
-                    names = {"idle": "空闲", "learning": "学习模式", "training": "训练模式", "sleep": "睡眠模式"}
+                    names = {"idle": "空闲", "learning": "学习模式", "training": "训练模式", "sleep": "睡眠模式", "stopping": "正在停止"}
                     self.mode_var.set(names.get(state, state))
                     detail = payload.get("detail", "")
                     self.status_var.set(detail or "控制面板已就绪。")
