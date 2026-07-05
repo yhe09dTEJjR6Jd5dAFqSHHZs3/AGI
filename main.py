@@ -1,5 +1,6 @@
 import ctypes
 import datetime
+from bisect import bisect_right
 import json
 import math
 import os
@@ -23,6 +24,11 @@ user32 = ctypes.WinDLL("user32", use_last_error=True)
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
+try:
+    user32.SetProcessDPIAware()
+except Exception:
+    pass
+
 WH_MOUSE_LL = 14
 HC_ACTION = 0
 WM_QUIT = 0x0012
@@ -36,7 +42,15 @@ WM_MOUSEHWHEEL = 0x020E
 WM_XBUTTONDOWN = 0x020B
 WM_XBUTTONUP = 0x020C
 PM_NOREMOVE = 0
+INPUT_MOUSE = 0
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_ABSOLUTE = 0x8000
+MOUSEEVENTF_VIRTUALDESK = 0x4000
+AI_MOUSE_MARKER = 0x4C445F41495F4D31 if ctypes.sizeof(ctypes.c_void_p) >= 8 else 0x495F4D31
 GA_ROOT = 2
+GW_HWNDPREV = 3
 SRCCOPY = 0x00CC0020
 DIB_RGB_COLORS = 0
 BI_RGB = 0
@@ -79,6 +93,16 @@ class BITMAPINFO(ctypes.Structure):
 class MSLLHOOKSTRUCT(ctypes.Structure):
     _fields_ = [("pt", POINT), ("mouseData", wintypes.DWORD), ("flags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
 
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
+
+class INPUTUNION(ctypes.Union):
+    _fields_ = [("mi", MOUSEINPUT)]
+
+class INPUT(ctypes.Structure):
+    _anonymous_ = ("union",)
+    _fields_ = [("type", wintypes.DWORD), ("union", INPUTUNION)]
+
 class PROCESSENTRY32W(ctypes.Structure):
     _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ULONG_PTR), ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG), ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
 
@@ -105,10 +129,16 @@ user32.GetWindowFromPoint.argtypes = [POINT]
 user32.GetWindowFromPoint.restype = wintypes.HWND
 user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
 user32.GetAncestor.restype = wintypes.HWND
+user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+user32.GetWindow.restype = wintypes.HWND
 user32.EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
 user32.EnumWindows.restype = wintypes.BOOL
 user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+user32.GetWindowTextLengthW.restype = ctypes.c_int
+user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetWindowTextW.restype = ctypes.c_int
 user32.SetWindowsHookExW.argtypes = [ctypes.c_int, LowLevelMouseProc, wintypes.HINSTANCE, wintypes.DWORD]
 user32.SetWindowsHookExW.restype = wintypes.HHOOK
 user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
@@ -131,6 +161,8 @@ user32.GetDC.argtypes = [wintypes.HWND]
 user32.GetDC.restype = wintypes.HDC
 user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
 user32.ReleaseDC.restype = ctypes.c_int
+user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+user32.SendInput.restype = wintypes.UINT
 
 kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wintypes.HMODULE
@@ -161,6 +193,8 @@ gdi32.DeleteDC.argtypes = [wintypes.HDC]
 gdi32.DeleteDC.restype = wintypes.BOOL
 gdi32.BitBlt.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.DWORD]
 gdi32.BitBlt.restype = wintypes.BOOL
+gdi32.StretchBlt.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+gdi32.StretchBlt.restype = wintypes.BOOL
 gdi32.GetDIBits.argtypes = [wintypes.HDC, wintypes.HBITMAP, wintypes.UINT, wintypes.UINT, ctypes.c_void_p, ctypes.POINTER(BITMAPINFO), wintypes.UINT]
 gdi32.GetDIBits.restype = ctypes.c_int
 
@@ -199,21 +233,25 @@ class ResourceMeter:
 
     def interval(self):
         sample = self.sample()
-        if sample["cpu"] >= 92 or sample["memory"] >= 94:
-            return 6.0
-        if sample["cpu"] >= 82 or sample["memory"] >= 88:
-            return 3.0
-        if sample["cpu"] >= 70 or sample["memory"] >= 80:
-            return 1.8
+        if sample["cpu"] >= 90 or sample["memory"] >= 94:
+            return 12.0
+        if sample["cpu"] >= 80 or sample["memory"] >= 88:
+            return 5.0
+        if sample["cpu"] >= 70 or sample["memory"] >= 82:
+            return 2.0
         return 1.0
+
+    def allow_capture(self):
+        sample = self.sample()
+        return sample["cpu"] < 76 and sample["memory"] < 84
 
     def allow_compute(self):
         sample = self.sample()
-        return sample["cpu"] < 85 and sample["memory"] < 90
+        return sample["cpu"] < 60 and sample["memory"] < 76
 
     def critical(self):
         sample = self.sample()
-        return sample["cpu"] >= 95 or sample["memory"] >= 97
+        return sample["cpu"] >= 90 or sample["memory"] >= 94
 
 class Settings:
     def __init__(self):
@@ -427,6 +465,8 @@ class DataStore:
         with self.lock:
             frame_rows = self.conn.execute("SELECT phash, score, reward, created FROM frames ORDER BY created DESC LIMIT 4000").fetchall()
             mouse_rows = self.conn.execute("SELECT event_type, source, relative_x, relative_y, speed, created FROM mouse_events ORDER BY created DESC LIMIT 12000").fetchall()
+        frame_rows.reverse()
+        mouse_rows.reverse()
         return frame_rows, mouse_rows
 
     def pool_size(self):
@@ -441,14 +481,18 @@ class DataStore:
                 pass
         return total
 
-    def prune_models(self, maximum):
+    def prune_models(self, maximum, cancelled=None, cooperative=None):
         summaries = self.model_summaries()
         if len(summaries) <= maximum:
             return 0
-        target = max(0, int(maximum * 0.5))
+        target = max(0, int(math.floor(maximum * 0.5)))
         removed = 0
-        for path, quality, trained_at in sorted(summaries, key=lambda value: (value[1], value[2])):
+        for index, (path, quality, trained_at) in enumerate(sorted(summaries, key=lambda value: (value[1], value[2]))):
             if len(summaries) - removed <= target:
+                break
+            if cancelled is not None and cancelled():
+                break
+            if index % 12 == 0 and cooperative is not None and not cooperative():
                 break
             try:
                 path.unlink(missing_ok=True)
@@ -464,64 +508,131 @@ class DataStore:
             return None
         return candidate
 
-    def prune_experience(self, maximum, cancelled, progress):
+    def prune_experience(self, maximum, cancelled, progress, cooperative=None):
+        maximum = max(1, int(maximum))
         current = self.pool_size()
         if current <= maximum:
             return 0, current
-        target = max(0, int(maximum * 0.5))
+        target = int(maximum * 0.5)
         removed = 0
-        with self.lock:
-            rows = self.conn.execute("SELECT id, screenshot_path FROM frames ORDER BY reward ASC, created ASC").fetchall()
-        for index, row in enumerate(rows):
-            if cancelled():
-                return removed, self.pool_size()
+
+        def compact():
             with self.lock:
-                self.conn.execute("DELETE FROM frames WHERE id=?", (row[0],))
-                self.conn.commit()
-            candidate = self._safe_screen_path(row[1])
+                if self.conn is None:
+                    return
+                try:
+                    self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    self.conn.execute("VACUUM")
+                    self.conn.commit()
+                except sqlite3.Error:
+                    pass
+
+        def remove_screen(stored):
+            candidate = self._safe_screen_path(stored)
             if candidate is not None:
                 try:
                     candidate.unlink(missing_ok=True)
                 except OSError:
                     pass
-            removed += 1
-            if index % 24 == 0:
-                current = self.pool_size()
-                progress(min(92.0, 60.0 + 30.0 * min(1.0, removed / max(1, len(rows)))))
-                if current <= target:
-                    break
-        current = self.pool_size()
-        if current > target:
+
+        def clear_orphan_screens():
+            if self.screens is None or not self.screens.exists():
+                return
             with self.lock:
-                sessions = self.conn.execute("SELECT id FROM sessions ORDER BY started ASC").fetchall()
-            for row in sessions:
+                rows = self.conn.execute("SELECT screenshot_path FROM frames").fetchall()
+            retained = {str(self._safe_screen_path(row[0])) for row in rows if self._safe_screen_path(row[0]) is not None}
+            for index, item in enumerate(self.screens.rglob("*")):
                 if cancelled():
-                    return removed, self.pool_size()
-                session_id = row[0]
-                with self.lock:
-                    paths = self.conn.execute("SELECT screenshot_path FROM frames WHERE session_id=?", (session_id,)).fetchall()
-                    self.conn.execute("DELETE FROM frames WHERE session_id=?", (session_id,))
-                    self.conn.execute("DELETE FROM mouse_events WHERE session_id=?", (session_id,))
-                    self.conn.execute("DELETE FROM system_events WHERE session_id=?", (session_id,))
-                    self.conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
-                    self.conn.commit()
-                for stored in paths:
-                    candidate = self._safe_screen_path(stored[0])
-                    if candidate is not None:
-                        try:
-                            candidate.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                current = self.pool_size()
-                if current <= target:
-                    break
+                    return
+                if index % 24 == 0 and cooperative is not None and not cooperative():
+                    return
+                try:
+                    if item.is_file() and str(item.resolve()) not in retained:
+                        item.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
         with self.lock:
-            try:
-                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                self.conn.execute("VACUUM")
+            frame_rows = self.conn.execute("SELECT id, screenshot_path FROM frames ORDER BY reward ASC, created ASC").fetchall()
+        total_frames = max(1, len(frame_rows))
+        for index, row in enumerate(frame_rows):
+            if cancelled():
+                return removed, self.pool_size()
+            if index % 24 == 0 and cooperative is not None and not cooperative():
+                return removed, self.pool_size()
+            with self.lock:
+                if self.conn is None:
+                    return removed, self.pool_size()
+                self.conn.execute("DELETE FROM frames WHERE id=?", (row[0],))
+                if index % 32 == 31 or index + 1 == len(frame_rows):
+                    self.conn.commit()
+            remove_screen(row[1])
+            removed += 1
+            if index % 24 == 0 or index + 1 == len(frame_rows):
+                progress(min(78.0, 56.0 + 22.0 * (index + 1) / total_frames))
+                if self.pool_size() <= target:
+                    compact()
+                    return removed, self.pool_size()
+
+        with self.lock:
+            sessions = self.conn.execute("""
+                SELECT s.id, COALESCE(AVG(f.reward), -1000000000.0), s.started
+                FROM sessions AS s
+                LEFT JOIN frames AS f ON f.session_id=s.id
+                GROUP BY s.id
+                ORDER BY COALESCE(AVG(f.reward), -1000000000.0) ASC, s.started ASC
+            """).fetchall()
+        total_sessions = max(1, len(sessions))
+        for index, row in enumerate(sessions):
+            if cancelled():
+                return removed, self.pool_size()
+            if index % 8 == 0 and cooperative is not None and not cooperative():
+                return removed, self.pool_size()
+            session_id = row[0]
+            with self.lock:
+                paths = self.conn.execute("SELECT screenshot_path FROM frames WHERE session_id=?", (session_id,)).fetchall()
+                mouse_count = self.conn.execute("SELECT COUNT(*) FROM mouse_events WHERE session_id=?", (session_id,)).fetchone()[0]
+                event_count = self.conn.execute("SELECT COUNT(*) FROM system_events WHERE session_id=?", (session_id,)).fetchone()[0]
+                self.conn.execute("DELETE FROM frames WHERE session_id=?", (session_id,))
+                self.conn.execute("DELETE FROM mouse_events WHERE session_id=?", (session_id,))
+                self.conn.execute("DELETE FROM system_events WHERE session_id=?", (session_id,))
+                self.conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
                 self.conn.commit()
-            except sqlite3.Error:
-                pass
+            for stored in paths:
+                remove_screen(stored[0])
+            removed += len(paths) + int(mouse_count) + int(event_count) + 1
+            progress(min(92.0, 78.0 + 14.0 * (index + 1) / total_sessions))
+            if self.pool_size() <= target:
+                compact()
+                return removed, self.pool_size()
+
+        if cancelled():
+            return removed, self.pool_size()
+        with self.lock:
+            if self.conn is not None:
+                mouse_count = self.conn.execute("SELECT COUNT(*) FROM mouse_events").fetchone()[0]
+                event_count = self.conn.execute("SELECT COUNT(*) FROM system_events").fetchone()[0]
+                self.conn.execute("DELETE FROM mouse_events")
+                self.conn.execute("DELETE FROM system_events")
+                self.conn.commit()
+                removed += int(mouse_count) + int(event_count)
+        clear_orphan_screens()
+        compact()
+        current = self.pool_size()
+        if current > target and not cancelled():
+            with self.lock:
+                if self.conn is not None:
+                    frame_count = self.conn.execute("SELECT COUNT(*) FROM frames").fetchone()[0]
+                    session_count = self.conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+                    self.conn.execute("DELETE FROM frames")
+                    self.conn.execute("DELETE FROM mouse_events")
+                    self.conn.execute("DELETE FROM system_events")
+                    self.conn.execute("DELETE FROM sessions")
+                    self.conn.commit()
+                    removed += int(frame_count) + int(session_count)
+            clear_orphan_screens()
+            compact()
+        progress(96.0)
         return removed, self.pool_size()
 
 def filetime_value(value):
@@ -568,6 +679,30 @@ def cursor_position():
         return (int(point.x), int(point.y))
     return (0, 0)
 
+def send_ai_mouse(x, y, flags, absolute=True):
+    event = INPUT()
+    event.type = INPUT_MOUSE
+    if absolute:
+        screen = virtual_screen_rect()
+        width = max(1, screen[2] - screen[0] - 1)
+        height = max(1, screen[3] - screen[1] - 1)
+        dx = int(max(0, min(65535, round((x - screen[0]) * 65535 / width))))
+        dy = int(max(0, min(65535, round((y - screen[1]) * 65535 / height))))
+        flags |= MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+    else:
+        dx = 0
+        dy = 0
+    event.mi = MOUSEINPUT(dx, dy, 0, flags, 0, AI_MOUSE_MARKER)
+    return int(user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT))) == 1
+
+def ai_move_to(x, y):
+    return send_ai_mouse(x, y, MOUSEEVENTF_MOVE, True)
+
+def ai_left_click():
+    down = send_ai_mouse(0, 0, MOUSEEVENTF_LEFTDOWN, False)
+    up = send_ai_mouse(0, 0, MOUSEEVENTF_LEFTUP, False)
+    return down and up
+
 def virtual_screen_rect():
     left = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
     top = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
@@ -580,17 +715,36 @@ def screen_contains(rect):
 def root_window(hwnd):
     return user32.GetAncestor(hwnd, GA_ROOT)
 
+def rectangle_overlap(first, second):
+    return first[0] < second[2] and second[0] < first[2] and first[1] < second[3] and second[1] < first[3]
+
+def window_rectangle(hwnd):
+    rect = RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    if rect.right <= rect.left or rect.bottom <= rect.top:
+        return None
+    return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+
 def client_unobscured(hwnd, rect):
     own_root = root_window(hwnd)
     if not own_root:
         return False
+    above = user32.GetWindow(own_root, GW_HWNDPREV)
+    checked = set()
+    while above and above not in checked:
+        checked.add(above)
+        if user32.IsWindowVisible(above) and not user32.IsIconic(above):
+            candidate = window_rectangle(above)
+            if candidate is not None and rectangle_overlap(candidate, rect):
+                return False
+        above = user32.GetWindow(above, GW_HWNDPREV)
     x0, y0, x1, y1 = rect
-    padding_x = max(3, min(20, (x1 - x0) // 10))
-    padding_y = max(3, min(20, (y1 - y0) // 10))
-    xs = (x0 + padding_x, (x0 + x1) // 2, x1 - padding_x - 1)
-    ys = (y0 + padding_y, (y0 + y1) // 2, y1 - padding_y - 1)
-    for x in xs:
-        for y in ys:
+    ratios = (0.035, 0.18, 0.35, 0.5, 0.65, 0.82, 0.965)
+    for x_ratio in ratios:
+        x = x0 + min(x1 - x0 - 1, max(0, int((x1 - x0) * x_ratio)))
+        for y_ratio in ratios:
+            y = y0 + min(y1 - y0 - 1, max(0, int((y1 - y0) * y_ratio)))
             found = user32.GetWindowFromPoint(POINT(x, y))
             if not found or root_window(found) != own_root:
                 return False
@@ -610,22 +764,44 @@ def valid_client(hwnd, require_cursor=True):
         return None
     return rect
 
+def window_title(hwnd):
+    length = max(0, int(user32.GetWindowTextLengthW(hwnd)))
+    buffer = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buffer, len(buffer))
+    return buffer.value
+
 def find_emulator_window(executable):
     filename = Path(executable).name.lower()
-    pids = processes_for_name(filename)
+    names = {filename, "dnplayer.exe", "ldplayer.exe", "ldvboxheadless.exe", "ld9boxheadless.exe"}
+    pids = set()
+    for name in names:
+        pids.update(processes_for_name(name))
     candidates = []
-    if pids:
-        def callback(hwnd, _):
-            pid = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if int(pid.value) in pids and user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd):
-                rect = client_rect(hwnd)
-                if rect is not None:
-                    area = (rect[2] - rect[0]) * (rect[3] - rect[1])
-                    candidates.append((area, hwnd))
+
+    def add_candidate(hwnd, matched):
+        if not matched or not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+            return
+        rect = client_rect(hwnd)
+        if rect is None:
+            return
+        area = (rect[2] - rect[0]) * (rect[3] - rect[1])
+        candidates.append((area, hwnd))
+
+    def callback(hwnd, _):
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if int(pid.value) in pids:
+            add_candidate(hwnd, True)
+        return True
+
+    user32.EnumWindows(EnumWindowsProc(callback), 0)
+    if not candidates:
+        tokens = ("dnplayer", "ldplayer", "ldplayer9", "雷电", "leidian")
+        def title_callback(hwnd, _):
+            title = window_title(hwnd).lower()
+            add_candidate(hwnd, any(token in title for token in tokens))
             return True
-        procedure = EnumWindowsProc(callback)
-        user32.EnumWindows(procedure, 0)
+        user32.EnumWindows(EnumWindowsProc(title_callback), 0)
     if not candidates:
         return None
     candidates.sort(reverse=True, key=lambda item: item[0])
@@ -646,10 +822,13 @@ def capture_client(hwnd, max_width=640, max_height=360):
     local = RECT()
     if not user32.GetClientRect(hwnd, ctypes.byref(local)):
         return None
-    width = int(local.right - local.left)
-    height = int(local.bottom - local.top)
-    if width <= 0 or height <= 0:
+    source_width = int(local.right - local.left)
+    source_height = int(local.bottom - local.top)
+    if source_width <= 0 or source_height <= 0:
         return None
+    scale = min(1.0, max_width / source_width, max_height / source_height)
+    width = max(1, int(source_width * scale))
+    height = max(1, int(source_height * scale))
     source_dc = user32.GetDC(hwnd)
     if not source_dc:
         return None
@@ -662,7 +841,7 @@ def capture_client(hwnd, max_width=640, max_height=360):
         if not memory_dc or not bitmap:
             return None
         old_object = gdi32.SelectObject(memory_dc, bitmap)
-        if not gdi32.BitBlt(memory_dc, 0, 0, width, height, source_dc, 0, 0, SRCCOPY):
+        if not gdi32.StretchBlt(memory_dc, 0, 0, width, height, source_dc, 0, 0, source_width, source_height, SRCCOPY):
             return None
         info = BITMAPINFO()
         info.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
@@ -676,19 +855,14 @@ def capture_client(hwnd, max_width=640, max_height=360):
         received = gdi32.GetDIBits(memory_dc, bitmap, 0, height, ctypes.byref(raw), ctypes.byref(info), DIB_RGB_COLORS)
         if received != height:
             return None
-        scale = min(1.0, max_width / width, max_height / height)
-        target_width = max(1, int(width * scale))
-        target_height = max(1, int(height * scale))
-        rgb = bytearray(target_width * target_height * 3)
+        rgb = bytearray(width * height * 3)
         grayscale = [[0] * 9 for _ in range(8)]
-        for y in range(target_height):
-            source_y = min(height - 1, int(y * height / target_height))
-            raw_y = height - 1 - source_y
+        for y in range(height):
+            raw_y = height - 1 - y
             source_row = raw_y * width * 4
-            output_row = y * target_width * 3
-            for x in range(target_width):
-                source_x = min(width - 1, int(x * width / target_width))
-                source_index = source_row + source_x * 4
+            output_row = y * width * 3
+            for x in range(width):
+                source_index = source_row + x * 4
                 output_index = output_row + x * 3
                 blue = raw[source_index]
                 green = raw[source_index + 1]
@@ -697,10 +871,10 @@ def capture_client(hwnd, max_width=640, max_height=360):
                 rgb[output_index + 1] = green
                 rgb[output_index + 2] = blue
         for y in range(8):
-            sy = min(target_height - 1, int((y + 0.5) * target_height / 8))
+            sy = min(height - 1, int((y + 0.5) * height / 8))
             for x in range(9):
-                sx = min(target_width - 1, int((x + 0.5) * target_width / 9))
-                index = (sy * target_width + sx) * 3
+                sx = min(width - 1, int((x + 0.5) * width / 9))
+                index = (sy * width + sx) * 3
                 grayscale[y][x] = (rgb[index] * 299 + rgb[index + 1] * 587 + rgb[index + 2] * 114) // 1000
         value = 0
         for y in range(8):
@@ -708,7 +882,7 @@ def capture_client(hwnd, max_width=640, max_height=360):
                 value <<= 1
                 if grayscale[y][x] > grayscale[y][x + 1]:
                     value |= 1
-        return {"width": target_width, "height": target_height, "png": encode_png(target_width, target_height, rgb), "phash": f"{value:016x}"}
+        return {"width": width, "height": height, "png": encode_png(width, height, rgb), "phash": f"{value:016x}"}
     finally:
         if old_object and memory_dc:
             gdi32.SelectObject(memory_dc, old_object)
@@ -804,7 +978,8 @@ class MouseHook:
                     wheel = 0
                     if int(wparam) in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL):
                         wheel = ctypes.c_short((int(info.mouseData) >> 16) & 0xFFFF).value
-                    self.sink(event_type, button, wheel, int(info.pt.x), int(info.pt.y), time.time())
+                    source = "AI" if int(info.dwExtraInfo) == AI_MOUSE_MARKER else "用户"
+                    self.sink(event_type, button, wheel, int(info.pt.x), int(info.pt.y), time.time(), source)
         except Exception:
             pass
         return user32.CallNextHookEx(self.handle, code, wparam, lparam)
@@ -830,12 +1005,14 @@ class Controller:
         self.frame_count = 0
         self.mouse_count = 0
         self.last_mouse = None
-        self.ai_until = 0.0
         self.ai_step = 0
         self.ai_plan = []
         self.last_model_training = 0.0
+        self.last_observation = 0.0
+        self.capture_failures = 0
         self.mouse_queue = queue.Queue(maxsize=12000)
         self.writer_stop = threading.Event()
+        self.writer_busy = threading.Event()
         self.writer = threading.Thread(target=self._mouse_writer, name="MouseWriter", daemon=True)
         self.writer.start()
         self.hook = MouseHook(self.on_mouse)
@@ -864,29 +1041,45 @@ class Controller:
     def _mouse_writer(self):
         pending = []
         last_write = time.monotonic()
-        while not self.writer_stop.is_set() or not self.mouse_queue.empty():
+        while not self.writer_stop.is_set() or not self.mouse_queue.empty() or pending:
             try:
                 pending.append(self.mouse_queue.get(timeout=0.25))
             except queue.Empty:
                 pass
             if pending and (len(pending) >= 80 or time.monotonic() - last_write >= 0.6 or self.writer_stop.is_set()):
+                self.writer_busy.set()
                 try:
                     self.store.save_mouse_batch(pending)
                 except Exception:
                     pass
-                pending = []
-                last_write = time.monotonic()
+                finally:
+                    pending = []
+                    last_write = time.monotonic()
+                    self.writer_busy.clear()
 
-    def on_mouse(self, event_type, button, wheel, x, y, created):
+    def flush_mouse_records(self, timeout=3.0):
+        deadline = time.monotonic() + max(0.1, timeout)
+        while time.monotonic() < deadline:
+            if self.mouse_queue.empty() and not self.writer_busy.is_set():
+                return True
+            time.sleep(0.04)
+        return self.mouse_queue.empty() and not self.writer_busy.is_set()
+
+    def on_mouse(self, event_type, button, wheel, x, y, created, source):
+        outside = False
         with self.lock:
             if self.state not in ("learning", "training") or not self.session_id or not self.target_rect:
                 return
             session_id = self.session_id
             rect = self.target_rect
-            source = "AI" if self.state == "training" and time.monotonic() <= self.ai_until else "用户"
+            outside = not point_inside((x, y), rect)
             previous = self.last_mouse
-            self.last_mouse = (x, y, created)
-            self.mouse_count += 1
+            if not outside:
+                self.last_mouse = (x, y, created)
+                self.mouse_count += 1
+        if outside:
+            self.request_idle("鼠标已离开雷电模拟器客户区")
+            return
         dx = 0.0
         dy = 0.0
         direction = 0.0
@@ -947,7 +1140,8 @@ class Controller:
 
     def start_session(self, mode, automatic=False):
         with self.lock:
-            if self.state != "idle":
+            permitted = self.state == "idle" or (automatic and self.state == "sleep")
+            if not permitted:
                 if not automatic:
                     self.emit("notice", "当前不是空闲状态。")
                 return False
@@ -979,16 +1173,18 @@ class Controller:
             self.session_mode = mode
             self.session_started = time.monotonic()
             self.hunger_anchor = self.session_started
+            self.last_observation = self.session_started
+            self.capture_failures = 0
             self.last_score = None
             self.frame_scores = []
             self.frame_count = 0
             self.mouse_count = 0
             self.last_mouse = None
-            self.ai_until = 0.0
             self.ai_step = 0
             model = self.store.best_model() if mode == "training" else None
-            self.ai_plan = model.get("hotspots", []) if isinstance(model, dict) else []
-        self.store.add_system_event(session_id, "mode_enter", {"mode": mode, "automatic": automatic, "time": time.time()})
+            plan = model.get("hotspots", []) if isinstance(model, dict) else []
+            self.ai_plan = [item for item in plan if isinstance(item, dict)] if isinstance(plan, list) else []
+        self.store.add_system_event(session_id, "mode_enter", {"mode": mode, "automatic": automatic, "time": time.time(), "client_rect": rect, "resource": self.resources.sample()})
         self.post_state("已进入" + ("学习模式" if mode == "learning" else "训练模式"))
         threading.Thread(target=self._capture_loop, args=(token,), name="CaptureLoop", daemon=True).start()
         threading.Thread(target=self._monitor_loop, args=(token,), name="SessionMonitor", daemon=True).start()
@@ -998,19 +1194,50 @@ class Controller:
 
     def _capture_loop(self, token):
         while self._is_current(token, ("learning", "training")):
-            if self.resources.critical():
-                self.emit("state", {"state": self.current_state(), "detail": "系统资源繁忙，已自动限速记录", "cpu": self.resources.sample()["cpu"], "memory": self.resources.sample()["memory"]})
-                time.sleep(4.0)
+            if not self.resources.allow_capture():
+                sample = self.resources.sample()
+                self.emit("state", {"state": self.current_state(), "detail": "系统资源繁忙，已自动限速记录", "cpu": sample["cpu"], "memory": sample["memory"]})
+                time.sleep(max(2.0, self.resources.interval()))
                 continue
             interval = self.resources.interval()
             with self.lock:
                 hwnd = self.target_hwnd
                 session_id = self.session_id
-            if hwnd and session_id:
+                mode = self.session_mode
+            rect = valid_client(hwnd, True) if hwnd else None
+            if rect is None:
+                self.request_idle("雷电模拟器客户区异常或鼠标已离开客户区")
+                return
+            observation_due = False
+            now_observation = time.monotonic()
+            with self.lock:
+                self.target_rect = rect
+                if now_observation - self.last_observation >= 5.0:
+                    self.last_observation = now_observation
+                    observation_due = True
+            if session_id and observation_due:
+                try:
+                    self.store.add_system_event(session_id, "client_observation", {"mode": mode, "client_rect": rect, "cursor": cursor_position(), "resource": self.resources.sample()})
+                except Exception:
+                    pass
+            if session_id:
                 image = capture_client(hwnd)
-                if image is not None:
+                if not self._is_current(token, ("learning", "training")):
+                    return
+                if image is None:
+                    with self.lock:
+                        self.capture_failures += 1
+                        failures = self.capture_failures
+                    if failures >= 3:
+                        self.request_idle("连续无法记录雷电模拟器画面")
+                        return
+                    sample = self.resources.sample()
+                    self.emit("state", {"state": self.current_state(), "detail": "暂时无法记录画面，正在重试", "cpu": sample["cpu"], "memory": sample["memory"]})
+                else:
                     try:
                         historical = self.store.recent_hashes()
+                        if not self._is_current(token, ("learning", "training")):
+                            return
                         score = frame_score(image["phash"], historical)
                         now = time.monotonic()
                         with self.lock:
@@ -1023,9 +1250,19 @@ class Controller:
                             self.frame_scores.append(score)
                             self.frame_scores = self.frame_scores[-120:]
                             self.frame_count += 1
+                            self.capture_failures = 0
+                        if not self._is_current(token, ("learning", "training")):
+                            return
                         self.store.save_frame(session_id, image, image["phash"], score, hunger, reward)
                     except Exception as error:
-                        self.emit("state", {"state": self.current_state(), "detail": "记录已限速：" + str(error), "cpu": self.resources.sample()["cpu"], "memory": self.resources.sample()["memory"]})
+                        with self.lock:
+                            self.capture_failures += 1
+                            failures = self.capture_failures
+                        if failures >= 3:
+                            self.request_idle("连续无法写入经验池：" + str(error))
+                            return
+                        sample = self.resources.sample()
+                        self.emit("state", {"state": self.current_state(), "detail": "记录已限速：" + str(error), "cpu": sample["cpu"], "memory": sample["memory"]})
             time.sleep(interval)
 
     def _monitor_loop(self, token):
@@ -1071,30 +1308,49 @@ class Controller:
             step = self.ai_step
             self.ai_step += 1
             hotspots = list(self.ai_plan)
-        if hotspots and step % 3 != 2:
+        hotspot = None
+        x_ratio = 0.08 + 0.84 * ((step * 0.618033988749895) % 1.0)
+        y_ratio = 0.08 + 0.84 * ((step * 0.414213562373095) % 1.0)
+        if hotspots and step % 4 != 3:
             item = hotspots[step % len(hotspots)]
-            x_ratio = min(0.95, max(0.05, float(item.get("x", 0.5))))
-            y_ratio = min(0.95, max(0.05, float(item.get("y", 0.5))))
-        else:
-            x_ratio = 0.08 + 0.84 * ((step * 0.618033988749895) % 1.0)
-            y_ratio = 0.08 + 0.84 * ((step * 0.414213562373095) % 1.0)
+            try:
+                x_ratio = min(0.95, max(0.05, float(item.get("x", 0.5))))
+                y_ratio = min(0.95, max(0.05, float(item.get("y", 0.5))))
+                hotspot = item
+            except (TypeError, ValueError):
+                hotspot = None
         x = rect[0] + int(width * x_ratio)
         y = rect[1] + int(height * y_ratio)
-        return x, y
+        return x, y, hotspot
 
     def _ai_loop(self, token):
         while self._is_current(token, ("training",)):
             if not self.resources.allow_compute():
-                time.sleep(1.5)
+                time.sleep(max(1.5, self.resources.interval()))
                 continue
             with self.lock:
-                rect = self.target_rect
-            if rect:
-                x, y = self._ai_target(rect)
-                with self.lock:
-                    self.ai_until = time.monotonic() + 0.18
-                user32.SetCursorPos(x, y)
-            time.sleep(max(0.55, self.resources.interval() * 0.9))
+                hwnd = self.target_hwnd
+            rect = valid_client(hwnd, True) if hwnd else None
+            if rect is None:
+                self.request_idle("雷电模拟器客户区异常或鼠标已离开客户区")
+                return
+            x, y, hotspot = self._ai_target(rect)
+            if not point_inside((x, y), rect) or not ai_move_to(x, y):
+                self.request_idle("AI 鼠标操作无法确认位于雷电模拟器客户区内")
+                return
+            time.sleep(0.05)
+            rect = valid_client(hwnd, True) if hwnd else None
+            try:
+                should_click = isinstance(hotspot, dict) and float(hotspot.get("weight", 0.0)) >= 3.0 and int(hotspot.get("clicks", 0)) > 0
+            except (TypeError, ValueError):
+                should_click = False
+            if rect is None or not point_inside(cursor_position(), rect):
+                self.request_idle("雷电模拟器客户区异常或鼠标已离开客户区")
+                return
+            if should_click and self.resources.allow_compute() and not ai_left_click():
+                self.request_idle("AI 鼠标点击无法执行")
+                return
+            time.sleep(max(0.7, self.resources.interval()))
 
     def _close_active_session(self, reason):
         with self.lock:
@@ -1170,6 +1426,7 @@ class Controller:
         return not self._cancelled(token)
 
     def _train_model(self, token):
+        self.flush_mouse_records()
         if not self._wait_resource(token):
             return None
         frames, mouse = self.store.collect_training_data()
@@ -1177,24 +1434,54 @@ class Controller:
             return None
         rewards = [float(row[2]) for row in frames]
         scores = [float(row[1]) for row in frames]
+        frame_times = [float(row[3]) for row in frames]
         quality = (sum(rewards) / len(rewards)) if rewards else 0.0
         diversity = len(set(row[0] for row in frames)) / max(1, len(frames))
-        quality += diversity * 0.15
         grid = {}
-        total = max(1, len(mouse))
+        feedback_total = 0.0
+        feedback_count = 0
         for index, row in enumerate(mouse):
-            if index % 700 == 0 and not self._wait_resource(token):
+            if index % 500 == 0 and not self._wait_resource(token):
                 return None
             event_type, source, relative_x, relative_y, speed, created = row
-            if source == "用户" and event_type in ("button_down", "button_up", "move") and relative_x is not None and relative_y is not None and 0.0 <= relative_x <= 1.0 and 0.0 <= relative_y <= 1.0:
-                gx = min(7, max(0, int(float(relative_x) * 8)))
-                gy = min(7, max(0, int(float(relative_y) * 8)))
-                key = (gx, gy)
-                weight = 4.0 if event_type == "button_down" else 1.0
-                grid[key] = grid.get(key, 0.0) + weight
+            if source != "用户" or event_type not in ("button_down", "button_up", "move") or relative_x is None or relative_y is None:
+                continue
+            x = float(relative_x)
+            y = float(relative_y)
+            if not 0.0 <= x <= 1.0 or not 0.0 <= y <= 1.0:
+                continue
+            frame_index = bisect_right(frame_times, float(created))
+            response = 0.0
+            if frame_index < len(frames) and frame_times[frame_index] - float(created) <= 12.0:
+                previous_score = float(frames[frame_index - 1][1]) if frame_index else 0.0
+                score_gain = float(frames[frame_index][1]) - previous_score
+                response = max(-0.75, min(1.0, score_gain * 3.0 + float(frames[frame_index][2]) * 0.60))
+            gx = min(7, max(0, int(x * 8)))
+            gy = min(7, max(0, int(y * 8)))
+            key = (gx, gy)
+            entry = grid.setdefault(key, {"weight": 0.0, "clicks": 0, "feedback": 0.0, "samples": 0})
+            base = 4.0 if event_type == "button_down" else 1.0
+            speed_factor = min(0.35, max(0.0, float(speed or 0.0)) / 5000.0)
+            weight = base * (1.0 + max(0.0, response) * 2.0 + speed_factor)
+            entry["weight"] += weight
+            entry["feedback"] += response
+            entry["samples"] += 1
+            if event_type == "button_down":
+                entry["clicks"] += 1
+            feedback_total += response
+            feedback_count += 1
+        action_quality = feedback_total / max(1, feedback_count)
+        quality += diversity * 0.15 + action_quality * 0.10
         hotspots = []
-        for key, weight in sorted(grid.items(), key=lambda item: item[1], reverse=True)[:12]:
-            hotspots.append({"x": (key[0] + 0.5) / 8.0, "y": (key[1] + 0.5) / 8.0, "weight": weight})
+        for key, entry in sorted(grid.items(), key=lambda item: (item[1]["weight"], item[1]["clicks"], item[1]["feedback"]), reverse=True)[:12]:
+            hotspots.append({
+                "x": (key[0] + 0.5) / 8.0,
+                "y": (key[1] + 0.5) / 8.0,
+                "weight": round(float(entry["weight"]), 6),
+                "clicks": int(entry["clicks"]),
+                "feedback": round(float(entry["feedback"]) / max(1, int(entry["samples"])), 6),
+                "samples": int(entry["samples"])
+            })
         payload = {
             "id": uuid.uuid4().hex,
             "trained_at": time.time(),
@@ -1204,8 +1491,9 @@ class Controller:
             "mean_score": sum(scores) / len(scores) if scores else 0.0,
             "mean_reward": sum(rewards) / len(rewards) if rewards else 0.0,
             "diversity": diversity,
+            "action_quality": action_quality,
             "hotspots": hotspots,
-            "hash_samples": [row[0] for row in frames[:128]]
+            "hash_samples": [row[0] for row in frames[-128:]]
         }
         name = "model_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f") + "_" + payload["id"][:8] + ".json"
         final_path = self.store.models / name
@@ -1229,21 +1517,26 @@ class Controller:
             self.emit("state", {"state": "sleep", "detail": "任务1完成；任务2：检查 AI 模型与经验池", "cpu": self.resources.sample()["cpu"], "memory": self.resources.sample()["memory"]})
             if not self._wait_resource(token):
                 return
-            model_removed = self.store.prune_models(max(1, int(self.settings.data["model_limit"])))
+            self.flush_mouse_records()
+            model_removed = self.store.prune_models(max(1, int(self.settings.data["model_limit"])), lambda: self._cancelled(token), lambda: self._wait_resource(token))
             def update(value):
                 self.emit("progress", value)
-            experience_removed, remaining = self.store.prune_experience(max(1, int(self.settings.data["experience_limit"])), lambda: self._cancelled(token), update)
+            experience_removed, remaining = self.store.prune_experience(max(1, int(self.settings.data["experience_limit"])), lambda: self._cancelled(token), update, lambda: self._wait_resource(token))
             if self._cancelled(token):
                 return
             self.emit("progress", 100.0)
             detail = "任务2完成：删除 AI 模型 {} 个，删除经验 {} 条，经验池 {:.2f} MB".format(model_removed, experience_removed, remaining / 1024 / 1024)
             if resume_training:
                 hwnd, rect, reason = self._find_valid_target(False)
-                if hwnd is None or not self._place_cursor_before_entry(hwnd, rect):
+                if hwnd is None or rect is None or not self._place_cursor_before_entry(hwnd, rect):
                     self._finish_idle(token, "自动睡眠完成，但无法恢复训练：" + (reason or "客户区状态异常"))
                     return
-                self._finish_idle(token, detail + "；准备恢复训练模式")
-                self.start_session("training", automatic=True)
+                if self._cancelled(token) or valid_client(hwnd, True) is None:
+                    self._finish_idle(token, "自动睡眠完成，但雷电模拟器客户区状态异常")
+                    return
+                self.emit("progress", 0.0)
+                if not self.start_session("training", automatic=True):
+                    self._finish_idle(token, "自动睡眠完成，但无法恢复训练模式")
             else:
                 self._finish_idle(token, detail)
         except Exception as error:
@@ -1305,6 +1598,8 @@ class Panel:
         self.performance_var = StringVar(value="CPU 0.0% · 内存 0.0%")
         self.progress_var = DoubleVar(value=0.0)
         self.mode_buttons = []
+        self.configuration_buttons = []
+        self.scroll_canvas = None
         self.build()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(90, self.drain)
@@ -1317,20 +1612,45 @@ class Panel:
         self.events.put((kind, payload))
 
     def button(self, parent, text, command, color, row=None, column=None, **grid):
-        item = Button(parent, text=text, command=command, bg=color, fg="white", activebackground=color, activeforeground="white", relief="flat", bd=0, font=("Microsoft YaHei UI", 10, "bold"), cursor="hand2", padx=14, pady=10)
+        item = Button(parent, text=text, command=command, bg=color, fg="white", activebackground=color, activeforeground="white", relief="flat", bd=0, font=("Microsoft YaHei UI", 10, "bold"), cursor="hand2", padx=14, pady=10, takefocus=True)
         if row is not None:
             item.grid(row=row, column=column, **grid)
         return item
 
     def build(self):
         self.root.title("雷电智能学习与训练控制面板")
-        self.root.geometry("940x620")
-        self.root.minsize(760, 520)
+        self.root.geometry("960x660")
+        self.root.resizable(True, True)
         self.root.configure(bg="#101826")
         self.root.grid_columnconfigure(0, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
-        outer = Frame(self.root, bg="#101826", padx=18, pady=16)
-        outer.grid(row=0, column=0, sticky="nsew")
+        host = Frame(self.root, bg="#101826")
+        host.grid(row=0, column=0, sticky="nsew")
+        host.grid_columnconfigure(0, weight=1)
+        host.grid_rowconfigure(0, weight=1)
+        canvas = Canvas(host, bg="#101826", highlightthickness=0, bd=0, xscrollincrement=16, yscrollincrement=16)
+        vertical = ttk.Scrollbar(host, orient="vertical", command=canvas.yview)
+        horizontal = ttk.Scrollbar(host, orient="horizontal", command=canvas.xview)
+        canvas.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+        outer = Frame(canvas, bg="#101826", padx=18, pady=16)
+        outer_id = canvas.create_window((0, 0), window=outer, anchor="nw")
+        self.scroll_canvas = canvas
+
+        def sync_region(event=None):
+            bounds = canvas.bbox("all")
+            if bounds is not None:
+                canvas.configure(scrollregion=bounds)
+
+        def sync_width(event):
+            canvas.itemconfigure(outer_id, width=max(760, event.width))
+            sync_region()
+
+        outer.bind("<Configure>", sync_region)
+        canvas.bind("<Configure>", sync_width)
+        self.root.bind_all("<MouseWheel>", self.scroll_wheel, add="+")
         outer.grid_columnconfigure(0, weight=1)
         outer.grid_rowconfigure(2, weight=1)
         header = Frame(outer, bg="#101826")
@@ -1338,8 +1658,9 @@ class Panel:
         header.grid_columnconfigure(0, weight=1)
         Label(header, text="雷电智能学习与训练控制面板", bg="#101826", fg="white", font=("Microsoft YaHei UI", 20, "bold")).grid(row=0, column=0, sticky="w")
         Label(header, textvariable=self.mode_var, bg="#1e293b", fg="#f8fafc", font=("Microsoft YaHei UI", 10, "bold"), padx=12, pady=6).grid(row=0, column=1, sticky="e")
-        rainbow = Canvas(outer, height=10, bg="#101826", highlightthickness=0)
+        rainbow = Canvas(outer, height=10, bg="#101826", highlightthickness=0, bd=0)
         rainbow.grid(row=1, column=0, sticky="ew", pady=(12, 16))
+
         def draw_rainbow(event=None):
             rainbow.delete("all")
             colors = ("#ef4444", "#f97316", "#eab308", "#22c55e", "#06b6d4", "#3b82f6", "#a855f7")
@@ -1347,28 +1668,28 @@ class Panel:
             section = width / len(colors)
             for index, color in enumerate(colors):
                 rainbow.create_rectangle(index * section, 0, (index + 1) * section + 1, 10, fill=color, outline=color)
+
         rainbow.bind("<Configure>", draw_rainbow)
         body = Frame(outer, bg="#f8fafc", padx=18, pady=18)
         body.grid(row=2, column=0, sticky="nsew")
         body.grid_columnconfigure(1, weight=1)
-        for index in range(8):
-            body.grid_rowconfigure(index, weight=0)
         labels = (("雷电模拟器", self.path_var), ("存储路径", self.storage_var), ("经验池上限", self.experience_var), ("AI 模型数量上限", self.model_var))
         colors = ("#ef4444", "#f97316", "#eab308", "#22c55e")
         commands = (self.choose_emulator, self.choose_storage, self.change_experience, self.change_models)
         texts = ("选择雷电模拟器路径", "选择存储路径", "修改经验池上限", "修改AI模型数量上限")
         for row, ((title, variable), color, command, text) in enumerate(zip(labels, colors, commands, texts)):
             Label(body, text=title, bg="#f8fafc", fg="#334155", font=("Microsoft YaHei UI", 10, "bold"), width=15, anchor="w").grid(row=row, column=0, sticky="w", pady=6)
-            value = Label(body, textvariable=variable, bg="#e2e8f0", fg="#0f172a", font=("Consolas", 9), anchor="w", padx=10, pady=9)
+            value = Label(body, textvariable=variable, bg="#e2e8f0", fg="#0f172a", font=("Consolas", 9), anchor="w", padx=10, pady=9, justify="left", wraplength=460)
             value.grid(row=row, column=1, sticky="ew", padx=(8, 10), pady=6)
-            self.button(body, text, command, color, row=row, column=2, sticky="e", pady=6)
+            action = self.button(body, text, command, color, row=row, column=2, sticky="e", pady=6)
+            self.configuration_buttons.append(action)
         divider = Frame(body, bg="#cbd5e1", height=1)
         divider.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 12))
         actions = Frame(body, bg="#f8fafc")
         actions.grid(row=5, column=0, columnspan=3, sticky="ew")
         for index in range(4):
             actions.grid_columnconfigure(index, weight=1)
-        self.button(actions, "更多信息", self.more_info, "#06b6d4", row=0, column=0, sticky="ew", padx=(0, 7))
+        info_button = self.button(actions, "更多信息", self.more_info, "#06b6d4", row=0, column=0, sticky="ew", padx=(0, 7))
         learn = self.button(actions, "学习模式", lambda: self.controller.start_session("learning"), "#3b82f6", row=0, column=1, sticky="ew", padx=7)
         train = self.button(actions, "训练模式", lambda: self.controller.start_session("training"), "#a855f7", row=0, column=2, sticky="ew", padx=7)
         sleep = self.button(actions, "睡眠模式", self.controller.start_sleep, "#ef4444", row=0, column=3, sticky="ew", padx=(7, 0))
@@ -1379,8 +1700,29 @@ class Panel:
         footer = Frame(body, bg="#eef2ff", padx=12, pady=10)
         footer.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         footer.grid_columnconfigure(0, weight=1)
-        Label(footer, textvariable=self.status_var, bg="#eef2ff", fg="#1e3a8a", font=("Microsoft YaHei UI", 9), anchor="w", justify="left").grid(row=0, column=0, sticky="ew")
+        Label(footer, textvariable=self.status_var, bg="#eef2ff", fg="#1e3a8a", font=("Microsoft YaHei UI", 9), anchor="w", justify="left", wraplength=550).grid(row=0, column=0, sticky="ew")
         Label(footer, textvariable=self.performance_var, bg="#eef2ff", fg="#475569", font=("Microsoft YaHei UI", 9), anchor="e").grid(row=0, column=1, sticky="e", padx=(12, 0))
+        self.configuration_buttons.append(info_button)
+        self.root.after_idle(sync_region)
+
+    def scroll_wheel(self, event):
+        canvas = self.scroll_canvas
+        if canvas is None:
+            return None
+        try:
+            x = self.root.winfo_pointerx()
+            y = self.root.winfo_pointery()
+            inside = canvas.winfo_rootx() <= x < canvas.winfo_rootx() + canvas.winfo_width() and canvas.winfo_rooty() <= y < canvas.winfo_rooty() + canvas.winfo_height()
+            if not inside or not event.delta:
+                return None
+            steps = -1 if event.delta > 0 else 1
+            if event.state & 0x0001:
+                canvas.xview_scroll(steps * 3, "units")
+            else:
+                canvas.yview_scroll(steps * 3, "units")
+            return "break"
+        except Exception:
+            return None
 
     def protect_configuration(self):
         if self.controller.busy():
@@ -1447,8 +1789,8 @@ class Panel:
         info = self.controller.information()
         window = Toplevel(self.root)
         window.title("更多信息")
-        window.geometry("650x460")
-        window.minsize(520, 360)
+        window.geometry("670x500")
+        window.resizable(True, True)
         window.configure(bg="#0f172a")
         window.grid_columnconfigure(0, weight=1)
         window.grid_rowconfigure(1, weight=1)
@@ -1466,11 +1808,13 @@ class Panel:
             ("经验池大小", self.format_bytes(info["pool_size"])),
             ("AI 模型数量", str(info["model_count"])),
             ("奖励定义", "画面评分 − 饥饿值"),
-            ("资源保护", "自动限速、分批写入、低频训练与清理")
+            ("画面评分", "与最相似的一批历史画面越相似，评分越低"),
+            ("饥饿重置", "当前有效画面评分高于上一条时重置为正极小值"),
+            ("资源保护", "自动限速、批量写入、训练暂停、可取消清理")
         ]
         for index, (name, value) in enumerate(rows):
             Label(content, text=name, bg="#f8fafc", fg="#475569", font=("Microsoft YaHei UI", 10, "bold"), anchor="w").grid(row=index, column=0, sticky="w", pady=5)
-            Label(content, text=value, bg="#f8fafc", fg="#0f172a", font=("Microsoft YaHei UI", 10), anchor="w", wraplength=390, justify="left").grid(row=index, column=1, sticky="ew", padx=(18, 0), pady=5)
+            Label(content, text=value, bg="#f8fafc", fg="#0f172a", font=("Microsoft YaHei UI", 10), anchor="w", wraplength=410, justify="left").grid(row=index, column=1, sticky="ew", padx=(18, 0), pady=5)
 
     def drain(self):
         try:
@@ -1487,18 +1831,24 @@ class Panel:
                     for button in self.mode_buttons:
                         button.configure(state=normal)
                 elif kind == "progress":
-                    self.progress_var.set(float(payload))
+                    self.progress_var.set(max(0.0, min(100.0, float(payload))))
                 elif kind == "notice":
                     self.status_var.set(str(payload))
                     messagebox.showwarning("提示", str(payload), parent=self.root)
         except queue.Empty:
             pass
-        self.root.after(90, self.drain)
+        try:
+            self.root.after(90, self.drain)
+        except Exception:
+            pass
 
     def refresh_performance(self):
-        info = self.controller.information()
-        self.performance_var.set("CPU {:.1f}% · 内存 {:.1f}%".format(info["cpu"], info["memory"]))
-        self.root.after(1200, self.refresh_performance)
+        try:
+            info = self.controller.information()
+            self.performance_var.set("CPU {:.1f}% · 内存 {:.1f}%".format(info["cpu"], info["memory"]))
+            self.root.after(1200, self.refresh_performance)
+        except Exception:
+            pass
 
     def close(self):
         try:
