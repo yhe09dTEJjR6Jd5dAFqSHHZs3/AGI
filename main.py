@@ -151,8 +151,9 @@ user32.IsIconic.argtypes = [wintypes.HWND]
 user32.IsIconic.restype = wintypes.BOOL
 user32.IsWindow.argtypes = [wintypes.HWND]
 user32.IsWindow.restype = wintypes.BOOL
-user32.GetWindowFromPoint.argtypes = [POINT]
-user32.GetWindowFromPoint.restype = wintypes.HWND
+WindowFromPoint = user32.WindowFromPoint
+WindowFromPoint.argtypes = [POINT]
+WindowFromPoint.restype = wintypes.HWND
 user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
 user32.GetAncestor.restype = wintypes.HWND
 user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
@@ -1341,7 +1342,7 @@ def client_unobscured(hwnd, rect):
         return False
     points = ((rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2), (rect[0] + 2, rect[1] + 2), (rect[2] - 2, rect[1] + 2), (rect[0] + 2, rect[3] - 2), (rect[2] - 2, rect[3] - 2)
     for x, y in points:
-        hit = user32.GetWindowFromPoint(POINT(int(x), int(y)))
+        hit = WindowFromPoint(POINT(int(x), int(y)))
         if hit and root_window(hit) != own_root:
             pid = wintypes.DWORD()
             user32.GetWindowThreadProcessId(hit, ctypes.byref(pid))
@@ -1354,7 +1355,6 @@ def client_unobscured(hwnd, rect):
         if root_window(above) == own_root:
             above = user32.GetWindow(above, GW_HWNDPREV)
             continue
-        style = int(user32.GetWindowLongW(above, GWL_EXSTYLE))
         title = window_title(above)
         if "tooltip" in title.lower() or "工具提示" in title:
             above = user32.GetWindow(above, GW_HWNDPREV)
