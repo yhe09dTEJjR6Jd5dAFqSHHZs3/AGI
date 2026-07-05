@@ -1323,6 +1323,27 @@ def run_self_test():
     execution_snapshot = type("Snapshot", (), {"hash_value": a, "image_checksum": "", "semantic_vector": ()})()
     require(not TrainingService(execution_panel).execute_and_record(None, "s", time.perf_counter(), (0, 0, 100, 100), execution_snapshot, {"type": "click", "start_rel": [0.5, 0.5]}, {}, execution_stop)[0], 'not TrainingService(execution_panel).execute_and_record(None, "s", time.perf_counter(), (0, 0, 100, 100), execution_snapshot, {"type": "click", "start_rel": [0.')
     require(execution_stop.is_set() and execution_panel.termination_reason == "cursor_outside", 'execution_stop.is_set() and execution_panel.termination_reason == "cursor_outside"')
+    cursor_gate_panel = type("CursorGatePanel", (), {})()
+    cursor_gate_panel.positions = [(-10, -10), (-10, -10)]
+    cursor_gate_panel.cursor_position = lambda: cursor_gate_panel.positions.pop(0) if cursor_gate_panel.positions else (-10, -10)
+    cursor_gate_panel.current_rect = lambda: (0, 0, 100, 100)
+    cursor_gate_panel.is_run_active = lambda token=None, mode=None: True
+    cursor_gate_panel.observe_cursor_activity = lambda: setattr(cursor_gate_panel, "observed", True)
+    cursor_gate_panel.mark_learning_activity = lambda: setattr(cursor_gate_panel, "marked", True)
+    cursor_gate_panel.log_exception = lambda *args, **kwargs: None
+    cursor_gate_panel.runtime_environment_issue = ""
+    cursor_gate_panel.executor = type("Executor", (), {"controller": type("Controller", (), {"position": None})()})()
+    cursor_gate_panel.window_manager = type("Window", (), {"check_window": lambda self, force=True: type("Check", (), {"ok": True, "reason": "ok"})()})()
+    class CursorGateStore:
+        def __init__(self):
+            self.events = []
+        def append_evidence(self, name, **data):
+            self.events.append((name, data))
+    cursor_gate_panel.store = CursorGateStore()
+    cursor_gate_panel.ensure_cursor_inside_window = ControlPanel.ensure_cursor_inside_window.__get__(cursor_gate_panel, type(cursor_gate_panel))
+    require(not cursor_gate_panel.ensure_cursor_inside_window((0, 0, 100, 100), token=1, stop_event=threading.Event(), mode="starting", check=type("Check", (), {"ok": True})()), 'ensure_cursor_inside_window rejects ineffective automatic cursor move')
+    require(cursor_gate_panel.store.events[-1][0] == "auto_cursor_move_failed", 'ineffective automatic cursor move records auto_cursor_move_failed evidence')
+    require("DPI" in cursor_gate_panel.runtime_environment_issue and "多显示器" in cursor_gate_panel.runtime_environment_issue, 'cursor move failure message names DPI and multi-monitor coordinate risks')
     require(("sleep", "training") not in ALLOWED_TRANSITIONS, '("sleep", "training") not in ALLOWED_TRANSITIONS')
     require(("sleep", "starting") not in ALLOWED_TRANSITIONS, '("sleep", "starting") not in ALLOWED_TRANSITIONS')
     require(("sleep", "idle") not in ALLOWED_TRANSITIONS, '("sleep", "idle") not in ALLOWED_TRANSITIONS')
@@ -8040,6 +8061,18 @@ class ControlPanel(tk.Tk):
                     self.store.append_evidence("auto_cursor_move", trigger_mode=mode, safety=safety)
             except Exception:
                 log_suppressed_exception("suppressed_exception")
+            if after is None or not point_inside(rect, after[0], after[1]):
+                try:
+                    if self.store:
+                        self.store.append_evidence("auto_cursor_move_failed", mode=mode, rect=list(rect), before=list(pos) if pos else None, target=list(target), after=list(after) if after else None, message="鼠标移动后未进入客户区，可能存在 DPI 缩放、权限或多显示器坐标异常")
+                except Exception:
+                    log_suppressed_exception("suppressed_exception")
+                self.runtime_environment_issue = "鼠标移动后未进入客户区，可能存在 DPI 缩放、权限或多显示器坐标异常"
+                return False
+            fresh_check = self.window_manager.check_window(force=True) if self.window_manager else None
+            if not fresh_check or not fresh_check.ok:
+                self.runtime_environment_issue = f"雷电模拟器客户区异常：{getattr(fresh_check, 'reason', '无法复检客户区')}"
+                return False
             return True
         except Exception as exc:
             self.log_exception("cursor.ensure_inside", exc, {"rect": list(rect), "target": list(target)})
@@ -8216,7 +8249,8 @@ class ControlPanel(tk.Tk):
             if stop_event.is_set() or not self.is_run_active(token, "starting"):
                 return
             if not self.ensure_cursor_inside_window(check.rect, token=token, stop_event=stop_event, mode="starting", check=check):
-                self.finish_run(token, "无法确保鼠标位于雷电模拟器客户区内", 0.0, reason="window_invalid")
+                cursor_issue = getattr(self, "runtime_environment_issue", "") or "无法确保鼠标位于雷电模拟器客户区内"
+                self.finish_run(token, cursor_issue, 0.0, reason="window_invalid")
                 return
             if not self.activate_run(token, mode):
                 return
