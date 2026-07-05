@@ -16,7 +16,9 @@
 “忽略”：关闭弹窗→空闲（用户确认运行环境符合要求）；
 “退出”；
 
-只允许用户修改：雷电模拟器路径（默认D:\LDPlayer9\dnplayer.exe）、存储路径（默认C:\Users\Administrator\Desktop\AAA）、经验池上限（默认10GB）、AI模型数量上限（默认100个）；
+允许用户修改：雷电模拟器路径（默认D:\LDPlayer9\dnplayer.exe）、存储路径（默认C:\Users\Administrator\Desktop\AAA）、经验池上限（默认10GB）、AI模型数量上限（默认100个）；
+
+禁止用户修改：AI模型数量下限（30个）；
 
 控制面板：
 ①掌控感：用户可以随意改变形状大小；
