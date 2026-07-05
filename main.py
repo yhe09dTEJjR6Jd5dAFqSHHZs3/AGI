@@ -1,6 +1,7 @@
 import ctypes
 import datetime
 from bisect import bisect_right
+from dataclasses import dataclass
 import json
 import math
 import os
@@ -239,25 +240,163 @@ gdi32.StretchBlt.restype = wintypes.BOOL
 gdi32.GetDIBits.argtypes = [wintypes.HDC, wintypes.HBITMAP, wintypes.UINT, wintypes.UINT, ctypes.c_void_p, ctypes.POINTER(BITMAPINFO), wintypes.UINT]
 gdi32.GetDIBits.restype = ctypes.c_int
 
-class ResourceMeter:
+@dataclass
+class ResourceBudget:
+    allowed: bool
+    next_interval: float
+    max_batch: int
+    cpu_workers: int
+    gpu: str
+    gpu_batch_size: int
+    max_capture_resolution: tuple
+    must_pause: bool
+    pause_reason: str
+    state: str = "正常"
+
+class HardwareProbe:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.last_probe = 0.0
+        self.gpus = []
+        self.backend = "CPU"
+
+    def probe(self):
+        now = time.monotonic()
+        with self.lock:
+            if now - self.last_probe < 5.0 and self.gpus:
+                return [dict(item) for item in self.gpus]
+            gpus = self._probe_windows_gpus()
+            self.gpus = gpus or [{"name": "CPU 受限后端", "adapter_type": "CPU", "hardware": False, "software": True, "dedicated_total": 0, "dedicated_used": 0, "dedicated_free": 0, "shared_total": 0, "utilization": 0.0, "engine_utilization": 0.0, "ldplayer": False, "program": True}]
+            self.backend = self._select_backend(self.gpus)
+            self.last_probe = now
+            return [dict(item) for item in self.gpus]
+
+    def _probe_windows_gpus(self):
+        if os.name != "nt":
+            return []
+        items = []
+        try:
+            import subprocess
+            cmd = ["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM,VideoProcessor,PNPDeviceID | ConvertTo-Json -Compress"]
+            raw = subprocess.check_output(cmd, timeout=2.5, creationflags=0x08000000).decode("utf-8", "ignore").strip()
+            data = json.loads(raw) if raw else []
+            if isinstance(data, dict):
+                data = [data]
+            for index, item in enumerate(data):
+                name = str(item.get("Name") or "GPU {}".format(index + 1))
+                dedicated = int(item.get("AdapterRAM") or 0)
+                lower = name.lower()
+                software = any(x in lower for x in ("basic render", "software", "warp", "remote"))
+                discrete = any(x in lower for x in ("nvidia", "radeon", "arc"))
+                items.append({"name": name, "adapter_type": "独立 GPU" if discrete else "集成/通用 GPU", "hardware": not software, "software": software, "dedicated_total": max(0, dedicated), "dedicated_used": 0, "dedicated_free": max(0, dedicated), "shared_total": 0, "utilization": 0.0, "engine_utilization": 0.0, "ldplayer": False, "program": index == 0})
+        except Exception:
+            pass
+        return items
+
+    def _select_backend(self, gpus):
+        usable = [g for g in gpus if g.get("hardware") and not g.get("software") and g.get("dedicated_total", 0) > 0]
+        if not usable:
+            return "CPU"
+        if any("nvidia" in g.get("name", "").lower() for g in usable):
+            return "CUDA"
+        return "DirectML"
+
+    def choose_gpu(self, metrics):
+        gpus = self.probe()
+        usable = [g for g in gpus if g.get("hardware") and not g.get("software")]
+        if not usable:
+            return "CPU"
+        usable.sort(key=lambda g: (g.get("ldplayer", False), -g.get("dedicated_free", 0), g.get("utilization", 0.0)))
+        gpu = usable[0]
+        if metrics.get("gpu_metrics_unavailable"):
+            return "CPU"
+        return gpu.get("name") or "GPU"
+
+class ComputeBackend:
+    def __init__(self, probe):
+        self.probe = probe
+
+    def name(self):
+        return self.probe.backend
+
+    def encode_frames(self, frames, budget):
+        return frames[:max(1, budget.max_batch)]
+
+    def infer_policy(self, features, budget):
+        confidence = 0.0 if not features else min(1.0, max(0.0, float(features.get("score", 0.0))))
+        return {"confidence": confidence, "uncertainty": 1.0 - confidence}
+
+class GpuScheduler:
+    def __init__(self, probe):
+        self.probe = probe
+
+    def assign(self, metrics):
+        return self.probe.choose_gpu(metrics)
+
+class ModelRuntime:
+    def __init__(self, backend):
+        self.backend = backend
+
+    def confidence_band(self, confidence, pressure):
+        if pressure:
+            return "pressure"
+        if confidence >= 0.65:
+            return "high"
+        if confidence >= 0.35:
+            return "medium"
+        return "low"
+
+class ResourceGovernor:
     def __init__(self):
         self.lock = threading.Lock()
         self.storage_path = Path.cwd()
         self.previous = None
-        self.last_sample = 0.0
-        self.value = {"cpu": 0.0, "memory": 0.0, "avail_memory": 0, "disk_free": 0, "queue": 0, "queue_age": 0.0, "io_latency": 0.0, "process_cpu": 0.0, "process_memory": 0, "capture_latency": 0.0, "sqlite_latency": 0.0, "capture_failure_rate": 0.0, "fsync_latency": 0.0, "wal_bytes": 0}
         self.process_previous = None
         self.process_last_sample = 0.0
+        self.last_sample = 0.0
+        self.window = []
+        self.metrics = {"cpu": 0.0, "process_cpu": 0.0, "ldplayer_cpu": 0.0, "memory": 0.0, "avail_memory": 0, "commit_free": 0, "disk_free": 0, "sqlite_latency": 0.0, "capture_latency": 0.0, "queue": 0, "queue_age": 0.0, "gpu": 0.0, "gpu_dedicated_total": 0, "gpu_dedicated_used": 0, "gpu_dedicated_free": 0, "gpu_engine": 0.0, "ldplayer_gpu": 0.0, "program_gpu": 0.0, "last_user_input": time.time(), "capture_failure_rate": 0.0}
+        self.probe = HardwareProbe()
+        self.backend = ComputeBackend(self.probe)
+        self.gpu_scheduler = GpuScheduler(self.probe)
+        self.runtime = ModelRuntime(self.backend)
+        self.levels = {}
+        self.last_pressure = 0.0
+        self.healthy_since = time.monotonic()
+        self.pressure_reasons = []
+        self.sample()
+
+    def set_storage_path(self, path):
+        with self.lock:
+            self.storage_path = Path(path)
+
+    def update_queue(self, length, age=0.0):
+        with self.lock:
+            self.metrics["queue"] = int(length)
+            self.metrics["queue_age"] = float(age)
+
+    def update_capture_metrics(self, elapsed_ms=None, failed=False):
+        with self.lock:
+            if elapsed_ms is not None:
+                self.metrics["capture_latency"] = float(elapsed_ms)
+            old = float(self.metrics.get("capture_failure_rate", 0.0))
+            self.metrics["capture_failure_rate"] = old * 0.95 + (0.05 if failed else 0.0)
+
+    def update_sqlite_latency(self, elapsed_ms):
+        with self.lock:
+            self.metrics["sqlite_latency"] = float(elapsed_ms)
+
+    def update_user_input(self):
+        with self.lock:
+            self.metrics["last_user_input"] = time.time()
 
     def sample(self):
         now = time.monotonic()
         with self.lock:
-            if now - self.last_sample < 0.8:
-                return dict(self.value)
-            idle = FILETIME()
-            kernel = FILETIME()
-            user = FILETIME()
-            cpu = self.value["cpu"]
+            if now - self.last_sample < 0.5 and self.window:
+                return self.summary_locked()
+            cpu = self.metrics.get("cpu", 0.0)
+            idle = FILETIME(); kernel = FILETIME(); user = FILETIME()
             if kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
                 current = tuple((item.dwHighDateTime << 32) | item.dwLowDateTime for item in (idle, kernel, user))
                 if self.previous is not None:
@@ -266,94 +405,124 @@ class ResourceMeter:
                     if total_delta > 0:
                         cpu = max(0.0, min(100.0, (1.0 - idle_delta / total_delta) * 100.0))
                 self.previous = current
-            status = MEMORYSTATUSEX()
-            status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-            memory = self.value["memory"]
-            avail_memory = self.value.get("avail_memory", 0)
+            status = MEMORYSTATUSEX(); status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            memory = self.metrics.get("memory", 0.0); avail_memory = self.metrics.get("avail_memory", 0)
+            commit_free = self.metrics.get("commit_free", 0)
             if kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
                 memory = float(status.dwMemoryLoad)
                 avail_memory = int(status.ullAvailPhys)
-            disk_free = self.value.get("disk_free", 0)
+                commit_free = max(0, int(status.ullAvailPageFile))
+            disk_free = self.metrics.get("disk_free", 0)
             try:
                 disk_free = int(__import__("shutil").disk_usage(self.storage_path).free)
             except Exception:
                 pass
-            io_latency = max(float(self.value.get("capture_latency", 0.0)) / 1000.0, float(self.value.get("sqlite_latency", 0.0)) / 1000.0, float(self.value.get("fsync_latency", 0.0)) / 1000.0, float(self.value.get("queue_age", 0.0)) / 10.0)
-            process_cpu = self.value.get("process_cpu", 0.0)
-            process_memory = self.value.get("process_memory", 0)
-            try:
-                creation = FILETIME(); exit_time = FILETIME(); kernel_time = FILETIME(); user_time = FILETIME()
-                if kernel32.GetProcessTimes(kernel32.GetCurrentProcess(), ctypes.byref(creation), ctypes.byref(exit_time), ctypes.byref(kernel_time), ctypes.byref(user_time)):
-                    proc = filetime_value(kernel_time) + filetime_value(user_time)
-                    if self.process_previous is not None:
-                        dt = max(0.001, now - self.process_last_sample)
-                        process_cpu = max(0.0, min(100.0, (proc - self.process_previous) / 10000000.0 / dt * 100.0 / max(1, os.cpu_count() or 1)))
-                    self.process_previous = proc
-                    self.process_last_sample = now
-                counters = PROCESS_MEMORY_COUNTERS()
-                counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
-                if psapi.GetProcessMemoryInfo(kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
-                    process_memory = int(counters.WorkingSetSize)
-            except Exception:
-                pass
-            self.value = {"cpu": cpu, "memory": memory, "avail_memory": avail_memory, "disk_free": disk_free, "queue": self.value.get("queue", 0), "queue_age": self.value.get("queue_age", 0.0), "io_latency": io_latency, "process_cpu": process_cpu, "process_memory": process_memory, "capture_latency": self.value.get("capture_latency", 0.0), "sqlite_latency": self.value.get("sqlite_latency", 0.0), "capture_failure_rate": self.value.get("capture_failure_rate", 0.0), "fsync_latency": self.value.get("fsync_latency", 0.0), "wal_bytes": self.value.get("wal_bytes", 0)}
+            process_cpu, process_memory = self._process_metrics(now)
+            gpus = self.probe.probe()
+            gpu_total = max([int(g.get("dedicated_total", 0)) for g in gpus] or [0])
+            gpu_used = max([int(g.get("dedicated_used", 0)) for g in gpus] or [0])
+            self.metrics.update({"cpu": cpu, "memory": memory, "avail_memory": avail_memory, "commit_free": commit_free, "disk_free": disk_free, "process_cpu": process_cpu, "process_memory": process_memory, "gpu": max([float(g.get("utilization", 0.0)) for g in gpus] or [0.0]), "gpu_dedicated_total": gpu_total, "gpu_dedicated_used": gpu_used, "gpu_dedicated_free": max(0, gpu_total - gpu_used), "gpu_engine": max([float(g.get("engine_utilization", 0.0)) for g in gpus] or [0.0])})
+            point = dict(self.metrics, t=now)
+            self.window.append(point)
+            self.window = [p for p in self.window if now - p["t"] <= 10.0]
             self.last_sample = now
-            return dict(self.value)
+            return self.summary_locked()
 
-    def interval(self):
+    def _process_metrics(self, now):
+        process_cpu = self.metrics.get("process_cpu", 0.0)
+        process_memory = self.metrics.get("process_memory", 0)
+        try:
+            creation = FILETIME(); exit_time = FILETIME(); kernel_time = FILETIME(); user_time = FILETIME()
+            if kernel32.GetProcessTimes(kernel32.GetCurrentProcess(), ctypes.byref(creation), ctypes.byref(exit_time), ctypes.byref(kernel_time), ctypes.byref(user_time)):
+                proc = filetime_value(kernel_time) + filetime_value(user_time)
+                if self.process_previous is not None:
+                    dt = max(0.001, now - self.process_last_sample)
+                    process_cpu = max(0.0, min(100.0, (proc - self.process_previous) / 10000000.0 / dt * 100.0 / max(1, os.cpu_count() or 1)))
+                self.process_previous = proc
+                self.process_last_sample = now
+            counters = PROCESS_MEMORY_COUNTERS(); counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+            if psapi.GetProcessMemoryInfo(kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+                process_memory = int(counters.WorkingSetSize)
+        except Exception:
+            pass
+        return process_cpu, process_memory
+
+    def summary_locked(self):
+        result = dict(self.metrics)
+        keys = list(result.keys())
+        for key in keys:
+            values = [float(p.get(key, 0.0)) for p in self.window if isinstance(p.get(key, 0.0), (int, float))]
+            if not values:
+                continue
+            ordered = sorted(values)
+            result[key + "_avg"] = sum(values) / len(values)
+            result[key + "_p95"] = ordered[min(len(ordered) - 1, int(math.ceil(len(ordered) * 0.95)) - 1)]
+            result[key + "_trend"] = values[-1] - values[0]
+        result["io_latency"] = max(result.get("capture_latency_p95", result.get("capture_latency", 0.0)) / 1000.0, result.get("sqlite_latency_p95", result.get("sqlite_latency", 0.0)) / 1000.0, result.get("queue_age", 0.0))
+        result["backend"] = self.probe.backend
+        result["gpus"] = self.probe.probe()
+        result["resource_state"] = "暂停" if self.pressure_reasons else "正常"
+        result["pause_reason"] = "；".join(self.pressure_reasons)
+        return result
+
+    def acquire(self, task):
         sample = self.sample()
-        if sample["cpu"] >= 90 or sample["memory"] >= 94:
-            return 12.0
-        if sample["cpu"] >= 80 or sample["memory"] >= 88:
-            return 5.0
-        if sample["cpu"] >= 70 or sample["memory"] >= 82:
-            return 2.0
-        return 1.0
-
-    def set_storage_path(self, path):
+        now = time.monotonic()
+        reasons = []
+        hard = False
+        if sample.get("avail_memory", 0) < 384 * 1024 * 1024:
+            hard = True; reasons.append("可用内存不足")
+        if sample.get("disk_free", 0) < 1024 * 1024 * 1024:
+            hard = True; reasons.append("磁盘剩余空间不足 1 GB")
+        if sample.get("queue_age", 0.0) > 2.0:
+            hard = True; reasons.append("鼠标队列等待超过 2 秒")
+        if sample.get("gpu_dedicated_total", 0) and sample.get("gpu_dedicated_free", 0) < max(512 * 1024 * 1024, sample.get("gpu_dedicated_total", 0) * 0.15):
+            hard = True; reasons.append("GPU 专用显存安全余量不足")
+        yellow = []
+        if sample.get("capture_latency_p95", 0.0) > 150.0:
+            yellow.append("截图 P95 延迟 {:.0f} ms".format(sample.get("capture_latency_p95", 0.0)))
+        if sample.get("sqlite_latency_p95", 0.0) > 100.0:
+            yellow.append("SQLite 写入 P95 延迟 {:.0f} ms".format(sample.get("sqlite_latency_p95", 0.0)))
+        if sample.get("queue_age", 0.0) > 1.0:
+            yellow.append("队列等待超过 1 秒")
+        if sample.get("cpu_trend", 0.0) > 8.0 or sample.get("gpu_trend", 0.0) > 8.0 or sample.get("memory_trend", 0.0) > 4.0:
+            yellow.append("资源使用持续升高")
+        if sample.get("process_cpu_avg", 0.0) > 70.0 and time.time() - sample.get("last_user_input", time.time()) < 60.0:
+            yellow.append("本程序 CPU 接近前台预算")
+        pressure = hard or bool(yellow)
         with self.lock:
-            self.storage_path = Path(path)
-
-    def update_queue(self, length, age=0.0):
-        with self.lock:
-            self.value["queue"] = int(length)
-            self.value["queue_age"] = float(age)
-
-    def update_capture_metrics(self, elapsed_ms=None, failed=False):
-        with self.lock:
-            if elapsed_ms is not None:
-                old = float(self.value.get("capture_latency", 0.0))
-                self.value["capture_latency"] = elapsed_ms if old <= 0 else old * 0.85 + float(elapsed_ms) * 0.15
-            old_rate = float(self.value.get("capture_failure_rate", 0.0))
-            self.value["capture_failure_rate"] = old_rate * 0.95 + (0.05 if failed else 0.0)
-
-    def update_sqlite_latency(self, elapsed_ms):
-        with self.lock:
-            old = float(self.value.get("sqlite_latency", 0.0))
-            self.value["sqlite_latency"] = elapsed_ms if old <= 0 else old * 0.85 + float(elapsed_ms) * 0.15
-
-    def hard_stop(self):
-        sample = self.sample()
-        return sample.get("avail_memory", 1) < 256 * 1024 * 1024 or sample.get("sqlite_latency", 0.0) > 800.0 or sample.get("capture_latency", 0.0) > 800.0 or sample.get("queue_age", 0.0) > 12.0
-
-    def allow_capture(self):
-        sample = self.sample()
-        return sample.get("disk_free", 0) >= 1024 * 1024 * 1024 and sample.get("queue", 0) < 9000 and sample.get("queue_age", 0.0) < 8.0 and sample.get("capture_failure_rate", 0.0) < 0.35 and sample["cpu"] < 76 and sample["memory"] < 84
-
-    def allow_training(self):
-        sample = self.sample()
-        return sample.get("avail_memory", 0) >= 768 * 1024 * 1024 and sample.get("disk_free", 0) >= 1024 * 1024 * 1024 and sample["cpu"] < 60 and sample["memory"] < 76 and sample.get("sqlite_latency", 0.0) < 250.0
-
-    def allow_maintenance(self):
-        sample = self.sample()
-        return sample.get("avail_memory", 0) >= 256 * 1024 * 1024 and sample.get("sqlite_latency", 0.0) < 1000.0 and sample.get("queue_age", 0.0) < 12.0
-
-    def allow_compute(self):
-        return self.allow_training()
-
-    def critical(self):
-        sample = self.sample()
-        return self.hard_stop() or sample["cpu"] >= 90 or sample["memory"] >= 94
+            if pressure:
+                self.last_pressure = now
+                self.healthy_since = now
+                for key in ("capture", "ai_inference", "sleep_training", "maintenance"):
+                    self.levels[key] = max(1, int(self.levels.get(key, 4) / 2))
+            elif now - self.healthy_since >= (20.0 if now - self.last_pressure >= 5.0 else 999.0):
+                self.levels[task] = min(16, int(self.levels.get(task, 4)) + 1)
+                self.healthy_since = now if now - self.healthy_since >= 10.0 else self.healthy_since
+            level = int(self.levels.get(task, 4))
+            self.pressure_reasons = reasons + yellow
+        frontend = task in ("capture", "ai_inference")
+        idle_boost = time.time() - sample.get("last_user_input", time.time()) >= 60.0
+        cpu_cap = 0.85 if idle_boost else 0.70
+        cores = max(1, os.cpu_count() or 1)
+        reserved = max(1, int(math.ceil(cores * 0.25)))
+        workers = max(1, min(max(1, cores - reserved), level, int(cores * cpu_cap)))
+        if task == "maintenance":
+            workers = 1
+        if task == "sleep_training" and frontend:
+            workers = 1
+        interval_base = {"capture": 1.0, "ai_inference": 0.8, "sleep_training": 0.05, "maintenance": 1.0}.get(task, 1.0)
+        interval = max(0.05, interval_base * max(1.0, 4.0 / max(1, level)))
+        gpu_name = self.gpu_scheduler.assign(sample)
+        gpu_batch = 0 if gpu_name == "CPU" else max(1, min(16, level))
+        max_batch = max(1, min(64, level * (2 if task == "sleep_training" else 1)))
+        resolution = (640, 360) if level >= 4 else (426, 240) if level >= 2 else (320, 180)
+        pause = hard or (task == "sleep_training" and bool(yellow)) or (task == "maintenance" and (bool(yellow) or frontend))
+        if task == "ai_inference" and hard:
+            pause = True
+        state = "暂停" if pause else "降速" if yellow else "正常"
+        reason = "；".join(reasons + yellow)
+        return ResourceBudget(not pause, interval, max_batch, workers, gpu_name, gpu_batch, resolution, pause, reason, state)
 
 class Settings:
     def __init__(self):
@@ -1747,7 +1916,7 @@ class Controller:
         self.settings = settings
         self.event_sink = event_sink
         self.store = DataStore()
-        self.resources = ResourceMeter()
+        self.resources = ResourceGovernor()
         self.lock = threading.RLock()
         self.state = "idle"
         self.epoch = 0
@@ -1778,6 +1947,9 @@ class Controller:
         self.raw_critical_queue = queue.Queue(maxsize=2048)
         self.raw_mouse_stop = threading.Event()
         self.raw_mouse_drops = 0
+        self.capture_queue = queue.Queue(maxsize=32)
+        self.feature_queue = queue.Queue(maxsize=32)
+        self.persist_queue = queue.Queue(maxsize=32)
         self.control_queue = queue.Queue(maxsize=64)
         self.stop_requested = threading.Event()
         self.last_move_kept = None
@@ -1919,6 +2091,8 @@ class Controller:
 
     def on_mouse(self, event_type, button, wheel, x, y, created, created_monotonic_ns, flags, extra_info):
         source = self.classify_mouse_source(event_type, button, wheel, x, y, flags, extra_info, created_monotonic_ns)
+        if source == "user":
+            self.resources.update_user_input()
         with self.lock:
             if self.state not in ("learning", "training") or not self.session_id or not self.target_rect:
                 return
@@ -2094,12 +2268,13 @@ class Controller:
 
     def _capture_loop(self, token):
         while self._is_current(token, ("learning", "training")):
-            if not self.resources.allow_capture():
+            budget = self.resources.acquire("capture")
+            if not budget.allowed:
                 sample = self.resources.sample()
-                self.emit("state", {"state": self.current_state(), "detail": "系统资源繁忙，已自动限速记录", "cpu": sample["cpu"], "memory": sample["memory"]})
-                time.sleep(max(2.0, self.resources.interval()))
+                self.emit("state", {"state": self.current_state(), "detail": budget.pause_reason or "资源预算要求暂停截图记录", "cpu": sample["cpu"], "memory": sample["memory"]})
+                time.sleep(max(0.05, budget.next_interval))
                 continue
-            interval = self.resources.interval()
+            interval = budget.next_interval
             with self.lock:
                 hwnd = self.target_hwnd
                 session_id = self.session_id
@@ -2124,7 +2299,7 @@ class Controller:
                 except Exception:
                     pass
             if session_id:
-                image = capture_client(hwnd)
+                image = capture_client(hwnd, budget.max_capture_resolution[0], budget.max_capture_resolution[1])
                 if image is not None:
                     self.resources.update_capture_metrics(image.get("capture_elapsed_ms"), False)
                 if not self._is_current(token, ("learning", "training")):
@@ -2242,7 +2417,7 @@ class Controller:
         trend = scores[-1] - scores[0]
         lcbs = [float(a.get("confidence_lower_bound", 0.0)) for a in plan if isinstance(a, dict)]
         uncs = [float(a.get("uncertainty", 1.0)) for a in plan if isinstance(a, dict)]
-        features = {"score_mean": mean, "score_variance": variance, "score_trend": trend, "hunger_growth_speed": hunger_speed, "action_lcb_mean": sum(lcbs) / max(1, len(lcbs)), "action_uncertainty": sum(uncs) / max(1, len(uncs)), "sample_coverage": min(1.0, len(plan) / 128.0), "mouse_queue_length": queue_len, "queue_pressure": min(1.0, queue_len / 12000.0), "resource_pressure": 1.0 if self.resources.critical() else 0.0, "cpu_margin": max(0.0, 100.0 - sample.get("cpu", 0.0)), "memory_margin": max(0.0, 100.0 - sample.get("memory", 0.0)), "disk_free": sample.get("disk_free", 0)}
+        features = {"score_mean": mean, "score_variance": variance, "score_trend": trend, "hunger_growth_speed": hunger_speed, "action_lcb_mean": sum(lcbs) / max(1, len(lcbs)), "action_uncertainty": sum(uncs) / max(1, len(uncs)), "sample_coverage": min(1.0, len(plan) / 128.0), "mouse_queue_length": queue_len, "queue_pressure": min(1.0, queue_len / 12000.0), "resource_pressure": 1.0 if self.resources.acquire("sleep_training").must_pause else 0.0, "cpu_margin": max(0.0, 100.0 - sample.get("cpu", 0.0)), "memory_margin": max(0.0, 100.0 - sample.get("memory", 0.0)), "disk_free": sample.get("disk_free", 0)}
         decision = self.sleep_decision_model(features)
         return decision["sleep_probability"] >= 0.62 and decision["expected_sleep_gain"] > 0.0
 
@@ -2332,8 +2507,9 @@ class Controller:
 
     def _ai_loop(self, token):
         while self._is_current(token, ("training",)):
-            if not self.resources.allow_compute():
-                time.sleep(max(1.5, self.resources.interval()))
+            budget = self.resources.acquire("ai_inference")
+            if not budget.allowed:
+                time.sleep(max(0.05, budget.next_interval))
                 continue
             with self.lock:
                 hwnd = self.target_hwnd
@@ -2342,6 +2518,12 @@ class Controller:
                 self.request_idle("雷电模拟器客户区异常或鼠标已离开客户区", token)
                 return
             target = self._ai_target(rect)
+            band = self.resources.runtime.confidence_band(float(target.get("confidence", 0.0)), budget.state == "暂停")
+            if band == "low":
+                time.sleep(max(0.05, budget.next_interval))
+                continue
+            if band in ("medium", "pressure") and target.get("action_type") != "移动":
+                target["action_type"] = "移动"
             x, y = target["x"], target["y"]
             self.ai_input_tracker.register("move", "", 0, x, y)
             if not point_inside((x, y), rect) or not ai_move_to(x, y):
@@ -2354,22 +2536,22 @@ class Controller:
                 return
             action_type = target.get("action_type", "移动")
             ok = True
-            if action_type == "左键" and self.resources.allow_compute():
+            if action_type == "左键" and budget.allowed:
                 current_x, current_y = cursor_position()
                 self.ai_input_tracker.register("button_down", "left", 0, current_x, current_y)
                 self.ai_input_tracker.register("button_up", "left", 0, current_x, current_y)
                 ok = ai_left_click()
-            elif action_type == "右键" and self.resources.allow_compute():
+            elif action_type == "右键" and budget.allowed:
                 current_x, current_y = cursor_position()
                 self.ai_input_tracker.register("button_down", "right", 0, current_x, current_y)
                 self.ai_input_tracker.register("button_up", "right", 0, current_x, current_y)
                 ok = ai_right_click()
-            elif action_type == "滚轮" and self.resources.allow_compute():
+            elif action_type == "滚轮" and budget.allowed:
                 current_x, current_y = cursor_position()
                 delta = target.get("wheel_delta", 120)
                 self.ai_input_tracker.register("wheel", "vertical", delta, current_x, current_y)
                 ok = ai_wheel(delta, False)
-            elif action_type == "水平滚轮" and self.resources.allow_compute():
+            elif action_type == "水平滚轮" and budget.allowed:
                 current_x, current_y = cursor_position()
                 delta = target.get("wheel_delta", 120)
                 self.ai_input_tracker.register("wheel", "horizontal", delta, current_x, current_y)
@@ -2383,7 +2565,7 @@ class Controller:
             if not ok:
                 self.request_idle("AI 鼠标动作无法执行" + str(action_type), token)
                 return
-            time.sleep(max(0.7, self.resources.interval()))
+            time.sleep(max(0.05, budget.next_interval))
 
     def _write_barrier(self, session_id, reason):
         deadline = time.monotonic() + 5.0
@@ -2505,12 +2687,15 @@ class Controller:
         return not self._is_current(token, ("sleep",))
 
     def _wait_resource(self, token, purpose="training"):
-        allowed = self.resources.allow_maintenance if purpose == "maintenance" else self.resources.allow_training
-        while not self._cancelled(token) and not allowed():
+        task = "maintenance" if purpose == "maintenance" else "sleep_training"
+        while not self._cancelled(token):
+            budget = self.resources.acquire(task)
+            if budget.allowed:
+                return True
             sample = self.resources.sample()
-            self.emit("state", {"state": "sleep", "detail": "系统资源繁忙，睡眠任务已暂缓", "cpu": sample["cpu"], "memory": sample["memory"]})
-            time.sleep(1.2)
-        return not self._cancelled(token)
+            self.emit("state", {"state": "sleep", "detail": budget.pause_reason or "资源预算要求暂停睡眠任务", "cpu": sample["cpu"], "memory": sample["memory"]})
+            time.sleep(max(0.05, budget.next_interval))
+        return False
 
     def _semantic_actions(self, mouse_rows):
         actions = []
@@ -2595,7 +2780,7 @@ class Controller:
             frame_start_times = [int(row[13] or row[2]) for row in frame_rows]
             critical_times = [int(row[2]) for row in mouse_rows if row[4] in ("button_down", "button_up", "wheel") and (row[12] or row[13])]
             for index, action in enumerate(semantic_actions):
-                if index % 500 == 0 and not self._wait_resource(token):
+                if (index % 64 == 0 or time.monotonic() - getattr(self, "_last_training_budget_check", 0.0) >= 0.05) and (setattr(self, "_last_training_budget_check", time.monotonic()) or True) and not self._wait_resource(token):
                     return None
                 action_ns = int(action["action_time"])
                 before_index = bisect_right(frame_finish_times, action_ns) - 1
@@ -2763,6 +2948,9 @@ class Controller:
             pool_size = 0
             model_count = 0
         resource = dict(sample)
+        capture_budget = self.resources.acquire("capture")
+        training_budget = self.resources.acquire("sleep_training")
+        gpu_name = capture_budget.gpu if capture_budget.gpu != "CPU" else training_budget.gpu
         return {
             "state": state,
             "frames": frames,
@@ -2772,7 +2960,19 @@ class Controller:
             "memory": sample["memory"],
             "pool_size": pool_size,
             "model_count": model_count,
-            "resource": resource
+            "resource": resource,
+            "gpu_name": gpu_name,
+            "backend": sample.get("backend", "CPU"),
+            "gpu": sample.get("gpu", 0.0),
+            "gpu_total": sample.get("gpu_dedicated_total", 0),
+            "gpu_used": sample.get("gpu_dedicated_used", 0),
+            "gpu_batch_size": max(capture_budget.gpu_batch_size, training_budget.gpu_batch_size),
+            "cpu_workers": max(capture_budget.cpu_workers, training_budget.cpu_workers),
+            "capture_fps": 1.0 / max(0.001, capture_budget.next_interval),
+            "capture_resolution": "{}×{}".format(capture_budget.max_capture_resolution[0], capture_budget.max_capture_resolution[1]),
+            "queue_age": sample.get("queue_age", 0.0),
+            "resource_state": capture_budget.state if capture_budget.state != "正常" else training_budget.state,
+            "pause_reason": capture_budget.pause_reason or training_budget.pause_reason or "无"
         }
 
     def shutdown(self):
@@ -2814,6 +3014,23 @@ class Controller:
         finally:
             self.store.close()
 
+def work_area_for_window(window=None):
+    try:
+        if window is not None and window.winfo_exists():
+            x = window.winfo_rootx(); y = window.winfo_rooty(); w = max(1, window.winfo_width()); h = max(1, window.winfo_height())
+        else:
+            x = user32.GetSystemMetrics(SM_XVIRTUALSCREEN); y = user32.GetSystemMetrics(SM_YVIRTUALSCREEN); w = max(1, user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)); h = max(1, user32.GetSystemMetrics(SM_CYVIRTUALSCREEN))
+        rect = RECT(int(x), int(y), int(x + w), int(y + h))
+        monitor = user32.MonitorFromRect(ctypes.byref(rect), 2)
+        info = MONITORINFO(); info.cbSize = ctypes.sizeof(MONITORINFO)
+        if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            return (info.rcWork.left, info.rcWork.top, info.rcWork.right, info.rcWork.bottom)
+    except Exception:
+        pass
+    width = max(800, user32.GetSystemMetrics(SM_CXVIRTUALSCREEN))
+    height = max(600, user32.GetSystemMetrics(SM_CYVIRTUALSCREEN))
+    return (0, 0, width, height)
+
 class Panel:
     def __init__(self, root):
         self.root = root
@@ -2827,6 +3044,10 @@ class Panel:
         self.mode_var = StringVar(value="空闲")
         self.status_var = StringVar(value=("配置读取错误：" + "；".join(self.settings.config_errors)) if self.settings.config_errors else "控制面板已就绪。")
         self.performance_var = StringVar(value="CPU 0.0% · 内存 0.0%")
+        self.layout_after = None
+        self.layout_signature = None
+        self.footer_status_label = None
+        self.footer_perf_label = None
         self.progress_var = DoubleVar(value=0.0)
         self.mode_buttons = []
         self.configuration_buttons = []
@@ -2850,7 +3071,10 @@ class Panel:
 
     def build(self):
         self.root.title("雷电智能学习与训练控制面板")
-        self.root.geometry("960x660")
+        wx1, wy1, wx2, wy2 = work_area_for_window(self.root)
+        width = int(min(960, (wx2 - wx1) * 0.72))
+        height = int(min(660, (wy2 - wy1) * 0.78))
+        self.root.geometry("{}x{}+{}+{}".format(width, height, wx1 + max(0, ((wx2 - wx1) - width) // 2), wy1 + max(0, ((wy2 - wy1) - height) // 2)))
         self.root.minsize(360, 420)
         self.root.resizable(True, True)
         self.root.configure(bg="#101826")
@@ -2862,11 +3086,9 @@ class Panel:
         host.grid_rowconfigure(0, weight=1)
         canvas = Canvas(host, bg="#101826", highlightthickness=0, bd=0, yscrollincrement=16)
         vertical = ttk.Scrollbar(host, orient="vertical", command=canvas.yview)
-        horizontal = ttk.Scrollbar(host, orient="horizontal", command=canvas.xview)
-        canvas.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        canvas.configure(yscrollcommand=vertical.set)
         canvas.grid(row=0, column=0, sticky="nsew")
         vertical.grid(row=0, column=1, sticky="ns")
-        horizontal.grid(row=1, column=0, sticky="ew")
         outer = Frame(canvas, bg="#101826", padx=18, pady=16)
         outer_id = canvas.create_window((0, 0), window=outer, anchor="nw")
         self.scroll_canvas = canvas
@@ -2926,7 +3148,8 @@ class Panel:
             value_labels.append(value)
         def layout_config(event=None):
             width = max(1, config_panel.winfo_width())
-            columns = 2 if width >= 720 else 1
+            minimum = max([button.winfo_reqwidth() for button in self.configuration_buttons] + [300]) + 42
+            columns = max(1, min(2, width // max(1, minimum)))
             for column in range(2):
                 config_panel.grid_columnconfigure(column, weight=1 if column < columns else 0, uniform="config" if columns == 2 else "")
             for index, card in enumerate(config_cards):
@@ -2935,8 +3158,7 @@ class Panel:
             for label in value_labels:
                 label.configure(wraplength=wrap)
             sync_region()
-        config_panel.bind("<Configure>", layout_config)
-        self.root.after_idle(layout_config)
+        self.layout_config = layout_config
         divider = Frame(body, bg="#cbd5e1", height=1)
         divider.grid(row=1, column=0, sticky="ew", pady=(12, 12))
         actions = Frame(body, bg="#f8fafc")
@@ -2949,14 +3171,16 @@ class Panel:
         sleep = self.button(actions, "睡眠模式", self.controller.start_sleep, "#ef4444", row=0, column=3, sticky="ew", padx=(7, 0))
         action_buttons = [info_button, learn, train, sleep]
         def layout_actions(event=None):
-            width = actions.winfo_width()
-            columns = 4 if width >= 760 else (2 if width >= 480 else 1)
+            width = max(1, actions.winfo_width())
+            minimum = max([button.winfo_reqwidth() for button in action_buttons] + [130]) + 20
+            columns = max(1, min(4, width // max(1, minimum)))
+            if columns == 3:
+                columns = 2
             for i in range(4):
                 actions.grid_columnconfigure(i, weight=1 if i < columns else 0)
             for index, button in enumerate(action_buttons):
                 button.grid_configure(row=index // columns, column=index % columns, padx=5, pady=5, sticky="ew")
-        actions.bind("<Configure>", layout_actions)
-        self.root.after_idle(layout_actions)
+        self.layout_actions = layout_actions
         self.mode_buttons = [learn, train, sleep]
         Label(body, text="任务进度", bg="#f8fafc", fg="#334155", font=("Microsoft YaHei UI", 10, "bold"), anchor="w").grid(row=3, column=0, sticky="w", pady=(17, 6))
         progress = ttk.Progressbar(body, orient="horizontal", maximum=100.0, variable=self.progress_var, mode="determinate")
@@ -2964,9 +3188,49 @@ class Panel:
         footer = Frame(body, bg="#eef2ff", padx=12, pady=10)
         footer.grid(row=5, column=0, sticky="ew", pady=(12, 0))
         footer.grid_columnconfigure(0, weight=1)
-        Label(footer, textvariable=self.status_var, bg="#eef2ff", fg="#1e3a8a", font=("Microsoft YaHei UI", 9), anchor="w", justify="left", wraplength=550).grid(row=0, column=0, sticky="ew")
-        Label(footer, textvariable=self.performance_var, bg="#eef2ff", fg="#475569", font=("Microsoft YaHei UI", 9), anchor="e").grid(row=0, column=1, sticky="e", padx=(12, 0))
+        self.footer_status_label = Label(footer, textvariable=self.status_var, bg="#eef2ff", fg="#1e3a8a", font=("Microsoft YaHei UI", 9), anchor="w", justify="left")
+        self.footer_perf_label = Label(footer, textvariable=self.performance_var, bg="#eef2ff", fg="#475569", font=("Microsoft YaHei UI", 9), anchor="e")
+        self.footer_status_label.grid(row=0, column=0, sticky="ew")
+        self.footer_perf_label.grid(row=0, column=1, sticky="e", padx=(12, 0))
+        self.footer = footer
+        def schedule_layout(event=None):
+            if self.layout_after is not None:
+                self.root.after_cancel(self.layout_after)
+            self.layout_after = self.root.after(40, self.apply_adaptive_layout)
+        self.root.bind("<Configure>", schedule_layout, add="+")
+        config_panel.bind("<Configure>", schedule_layout)
+        actions.bind("<Configure>", schedule_layout)
+        self.root.after_idle(self.apply_adaptive_layout)
         self.root.after_idle(sync_region)
+
+    def apply_adaptive_layout(self):
+        self.layout_after = None
+        try:
+            if hasattr(self, "layout_config"):
+                self.layout_config()
+            if hasattr(self, "layout_actions"):
+                self.layout_actions()
+            if self.footer_status_label is not None and self.footer_perf_label is not None:
+                footer_width = max(1, self.footer.winfo_width())
+                perf_width = self.footer_perf_label.winfo_reqwidth()
+                inline = footer_width >= perf_width + 360
+                self.footer_status_label.grid_configure(row=0, column=0, columnspan=1 if inline else 2, sticky="ew")
+                self.footer_perf_label.grid_configure(row=0 if inline else 1, column=1 if inline else 0, columnspan=1 if inline else 2, sticky="e" if inline else "w", padx=(12, 0) if inline else (0, 0), pady=(0, 0) if inline else (6, 0))
+                wrap = max(160, footer_width - (perf_width + 38 if inline else 24))
+                self.footer_status_label.configure(wraplength=wrap)
+            wx1, wy1, wx2, wy2 = work_area_for_window(self.root)
+            dpi = 96
+            try:
+                dpi = int(self.root.winfo_fpixels("1i"))
+            except Exception:
+                pass
+            signature = (wx1, wy1, wx2, wy2, dpi)
+            if signature != self.layout_signature:
+                self.layout_signature = signature
+                min_width = max(360, max([button.winfo_reqwidth() for button in self.configuration_buttons + self.mode_buttons] + [320]) + 80)
+                self.root.minsize(min_width, 420)
+        except Exception:
+            pass
 
     def scroll_wheel(self, event):
         canvas = self.scroll_canvas
@@ -2979,10 +3243,7 @@ class Panel:
             if not inside or not event.delta:
                 return None
             steps = -1 if event.delta > 0 else 1
-            if event.state & 0x0001:
-                canvas.xview_scroll(steps * 3, "units")
-            else:
-                canvas.yview_scroll(steps * 3, "units")
+            canvas.yview_scroll(steps * 3, "units")
             return "break"
         except Exception:
             return None
@@ -3069,15 +3330,25 @@ class Panel:
         info = self.controller.information()
         window = Toplevel(self.root)
         window.title("更多信息")
-        window.geometry("670x500")
+        wx1, wy1, wx2, wy2 = work_area_for_window(self.root)
+        width = max(520, min(980, int((wx2 - wx1) * 0.55)))
+        height = max(420, min(820, int((wy2 - wy1) * 0.65)))
+        window.geometry("{}x{}+{}+{}".format(width, height, wx1 + max(0, ((wx2 - wx1) - width) // 2), wy1 + max(0, ((wy2 - wy1) - height) // 2)))
         window.resizable(True, True)
         window.configure(bg="#0f172a")
         window.grid_columnconfigure(0, weight=1)
         window.grid_rowconfigure(1, weight=1)
         Label(window, text="运行信息", bg="#0f172a", fg="white", font=("Microsoft YaHei UI", 18, "bold"), padx=20, pady=18).grid(row=0, column=0, sticky="w")
-        content = Frame(window, bg="#f8fafc", padx=20, pady=18)
-        content.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        info_canvas = Canvas(window, bg="#f8fafc", highlightthickness=0, bd=0)
+        info_scroll = ttk.Scrollbar(window, orient="vertical", command=info_canvas.yview)
+        info_canvas.configure(yscrollcommand=info_scroll.set)
+        info_canvas.grid(row=1, column=0, sticky="nsew", padx=(16, 0), pady=(0, 16))
+        info_scroll.grid(row=1, column=1, sticky="ns", padx=(0, 16), pady=(0, 16))
+        content = Frame(info_canvas, bg="#f8fafc", padx=20, pady=18)
+        content_id = info_canvas.create_window((0, 0), window=content, anchor="nw")
         content.grid_columnconfigure(1, weight=1)
+        content.bind("<Configure>", lambda event: info_canvas.configure(scrollregion=info_canvas.bbox("all")))
+        info_canvas.bind("<Configure>", lambda event: info_canvas.itemconfigure(content_id, width=event.width))
         rows = [
             ("当前状态", info["state"]),
             ("本次会话", info["session"]),
@@ -3085,6 +3356,17 @@ class Panel:
             ("本次记录鼠标事件", str(info["mouse"])),
             ("CPU 使用率", "{:.1f}%".format(info["cpu"])),
             ("内存使用率", "{:.1f}%".format(info["memory"])),
+            ("GPU 名称", info.get("gpu_name", "CPU")),
+            ("当前计算后端", info.get("backend", "CPU")),
+            ("GPU 利用率", "{:.1f}%".format(info.get("gpu", 0.0))),
+            ("专用显存", "{} / {}".format(self.format_bytes(info.get("gpu_used", 0)), self.format_bytes(info.get("gpu_total", 0)))),
+            ("当前 GPU batch size", str(info.get("gpu_batch_size", 0))),
+            ("当前 CPU worker 数", str(info.get("cpu_workers", 1))),
+            ("当前截图频率", "约 {:.2f} FPS".format(info.get("capture_fps", 0.0))),
+            ("当前截图分辨率", info.get("capture_resolution", "未知")),
+            ("当前队列等待时间", "{:.2f} 秒".format(info.get("queue_age", 0.0))),
+            ("当前资源状态", info.get("resource_state", "正常")),
+            ("限速原因", info.get("pause_reason", "无")),
             ("经验池大小", self.format_bytes(info["pool_size"])),
             ("AI 模型数量", str(info["model_count"])),
             ("奖励定义", "画面评分 − 饥饿值"),
@@ -3127,7 +3409,7 @@ class Panel:
     def refresh_performance(self):
         try:
             info = self.controller.information()
-            self.performance_var.set("CPU {:.1f}% · 内存 {:.1f}%".format(info["cpu"], info["memory"]))
+            self.performance_var.set("CPU {:.1f}% · 内存 {:.1f}% · GPU {:.1f}% · {}".format(info["cpu"], info["memory"], info.get("gpu", 0.0), info.get("resource_state", "正常")))
             self.root.after(1200, self.refresh_performance)
         except Exception:
             pass
