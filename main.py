@@ -25,9 +25,12 @@ gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 try:
-    user32.SetProcessDPIAware()
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
-    pass
+    try:
+        user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
 WH_MOUSE_LL = 14
 WH_KEYBOARD_LL = 13
@@ -233,7 +236,9 @@ class ResourceMeter:
         self.storage_path = Path.cwd()
         self.previous = None
         self.last_sample = 0.0
-        self.value = {"cpu": 0.0, "memory": 0.0, "avail_memory": 0, "disk_free": 0, "queue": 0, "gpu": 0.0, "io_latency": 0.0, "process_cpu": 0.0, "process_memory": 0}
+        self.value = {"cpu": 0.0, "memory": 0.0, "avail_memory": 0, "disk_free": 0, "queue": 0, "queue_age": 0.0, "gpu": 0.0, "io_latency": 0.0, "process_cpu": 0.0, "process_memory": 0, "capture_latency": 0.0, "sqlite_latency": 0.0, "capture_failure_rate": 0.0}
+        self.process_previous = None
+        self.process_last_sample = 0.0
 
     def sample(self):
         now = time.monotonic()
@@ -270,7 +275,20 @@ class ResourceMeter:
             except Exception:
                 pass
             io_latency = time.monotonic() - io_start
-            self.value = {"cpu": cpu, "memory": memory, "avail_memory": avail_memory, "disk_free": disk_free, "queue": self.value.get("queue", 0), "gpu": 0.0, "io_latency": io_latency, "process_cpu": 0.0, "process_memory": 0}
+            process_cpu = self.value.get("process_cpu", 0.0)
+            process_memory = self.value.get("process_memory", 0)
+            try:
+                creation = FILETIME(); exit_time = FILETIME(); kernel_time = FILETIME(); user_time = FILETIME()
+                if kernel32.GetProcessTimes(kernel32.GetCurrentProcess(), ctypes.byref(creation), ctypes.byref(exit_time), ctypes.byref(kernel_time), ctypes.byref(user_time)):
+                    proc = filetime_value(kernel_time) + filetime_value(user_time)
+                    if self.process_previous is not None:
+                        dt = max(0.001, now - self.process_last_sample)
+                        process_cpu = max(0.0, min(100.0, (proc - self.process_previous) / 10000000.0 / dt * 100.0 / max(1, os.cpu_count() or 1)))
+                    self.process_previous = proc
+                    self.process_last_sample = now
+            except Exception:
+                pass
+            self.value = {"cpu": cpu, "memory": memory, "avail_memory": avail_memory, "disk_free": disk_free, "queue": self.value.get("queue", 0), "queue_age": self.value.get("queue_age", 0.0), "gpu": 0.0, "io_latency": io_latency, "process_cpu": process_cpu, "process_memory": process_memory, "capture_latency": self.value.get("capture_latency", 0.0), "sqlite_latency": self.value.get("sqlite_latency", 0.0), "capture_failure_rate": self.value.get("capture_failure_rate", 0.0)}
             self.last_sample = now
             return dict(self.value)
 
@@ -288,21 +306,42 @@ class ResourceMeter:
         with self.lock:
             self.storage_path = Path(path)
 
-    def update_queue(self, length):
+    def update_queue(self, length, age=0.0):
         with self.lock:
             self.value["queue"] = int(length)
+            self.value["queue_age"] = float(age)
+
+    def update_capture_metrics(self, elapsed_ms=None, failed=False):
+        with self.lock:
+            if elapsed_ms is not None:
+                old = float(self.value.get("capture_latency", 0.0))
+                self.value["capture_latency"] = elapsed_ms if old <= 0 else old * 0.85 + float(elapsed_ms) * 0.15
+            old_rate = float(self.value.get("capture_failure_rate", 0.0))
+            self.value["capture_failure_rate"] = old_rate * 0.95 + (0.05 if failed else 0.0)
+
+    def update_sqlite_latency(self, elapsed_ms):
+        with self.lock:
+            old = float(self.value.get("sqlite_latency", 0.0))
+            self.value["sqlite_latency"] = elapsed_ms if old <= 0 else old * 0.85 + float(elapsed_ms) * 0.15
 
     def hard_stop(self):
         sample = self.sample()
-        return sample.get("avail_memory", 1) < 512 * 1024 * 1024 or sample.get("disk_free", 1) < 1024 * 1024 * 1024 or sample.get("io_latency", 0.0) > 0.20 or sample.get("queue", 0) > 10000
+        return sample.get("avail_memory", 1) < 256 * 1024 * 1024 or sample.get("io_latency", 0.0) > 0.50
 
     def allow_capture(self):
         sample = self.sample()
-        return not self.hard_stop() and sample["cpu"] < 76 and sample["memory"] < 84
+        return sample.get("disk_free", 0) >= 1024 * 1024 * 1024 and sample.get("queue", 0) < 9000 and sample.get("queue_age", 0.0) < 8.0 and sample.get("capture_failure_rate", 0.0) < 0.35 and sample["cpu"] < 76 and sample["memory"] < 84
+
+    def allow_training(self):
+        sample = self.sample()
+        return sample.get("avail_memory", 0) >= 768 * 1024 * 1024 and sample.get("disk_free", 0) >= 1024 * 1024 * 1024 and sample["cpu"] < 60 and sample["memory"] < 76 and sample.get("sqlite_latency", 0.0) < 250.0
+
+    def allow_maintenance(self):
+        sample = self.sample()
+        return sample.get("avail_memory", 0) >= 256 * 1024 * 1024 and sample.get("io_latency", 0.0) < 1.0
 
     def allow_compute(self):
-        sample = self.sample()
-        return not self.hard_stop() and sample["cpu"] < 60 and sample["memory"] < 76
+        return self.allow_training()
 
     def critical(self):
         sample = self.sample()
@@ -565,6 +604,11 @@ class DataStore:
         self.conn.execute("UPDATE action_outcomes SET action_id=COALESCE(action_id, mouse_event_id) WHERE action_id IS NULL OR action_id=''")
         self.conn.execute("DELETE FROM action_outcomes WHERE rowid NOT IN (SELECT MAX(rowid) FROM action_outcomes GROUP BY action_id)")
         self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_action_outcomes_action_id ON action_outcomes(action_id)")
+        missing_lsh = self.conn.execute("SELECT COUNT(*) FROM frames WHERE (dhash64 IS NOT NULL OR phash IS NOT NULL) AND id NOT IN (SELECT frame_id FROM frame_lsh)").fetchone()[0]
+        if missing_lsh:
+            for fid, dhash, phash in self.conn.execute("SELECT id, dhash64, phash FROM frames WHERE (dhash64 IS NOT NULL OR phash IS NOT NULL) AND id NOT IN (SELECT frame_id FROM frame_lsh)").fetchall():
+                value = dhash or phash
+                self.conn.executemany("INSERT OR IGNORE INTO frame_lsh(key, frame_id) VALUES (?, ?)", [(key, fid) for key in self._hash_buckets(value)])
 
     def close(self):
         with self.lock:
@@ -602,6 +646,12 @@ class DataStore:
             self.conn.execute("INSERT INTO system_events(id, session_id, created, kind, payload) VALUES (?, ?, ?, ?, ?)", (uuid.uuid4().hex, session_id, time.time(), kind, json.dumps(payload, ensure_ascii=False)))
             self.conn.commit()
 
+    def assign_state_cluster(self, dhash, width=None, height=None, gray32x18=None, edge_density=0.0):
+        buckets = self._hash_buckets(dhash)
+        aspect = 0.0 if not width or not height else round(float(width) / max(1, float(height)), 1)
+        edge = int(max(0, min(9, round(float(edge_density or 0.0) * 10))))
+        return "{:04x}_{:04x}_{:.1f}_{}".format(buckets[0] & 0xFFFF, buckets[2] & 0xFFFF, aspect, edge)
+
     def _hash_buckets(self, phash):
         value = int(phash, 16)
         parts = tuple((value >> shift) & 0xFFFF for shift in (48, 32, 16, 0))
@@ -626,12 +676,12 @@ class DataStore:
                         values.append(part ^ (1 << first) ^ (1 << second) ^ (1 << third))
         return values
 
-    def nearest_hashes(self, dhash, limit=8):
+    def nearest_hashes(self, dhash, limit=8, strict=True):
         current = int(dhash, 16)
         parts = tuple((current >> shift) & 0xFFFF for shift in (48, 32, 16, 0))
         candidate = {}
         fallback = False
-        max_candidates = 512
+        max_candidates = 4096
         with self.lock:
             if self.conn is None:
                 return {"hashes": [], "candidate_count": 0, "top_k_distance": 64.0, "retrieval_fallback": False}
@@ -653,6 +703,7 @@ class DataStore:
                         SELECT frames.id, frames.dhash64, frames.phash
                         FROM frame_lsh JOIN frames ON frames.id=frame_lsh.frame_id
                         WHERE frame_lsh.key IN ({placeholders})
+                        ORDER BY frames.created DESC
                         LIMIT {max_candidates}
                     """, chunk).fetchall()
                     for row in rows:
@@ -661,11 +712,12 @@ class DataStore:
                             break
                     if len(candidate) >= max_candidates:
                         break
-                if len(candidate) >= limit:
+                if len(candidate) >= max_candidates:
                     break
-            if len(candidate) < limit:
+            total = self.conn.execute("SELECT COUNT(*) FROM frames WHERE dhash64 IS NOT NULL OR phash IS NOT NULL").fetchone()[0]
+            if strict and (len(candidate) < limit or len(candidate) >= max_candidates or total <= 200000):
                 fallback = True
-                rows = self.conn.execute("SELECT id, dhash64, phash FROM frames WHERE dhash64 IS NOT NULL OR phash IS NOT NULL ORDER BY created DESC LIMIT ?", (max_candidates,)).fetchall()
+                rows = self.conn.execute("SELECT id, dhash64, phash FROM frames WHERE dhash64 IS NOT NULL OR phash IS NOT NULL").fetchall()
                 for row in rows:
                     candidate[row[0]] = row
         ranked = []
@@ -705,7 +757,7 @@ class DataStore:
         size_bytes = final_path.stat().st_size
         dhash = image.get("dhash64") or phash
         buckets = self._hash_buckets(dhash)
-        state_cluster_id = "{:04x}_{:04x}".format(buckets[0] & 0xFFFF, buckets[2] & 0xFFFF)
+        state_cluster_id = self.assign_state_cluster(dhash, image.get("width"), image.get("height"), image.get("gray32x18"), image.get("edge_density", 0.0))
         with self.lock:
             try:
                 self.conn.execute("BEGIN IMMEDIATE")
@@ -808,20 +860,36 @@ class DataStore:
             self.conn.executemany("UPDATE mouse_events SET before_frame_id=?, after_frame_id=?, action_time=?, post_action_delay_ms=?, score_delta=?, reward_delta=?, outcome_valid=? WHERE id=?", [(item["before_frame_id"], item["after_frame_id"], item["action_time"], item["post_action_delay_ms"], item["score_delta"], item["reward_delta"], 1 if item.get("outcome_valid") else 0, item["mouse_event_id"]) for item in outcomes])
             self.conn.commit()
 
-    def pool_size(self):
+    def pool_breakdown(self):
+        result = {"frame_asset_bytes": 0, "database_bytes": 0, "transient_bytes": 0, "experience_total_bytes": 0}
         if self.pool is None:
-            return 0
-        total = 0
+            return result
+        with self.lock:
+            try:
+                result["frame_asset_bytes"] = int(self.conn.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM frames").fetchone()[0] or 0)
+            except Exception:
+                pass
         try:
             for item in self.pool.rglob("*"):
                 try:
-                    if item.is_file():
-                        total += item.stat().st_size
+                    if not item.is_file():
+                        continue
+                    size = item.stat().st_size
+                    name = item.name.lower()
+                    parts = {part.lower() for part in item.parts}
+                    if name.startswith("records.sqlite3"):
+                        result["database_bytes"] += size
+                    elif "trash" in parts or name.endswith(".tmp"):
+                        result["transient_bytes"] += size
+                    result["experience_total_bytes"] += size
                 except OSError:
                     pass
         except OSError:
-            return 0
-        return int(total)
+            pass
+        return result
+
+    def pool_size(self):
+        return int(self.pool_breakdown().get("experience_total_bytes", 0))
 
     def _reconcile_asset_bytes(self):
         with self.lock:
@@ -1055,52 +1123,62 @@ class DataStore:
             return 0, current
         target = int(math.floor(maximum * 0.5))
         removed = 0
-        with self.lock:
-            self.conn.execute("DROP TABLE IF EXISTS prune_candidates")
-            self.conn.execute("CREATE TEMP TABLE prune_candidates(id TEXT PRIMARY KEY, screenshot_path TEXT NOT NULL, size_bytes INTEGER NOT NULL, rank INTEGER NOT NULL)")
-            rows = self.conn.execute("""
-                SELECT frames.id, frames.screenshot_path, frames.size_bytes,
-                       ((MAX(1, COALESCE(state_clusters.count, frames.state_support_count, 1)) - 1.0) / MAX(1, COALESCE(state_clusters.count, frames.state_support_count, 1))) AS redundancy,
-                       MIN(4.0, MAX(0.05, (? - frames.created) / 86400.0)) AS age,
-                       MAX(0.05, 1.0 - frames.reward) AS low_value,
-                       MAX(0.05, 1.0 - frames.action_outcome_information) AS low_information,
-                       MAX(1.0, frames.size_bytes / 1048576.0) AS size_gain
-                FROM frames LEFT JOIN state_clusters ON state_clusters.cluster_id=frames.state_cluster_id
-                WHERE frames.model_dependency_count=0
-                  AND frames.model_refs=0
-                  AND frames.asset_ref_count<=1
-                  AND COALESCE(state_clusters.count, frames.state_support_count, 1)>1
-                  AND frames.validation_last_used<?
-                ORDER BY (redundancy * age * low_value * low_information * size_gain) DESC
-                LIMIT 100000
-            """, (time.time(), time.time() - 3600.0)).fetchall()
-            rank = 0
-            for row in rows:
-                rank += 1
-                self.conn.execute("INSERT OR IGNORE INTO prune_candidates(id, screenshot_path, size_bytes, rank) VALUES (?, ?, ?, ?)", (row[0], row[1], row[2], rank))
-            self.conn.commit()
-        offset_rank = 0
-        while current > target and not cancelled():
-            if cooperative is not None and not cooperative():
-                break
+        def build_candidates(force):
             with self.lock:
-                rows = self.conn.execute("SELECT id, screenshot_path, size_bytes, rank FROM prune_candidates WHERE rank>? ORDER BY rank LIMIT 512", (offset_rank,)).fetchall()
-            if not rows:
-                break
-            offset_rank = int(rows[-1][3])
-            before = current
-            removed += self._delete_frame_batch([(row[0], row[1], row[2]) for row in rows])
-            current = self.pool_size()
-            if current <= target:
-                break
-            if before <= current:
+                self.conn.execute("DROP TABLE IF EXISTS prune_candidates")
+                self.conn.execute("CREATE TEMP TABLE prune_candidates(id TEXT PRIMARY KEY, screenshot_path TEXT NOT NULL, size_bytes INTEGER NOT NULL, rank INTEGER NOT NULL)")
+                guard = "" if force else "AND frames.model_dependency_count=0 AND frames.model_refs=0 AND frames.asset_ref_count<=1 AND COALESCE(state_clusters.count, frames.state_support_count, 1)>1 AND frames.validation_last_used<?"
+                params = [time.time()]
+                if not force:
+                    params.append(time.time() - 3600.0)
+                query = """
+                    SELECT frames.id, frames.screenshot_path, frames.size_bytes,
+                           ((MAX(1, COALESCE(state_clusters.count, frames.state_support_count, 1)) - 1.0) / MAX(1, COALESCE(state_clusters.count, frames.state_support_count, 1))) AS redundancy,
+                           MIN(1.0, MAX(0.0, (? - frames.created) / 2592000.0)) AS age,
+                           MIN(1.0, MAX(0.0, (1.0 - frames.reward))) AS low_value,
+                           MIN(1.0, MAX(0.0, (1.0 - frames.action_outcome_information))) AS low_information,
+                           MIN(1.0, MAX(0.0, frames.size_bytes / 10485760.0)) AS size_gain,
+                           ROW_NUMBER() OVER (PARTITION BY frames.state_cluster_id ORDER BY frames.reward DESC, frames.action_outcome_information DESC, frames.created DESC) AS cluster_rank
+                    FROM frames LEFT JOIN state_clusters ON state_clusters.cluster_id=frames.state_cluster_id
+                    WHERE 1=1 {guard}
+                    ORDER BY ((redundancy * 0.30) + (low_value * 0.25) + (low_information * 0.20) + (age * 0.15) + (size_gain * 0.10) + CASE WHEN cluster_rank>1 THEN 0.25 ELSE 0 END) DESC
+                    LIMIT 200000
+                """.format(guard=guard)
+                rows = self.conn.execute(query, params).fetchall()
+                rank = 0
+                for row in rows:
+                    if force or row[3] > 0 or row[8] > 1:
+                        rank += 1
+                        self.conn.execute("INSERT OR IGNORE INTO prune_candidates(id, screenshot_path, size_bytes, rank) VALUES (?, ?, ?, ?)", (row[0], row[1], row[2], rank))
+                self.conn.commit()
+                return rank
+        for force in (False, True):
+            build_candidates(force)
+            offset_rank = 0
+            while current > target and not cancelled():
+                if cooperative is not None and not cooperative():
+                    time.sleep(0.5)
+                    continue
+                with self.lock:
+                    rows = self.conn.execute("SELECT id, screenshot_path, size_bytes, rank FROM prune_candidates WHERE rank>? ORDER BY rank LIMIT 512", (offset_rank,)).fetchall()
+                if not rows:
+                    break
+                offset_rank = int(rows[-1][3])
+                before = current
+                removed += self._delete_frame_batch([(row[0], row[1], row[2]) for row in rows])
                 self._compact_database(cooperative)
                 current = self.pool_size()
-            progress(min(95.0, 56.0 + 39.0 * min(1.0, (maximum - current) / max(1, maximum - target))))
+                if current <= target:
+                    break
+                if before <= current and force:
+                    break
+                progress(min(95.0, 56.0 + 39.0 * min(1.0, (maximum - current) / max(1, maximum - target))))
+            if current <= target or cancelled():
+                break
         self._compact_database(cooperative)
         remaining = self.pool_size()
         if remaining > target and not cancelled():
-            raise RuntimeError("经验池无法清理到上限 50%，已停止新增截图；当前 {:.2f} MB，目标 {:.2f} MB".format(remaining / 1024 / 1024, target / 1024 / 1024))
+            self.add_system_event(None, "pool_prune_incomplete", {"remaining": remaining, "target": target, "breakdown": self.pool_breakdown()})
         progress(96.0)
         return removed, remaining
 
@@ -1515,7 +1593,7 @@ class MouseHook:
                     if int(wparam) in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL):
                         wheel = ctypes.c_short((int(info.mouseData) >> 16) & 0xFFFF).value
                     source = "AI" if int(info.dwExtraInfo) == AI_MOUSE_MARKER else "用户"
-                    self.sink(event_type, button, wheel, int(info.pt.x), int(info.pt.y), time.monotonic(), source)
+                    self.sink(event_type, button, wheel, int(info.pt.x), int(info.pt.y), time.time(), time.monotonic_ns(), source)
         except Exception:
             pass
         return user32.CallNextHookEx(self.handle, code, wparam, lparam)
@@ -1611,10 +1689,13 @@ class Controller:
         self.latest_frame_features = None
         self.action_limits = {}
         self.last_model_training = 0.0
+        self.last_training_attempt = 0.0
+        self.last_training_success = 0.0
+        self.last_training_data_fingerprint = ""
         self.last_observation = 0.0
         self.capture_failures = 0
         self.mouse_queue = queue.Queue(maxsize=12000)
-        self.control_queue = queue.Queue()
+        self.control_queue = queue.Queue(maxsize=64)
         self.stop_requested = threading.Event()
         self.last_move_kept = None
         self.writer_stop = threading.Event()
@@ -1652,6 +1733,11 @@ class Controller:
         self.store.ensure(self.settings.data["storage_path"])
 
     def on_control_signal(self, kind, reason, created=None, token=None):
+        if kind in ("stop", "esc"):
+            with self.lock:
+                if self.stop_requested.is_set():
+                    return
+                self.stop_requested.set()
         try:
             self.control_queue.put_nowait({"kind": kind, "reason": reason, "created": created or time.time(), "token": token})
         except queue.Full:
@@ -1671,7 +1757,7 @@ class Controller:
         pending = []
         last_write = time.monotonic()
         while not self.writer_stop.is_set() or not self.mouse_queue.empty() or pending:
-            self.resources.update_queue(self.mouse_queue.qsize())
+            self.resources.update_queue(self.mouse_queue.qsize(), max(0.0, time.time() - float(pending[0].get("created", time.time()))) if pending else 0.0)
             try:
                 pending.append(self.mouse_queue.get(timeout=0.25))
                 self.writer_busy.set()
@@ -1708,7 +1794,7 @@ class Controller:
             time.sleep(0.04)
         return self.mouse_queue.empty() and not self.writer_busy.is_set()
 
-    def on_mouse(self, event_type, button, wheel, x, y, created, source):
+    def on_mouse(self, event_type, button, wheel, x, y, created, created_monotonic_ns, source):
         with self.lock:
             if self.state not in ("learning", "training") or not self.session_id or not self.target_rect:
                 return
@@ -1718,22 +1804,21 @@ class Controller:
             previous = self.last_mouse
             critical = event_type != "move" or button or wheel
             if self.state == "training" and source == "用户" and (critical or (previous is not None and math.hypot(x - previous[0], y - previous[1]) >= 12)):
-                self.stop_requested.set()
                 self.on_control_signal("stop", "训练模式检测到真实用户鼠标操作，AI 已停止")
             if not critical:
                 last_kept = self.last_move_kept
-                if last_kept is not None and created - last_kept[2] < 0.010 and abs(x - last_kept[0]) < 3 and abs(y - last_kept[1]) < 3:
-                    self.last_mouse = (x, y, created)
+                if last_kept is not None and (created_monotonic_ns - last_kept[2]) < 10_000_000 and abs(x - last_kept[0]) < 3 and abs(y - last_kept[1]) < 3:
+                    self.last_mouse = (x, y, created_monotonic_ns)
                     return
-                self.last_move_kept = (x, y, created)
-            self.last_mouse = (x, y, created)
+                self.last_move_kept = (x, y, created_monotonic_ns)
+            self.last_mouse = (x, y, created_monotonic_ns)
             self.mouse_count += 1
         dx = 0.0
         dy = 0.0
         direction = 0.0
         speed = 0.0
         if previous is not None:
-            dt = max(0.000001, created - previous[2])
+            dt = max(0.000001, (created_monotonic_ns - previous[2]) / 1_000_000_000.0)
             dx = float(x - previous[0])
             dy = float(y - previous[1])
             direction = math.atan2(dy, dx) if dx or dy else 0.0
@@ -1743,7 +1828,7 @@ class Controller:
         record = {
             "session_id": session_id,
             "created": created,
-            "created_monotonic_ns": int(created * 1_000_000_000),
+            "created_monotonic_ns": int(created_monotonic_ns),
             "source": source,
             "event_type": event_type,
             "button": button,
@@ -1761,7 +1846,6 @@ class Controller:
             self.mouse_queue.put_nowait(record)
         except queue.Full:
             if critical:
-                self.stop_requested.set()
                 self.on_control_signal("stop", "鼠标高优先级事件队列过载")
             with self.loss_lock:
                 item = self.move_loss.get(session_id)
@@ -1771,7 +1855,6 @@ class Controller:
                     item[1] = created
                     item[2] += 1
         if outside:
-            self.stop_requested.set()
             self.on_control_signal("stop", "鼠标已离开雷电模拟器客户区")
 
     def _is_current(self, token, states=None):
@@ -1915,9 +1998,12 @@ class Controller:
                     pass
             if session_id:
                 image = capture_client(hwnd)
+                if image is not None:
+                    self.resources.update_capture_metrics(image.get("capture_elapsed_ms"), False)
                 if not self._is_current(token, ("learning", "training")):
                     return
                 if image is None:
+                    self.resources.update_capture_metrics(None, True)
                     with self.lock:
                         self.capture_failures += 1
                         failures = self.capture_failures
@@ -1949,7 +2035,9 @@ class Controller:
                             reward = score - hunger
                         if not self._is_current(token, ("learning", "training")):
                             return
+                        sqlite_start = time.monotonic()
                         self.store.save_frame(session_id, image, image["phash"], score, hunger, reward)
+                        self.resources.update_sqlite_latency((time.monotonic() - sqlite_start) * 1000.0)
                         with self.lock:
                             if reset_hunger:
                                 self.hunger_anchor = now
@@ -2011,7 +2099,12 @@ class Controller:
             queue_len = self.mouse_queue.qsize()
             hunger_speed = 0.00004
         sample = self.resources.sample()
-        if sample.get("disk_free", 1) < 768 * 1024 * 1024 or sample.get("avail_memory", 1) < 384 * 1024 * 1024 or queue_len > 10000:
+        try:
+            if self.store.pool_size() >= int(self.settings.data["experience_limit"] * 0.95):
+                return True
+        except Exception:
+            pass
+        if sample.get("disk_free", 1) < 1024 * 1024 * 1024 or sample.get("avail_memory", 1) < 384 * 1024 * 1024 or queue_len > 10000:
             return True
         if not plan or mouse_count < 30 or time.time() - self.last_model_training < 180.0:
             return False
@@ -2271,8 +2364,9 @@ class Controller:
     def _cancelled(self, token):
         return not self._is_current(token, ("sleep",))
 
-    def _wait_resource(self, token):
-        while not self._cancelled(token) and not self.resources.allow_compute():
+    def _wait_resource(self, token, purpose="training"):
+        allowed = self.resources.allow_maintenance if purpose == "maintenance" else self.resources.allow_training
+        while not self._cancelled(token) and not allowed():
             sample = self.resources.sample()
             self.emit("state", {"state": "sleep", "detail": "系统资源繁忙，睡眠任务已暂缓", "cpu": sample["cpu"], "memory": sample["memory"]})
             time.sleep(1.2)
@@ -2324,6 +2418,13 @@ class Controller:
         if not self._wait_resource(token):
             return None
         frames_by_session, mouse_by_session = self.store.collect_training_data()
+        fingerprint = str((sum(len(v) for v in frames_by_session.values()), sum(len(v) for v in mouse_by_session.values()), max([row[3] for rows in frames_by_session.values() for row in rows] or [0])))
+        now_attempt = time.time()
+        if fingerprint == self.last_training_data_fingerprint and now_attempt - self.last_training_attempt < 900.0:
+            self.store.add_system_event(None, "model_skipped", {"reason": "训练数据指纹未变化", "fingerprint": fingerprint, "time": now_attempt})
+            return self.store.best_model()
+        self.last_training_attempt = now_attempt
+        self.last_training_data_fingerprint = fingerprint
         if self._cancelled(token):
             return None
         ordered_sessions = sorted(frames_by_session.keys(), key=lambda sid: frames_by_session[sid][0][3] if frames_by_session.get(sid) else 0.0)
@@ -2364,7 +2465,7 @@ class Controller:
                 score_delta = float(after[6]) - float(before[6])
                 reward_delta = float(after[7]) - float(before[7])
                 post_ms = (frame_start_times[after_index] - action_ns) / 1_000_000.0
-                state_key = str(before[4] or before[5]) + ":" + str(round((before[8] / max(1, before[9])), 2))
+                state_key = self.store.assign_state_cluster(before[4] or before[5], before[8], before[9], before[10], before[11])
                 gx = min(15, max(0, int(action["rx"] * 16)))
                 gy = min(8, max(0, int(action["ry"] * 9)))
                 example = {"action_id": action["action_id"], "session_id": session_id, "before_frame_id": before[0], "after_frame_id": after[0], "mouse_event_id": action["mouse_event_id"], "action_time": action_ns, "post_action_delay_ms": post_ms, "score_delta": score_delta, "reward_delta": reward_delta, "outcome_valid": True}
@@ -2423,7 +2524,7 @@ class Controller:
         enough = len(outcomes) >= 30 and len({a["state_key"] for a in actions}) >= 4 and validation_sample_count >= 12 and validation_hits >= 6
         if not enough or validation_quality <= champion_quality:
             payload["champion"] = False
-            self.store.add_system_event(None, "model_candidate_rejected", {"validation_quality": validation_quality, "champion_quality": champion_quality, "validation_samples": validation_sample_count, "validation_hits": validation_hits, "training_samples": len(outcomes), "time": time.time()})
+            self.store.add_system_event(None, "model_candidate_rejected", {"validation_quality": validation_quality, "champion_quality": champion_quality, "validation_samples": validation_sample_count, "validation_hits": validation_hits, "training_samples": len(outcomes), "fingerprint": fingerprint, "time": time.time()})
             return champion if isinstance(champion, dict) else payload
         name = "model_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f") + "_" + payload["id"][:8] + ".json"
         final_path = self.store.models / name
@@ -2434,6 +2535,7 @@ class Controller:
             return None
         temp_path.replace(final_path)
         self.last_model_training = time.time()
+        self.last_training_success = self.last_model_training
         return payload
 
     def _sleep_worker(self, token, resume_training):
@@ -2446,13 +2548,13 @@ class Controller:
             self.emit("progress", 56.0)
             self.emit("state", {"state": "sleep", "detail": "任务1完成；任务2：检查 AI 模型与经验池", "cpu": self.resources.sample()["cpu"], "memory": self.resources.sample()["memory"]})
             self.store.recover_deletions()
-            if not self._wait_resource(token):
+            if not self._wait_resource(token, "maintenance"):
                 return
             self.flush_mouse_records()
-            model_removed = self.store.prune_models(max(1, int(self.settings.data["model_limit"])), lambda: self._cancelled(token), lambda: self._wait_resource(token))
+            model_removed = self.store.prune_models(max(1, int(self.settings.data["model_limit"])), lambda: self._cancelled(token), lambda: self._wait_resource(token, "maintenance"))
             def update(value):
                 self.emit("progress", value)
-            experience_removed, remaining = self.store.prune_experience(max(1, int(self.settings.data["experience_limit"])), lambda: self._cancelled(token), update, lambda: self._wait_resource(token))
+            experience_removed, remaining = self.store.prune_experience(max(1, int(self.settings.data["experience_limit"])), lambda: self._cancelled(token), update, lambda: self._wait_resource(token, "maintenance"))
             if self._cancelled(token):
                 return
             self.emit("progress", 100.0)
