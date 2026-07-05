@@ -67,6 +67,9 @@ VK_ESCAPE = 0x1B
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 PROCESS_VM_READ = 0x0010
 MONITOR_DEFAULTTONULL = 0
+GWL_EXSTYLE = -20
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_TOOLWINDOW = 0x00000080
 
 ULONG_PTR = ctypes.c_size_t
 LRESULT = ctypes.c_ssize_t
@@ -143,6 +146,8 @@ user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
 user32.GetAncestor.restype = wintypes.HWND
 user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
 user32.GetWindow.restype = wintypes.HWND
+user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.GetWindowLongW.restype = wintypes.LONG
 user32.EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
 user32.EnumWindows.restype = wintypes.BOOL
 user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
@@ -309,16 +314,42 @@ class Settings:
             "experience_limit": 10 * 1024 * 1024 * 1024,
             "model_limit": 100
         }
+        self.config_errors = []
         self.load()
 
     def load(self):
+        self.config_errors = []
         try:
             loaded = json.loads(self.path.read_text(encoding="utf-8"))
-            for key in self.data:
-                if key in loaded:
-                    self.data[key] = loaded[key]
-        except Exception:
-            pass
+        except Exception as error:
+            if self.path.exists():
+                self.config_errors.append("配置读取失败:" + str(error))
+            return
+        if not isinstance(loaded, dict):
+            self.config_errors.append("配置根对象不是字典")
+            return
+        if "emulator_path" in loaded:
+            if isinstance(loaded["emulator_path"], str):
+                self.data["emulator_path"] = loaded["emulator_path"]
+            else:
+                self.config_errors.append("emulator_path 类型无效")
+        if "storage_path" in loaded:
+            if isinstance(loaded["storage_path"], str):
+                self.data["storage_path"] = loaded["storage_path"]
+            else:
+                self.config_errors.append("storage_path 类型无效")
+        if "experience_limit" in loaded:
+            value = loaded["experience_limit"]
+            if isinstance(value, int) and int(0.1 * 1024 * 1024 * 1024) <= value <= 4096 * 1024 * 1024 * 1024:
+                self.data["experience_limit"] = value
+            else:
+                self.config_errors.append("experience_limit 超出范围或类型无效")
+        if "model_limit" in loaded:
+            value = loaded["model_limit"]
+            if isinstance(value, int) and 1 <= value <= 100000:
+                self.data["model_limit"] = value
+            else:
+                self.config_errors.append("model_limit 超出范围或类型无效")
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -369,10 +400,19 @@ class DataStore:
             );
             CREATE TABLE IF NOT EXISTS frames (
                 id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
+                session_id TEXT NOT NULL REFERENCES sessions(id),
                 created REAL NOT NULL,
                 screenshot_path TEXT NOT NULL,
                 phash TEXT NOT NULL,
+                created_monotonic_ns INTEGER NOT NULL DEFAULT 0,
+                capture_backend TEXT NOT NULL DEFAULT 'gdi',
+                capture_elapsed_ms REAL NOT NULL DEFAULT 0,
+                capture_complete INTEGER NOT NULL DEFAULT 1,
+                brightness REAL NOT NULL DEFAULT 0,
+                variance REAL NOT NULL DEFAULT 0,
+                gray32x18 TEXT,
+                edge_density REAL NOT NULL DEFAULT 0,
+                color_histogram TEXT,
                 dhash64 TEXT,
                 score REAL NOT NULL,
                 hunger REAL NOT NULL,
@@ -395,7 +435,7 @@ class DataStore:
             CREATE INDEX IF NOT EXISTS idx_frames_buckets ON frames(bucket0, bucket1, bucket2, bucket3);
             CREATE TABLE IF NOT EXISTS mouse_loss_events (
                 id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
+                session_id TEXT NOT NULL REFERENCES sessions(id),
                 created REAL NOT NULL,
                 started REAL NOT NULL,
                 ended REAL NOT NULL,
@@ -404,8 +444,9 @@ class DataStore:
             );
             CREATE TABLE IF NOT EXISTS mouse_events (
                 id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
+                session_id TEXT NOT NULL REFERENCES sessions(id),
                 created REAL NOT NULL,
+                created_monotonic_ns INTEGER NOT NULL DEFAULT 0,
                 source TEXT NOT NULL,
                 event_type TEXT NOT NULL,
                 button TEXT NOT NULL,
@@ -417,12 +458,26 @@ class DataStore:
                 dx REAL NOT NULL,
                 dy REAL NOT NULL,
                 direction REAL NOT NULL,
-                speed REAL NOT NULL
+                speed REAL NOT NULL,
+                before_frame_id TEXT,
+                after_frame_id TEXT,
+                action_time INTEGER NOT NULL DEFAULT 0,
+                post_action_delay_ms REAL NOT NULL DEFAULT 0,
+                score_delta REAL NOT NULL DEFAULT 0,
+                reward_delta REAL NOT NULL DEFAULT 0,
+                outcome_valid INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_mouse_session ON mouse_events(session_id, created);
+            CREATE INDEX IF NOT EXISTS idx_mouse_session_mono ON mouse_events(session_id, created_monotonic_ns);
+            CREATE INDEX IF NOT EXISTS idx_frames_session_mono ON frames(session_id, created_monotonic_ns);
+            CREATE TABLE IF NOT EXISTS state_clusters (cluster_id TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS frame_lsh (key INTEGER NOT NULL, frame_id TEXT NOT NULL, PRIMARY KEY(key, frame_id));
+            CREATE INDEX IF NOT EXISTS idx_frame_lsh_key ON frame_lsh(key);
+            CREATE TABLE IF NOT EXISTS ingestion_journal (id TEXT PRIMARY KEY, object_type TEXT NOT NULL, object_id TEXT NOT NULL, path TEXT, stage TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL, error TEXT);
+            CREATE TABLE IF NOT EXISTS action_outcomes (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), mouse_event_id TEXT NOT NULL, before_frame_id TEXT NOT NULL, after_frame_id TEXT NOT NULL, action_time INTEGER NOT NULL, post_action_delay_ms REAL NOT NULL, score_delta REAL NOT NULL, reward_delta REAL NOT NULL, outcome_valid INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS system_events (
                 id TEXT PRIMARY KEY,
-                session_id TEXT,
+                session_id TEXT REFERENCES sessions(id),
                 created REAL NOT NULL,
                 kind TEXT NOT NULL,
                 payload TEXT NOT NULL
@@ -465,6 +520,15 @@ class DataStore:
             "action_outcome_information": "REAL NOT NULL DEFAULT 0",
             "model_dependency_count": "INTEGER NOT NULL DEFAULT 0",
             "validation_last_used": "REAL NOT NULL DEFAULT 0",
+            "created_monotonic_ns": "INTEGER NOT NULL DEFAULT 0",
+            "capture_backend": "TEXT NOT NULL DEFAULT 'gdi'",
+            "capture_elapsed_ms": "REAL NOT NULL DEFAULT 0",
+            "capture_complete": "INTEGER NOT NULL DEFAULT 1",
+            "brightness": "REAL NOT NULL DEFAULT 0",
+            "variance": "REAL NOT NULL DEFAULT 0",
+            "gray32x18": "TEXT",
+            "edge_density": "REAL NOT NULL DEFAULT 0",
+            "color_histogram": "TEXT",
             "asset_ref_count": "INTEGER NOT NULL DEFAULT 1"
         }
         for name, definition in additions.items():
@@ -476,6 +540,13 @@ class DataStore:
         self.conn.execute("CREATE TABLE IF NOT EXISTS pool_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL)")
         self.conn.execute("INSERT OR IGNORE INTO pool_meta(key, value) VALUES ('total_asset_bytes', COALESCE((SELECT SUM(size_bytes) FROM frames), 0))")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_frames_cluster ON frames(state_cluster_id, state_support_count)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_frames_session_mono ON frames(session_id, created_monotonic_ns)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_mouse_session_mono ON mouse_events(session_id, created_monotonic_ns)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS state_clusters (cluster_id TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL DEFAULT 0)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS frame_lsh (key INTEGER NOT NULL, frame_id TEXT NOT NULL, PRIMARY KEY(key, frame_id))")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_frame_lsh_key ON frame_lsh(key)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS ingestion_journal (id TEXT PRIMARY KEY, object_type TEXT NOT NULL, object_id TEXT NOT NULL, path TEXT, stage TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL, error TEXT)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS action_outcomes (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), mouse_event_id TEXT NOT NULL, before_frame_id TEXT NOT NULL, after_frame_id TEXT NOT NULL, action_time INTEGER NOT NULL, post_action_delay_ms REAL NOT NULL, score_delta REAL NOT NULL, reward_delta REAL NOT NULL, outcome_valid INTEGER NOT NULL)")
 
     def close(self):
         with self.lock:
@@ -524,27 +595,25 @@ class DataStore:
         with self.lock:
             if self.conn is None:
                 return []
-            for column, value in zip(("bucket0", "bucket1", "bucket2", "bucket3"), buckets):
-                for row in self.conn.execute(f"SELECT phash, dhash64, score, reward, size_bytes FROM frames WHERE {column}=?", (value,)).fetchall():
+            for key in buckets[:4]:
+                rows = self.conn.execute("""
+                    SELECT frames.id, frames.dhash64, frames.phash
+                    FROM frame_lsh JOIN frames ON frames.id=frame_lsh.frame_id
+                    WHERE frame_lsh.key=?
+                    ORDER BY frames.created_monotonic_ns DESC
+                    LIMIT 64
+                """, (key,)).fetchall()
+                for row in rows:
                     candidate[row[0]] = row
-            radius = 1
-            while len(candidate) < limit and radius <= 8:
-                expanded = []
-                for value in buckets:
-                    expanded.extend([max(0, value - radius), min(65535, value + radius)])
-                for column in ("bucket0", "bucket1", "bucket2", "bucket3"):
-                    marks = ",".join("?" for _ in expanded)
-                    for row in self.conn.execute(f"SELECT phash, dhash64, score, reward, size_bytes FROM frames WHERE {column} IN ({marks})", expanded).fetchall():
-                        candidate[row[0]] = row
-                radius *= 2
-            if len(candidate) < limit:
-                for row in self.conn.execute("SELECT phash, dhash64, score, reward, size_bytes FROM frames ORDER BY ABS(reward) DESC, created DESC LIMIT 8192").fetchall():
-                    candidate[row[0]] = row
+                    if len(candidate) >= 256:
+                        break
+                if len(candidate) >= 256:
+                    break
         ranked = []
         for row in candidate.values():
             try:
-                stored = row[1] or row[0]
-                ranked.append((bit_count(current ^ int(stored, 16)), row[0]))
+                stored = row[1] or row[2]
+                ranked.append((bit_count(current ^ int(stored, 16)), row[2]))
             except Exception:
                 pass
         ranked.sort(key=lambda item: item[0])
@@ -560,6 +629,7 @@ class DataStore:
     def save_frame(self, session_id, image, phash, score, hunger, reward):
         identifier = uuid.uuid4().hex
         moment = time.time()
+        mono = time.monotonic_ns()
         folder = self.screens / session_id
         folder.mkdir(parents=True, exist_ok=True)
         relative = Path("screens") / session_id / (identifier + ".png")
@@ -570,9 +640,14 @@ class DataStore:
         buckets = self._hash_buckets(phash)
         state_cluster_id = "{:04x}_{:04x}".format(buckets[0], buckets[2])
         with self.lock:
-            temporary.replace(final_path)
+            self.conn.execute("INSERT INTO ingestion_journal(id, object_type, object_id, path, stage, created, updated) VALUES (?, ?, ?, ?, ?, ?, ?)", (uuid.uuid4().hex, "frame", identifier, str(relative), "prepared", moment, moment))
             support = self.conn.execute("SELECT COUNT(*) + 1 FROM frames WHERE state_cluster_id=?", (state_cluster_id,)).fetchone()[0]
-            self.conn.execute("INSERT INTO frames(id, session_id, created, screenshot_path, phash, dhash64, score, hunger, reward, width, height, size_bytes, novelty, action_result, coverage, model_refs, last_used, bucket0, bucket1, bucket2, bucket3, state_cluster_id, state_support_count, action_outcome_information, model_dependency_count, validation_last_used, asset_ref_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (identifier, session_id, moment, str(relative), phash, phash, score, hunger, reward, image["width"], image["height"], size_bytes, score, reward, score, 0, moment, *buckets, state_cluster_id, support, abs(reward), 0, moment, 1))
+            self.conn.execute("INSERT INTO frames(id, session_id, created, created_monotonic_ns, screenshot_path, phash, dhash64, score, hunger, reward, width, height, size_bytes, novelty, action_result, coverage, model_refs, last_used, bucket0, bucket1, bucket2, bucket3, state_cluster_id, state_support_count, action_outcome_information, model_dependency_count, validation_last_used, asset_ref_count, capture_backend, capture_elapsed_ms, capture_complete, brightness, variance, gray32x18, edge_density, color_histogram) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (identifier, session_id, moment, mono, str(relative), phash, phash, score, hunger, reward, image["width"], image["height"], size_bytes, score, reward, score, 0, moment, *buckets, state_cluster_id, support, abs(reward), 0, moment, 1, image.get("capture_backend", "gdi"), image.get("capture_elapsed_ms", 0.0), image.get("capture_complete", 1), image.get("brightness", 0.0), image.get("variance", 0.0), image.get("gray32x18"), image.get("edge_density", 0.0), image.get("color_histogram")))
+            temporary.replace(final_path)
+            self.conn.execute("UPDATE ingestion_journal SET stage=?, updated=? WHERE object_id=?", ("complete", time.time(), identifier))
+            self.conn.execute("INSERT OR IGNORE INTO state_clusters(cluster_id, count, updated_at) VALUES (?, 0, ?)", (state_cluster_id, moment))
+            self.conn.execute("UPDATE state_clusters SET count=count+1, updated_at=? WHERE cluster_id=?", (moment, state_cluster_id))
+            self.conn.executemany("INSERT OR IGNORE INTO frame_lsh(key, frame_id) VALUES (?, ?)", [(key, identifier) for key in self._hash_buckets(phash)])
             self.conn.execute("UPDATE sessions SET frame_count=frame_count+1 WHERE id=?", (session_id,))
             self.conn.execute("INSERT OR REPLACE INTO pool_meta(key, value) VALUES ('total_asset_bytes', COALESCE((SELECT value FROM pool_meta WHERE key='total_asset_bytes'), 0) + ?)", (int(size_bytes),))
             self.conn.commit()
@@ -583,12 +658,12 @@ class DataStore:
         values = []
         counts = {}
         for record in records:
-            values.append((uuid.uuid4().hex, record["session_id"], record["created"], record["source"], record["event_type"], record["button"], record["wheel"], record["x"], record["y"], record["relative_x"], record["relative_y"], record["dx"], record["dy"], record["direction"], record["speed"]))
+            values.append((uuid.uuid4().hex, record["session_id"], record["created"], record.get("created_monotonic_ns", 0), record["source"], record["event_type"], record["button"], record["wheel"], record["x"], record["y"], record["relative_x"], record["relative_y"], record["dx"], record["dy"], record["direction"], record["speed"]))
             counts[record["session_id"]] = counts.get(record["session_id"], 0) + 1
         with self.lock:
             if self.conn is None:
                 return
-            self.conn.executemany("INSERT INTO mouse_events(id, session_id, created, source, event_type, button, wheel, x, y, relative_x, relative_y, dx, dy, direction, speed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
+            self.conn.executemany("INSERT INTO mouse_events(id, session_id, created, created_monotonic_ns, source, event_type, button, wheel, x, y, relative_x, relative_y, dx, dy, direction, speed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
             self.conn.executemany("UPDATE sessions SET mouse_count=mouse_count+? WHERE id=?", [(value, key) for key, value in counts.items()])
             self.conn.commit()
 
@@ -623,27 +698,55 @@ class DataStore:
 
     def collect_training_data(self):
         with self.lock:
-            frame_rows = self.conn.execute("SELECT phash, score, reward, created FROM frames ORDER BY created DESC LIMIT 4000").fetchall()
-            sampled = [row[0] for row in self.conn.execute("SELECT id FROM frames ORDER BY created DESC LIMIT 4000").fetchall()]
+            sessions = [row[0] for row in self.conn.execute("SELECT id FROM sessions ORDER BY started DESC LIMIT 16").fetchall()]
+            frames = {}
+            mouse = {}
+            for session_id in sessions:
+                frame_rows = self.conn.execute("""
+                    SELECT id, session_id, created_monotonic_ns, created, dhash64, phash, score, reward, width, height, gray32x18, edge_density, color_histogram
+                    FROM frames
+                    WHERE session_id=? AND capture_complete=1 AND created_monotonic_ns>0
+                    ORDER BY created_monotonic_ns ASC
+                    LIMIT 6000
+                """, (session_id,)).fetchall()
+                mouse_rows = self.conn.execute("""
+                    SELECT id, session_id, created_monotonic_ns, created, event_type, source, relative_x, relative_y, speed, dx, dy, direction, button, wheel
+                    FROM mouse_events
+                    WHERE session_id=? AND created_monotonic_ns>0
+                    ORDER BY created_monotonic_ns ASC
+                    LIMIT 18000
+                """, (session_id,)).fetchall()
+                if frame_rows:
+                    frames[session_id] = frame_rows
+                if mouse_rows:
+                    mouse[session_id] = mouse_rows
+            sampled = [row[0] for rows in frames.values() for row in rows[-256:]]
             if sampled:
                 self.conn.executemany("UPDATE frames SET validation_last_used=?, model_dependency_count=MAX(model_dependency_count, 0) WHERE id=?", [(time.time(), item) for item in sampled])
-            mouse_rows = self.conn.execute("SELECT event_type, source, relative_x, relative_y, speed, created FROM mouse_events ORDER BY created DESC LIMIT 12000").fetchall()
             self.conn.commit()
-        frame_rows.reverse()
-        mouse_rows.reverse()
-        return frame_rows, mouse_rows
+        return frames, mouse
+
+
+    def save_action_outcomes(self, outcomes):
+        if not outcomes:
+            return
+        rows = [(uuid.uuid4().hex, item["session_id"], item["mouse_event_id"], item["before_frame_id"], item["after_frame_id"], item["action_time"], item["post_action_delay_ms"], item["score_delta"], item["reward_delta"], 1 if item.get("outcome_valid") else 0) for item in outcomes]
+        with self.lock:
+            self.conn.executemany("INSERT OR REPLACE INTO action_outcomes(id, session_id, mouse_event_id, before_frame_id, after_frame_id, action_time, post_action_delay_ms, score_delta, reward_delta, outcome_valid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+            self.conn.executemany("UPDATE mouse_events SET before_frame_id=?, after_frame_id=?, action_time=?, post_action_delay_ms=?, score_delta=?, reward_delta=?, outcome_valid=? WHERE id=?", [(item["before_frame_id"], item["after_frame_id"], item["action_time"], item["post_action_delay_ms"], item["score_delta"], item["reward_delta"], 1 if item.get("outcome_valid") else 0, item["mouse_event_id"]) for item in outcomes])
+            self.conn.commit()
 
     def pool_size(self):
-        if self.conn is None:
+        if self.pool is None or not self.pool.exists():
             return 0
-        with self.lock:
-            asset = self.conn.execute("SELECT COALESCE(value, 0) FROM pool_meta WHERE key='total_asset_bytes'").fetchone()
+        total = 0
+        for item in self.pool.rglob("*"):
             try:
-                db_bytes = self.conn.execute("SELECT COALESCE(SUM(pgsize), 0) FROM dbstat WHERE name NOT LIKE 'sqlite_%'").fetchone()[0]
-            except sqlite3.Error:
-                db_path = self.pool / "records.sqlite3"
-                db_bytes = db_path.stat().st_size if db_path.exists() else 0
-        return int((asset[0] if asset else 0) or 0) + int(db_bytes or 0)
+                if item.is_file():
+                    total += item.stat().st_size
+            except OSError:
+                pass
+        return int(total)
 
     def _reconcile_asset_bytes(self):
         with self.lock:
@@ -805,10 +908,13 @@ class DataStore:
         with self.lock:
             try:
                 self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                for _ in range(16):
+                freelist = int(self.conn.execute("PRAGMA freelist_count").fetchone()[0] or 0)
+                while freelist > 0:
                     if cooperative is not None and not cooperative():
                         break
-                    self.conn.execute("PRAGMA incremental_vacuum(512)")
+                    pages = min(4096, freelist)
+                    self.conn.execute("PRAGMA incremental_vacuum({})".format(pages))
+                    freelist = int(self.conn.execute("PRAGMA freelist_count").fetchone()[0] or 0)
                 self.conn.commit()
             except sqlite3.Error:
                 pass
@@ -820,53 +926,54 @@ class DataStore:
         current = self.pool_size()
         if current <= maximum:
             return 0, current
-        target = int(maximum * 0.5)
+        target = int(math.floor(maximum * 0.5))
         removed = 0
+        strategies = [
+            "ORDER BY COALESCE(state_clusters.count, frames.state_support_count, 1) DESC, reward ASC, action_outcome_information ASC, validation_last_used ASC, size_bytes DESC",
+            "ORDER BY reward ASC, action_outcome_information ASC, validation_last_used ASC, size_bytes DESC",
+            "ORDER BY validation_last_used ASC, reward ASC, size_bytes DESC"
+        ]
+        with self.lock:
+            self.conn.execute("DROP TABLE IF EXISTS prune_candidates")
+            self.conn.execute("CREATE TEMP TABLE prune_candidates(id TEXT PRIMARY KEY, screenshot_path TEXT NOT NULL, size_bytes INTEGER NOT NULL, rank INTEGER NOT NULL)")
+            rank = 0
+            for order in strategies:
+                rows = self.conn.execute("""
+                    SELECT frames.id, frames.screenshot_path, frames.size_bytes
+                    FROM frames LEFT JOIN state_clusters ON state_clusters.cluster_id=frames.state_cluster_id
+                    WHERE frames.asset_ref_count<=999999
+                    {}
+                    LIMIT 100000
+                """.format(order)).fetchall()
+                for row in rows:
+                    rank += 1
+                    self.conn.execute("INSERT OR IGNORE INTO prune_candidates(id, screenshot_path, size_bytes, rank) VALUES (?, ?, ?, ?)", (row[0], row[1], row[2], rank))
+            self.conn.commit()
+        offset_rank = 0
         while current > target and not cancelled():
             if cooperative is not None and not cooperative():
                 break
             with self.lock:
-                now = time.time()
-                self.conn.execute("""
-                    UPDATE frames
-                    SET state_support_count=(SELECT COUNT(*) FROM frames peer WHERE peer.state_cluster_id=frames.state_cluster_id)
-                    WHERE state_cluster_id IS NOT NULL
-                """)
-                rows = self.conn.execute("""
-                    SELECT id, screenshot_path, size_bytes,
-                           state_cluster_id,
-                           state_support_count,
-                           (
-                               (CASE WHEN state_support_count <= 1 THEN 1000000.0 ELSE 1.0 / state_support_count END)
-                               + ABS(action_outcome_information) * 0.40
-                               + model_dependency_count * 1000.0
-                               + asset_ref_count * 10.0
-                               - MIN(size_bytes, 10485760) / 10485760.0
-                               - MAX(0.0, ? - validation_last_used) * 0.0000001
-                           ) AS keep_value
-                    FROM frames
-                    WHERE COALESCE(model_dependency_count, 0)=0 AND COALESCE(asset_ref_count, 1)<=1 AND COALESCE(state_support_count, 1)>1
-                    ORDER BY keep_value ASC, validation_last_used ASC, created ASC
-                    LIMIT 128
-                """, (now,)).fetchall()
-                self.conn.commit()
+                rows = self.conn.execute("SELECT id, screenshot_path, size_bytes, rank FROM prune_candidates WHERE rank>? ORDER BY rank LIMIT 512", (offset_rank,)).fetchall()
             if not rows:
                 break
+            offset_rank = int(rows[-1][3])
             before = current
             removed += self._delete_frame_batch([(row[0], row[1], row[2]) for row in rows])
-            self._compact_database(cooperative)
             current = self.pool_size()
-            if before <= current:
+            if current <= target:
                 break
+            if before <= current:
+                self._compact_database(cooperative)
+                current = self.pool_size()
             progress(min(95.0, 56.0 + 39.0 * min(1.0, (maximum - current) / max(1, maximum - target))))
+        self._compact_database(cooperative)
         remaining = self.pool_size()
         if remaining > target and not cancelled():
-            self._compact_database(cooperative)
-            remaining = self.pool_size()
-            if remaining > target:
-                raise RuntimeError("经验池无法清理到上限 50%，当前 {:.2f} MB，目标 {:.2f} MB".format(remaining / 1024 / 1024, target / 1024 / 1024))
+            raise RuntimeError("经验池无法清理到上限 50%，已停止新增截图；当前 {:.2f} MB，目标 {:.2f} MB".format(remaining / 1024 / 1024, target / 1024 / 1024))
         progress(96.0)
         return removed, remaining
+
 
 def filetime_value(value):
     return (value.dwHighDateTime << 32) | value.dwLowDateTime
@@ -955,16 +1062,8 @@ def virtual_screen_rect():
     return (left, top, left + user32.GetSystemMetrics(SM_CXVIRTUALSCREEN), top + user32.GetSystemMetrics(SM_CYVIRTUALSCREEN))
 
 def screen_contains(rect):
-    rc = RECT(rect[0], rect[1], rect[2], rect[3])
-    monitor = user32.MonitorFromRect(ctypes.byref(rc), MONITOR_DEFAULTTONULL)
-    if not monitor:
-        return False
-    info = MONITORINFO()
-    info.cbSize = ctypes.sizeof(MONITORINFO)
-    if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
-        return False
-    m = (info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right, info.rcMonitor.bottom)
-    return rect[0] >= m[0] and rect[1] >= m[1] and rect[2] <= m[2] and rect[3] <= m[3]
+    virtual = virtual_screen_rect()
+    return rect[0] >= virtual[0] and rect[1] >= virtual[1] and rect[2] <= virtual[2] and rect[3] <= virtual[3]
 
 def root_window(hwnd):
     return user32.GetAncestor(hwnd, GA_ROOT)
@@ -988,20 +1087,19 @@ def client_unobscured(hwnd, rect):
     checked = set()
     while above and above not in checked:
         checked.add(above)
+        if root_window(above) == own_root:
+            above = user32.GetWindow(above, GW_HWNDPREV)
+            continue
+        style = int(user32.GetWindowLongW(above, GWL_EXSTYLE))
+        title = window_title(above)
+        if style & WS_EX_TRANSPARENT or style & WS_EX_TOOLWINDOW or "tooltip" in title.lower() or "工具提示" in title:
+            above = user32.GetWindow(above, GW_HWNDPREV)
+            continue
         if user32.IsWindowVisible(above) and not user32.IsIconic(above):
             candidate = window_rectangle(above)
             if candidate is not None and rectangle_overlap(candidate, rect):
                 return False
         above = user32.GetWindow(above, GW_HWNDPREV)
-    x0, y0, x1, y1 = rect
-    ratios = (0.035, 0.18, 0.35, 0.5, 0.65, 0.82, 0.965)
-    for x_ratio in ratios:
-        x = x0 + min(x1 - x0 - 1, max(0, int((x1 - x0) * x_ratio)))
-        for y_ratio in ratios:
-            y = y0 + min(y1 - y0 - 1, max(0, int((y1 - y0) * y_ratio)))
-            found = user32.GetWindowFromPoint(POINT(x, y))
-            if not found or root_window(found) != own_root:
-                return False
     return True
 
 def valid_client(hwnd, require_cursor=True):
@@ -1061,6 +1159,7 @@ def encode_png(width, height, rgb):
     return b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) + png_chunk(b"IDAT", zlib.compress(bytes(rows), 6)) + png_chunk(b"IEND", b"")
 
 def capture_client(hwnd, max_width=640, max_height=360):
+    started_capture = time.monotonic()
     local = RECT()
     if not user32.GetClientRect(hwnd, ctypes.byref(local)):
         return None
@@ -1126,9 +1225,29 @@ def capture_client(hwnd, max_width=640, max_height=360):
                     value |= 1
         mean = sum(rgb) / max(1, len(rgb))
         variance = sum((component - mean) ** 2 for component in rgb[::max(1, len(rgb)//4096)]) / max(1, len(rgb[::max(1, len(rgb)//4096)]))
-        if mean < 3.0 or variance < 2.0:
-            return None
-        return {"width": width, "height": height, "png": encode_png(width, height, rgb), "phash": f"{value:016x}", "dhash64": f"{value:016x}"}
+        sample_gray = []
+        for gy in range(18):
+            sy = min(height - 1, int((gy + 0.5) * height / 18))
+            for gx in range(32):
+                sx = min(width - 1, int((gx + 0.5) * width / 32))
+                index = (sy * width + sx) * 3
+                sample_gray.append((rgb[index] * 299 + rgb[index + 1] * 587 + rgb[index + 2] * 114) // 1000)
+        edge_total = 0
+        edge_hits = 0
+        for gy in range(18):
+            for gx in range(31):
+                delta = abs(sample_gray[gy * 32 + gx] - sample_gray[gy * 32 + gx + 1])
+                edge_total += delta
+                if delta > 24:
+                    edge_hits += 1
+        hist = [0] * 24
+        step = max(1, len(rgb) // 12288)
+        for index in range(0, len(rgb), 3 * step):
+            hist[min(7, rgb[index] // 32)] += 1
+            hist[8 + min(7, rgb[index + 1] // 32)] += 1
+            hist[16 + min(7, rgb[index + 2] // 32)] += 1
+        complete = 1 if mean >= 3.0 and variance >= 2.0 else 0
+        return {"width": width, "height": height, "png": encode_png(width, height, rgb), "phash": f"{value:016x}", "dhash64": f"{value:016x}", "capture_backend": "gdi", "capture_elapsed_ms": (time.monotonic() - started_capture) * 1000.0, "capture_complete": complete, "brightness": mean, "variance": variance, "gray32x18": bytes(sample_gray).hex(), "edge_density": edge_hits / max(1, edge_total), "color_histogram": json.dumps(hist, separators=(",", ":"))}
     finally:
         if old_object and memory_dc:
             gdi32.SelectObject(memory_dc, old_object)
@@ -1236,7 +1355,7 @@ class MouseHook:
                     if int(wparam) in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL):
                         wheel = ctypes.c_short((int(info.mouseData) >> 16) & 0xFFFF).value
                     source = "AI" if int(info.dwExtraInfo) == AI_MOUSE_MARKER else "用户"
-                    self.sink(event_type, button, wheel, int(info.pt.x), int(info.pt.y), time.time(), source)
+                    self.sink(event_type, button, wheel, int(info.pt.x), int(info.pt.y), time.monotonic(), source)
         except Exception:
             pass
         return user32.CallNextHookEx(self.handle, code, wparam, lparam)
@@ -1436,6 +1555,9 @@ class Controller:
             outside = not point_inside((x, y), rect)
             previous = self.last_mouse
             critical = event_type != "move" or button or wheel
+            if self.state == "training" and source == "用户" and (critical or (previous is not None and math.hypot(x - previous[0], y - previous[1]) >= 12)):
+                self.stop_requested.set()
+                self.on_control_signal("stop", "训练模式检测到真实用户鼠标操作，AI 已停止")
             if not critical:
                 last_kept = self.last_move_kept
                 if last_kept is not None and created - last_kept[2] < 0.010 and abs(x - last_kept[0]) < 3 and abs(y - last_kept[1]) < 3:
@@ -1458,7 +1580,8 @@ class Controller:
         height = max(1, rect[3] - rect[1])
         record = {
             "session_id": session_id,
-            "created": created,
+            "created": time.time(),
+            "created_monotonic_ns": time.monotonic_ns(),
             "source": source,
             "event_type": event_type,
             "button": button,
@@ -1568,7 +1691,7 @@ class Controller:
             self.last_mouse = None
             self.ai_step = 0
             model = self.store.best_model() if mode == "training" else None
-            plan = model.get("hotspots", []) if isinstance(model, dict) else []
+            plan = model.get("q_actions", model.get("hotspots", [])) if isinstance(model, dict) else []
             self.ai_plan = [item for item in plan if isinstance(item, dict)] if isinstance(plan, list) else []
         self.store.add_system_event(session_id, "mode_enter", {"mode": mode, "automatic": automatic, "time": time.time(), "client_rect": rect, "resource": self.resources.sample()})
         self.post_state("已进入" + ("学习模式" if mode == "learning" else "训练模式"))
@@ -1618,13 +1741,18 @@ class Controller:
                     with self.lock:
                         self.capture_failures += 1
                         failures = self.capture_failures
-                    if failures >= 3:
+                    if failures >= 12:
                         self.request_idle("连续无法记录雷电模拟器画面", token)
                         return
                     sample = self.resources.sample()
                     self.emit("state", {"state": self.current_state(), "detail": "暂时无法记录画面，正在重试", "cpu": sample["cpu"], "memory": sample["memory"]})
                 else:
                     try:
+                        if not image.get("capture_complete", 1):
+                            with self.lock:
+                                self.capture_failures += 1
+                            time.sleep(max(interval, 1.5))
+                            continue
                         historical = self.store.nearest_hashes(image["phash"], 8)
                         if not self._is_current(token, ("learning", "training")):
                             return
@@ -1651,7 +1779,7 @@ class Controller:
                         with self.lock:
                             self.capture_failures += 1
                             failures = self.capture_failures
-                        if failures >= 3:
+                        if failures >= 12:
                             self.request_idle("连续无法写入经验池：" + str(error), token)
                             return
                         sample = self.resources.sample()
@@ -1678,21 +1806,22 @@ class Controller:
 
     def _should_sleep(self, token):
         with self.lock:
-            if self.state != "training" or token != self.epoch:
+            if token != self.epoch or self.state != "training":
                 return False
             elapsed = time.monotonic() - self.session_started
-            count = self.frame_count
-            scores = list(self.frame_scores)
-        if count < 24:
+            scores = list(self.frame_scores[-40:])
+            mouse_count = self.mouse_count
+        if elapsed < 60.0:
             return False
-        if elapsed >= 240.0:
+        if mouse_count >= 80:
             return True
         if len(scores) >= 24:
             latest = scores[-12:]
             mean = sum(latest) / len(latest)
             variance = sum((value - mean) ** 2 for value in latest) / len(latest)
-            return elapsed >= 120.0 and variance < 0.0005
-        return False
+            trend = latest[-1] - latest[0]
+            return variance < 0.0005 and trend <= 0.0
+        return self.resources.critical() and mouse_count >= 20
 
     def _current_cluster(self):
         with self.lock:
@@ -1709,24 +1838,33 @@ class Controller:
     def _ai_target(self, rect):
         width = rect[2] - rect[0]
         height = rect[3] - rect[1]
-        cluster = self._current_cluster()
         with self.lock:
             step = self.ai_step
             self.ai_step += 1
             plan = list(self.ai_plan)
-        candidates = [item for item in plan if isinstance(item, dict) and item.get("cluster") in (cluster, "all")]
-        item = candidates[step % len(candidates)] if candidates else None
-        confidence = 0.0
-        click_allowed = False
-        if item:
+        viable = []
+        for item in plan:
+            if not isinstance(item, dict):
+                continue
             try:
-                x_ratio = min(0.95, max(0.05, float(item.get("x", 0.5))))
-                y_ratio = min(0.95, max(0.05, float(item.get("y", 0.5))))
-                confidence = float(item.get("confidence", 0.0))
-                click_allowed = confidence >= 0.62 and int(item.get("clicks", 0)) > 0 and step % 5 != 4
+                samples = int(item.get("samples", 0))
+                lcb = float(item.get("confidence_lower_bound", item.get("confidence", -1.0)))
+                uncertainty = float(item.get("uncertainty", 1.0))
+                action_type = str(item.get("action_type", "移动"))
+                if samples >= 3 and lcb > 0.0 and uncertainty <= 0.25:
+                    viable.append((lcb, samples, action_type, item))
             except (TypeError, ValueError):
-                item = None
-        if not item:
+                pass
+        viable.sort(reverse=True, key=lambda value: (value[0], value[1]))
+        item = viable[step % len(viable)][3] if viable else None
+        click_allowed = False
+        confidence = 0.0
+        if item is not None:
+            x_ratio = min(0.95, max(0.05, float(item.get("x", 0.5))))
+            y_ratio = min(0.95, max(0.05, float(item.get("y", 0.5))))
+            confidence = float(item.get("confidence_lower_bound", 0.0))
+            click_allowed = str(item.get("action_type", "")) in ("左键", "右键") and step % 5 != 4
+        else:
             x_ratio = 0.08 + 0.84 * ((step * 0.618033988749895) % 1.0)
             y_ratio = 0.08 + 0.84 * ((step * 0.414213562373095) % 1.0)
         x = rect[0] + int(width * x_ratio)
@@ -1883,95 +2021,62 @@ class Controller:
         self.flush_mouse_records()
         if not self._wait_resource(token):
             return None
-        frames, mouse = self.store.collect_training_data()
+        frames_by_session, mouse_by_session = self.store.collect_training_data()
         if self._cancelled(token):
             return None
-        rewards = [float(row[2]) for row in frames]
-        scores = [float(row[1]) for row in frames]
-        frame_times = [float(row[3]) for row in frames]
-        quality = (sum(rewards) / len(rewards)) if rewards else 0.0
-        diversity = len(set(row[0] for row in frames)) / max(1, len(frames))
-        grid = {}
-        feedback_total = 0.0
-        feedback_count = 0
-        for index, row in enumerate(mouse):
-            if index % 500 == 0 and not self._wait_resource(token):
-                return None
-            event_type, source, relative_x, relative_y, speed, created = row
-            if source != "用户" or event_type not in ("button_down", "button_up", "move") or relative_x is None or relative_y is None:
+        outcomes = []
+        states = {}
+        for session_id, mouse_rows in mouse_by_session.items():
+            frame_rows = frames_by_session.get(session_id, [])
+            if len(frame_rows) < 2:
                 continue
-            x = float(relative_x)
-            y = float(relative_y)
-            if not 0.0 <= x <= 1.0 or not 0.0 <= y <= 1.0:
-                continue
-            frame_index = bisect_right(frame_times, float(created))
-            response = 0.0
-            if frame_index < len(frames) and frame_times[frame_index] - float(created) <= 12.0:
-                previous_score = float(frames[frame_index - 1][1]) if frame_index else 0.0
-                score_gain = float(frames[frame_index][1]) - previous_score
-                response = max(-0.75, min(1.0, score_gain * 3.0 + float(frames[frame_index][2]) * 0.60))
-            gx = min(7, max(0, int(x * 8)))
-            gy = min(7, max(0, int(y * 8)))
-            if frame_index and float(frames[frame_index - 1][1]) >= 0.66:
-                cluster = "high"
-            elif frame_index and float(frames[frame_index - 1][1]) >= 0.33:
-                cluster = "mid"
-            else:
-                cluster = "low"
-            key = (cluster, gx, gy)
-            entry = grid.setdefault(key, {"weight": 0.0, "clicks": 0, "feedback": 0.0, "samples": 0})
-            base = 4.0 if event_type == "button_down" else 1.0
-            speed_factor = min(0.35, max(0.0, float(speed or 0.0)) / 5000.0)
-            weight = base * (1.0 + max(0.0, response) * 2.0 + speed_factor)
-            entry["weight"] += weight
-            entry["feedback"] += response
-            entry["samples"] += 1
-            if event_type == "button_down":
-                entry["clicks"] += 1
-            feedback_total += response
-            feedback_count += 1
-        action_quality = feedback_total / max(1, feedback_count)
-        quality += diversity * 0.15 + action_quality * 0.10
-        hotspots = []
-        for key, entry in sorted(grid.items(), key=lambda item: (item[1]["weight"], item[1]["clicks"], item[1]["feedback"]), reverse=True)[:12]:
-            hotspots.append({
-                "cluster": key[0],
-                "x": (key[1] + 0.5) / 8.0,
-                "y": (key[2] + 0.5) / 8.0,
-                "weight": round(float(entry["weight"]), 6),
-                "clicks": int(entry["clicks"]),
-                "feedback": round(float(entry["feedback"]) / max(1, int(entry["samples"])), 6),
-                "samples": int(entry["samples"]),
-                "confidence": round(min(0.99, max(0.0, int(entry["samples"]) / 20.0 + max(0.0, float(entry["feedback"])) / max(1, int(entry["samples"])))), 6)
-            })
-        validation_quality = quality * (0.85 if len(frames) < 64 else 1.0)
-        current_best = self.store.best_model()
-        if isinstance(current_best, dict) and validation_quality < float(current_best.get("validation_quality", current_best.get("quality", -999999.0))):
-            self.store.add_system_event(None, "model_rejected", {"candidate_quality": validation_quality, "best_quality": current_best.get("validation_quality", current_best.get("quality", 0.0)), "time": time.time()})
-            return current_best
-        payload = {
-            "id": uuid.uuid4().hex,
-            "trained_at": time.time(),
-            "quality": quality,
-            "train_quality": quality,
-            "frame_count": len(frames),
-            "mouse_count": len(mouse),
-            "training_samples": len(frames) + len(mouse),
-            "validation_samples": len(frames),
-            "coverage_states": diversity,
-            "failure_rate": 0.0,
-            "model_version": 2,
-            "champion": True,
-            "last_used": time.time(),
-            "mean_score": sum(scores) / len(scores) if scores else 0.0,
-            "mean_reward": sum(rewards) / len(rewards) if rewards else 0.0,
-            "diversity": diversity,
-            "action_quality": action_quality,
-            "validation_quality": validation_quality,
-            "policy": {"confidence_threshold": 0.62, "exploration_rate_max": 0.20, "failure_cooldown_seconds": 30, "low_confidence_action": "move_only", "blacklist_regions": []},
-            "hotspots": hotspots,
-            "hash_samples": [row[0] for row in frames[-128:]]
-        }
+            frame_times = [int(row[2]) for row in frame_rows]
+            for index, row in enumerate(mouse_rows):
+                if index % 500 == 0 and not self._wait_resource(token):
+                    return None
+                mid, sid, created_ns, created, event_type, source, rx, ry, speed, dx, dy, direction, button, wheel = row
+                if sid != session_id or source != "用户" or rx is None or ry is None:
+                    continue
+                if event_type not in ("button_down", "button_up", "wheel", "move"):
+                    continue
+                action_ns = int(created_ns)
+                before_index = bisect_right(frame_times, action_ns) - 1
+                after_start = action_ns + 250_000_000
+                after_end = action_ns + 3_000_000_000
+                after_index = bisect_right(frame_times, after_start - 1)
+                if before_index < 0 or after_index >= len(frame_rows) or frame_times[after_index] > after_end:
+                    continue
+                before = frame_rows[before_index]
+                after = frame_rows[after_index]
+                score_delta = float(after[6]) - float(before[6])
+                reward_delta = float(after[7]) - float(before[7])
+                post_ms = (int(after[2]) - action_ns) / 1_000_000.0
+                action_type = "左键" if button == "left" and event_type.startswith("button") else ("右键" if button == "right" and event_type.startswith("button") else ("滚轮" if event_type == "wheel" else "移动"))
+                state_key = str(before[4] or before[5]) + ":" + str(round((before[8] / max(1, before[9])), 2))
+                action_key = (state_key, min(15, max(0, int(float(rx) * 16))), min(8, max(0, int(float(ry) * 9))), action_type)
+                item = states.setdefault(action_key, {"samples": 0, "sum": 0.0, "sum2": 0.0, "recent": 0.0, "examples": [], "state_hash": before[4] or before[5], "gray32x18": before[10], "edge_density": before[11], "color_histogram": before[12], "aspect": before[8] / max(1, before[9])})
+                item["samples"] += 1
+                item["sum"] += reward_delta
+                item["sum2"] += reward_delta * reward_delta
+                item["recent"] = reward_delta
+                item["examples"].append({"session_id": session_id, "before_frame_id": before[0], "after_frame_id": after[0], "mouse_event_id": mid, "action_time": action_ns, "post_action_delay_ms": post_ms, "score_delta": score_delta, "reward_delta": reward_delta, "outcome_valid": True})
+                outcomes.append(item["examples"][-1])
+        if outcomes:
+            self.store.save_action_outcomes(outcomes)
+        if not outcomes:
+            self.store.add_system_event(None, "model_skipped", {"reason": "没有新增有效动作数据", "time": time.time()})
+            return self.store.best_model()
+        actions = []
+        for (state_key, gx, gy, action_type), item in states.items():
+            n = item["samples"]
+            mean = item["sum"] / max(1, n)
+            var = max(0.0, item["sum2"] / max(1, n) - mean * mean)
+            lcb = mean - 1.96 * math.sqrt(var / max(1, n))
+            actions.append({"state_key": state_key, "state_hash": item["state_hash"], "gray32x18": item["gray32x18"], "edge_density": item["edge_density"], "color_histogram": item["color_histogram"], "aspect": item["aspect"], "x": (gx + 0.5) / 16.0, "y": (gy + 0.5) / 9.0, "action_type": action_type, "samples": n, "average_reward_delta": mean, "reward_variance": var, "recent_validation": item["recent"], "confidence_lower_bound": lcb, "uncertainty": math.sqrt(var / max(1, n))})
+        train = actions[::2]
+        validation = actions[1::2] or actions[:]
+        validation_quality = sum(a["confidence_lower_bound"] for a in validation) / max(1, len(validation))
+        payload = {"id": uuid.uuid4().hex, "trained_at": time.time(), "quality": validation_quality, "train_quality": sum(a["average_reward_delta"] for a in train) / max(1, len(train)), "frame_count": sum(len(v) for v in frames_by_session.values()), "mouse_count": sum(len(v) for v in mouse_by_session.values()), "training_samples": len(outcomes), "validation_samples": len(validation), "coverage_states": len({a["state_key"] for a in actions}), "failure_rate": len([a for a in actions if a["average_reward_delta"] <= 0]) / max(1, len(actions)), "model_version": 3, "champion": True, "last_used": time.time(), "mean_reward": sum(o["reward_delta"] for o in outcomes) / max(1, len(outcomes)), "action_quality": validation_quality, "validation_quality": validation_quality, "policy": {"min_samples": 3, "uncertainty_threshold": 0.25, "min_confidence_lower_bound": 0.0, "similarity_threshold": 0.78, "low_confidence_action": "move_only", "blacklist_regions": []}, "q_actions": sorted(actions, key=lambda a: (a["confidence_lower_bound"], a["samples"]), reverse=True)[:256], "outcome_examples": outcomes[-256:]}
         name = "model_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f") + "_" + payload["id"][:8] + ".json"
         final_path = self.store.models / name
         temp_path = final_path.with_suffix(".tmp")
@@ -2264,16 +2369,17 @@ class Panel:
         self.panel_hidden_for_mode = True
         try:
             self.root.withdraw()
-            self.root.update()
-            time.sleep(0.08)
+            self.root.update_idletasks()
         except Exception:
             self.restore_panel()
             self.controller.emit("notice", "控制面板无法临时隐藏，未进入模式。")
             return False
-        started = self.controller.start_session(mode)
-        if not started:
-            self.restore_panel()
-        return started
+        def continue_start():
+            started = self.controller.start_session(mode)
+            if not started:
+                self.restore_panel()
+        self.root.after(80, continue_start)
+        return True
 
     def protect_configuration(self):
         if self.controller.busy():
