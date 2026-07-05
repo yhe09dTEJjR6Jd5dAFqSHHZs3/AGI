@@ -537,7 +537,11 @@ class DataStore:
             "asset_ref_count": "INTEGER NOT NULL DEFAULT 1",
             "score_candidate_count": "INTEGER NOT NULL DEFAULT 0",
             "score_top_k_distance": "REAL NOT NULL DEFAULT 64",
-            "score_retrieval_fallback": "INTEGER NOT NULL DEFAULT 0"
+            "score_retrieval_fallback": "INTEGER NOT NULL DEFAULT 0",
+            "capture_started_monotonic_ns": "INTEGER NOT NULL DEFAULT 0",
+            "capture_finished_monotonic_ns": "INTEGER NOT NULL DEFAULT 0",
+            "capture_started": "REAL NOT NULL DEFAULT 0",
+            "capture_finished": "REAL NOT NULL DEFAULT 0"
         }
         for name, definition in additions.items():
             if name not in frame_columns:
@@ -555,6 +559,12 @@ class DataStore:
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_frame_lsh_key ON frame_lsh(key)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS ingestion_journal (id TEXT PRIMARY KEY, object_type TEXT NOT NULL, object_id TEXT NOT NULL, path TEXT, stage TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL, error TEXT)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS action_outcomes (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), mouse_event_id TEXT NOT NULL, before_frame_id TEXT NOT NULL, after_frame_id TEXT NOT NULL, action_time INTEGER NOT NULL, post_action_delay_ms REAL NOT NULL, score_delta REAL NOT NULL, reward_delta REAL NOT NULL, outcome_valid INTEGER NOT NULL)")
+        action_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(action_outcomes)").fetchall()}
+        if "action_id" not in action_columns:
+            self.conn.execute("ALTER TABLE action_outcomes ADD COLUMN action_id TEXT")
+        self.conn.execute("UPDATE action_outcomes SET action_id=COALESCE(action_id, mouse_event_id) WHERE action_id IS NULL OR action_id=''")
+        self.conn.execute("DELETE FROM action_outcomes WHERE rowid NOT IN (SELECT MAX(rowid) FROM action_outcomes GROUP BY action_id)")
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_action_outcomes_action_id ON action_outcomes(action_id)")
 
     def close(self):
         with self.lock:
@@ -621,34 +631,41 @@ class DataStore:
         parts = tuple((current >> shift) & 0xFFFF for shift in (48, 32, 16, 0))
         candidate = {}
         fallback = False
+        max_candidates = 512
         with self.lock:
             if self.conn is None:
                 return {"hashes": [], "candidate_count": 0, "top_k_distance": 64.0, "retrieval_fallback": False}
-            for radius in range(4):
+            for radius in (0, 1):
+                keys = []
+                seen = set()
                 for index, part in enumerate(parts):
-                    for variant in self._bucket_variants(part, radius):
+                    for variant in set(self._bucket_variants(part, radius)):
                         key = (index << 16) | variant
-                        rows = self.conn.execute("""
-                            SELECT frames.id, frames.dhash64, frames.phash
-                            FROM frame_lsh JOIN frames ON frames.id=frame_lsh.frame_id
-                            WHERE frame_lsh.key=?
-                            LIMIT 2048
-                        """, (key,)).fetchall()
-                        for row in rows:
-                            candidate[row[0]] = row
-                ranked_probe = []
-                for row in candidate.values():
-                    try:
-                        stored = row[1] or row[2]
-                        ranked_probe.append(bit_count(current ^ int(stored, 16)))
-                    except Exception:
-                        pass
-                ranked_probe.sort()
-                if len(ranked_probe) >= limit and ranked_probe[min(limit, len(ranked_probe)) - 1] <= radius * 4 + 3:
+                        if key not in seen:
+                            seen.add(key)
+                            keys.append(key)
+                for start in range(0, len(keys), 400):
+                    chunk = keys[start:start + 400]
+                    if not chunk:
+                        continue
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = self.conn.execute(f"""
+                        SELECT frames.id, frames.dhash64, frames.phash
+                        FROM frame_lsh JOIN frames ON frames.id=frame_lsh.frame_id
+                        WHERE frame_lsh.key IN ({placeholders})
+                        LIMIT {max_candidates}
+                    """, chunk).fetchall()
+                    for row in rows:
+                        candidate[row[0]] = row
+                        if len(candidate) >= max_candidates:
+                            break
+                    if len(candidate) >= max_candidates:
+                        break
+                if len(candidate) >= limit:
                     break
             if len(candidate) < limit:
                 fallback = True
-                rows = self.conn.execute("SELECT id, dhash64, phash FROM frames WHERE dhash64 IS NOT NULL OR phash IS NOT NULL").fetchall()
+                rows = self.conn.execute("SELECT id, dhash64, phash FROM frames WHERE dhash64 IS NOT NULL OR phash IS NOT NULL ORDER BY created DESC LIMIT ?", (max_candidates,)).fetchall()
                 for row in rows:
                     candidate[row[0]] = row
         ranked = []
@@ -671,8 +688,10 @@ class DataStore:
 
     def save_frame(self, session_id, image, phash, score, hunger, reward):
         identifier = uuid.uuid4().hex
-        moment = time.time()
-        mono = time.monotonic_ns()
+        moment = float(image.get("capture_finished", time.time()))
+        mono = int(image.get("capture_finished_monotonic_ns", time.monotonic_ns()))
+        capture_started_mono = int(image.get("capture_started_monotonic_ns", mono))
+        capture_started_wall = float(image.get("capture_started", moment))
         folder = self.screens / session_id
         folder.mkdir(parents=True, exist_ok=True)
         relative = Path("screens") / session_id / (identifier + ".png")
@@ -692,7 +711,7 @@ class DataStore:
                 self.conn.execute("BEGIN IMMEDIATE")
                 self.conn.execute("INSERT INTO ingestion_journal(id, object_type, object_id, path, stage, created, updated) VALUES (?, ?, ?, ?, ?, ?, ?)", (uuid.uuid4().hex, "frame", identifier, str(relative), "prepared", moment, moment))
                 support = self.conn.execute("SELECT COUNT(*) + 1 FROM frames WHERE state_cluster_id=?", (state_cluster_id,)).fetchone()[0]
-                self.conn.execute("INSERT INTO frames(id, session_id, created, created_monotonic_ns, screenshot_path, phash, dhash64, score, hunger, reward, width, height, size_bytes, novelty, action_result, coverage, model_refs, last_used, bucket0, bucket1, bucket2, bucket3, state_cluster_id, state_support_count, action_outcome_information, model_dependency_count, validation_last_used, asset_ref_count, capture_backend, capture_elapsed_ms, capture_complete, brightness, variance, gray32x18, edge_density, color_histogram, score_candidate_count, score_top_k_distance, score_retrieval_fallback) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (identifier, session_id, moment, mono, str(relative), phash, dhash, score, hunger, reward, image["width"], image["height"], size_bytes, score, reward, score, 0, moment, *buckets, state_cluster_id, support, abs(reward), 0, moment, 1, image.get("capture_backend", "gdi"), image.get("capture_elapsed_ms", 0.0), image.get("capture_complete", 1), image.get("brightness", 0.0), image.get("variance", 0.0), image.get("gray32x18"), image.get("edge_density", 0.0), image.get("color_histogram"), int(image.get("score_candidate_count", 0)), float(image.get("score_top_k_distance", 64.0)), int(image.get("score_retrieval_fallback", 0))))
+                self.conn.execute("INSERT INTO frames(id, session_id, created, created_monotonic_ns, capture_started_monotonic_ns, capture_finished_monotonic_ns, capture_started, capture_finished, screenshot_path, phash, dhash64, score, hunger, reward, width, height, size_bytes, novelty, action_result, coverage, model_refs, last_used, bucket0, bucket1, bucket2, bucket3, state_cluster_id, state_support_count, action_outcome_information, model_dependency_count, validation_last_used, asset_ref_count, capture_backend, capture_elapsed_ms, capture_complete, brightness, variance, gray32x18, edge_density, color_histogram, score_candidate_count, score_top_k_distance, score_retrieval_fallback) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (identifier, session_id, moment, mono, capture_started_mono, mono, capture_started_wall, moment, str(relative), phash, dhash, score, hunger, reward, image["width"], image["height"], size_bytes, score, reward, score, 0, moment, *buckets, state_cluster_id, support, abs(reward), 0, moment, 1, image.get("capture_backend", "gdi"), image.get("capture_elapsed_ms", 0.0), image.get("capture_complete", 1), image.get("brightness", 0.0), image.get("variance", 0.0), image.get("gray32x18"), image.get("edge_density", 0.0), image.get("color_histogram"), int(image.get("score_candidate_count", 0)), float(image.get("score_top_k_distance", 64.0)), int(image.get("score_retrieval_fallback", 0))))
                 self.conn.execute("UPDATE ingestion_journal SET stage=?, updated=? WHERE object_id=?", ("complete", time.time(), identifier))
                 self.conn.execute("INSERT OR IGNORE INTO state_clusters(cluster_id, count, updated_at) VALUES (?, 0, ?)", (state_cluster_id, moment))
                 self.conn.execute("UPDATE state_clusters SET count=count+1, updated_at=? WHERE cluster_id=?", (moment, state_cluster_id))
@@ -756,7 +775,7 @@ class DataStore:
             mouse = {}
             for session_id in sessions:
                 frame_rows = self.conn.execute("""
-                    SELECT id, session_id, created_monotonic_ns, created, dhash64, phash, score, reward, width, height, gray32x18, edge_density, color_histogram
+                    SELECT id, session_id, created_monotonic_ns, created, dhash64, phash, score, reward, width, height, gray32x18, edge_density, color_histogram, capture_started_monotonic_ns, capture_finished_monotonic_ns
                     FROM frames
                     WHERE session_id=? AND capture_complete=1 AND created_monotonic_ns>0
                     ORDER BY created_monotonic_ns ASC
@@ -783,18 +802,26 @@ class DataStore:
     def save_action_outcomes(self, outcomes):
         if not outcomes:
             return
-        rows = [(uuid.uuid4().hex, item["session_id"], item["mouse_event_id"], item["before_frame_id"], item["after_frame_id"], item["action_time"], item["post_action_delay_ms"], item["score_delta"], item["reward_delta"], 1 if item.get("outcome_valid") else 0) for item in outcomes]
+        rows = [(item.get("action_id") or item["mouse_event_id"], uuid.uuid4().hex, item["session_id"], item["mouse_event_id"], item["before_frame_id"], item["after_frame_id"], item["action_time"], item["post_action_delay_ms"], item["score_delta"], item["reward_delta"], 1 if item.get("outcome_valid") else 0) for item in outcomes]
         with self.lock:
-            self.conn.executemany("INSERT OR REPLACE INTO action_outcomes(id, session_id, mouse_event_id, before_frame_id, after_frame_id, action_time, post_action_delay_ms, score_delta, reward_delta, outcome_valid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+            self.conn.executemany("INSERT INTO action_outcomes(action_id, id, session_id, mouse_event_id, before_frame_id, after_frame_id, action_time, post_action_delay_ms, score_delta, reward_delta, outcome_valid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(action_id) DO UPDATE SET session_id=excluded.session_id, mouse_event_id=excluded.mouse_event_id, before_frame_id=excluded.before_frame_id, after_frame_id=excluded.after_frame_id, action_time=excluded.action_time, post_action_delay_ms=excluded.post_action_delay_ms, score_delta=excluded.score_delta, reward_delta=excluded.reward_delta, outcome_valid=excluded.outcome_valid", rows)
             self.conn.executemany("UPDATE mouse_events SET before_frame_id=?, after_frame_id=?, action_time=?, post_action_delay_ms=?, score_delta=?, reward_delta=?, outcome_valid=? WHERE id=?", [(item["before_frame_id"], item["after_frame_id"], item["action_time"], item["post_action_delay_ms"], item["score_delta"], item["reward_delta"], 1 if item.get("outcome_valid") else 0, item["mouse_event_id"]) for item in outcomes])
             self.conn.commit()
 
     def pool_size(self):
-        if self.conn is None:
+        if self.pool is None:
             return 0
-        with self.lock:
-            row = self.conn.execute("SELECT value FROM pool_meta WHERE key='total_asset_bytes'").fetchone()
-        return int(row[0] if row else 0)
+        total = 0
+        try:
+            for item in self.pool.rglob("*"):
+                try:
+                    if item.is_file():
+                        total += item.stat().st_size
+                except OSError:
+                    pass
+        except OSError:
+            return 0
+        return int(total)
 
     def _reconcile_asset_bytes(self):
         with self.lock:
@@ -1197,6 +1224,14 @@ def client_unobscured(hwnd, rect):
     own_root = root_window(hwnd)
     if not own_root:
         return False
+    points = ((rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2), (rect[0] + 2, rect[1] + 2), (rect[2] - 2, rect[1] + 2), (rect[0] + 2, rect[3] - 2), (rect[2] - 2, rect[3] - 2)
+    for x, y in points:
+        hit = user32.GetWindowFromPoint(POINT(int(x), int(y)))
+        if hit and root_window(hit) != own_root:
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hit, ctypes.byref(pid))
+            client_unobscured.last_obstruction = {"title": window_title(hit), "pid": int(pid.value), "point": (int(x), int(y)), "rect": window_rectangle(hit)}
+            return False
     above = user32.GetWindow(own_root, GW_HWNDPREV)
     checked = set()
     while above and above not in checked:
@@ -1206,7 +1241,7 @@ def client_unobscured(hwnd, rect):
             continue
         style = int(user32.GetWindowLongW(above, GWL_EXSTYLE))
         title = window_title(above)
-        if style & WS_EX_TRANSPARENT or "tooltip" in title.lower() or "工具提示" in title:
+        if "tooltip" in title.lower() or "工具提示" in title:
             above = user32.GetWindow(above, GW_HWNDPREV)
             continue
         if user32.IsWindowVisible(above) and not user32.IsIconic(above):
@@ -1276,6 +1311,8 @@ def encode_png(width, height, rgb):
     return b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) + png_chunk(b"IDAT", zlib.compress(bytes(rows), 6)) + png_chunk(b"IEND", b"")
 
 def capture_client(hwnd, max_width=640, max_height=360):
+    capture_started_monotonic_ns = time.monotonic_ns()
+    capture_started = time.time()
     started_capture = time.monotonic()
     local = RECT()
     if not user32.GetClientRect(hwnd, ctypes.byref(local)):
@@ -1364,7 +1401,9 @@ def capture_client(hwnd, max_width=640, max_height=360):
             hist[8 + min(7, rgb[index + 1] // 32)] += 1
             hist[16 + min(7, rgb[index + 2] // 32)] += 1
         complete = 1 if mean >= 3.0 and variance >= 2.0 else 0
-        return {"width": width, "height": height, "png": encode_png(width, height, rgb), "phash": f"{value:016x}", "dhash64": f"{value:016x}", "capture_backend": "gdi", "capture_elapsed_ms": (time.monotonic() - started_capture) * 1000.0, "capture_complete": complete, "brightness": mean, "variance": variance, "gray32x18": bytes(sample_gray).hex(), "edge_density": edge_hits / (18 * 31), "color_histogram": json.dumps(hist, separators=(",", ":"))}
+        capture_finished_monotonic_ns = time.monotonic_ns()
+        capture_finished = time.time()
+        return {"width": width, "height": height, "png": encode_png(width, height, rgb), "phash": f"{value:016x}", "dhash64": f"{value:016x}", "capture_started_monotonic_ns": capture_started_monotonic_ns, "capture_finished_monotonic_ns": capture_finished_monotonic_ns, "capture_started": capture_started, "capture_finished": capture_finished, "capture_backend": "gdi", "capture_elapsed_ms": (capture_finished_monotonic_ns - capture_started_monotonic_ns) / 1000000.0, "capture_complete": complete, "brightness": mean, "variance": variance, "gray32x18": bytes(sample_gray).hex(), "edge_density": edge_hits / (18 * 31), "color_histogram": json.dumps(hist, separators=(",", ":"))}
     finally:
         if old_object and memory_dc:
             gdi32.SelectObject(memory_dc, old_object)
@@ -1703,8 +1742,8 @@ class Controller:
         height = max(1, rect[3] - rect[1])
         record = {
             "session_id": session_id,
-            "created": time.time(),
-            "created_monotonic_ns": time.monotonic_ns(),
+            "created": created,
+            "created_monotonic_ns": int(created * 1_000_000_000),
             "source": source,
             "event_type": event_type,
             "button": button,
@@ -1827,6 +1866,10 @@ class Controller:
             model = self.store.best_model() if mode == "training" else None
             plan = model.get("q_actions", model.get("hotspots", [])) if isinstance(model, dict) else []
             self.ai_plan = [item for item in plan if isinstance(item, dict)] if isinstance(plan, list) else []
+        with self.lock:
+            self.action_limits = {}
+            self.last_move_kept = None
+            self.stop_requested.clear()
         self.store.add_system_event(session_id, "mode_enter", {"mode": mode, "automatic": automatic, "time": time.time(), "client_rect": rect, "resource": self.resources.sample()})
         self.post_state("已进入" + ("学习模式" if mode == "learning" else "训练模式"))
         threads = [threading.Thread(target=self._capture_loop, args=(token,), name="CaptureLoop"), threading.Thread(target=self._monitor_loop, args=(token,), name="SessionMonitor")]
@@ -1853,6 +1896,9 @@ class Controller:
                 mode = self.session_mode
             rect = valid_client(hwnd, True) if hwnd else None
             if rect is None:
+                obstruction = getattr(client_unobscured, "last_obstruction", None)
+                if obstruction and self.session_id:
+                    self.store.add_system_event(self.session_id, "client_obstruction", obstruction)
                 self.request_idle("雷电模拟器客户区异常或鼠标已离开客户区", token)
                 return
             observation_due = False
@@ -1967,6 +2013,8 @@ class Controller:
         sample = self.resources.sample()
         if sample.get("disk_free", 1) < 768 * 1024 * 1024 or sample.get("avail_memory", 1) < 384 * 1024 * 1024 or queue_len > 10000:
             return True
+        if not plan or mouse_count < 30 or time.time() - self.last_model_training < 180.0:
+            return False
         if elapsed < 60.0 or len(scores) < 12:
             return False
         mean = sum(scores) / len(scores)
@@ -2152,8 +2200,12 @@ class Controller:
             else:
                 self.state = "idle"
         if previous in ("learning", "training"):
+            self.hook.stop()
+            self.keyboard_hook.stop()
             self.post_state("正在停止并执行统一写入屏障")
             self._close_active_session(reason, barrier=True)
+        elif previous == "sleep":
+            self.keyboard_hook.stop()
         with self.lock:
             if self.state == "stopping":
                 self.state = "idle"
@@ -2200,6 +2252,7 @@ class Controller:
             sleep_token = self.epoch
             self.cancel_event = threading.Event()
             self.state = "sleep"
+        self.hook.stop()
         self._close_active_session("AI 判断进入睡眠模式", barrier=True)
         self.post_state("AI 判断当前值得进入睡眠模式")
         threads = [threading.Thread(target=self._sleep_monitor, args=(sleep_token,), name="AutoSleepMonitor"), threading.Thread(target=self._sleep_worker, args=(sleep_token, True), name="AutoSleepWorker")]
@@ -2225,6 +2278,47 @@ class Controller:
             time.sleep(1.2)
         return not self._cancelled(token)
 
+    def _semantic_actions(self, mouse_rows):
+        actions = []
+        down = {}
+        wheel_bucket = None
+        last_move = None
+        for row in mouse_rows:
+            mid, sid, created_ns, created, event_type, source, rx, ry, speed, dx, dy, direction, button, wheel = row
+            if source not in ("用户", "AI") or rx is None or ry is None:
+                continue
+            ns = int(created_ns)
+            if event_type == "button_down" and button in ("left", "right"):
+                down[button] = row
+            elif event_type == "button_up" and button in down:
+                d = down.pop(button)
+                duration = ns - int(d[2])
+                distance = math.hypot(float(rx) - float(d[6]), float(ry) - float(d[7]))
+                if 0 <= duration <= 1_500_000_000 and distance <= 0.08:
+                    action_id = "click:{}:{}:{}".format(sid, d[0], mid)
+                    actions.append({"action_id": action_id, "mouse_event_id": mid, "session_id": sid, "action_time": ns, "source": source, "rx": float(rx), "ry": float(ry), "action_type": "左键" if button == "left" else "右键"})
+            elif event_type == "wheel" and wheel:
+                if wheel_bucket and ns - wheel_bucket["last_ns"] <= 180_000_000 and sid == wheel_bucket["session_id"]:
+                    wheel_bucket["last_ns"] = ns
+                    wheel_bucket["wheel"] += int(wheel)
+                    wheel_bucket["mouse_event_id"] = mid
+                    wheel_bucket["rx"] = float(rx)
+                    wheel_bucket["ry"] = float(ry)
+                else:
+                    if wheel_bucket:
+                        wheel_bucket["action_type"] = "滚轮"
+                        actions.append(wheel_bucket)
+                    wheel_bucket = {"action_id": "wheel:{}:{}".format(sid, mid), "mouse_event_id": mid, "session_id": sid, "action_time": ns, "last_ns": ns, "source": source, "rx": float(rx), "ry": float(ry), "wheel": int(wheel)}
+            elif event_type == "move":
+                keep = last_move is None or ns - int(last_move[2]) >= 350_000_000 or abs(float(direction) - float(last_move[11])) >= 0.85 or math.hypot(float(rx) - float(last_move[6]), float(ry) - float(last_move[7])) >= 0.10
+                if keep:
+                    actions.append({"action_id": "move:{}:{}".format(sid, mid), "mouse_event_id": mid, "session_id": sid, "action_time": ns, "source": source, "rx": float(rx), "ry": float(ry), "action_type": "移动"})
+                    last_move = row
+        if wheel_bucket:
+            wheel_bucket["action_type"] = "滚轮"
+            actions.append(wheel_bucket)
+        return actions
+
     def _train_model(self, token):
         self.flush_mouse_records()
         if not self._wait_resource(token):
@@ -2232,77 +2326,104 @@ class Controller:
         frames_by_session, mouse_by_session = self.store.collect_training_data()
         if self._cancelled(token):
             return None
+        ordered_sessions = sorted(frames_by_session.keys(), key=lambda sid: frames_by_session[sid][0][3] if frames_by_session.get(sid) else 0.0)
+        split_at = max(1, int(len(ordered_sessions) * 0.7)) if len(ordered_sessions) > 1 else len(ordered_sessions)
+        train_sessions = set(ordered_sessions[:split_at])
+        validation_sessions = set(ordered_sessions[split_at:])
+        if not validation_sessions and ordered_sessions:
+            validation_sessions = {ordered_sessions[-1]}
+            train_sessions = set(ordered_sessions[:-1]) or set(ordered_sessions)
         outcomes = []
+        validation_outcomes = []
         states = {}
+        all_actions_count = 0
         for session_id, mouse_rows in mouse_by_session.items():
             frame_rows = frames_by_session.get(session_id, [])
             if len(frame_rows) < 2:
                 continue
-            frame_times = [int(row[2]) for row in frame_rows]
-            for index, row in enumerate(mouse_rows):
+            semantic_actions = self._semantic_actions(mouse_rows)
+            all_actions_count += len(semantic_actions)
+            frame_finish_times = [int(row[14] or row[2]) for row in frame_rows]
+            frame_start_times = [int(row[13] or row[2]) for row in frame_rows]
+            critical_times = [int(row[2]) for row in mouse_rows if row[4] in ("button_down", "button_up", "wheel") and (row[12] or row[13])]
+            for index, action in enumerate(semantic_actions):
                 if index % 500 == 0 and not self._wait_resource(token):
                     return None
-                mid, sid, created_ns, created, event_type, source, rx, ry, speed, dx, dy, direction, button, wheel = row
-                if sid != session_id or source not in ("用户", "AI") or rx is None or ry is None:
-                    continue
-                if event_type not in ("button_down", "button_up", "wheel", "move"):
-                    continue
-                action_ns = int(created_ns)
-                before_index = bisect_right(frame_times, action_ns) - 1
+                action_ns = int(action["action_time"])
+                before_index = bisect_right(frame_finish_times, action_ns) - 1
                 after_start = action_ns + 250_000_000
-                after_end = action_ns + 3_000_000_000
-                after_index = bisect_right(frame_times, after_start - 1)
-                if before_index < 0 or after_index >= len(frame_rows) or frame_times[after_index] > after_end:
+                after_index = bisect_right(frame_start_times, after_start - 1)
+                if before_index < 0 or after_index >= len(frame_rows):
+                    continue
+                if frame_start_times[after_index] < after_start or frame_start_times[after_index] > action_ns + 3_000_000_000:
+                    continue
+                if any(action_ns < t < frame_start_times[after_index] for t in critical_times):
                     continue
                 before = frame_rows[before_index]
                 after = frame_rows[after_index]
                 score_delta = float(after[6]) - float(before[6])
                 reward_delta = float(after[7]) - float(before[7])
-                post_ms = (int(after[2]) - action_ns) / 1_000_000.0
-                action_type = "左键" if button == "left" and event_type.startswith("button") else ("右键" if button == "right" and event_type.startswith("button") else ("滚轮" if event_type == "wheel" else "移动"))
+                post_ms = (frame_start_times[after_index] - action_ns) / 1_000_000.0
                 state_key = str(before[4] or before[5]) + ":" + str(round((before[8] / max(1, before[9])), 2))
-                action_key = (state_key, min(15, max(0, int(float(rx) * 16))), min(8, max(0, int(float(ry) * 9))), action_type)
-                item = states.setdefault(action_key, {"samples": 0, "human_samples": 0, "ai_samples": 0, "sum": 0.0, "sum2": 0.0, "recent": 0.0, "examples": [], "state_hash": before[4] or before[5], "gray32x18": before[10], "edge_density": before[11], "color_histogram": before[12], "aspect": before[8] / max(1, before[9])})
-                item["samples"] += 1
-                if source == "用户":
-                    item["human_samples"] += 1
-                else:
-                    item["ai_samples"] += 1
-                item["sum"] += reward_delta
-                item["sum2"] += reward_delta * reward_delta
-                item["recent"] = reward_delta
-                item["examples"].append({"session_id": session_id, "before_frame_id": before[0], "after_frame_id": after[0], "mouse_event_id": mid, "action_time": action_ns, "post_action_delay_ms": post_ms, "score_delta": score_delta, "reward_delta": reward_delta, "outcome_valid": True})
-                outcomes.append(item["examples"][-1])
+                gx = min(15, max(0, int(action["rx"] * 16)))
+                gy = min(8, max(0, int(action["ry"] * 9)))
+                example = {"action_id": action["action_id"], "session_id": session_id, "before_frame_id": before[0], "after_frame_id": after[0], "mouse_event_id": action["mouse_event_id"], "action_time": action_ns, "post_action_delay_ms": post_ms, "score_delta": score_delta, "reward_delta": reward_delta, "outcome_valid": True}
+                if session_id in train_sessions:
+                    key = (state_key, gx, gy, action["action_type"])
+                    item = states.setdefault(key, {"samples": 0, "human_samples": 0, "ai_samples": 0, "sum": 0.0, "sum2": 0.0, "recent": 0.0, "examples": [], "state_hash": before[4] or before[5], "gray32x18": before[10], "edge_density": before[11], "color_histogram": before[12], "aspect": before[8] / max(1, before[9])})
+                    item["samples"] += 1
+                    item["human_samples" if action["source"] == "用户" else "ai_samples"] += 1
+                    item["sum"] += reward_delta
+                    item["sum2"] += reward_delta * reward_delta
+                    item["recent"] = reward_delta
+                    item["examples"].append(example)
+                    outcomes.append(example)
+                elif session_id in validation_sessions:
+                    validation_outcomes.append((state_key, gx, gy, action["action_type"], example))
         if outcomes:
-            self.store.save_action_outcomes(outcomes)
+            for start in range(0, len(outcomes), 750):
+                if self._cancelled(token):
+                    return None
+                self.store.save_action_outcomes(outcomes[start:start + 750])
         if not outcomes:
-            self.store.add_system_event(None, "model_skipped", {"reason": "没有新增有效动作数据", "time": time.time()})
+            self.store.add_system_event(None, "model_skipped", {"reason": "没有新增有效语义动作数据", "time": time.time(), "semantic_actions": all_actions_count})
             return self.store.best_model()
         actions = []
+        policy_lookup = {}
         for (state_key, gx, gy, action_type), item in states.items():
             n = item["samples"]
             mean = item["sum"] / max(1, n)
             var = max(0.0, item["sum2"] / max(1, n) - mean * mean)
             lcb = mean - 1.96 * math.sqrt(var / max(1, n))
-            human_supported = item.get("human_samples", 0) > 0
-            if not human_supported and action_type != "移动":
+            if item.get("human_samples", 0) <= 0 and action_type != "移动":
                 lcb = min(lcb, -0.01)
-            actions.append({"state_key": state_key, "state_hash": item["state_hash"], "gray32x18": item["gray32x18"], "edge_density": item["edge_density"], "color_histogram": item["color_histogram"], "aspect": item["aspect"], "x": (gx + 0.5) / 16.0, "y": (gy + 0.5) / 9.0, "action_type": action_type, "samples": n, "human_samples": item.get("human_samples", 0), "ai_samples": item.get("ai_samples", 0), "average_reward_delta": mean, "reward_variance": var, "recent_validation": item["recent"], "confidence_lower_bound": lcb, "uncertainty": math.sqrt(var / max(1, n))})
-        ordered_sessions = sorted(frames_by_session.items(), key=lambda pair: pair[1][0][3] if pair[1] else 0.0)
-        validation_session_ids = {sid for sid, _ in ordered_sessions[max(0, int(len(ordered_sessions) * 0.7)):]}
-        train = [a for a in actions if not any(ex["session_id"] in validation_session_ids for ex in states[(a["state_key"], min(15, max(0, int(a["x"] * 16))), min(8, max(0, int(a["y"] * 9))), a["action_type"])]["examples"])]
-        validation = [a for a in actions if a not in train] or actions[-max(1, len(actions)//4):]
-        validation_quality = sum(a["confidence_lower_bound"] for a in validation) / max(1, len(validation))
-        validation_rewards = [a["average_reward_delta"] for a in validation]
+            action_payload = {"state_key": state_key, "state_hash": item["state_hash"], "gray32x18": item["gray32x18"], "edge_density": item["edge_density"], "color_histogram": item["color_histogram"], "aspect": item["aspect"], "x": (gx + 0.5) / 16.0, "y": (gy + 0.5) / 9.0, "action_type": action_type, "samples": n, "human_samples": item.get("human_samples", 0), "ai_samples": item.get("ai_samples", 0), "average_reward_delta": mean, "reward_variance": var, "recent_validation": item["recent"], "confidence_lower_bound": lcb, "uncertainty": math.sqrt(var / max(1, n))}
+            actions.append(action_payload)
+            policy_lookup[(state_key, gx, gy, action_type)] = action_payload
+        validation_rewards = []
+        validation_hits = 0
+        validation_failures = 0
+        for state_key, gx, gy, action_type, example in validation_outcomes:
+            chosen = policy_lookup.get((state_key, gx, gy, action_type))
+            if chosen is None:
+                validation_failures += 1
+                continue
+            validation_hits += 1
+            validation_rewards.append(float(example["reward_delta"]))
+            if example["reward_delta"] <= 0:
+                validation_failures += 1
         validation_mean = sum(validation_rewards) / max(1, len(validation_rewards))
         validation_var = sum((v - validation_mean) ** 2 for v in validation_rewards) / max(1, len(validation_rewards))
         validation_ci = 1.96 * math.sqrt(validation_var / max(1, len(validation_rewards)))
-        payload = {"id": uuid.uuid4().hex, "trained_at": time.time(), "quality": validation_quality, "train_quality": sum(a["average_reward_delta"] for a in train) / max(1, len(train)), "frame_count": sum(len(v) for v in frames_by_session.values()), "mouse_count": sum(len(v) for v in mouse_by_session.values()), "training_samples": len(outcomes), "validation_samples": len(validation), "validation_mean_reward": validation_mean, "validation_confidence_interval": validation_ci, "validation_failure_rate": len([a for a in validation if a["average_reward_delta"] <= 0]) / max(1, len(validation)), "validation_state_coverage": len({a["state_key"] for a in validation}), "coverage_states": len({a["state_key"] for a in actions}), "failure_rate": len([a for a in actions if a["average_reward_delta"] <= 0]) / max(1, len(actions)), "model_version": 3, "champion": True, "last_used": time.time(), "mean_reward": sum(o["reward_delta"] for o in outcomes) / max(1, len(outcomes)), "action_quality": validation_quality, "validation_quality": validation_quality, "policy": {"min_samples": 3, "uncertainty_threshold": 0.25, "min_confidence_lower_bound": 0.0, "similarity_threshold": 0.78, "low_confidence_action": "move_only", "blacklist_regions": []}, "q_actions": sorted(actions, key=lambda a: (a["confidence_lower_bound"], a["samples"]), reverse=True)[:256], "outcome_examples": outcomes[-256:]}
+        validation_quality = validation_mean - validation_ci
+        validation_sample_count = len(validation_outcomes)
+        payload = {"id": uuid.uuid4().hex, "trained_at": time.time(), "quality": validation_quality, "train_quality": sum(a["average_reward_delta"] for a in actions) / max(1, len(actions)), "frame_count": sum(len(v) for v in frames_by_session.values()), "mouse_count": sum(len(v) for v in mouse_by_session.values()), "training_samples": len(outcomes), "semantic_actions": all_actions_count, "validation_samples": validation_sample_count, "validation_hits": validation_hits, "validation_mean_reward": validation_mean, "validation_confidence_interval": validation_ci, "validation_failure_rate": validation_failures / max(1, validation_sample_count), "validation_state_coverage": len({item[0] for item in validation_outcomes}), "coverage_states": len({a["state_key"] for a in actions}), "failure_rate": len([a for a in actions if a["average_reward_delta"] <= 0]) / max(1, len(actions)), "model_version": 4, "champion": True, "last_used": time.time(), "mean_reward": sum(o["reward_delta"] for o in outcomes) / max(1, len(outcomes)), "action_quality": validation_quality, "validation_quality": validation_quality, "policy": {"min_samples": 5, "uncertainty_threshold": 0.25, "min_confidence_lower_bound": 0.0, "similarity_threshold": 0.78, "low_confidence_action": "move_only", "blacklist_regions": []}, "q_actions": sorted(actions, key=lambda a: (a["confidence_lower_bound"], a["samples"]), reverse=True)[:256], "outcome_examples": outcomes[-256:]}
         champion = self.store.best_model()
         champion_quality = float(champion.get("validation_quality", -999999.0)) if isinstance(champion, dict) else -999999.0
-        if len(validation) < 3 or len({a["state_key"] for a in validation}) < 2 or validation_quality <= champion_quality:
+        enough = len(outcomes) >= 30 and len({a["state_key"] for a in actions}) >= 4 and validation_sample_count >= 12 and validation_hits >= 6
+        if not enough or validation_quality <= champion_quality:
             payload["champion"] = False
-            self.store.add_system_event(None, "model_candidate_rejected", {"validation_quality": validation_quality, "champion_quality": champion_quality, "validation_samples": len(validation), "time": time.time()})
+            self.store.add_system_event(None, "model_candidate_rejected", {"validation_quality": validation_quality, "champion_quality": champion_quality, "validation_samples": validation_sample_count, "validation_hits": validation_hits, "training_samples": len(outcomes), "time": time.time()})
             return champion if isinstance(champion, dict) else payload
         name = "model_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f") + "_" + payload["id"][:8] + ".json"
         final_path = self.store.models / name
@@ -2556,7 +2677,6 @@ class Panel:
         footer.grid_columnconfigure(0, weight=1)
         Label(footer, textvariable=self.status_var, bg="#eef2ff", fg="#1e3a8a", font=("Microsoft YaHei UI", 9), anchor="w", justify="left", wraplength=550).grid(row=0, column=0, sticky="ew")
         Label(footer, textvariable=self.performance_var, bg="#eef2ff", fg="#475569", font=("Microsoft YaHei UI", 9), anchor="e").grid(row=0, column=1, sticky="e", padx=(12, 0))
-        self.configuration_buttons.append(info_button)
         self.root.after_idle(sync_region)
 
     def scroll_wheel(self, event):
@@ -2715,6 +2835,8 @@ class Panel:
                         self.restore_panel()
                     normal = "normal" if state == "idle" else "disabled"
                     for button in self.mode_buttons:
+                        button.configure(state=normal)
+                    for button in self.configuration_buttons:
                         button.configure(state=normal)
                 elif kind == "progress":
                     self.progress_var.set(max(0.0, min(100.0, float(payload))))
