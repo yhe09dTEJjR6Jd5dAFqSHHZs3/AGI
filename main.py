@@ -353,6 +353,7 @@ class DataStore:
             self.models = models
             self.screens = screens
             self.conn = sqlite3.connect(str(pool / "records.sqlite3"), check_same_thread=False, timeout=30)
+            self.conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.execute("PRAGMA synchronous=NORMAL")
             self.conn.execute("PRAGMA foreign_keys=ON")
@@ -436,6 +437,10 @@ class DataStore:
                 updated REAL NOT NULL,
                 error TEXT
             );
+            CREATE TABLE IF NOT EXISTS pool_meta (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );
             """)
             self._migrate()
             self.conn.commit()
@@ -454,7 +459,13 @@ class DataStore:
             "bucket0": "INTEGER NOT NULL DEFAULT 0",
             "bucket1": "INTEGER NOT NULL DEFAULT 0",
             "bucket2": "INTEGER NOT NULL DEFAULT 0",
-            "bucket3": "INTEGER NOT NULL DEFAULT 0"
+            "bucket3": "INTEGER NOT NULL DEFAULT 0",
+            "state_cluster_id": "TEXT",
+            "state_support_count": "INTEGER NOT NULL DEFAULT 1",
+            "action_outcome_information": "REAL NOT NULL DEFAULT 0",
+            "model_dependency_count": "INTEGER NOT NULL DEFAULT 0",
+            "validation_last_used": "REAL NOT NULL DEFAULT 0",
+            "asset_ref_count": "INTEGER NOT NULL DEFAULT 1"
         }
         for name, definition in additions.items():
             if name not in frame_columns:
@@ -462,6 +473,9 @@ class DataStore:
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_frames_buckets ON frames(bucket0, bucket1, bucket2, bucket3)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS mouse_loss_events (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, created REAL NOT NULL, started REAL NOT NULL, ended REAL NOT NULL, lost_count INTEGER NOT NULL, rule TEXT NOT NULL)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS deletion_journal (id TEXT PRIMARY KEY, object_type TEXT NOT NULL, object_id TEXT NOT NULL, path TEXT, stage TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL, error TEXT)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS pool_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL)")
+        self.conn.execute("INSERT OR IGNORE INTO pool_meta(key, value) VALUES ('total_asset_bytes', COALESCE((SELECT SUM(size_bytes) FROM frames), 0))")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_frames_cluster ON frames(state_cluster_id, state_support_count)")
 
     def close(self):
         with self.lock:
@@ -503,23 +517,34 @@ class DataStore:
         value = int(phash, 16)
         return tuple((value >> shift) & 0xFFFF for shift in (48, 32, 16, 0))
 
-    def nearest_hashes(self, phash, limit=8):
-        current = int(phash, 16)
-        buckets = self._hash_buckets(phash)
+    def nearest_hashes(self, dhash, limit=8):
+        current = int(dhash, 16)
+        buckets = self._hash_buckets(dhash)
+        candidate = {}
         with self.lock:
             if self.conn is None:
                 return []
-            rows = self.conn.execute("""
-                SELECT phash FROM frames
-                WHERE bucket0=? OR bucket1=? OR bucket2=? OR bucket3=?
-                LIMIT 4096
-            """, buckets).fetchall()
-            if len(rows) < limit:
-                rows = self.conn.execute("SELECT phash FROM frames").fetchall()
+            for column, value in zip(("bucket0", "bucket1", "bucket2", "bucket3"), buckets):
+                for row in self.conn.execute(f"SELECT phash, dhash64, score, reward, size_bytes FROM frames WHERE {column}=?", (value,)).fetchall():
+                    candidate[row[0]] = row
+            radius = 1
+            while len(candidate) < limit and radius <= 8:
+                expanded = []
+                for value in buckets:
+                    expanded.extend([max(0, value - radius), min(65535, value + radius)])
+                for column in ("bucket0", "bucket1", "bucket2", "bucket3"):
+                    marks = ",".join("?" for _ in expanded)
+                    for row in self.conn.execute(f"SELECT phash, dhash64, score, reward, size_bytes FROM frames WHERE {column} IN ({marks})", expanded).fetchall():
+                        candidate[row[0]] = row
+                radius *= 2
+            if len(candidate) < limit:
+                for row in self.conn.execute("SELECT phash, dhash64, score, reward, size_bytes FROM frames ORDER BY ABS(reward) DESC, created DESC LIMIT 8192").fetchall():
+                    candidate[row[0]] = row
         ranked = []
-        for row in rows:
+        for row in candidate.values():
             try:
-                ranked.append((bit_count(current ^ int(row[0], 16)), row[0]))
+                stored = row[1] or row[0]
+                ranked.append((bit_count(current ^ int(stored, 16)), row[0]))
             except Exception:
                 pass
         ranked.sort(key=lambda item: item[0])
@@ -543,10 +568,13 @@ class DataStore:
         temporary.write_bytes(image["png"])
         size_bytes = temporary.stat().st_size
         buckets = self._hash_buckets(phash)
+        state_cluster_id = "{:04x}_{:04x}".format(buckets[0], buckets[2])
         with self.lock:
             temporary.replace(final_path)
-            self.conn.execute("INSERT INTO frames(id, session_id, created, screenshot_path, phash, dhash64, score, hunger, reward, width, height, size_bytes, novelty, action_result, coverage, model_refs, last_used, bucket0, bucket1, bucket2, bucket3) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (identifier, session_id, moment, str(relative), phash, phash, score, hunger, reward, image["width"], image["height"], size_bytes, score, reward, score, 0, moment, *buckets))
+            support = self.conn.execute("SELECT COUNT(*) + 1 FROM frames WHERE state_cluster_id=?", (state_cluster_id,)).fetchone()[0]
+            self.conn.execute("INSERT INTO frames(id, session_id, created, screenshot_path, phash, dhash64, score, hunger, reward, width, height, size_bytes, novelty, action_result, coverage, model_refs, last_used, bucket0, bucket1, bucket2, bucket3, state_cluster_id, state_support_count, action_outcome_information, model_dependency_count, validation_last_used, asset_ref_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (identifier, session_id, moment, str(relative), phash, phash, score, hunger, reward, image["width"], image["height"], size_bytes, score, reward, score, 0, moment, *buckets, state_cluster_id, support, abs(reward), 0, moment, 1))
             self.conn.execute("UPDATE sessions SET frame_count=frame_count+1 WHERE id=?", (session_id,))
+            self.conn.execute("INSERT OR REPLACE INTO pool_meta(key, value) VALUES ('total_asset_bytes', COALESCE((SELECT value FROM pool_meta WHERE key='total_asset_bytes'), 0) + ?)", (int(size_bytes),))
             self.conn.commit()
 
     def save_mouse_batch(self, records):
@@ -596,22 +624,32 @@ class DataStore:
     def collect_training_data(self):
         with self.lock:
             frame_rows = self.conn.execute("SELECT phash, score, reward, created FROM frames ORDER BY created DESC LIMIT 4000").fetchall()
+            sampled = [row[0] for row in self.conn.execute("SELECT id FROM frames ORDER BY created DESC LIMIT 4000").fetchall()]
+            if sampled:
+                self.conn.executemany("UPDATE frames SET validation_last_used=?, model_dependency_count=MAX(model_dependency_count, 0) WHERE id=?", [(time.time(), item) for item in sampled])
             mouse_rows = self.conn.execute("SELECT event_type, source, relative_x, relative_y, speed, created FROM mouse_events ORDER BY created DESC LIMIT 12000").fetchall()
+            self.conn.commit()
         frame_rows.reverse()
         mouse_rows.reverse()
         return frame_rows, mouse_rows
 
     def pool_size(self):
-        if self.pool is None or not self.pool.exists():
+        if self.conn is None:
             return 0
-        total = 0
-        for item in self.pool.rglob("*"):
+        with self.lock:
+            asset = self.conn.execute("SELECT COALESCE(value, 0) FROM pool_meta WHERE key='total_asset_bytes'").fetchone()
             try:
-                if item.is_file():
-                    total += item.stat().st_size
-            except OSError:
-                pass
-        return total
+                db_bytes = self.conn.execute("SELECT COALESCE(SUM(pgsize), 0) FROM dbstat WHERE name NOT LIKE 'sqlite_%'").fetchone()[0]
+            except sqlite3.Error:
+                db_path = self.pool / "records.sqlite3"
+                db_bytes = db_path.stat().st_size if db_path.exists() else 0
+        return int((asset[0] if asset else 0) or 0) + int(db_bytes or 0)
+
+    def _reconcile_asset_bytes(self):
+        with self.lock:
+            total = self.conn.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM frames").fetchone()[0]
+            self.conn.execute("INSERT OR REPLACE INTO pool_meta(key, value) VALUES ('total_asset_bytes', ?)", (int(total or 0),))
+            self.conn.commit()
 
     def prune_models(self, maximum, cancelled=None, cooperative=None):
         summaries = self.model_summaries()
@@ -640,16 +678,82 @@ class DataStore:
             return None
         return candidate
 
+    def _trash_path(self, journal_id):
+        path = self.pool / "trash" / journal_id
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _restore_trash(self, journal_id, stored):
+        source = self._trash_path(journal_id)
+        target = self._safe_screen_path(stored)
+        if target is None or not source.exists():
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.replace(target)
+
+    def _delete_frame_batch(self, rows):
+        if not rows:
+            return 0
+        moved = []
+        now = time.time()
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            for identifier, stored, size_bytes in rows:
+                journal_id = uuid.uuid4().hex
+                self.conn.execute("INSERT INTO deletion_journal(id, object_type, object_id, path, stage, created, updated, error) VALUES (?, 'frame', ?, ?, 'pending', ?, ?, '')", (journal_id, identifier, stored, now, now))
+                moved.append((journal_id, identifier, stored, int(size_bytes or 0)))
+            self.conn.commit()
+        for journal_id, identifier, stored, size_bytes in moved:
+            source = self._safe_screen_path(stored)
+            trash = self._trash_path(journal_id)
+            if source is not None and source.exists():
+                trash.parent.mkdir(parents=True, exist_ok=True)
+                source.replace(trash)
+            with self.lock:
+                self.conn.execute("BEGIN IMMEDIATE")
+                self.conn.execute("DELETE FROM frames WHERE id=?", (identifier,))
+                self.conn.execute("UPDATE deletion_journal SET stage='db_deleted', updated=?, error='' WHERE id=?", (time.time(), journal_id))
+                self.conn.execute("INSERT OR REPLACE INTO pool_meta(key, value) VALUES ('total_asset_bytes', MAX(0, COALESCE((SELECT value FROM pool_meta WHERE key='total_asset_bytes'), 0) - ?))", (size_bytes,))
+                self.conn.commit()
+            trash.unlink(missing_ok=True)
+            with self.lock:
+                self.conn.execute("UPDATE deletion_journal SET stage='complete', updated=? WHERE id=?", (time.time(), journal_id))
+                self.conn.commit()
+        return len(moved)
+
     def recover_deletions(self):
         if self.conn is None or self.pool is None:
             return
+        with self.lock:
+            journals = self.conn.execute("SELECT id, path, stage FROM deletion_journal WHERE object_type='frame' AND stage!='complete'").fetchall()
+        for journal_id, stored, stage in journals:
+            try:
+                if stage == "pending":
+                    self._restore_trash(journal_id, stored)
+                    with self.lock:
+                        self.conn.execute("UPDATE deletion_journal SET stage='complete', updated=?, error='' WHERE id=?", (time.time(), journal_id))
+                        self.conn.commit()
+                elif stage == "db_deleted":
+                    self._trash_path(journal_id).unlink(missing_ok=True)
+                    with self.lock:
+                        self.conn.execute("UPDATE deletion_journal SET stage='complete', updated=?, error='' WHERE id=?", (time.time(), journal_id))
+                        self.conn.commit()
+            except OSError as error:
+                with self.lock:
+                    self.conn.execute("UPDATE deletion_journal SET updated=?, error=? WHERE id=?", (time.time(), str(error), journal_id))
+                    self.conn.commit()
         referenced = set()
         with self.lock:
-            rows = self.conn.execute("SELECT screenshot_path FROM frames").fetchall()
-        for (stored,) in rows:
+            rows = self.conn.execute("SELECT id, screenshot_path, size_bytes FROM frames").fetchall()
+        missing = []
+        for identifier, stored, size_bytes in rows:
             path = self._safe_screen_path(stored)
             if path is not None:
                 referenced.add(path.resolve())
+            if path is None or not path.exists():
+                missing.append((identifier, stored, size_bytes))
+        if missing:
+            self._delete_frame_batch(missing)
         if self.screens and self.screens.exists():
             for item in self.screens.rglob("*.png"):
                 try:
@@ -658,14 +762,9 @@ class DataStore:
                 except OSError:
                     pass
         with self.lock:
-            rows = self.conn.execute("SELECT id, screenshot_path FROM frames").fetchall()
-            missing = [(identifier,) for identifier, stored in rows if self._safe_screen_path(stored) is None or not self._safe_screen_path(stored).exists()]
-            if missing:
-                self.conn.executemany("DELETE FROM mouse_events WHERE session_id IN (SELECT session_id FROM frames WHERE id=?)", missing)
-                self.conn.executemany("DELETE FROM frames WHERE id=?", missing)
-            self.conn.execute("DELETE FROM mouse_events WHERE session_id NOT IN (SELECT id FROM sessions)")
             self.conn.execute("DELETE FROM system_events WHERE session_id IS NOT NULL AND session_id NOT IN (SELECT id FROM sessions)")
             self.conn.commit()
+            self._reconcile_asset_bytes()
 
     def validate_consistency(self):
         if self.conn is None or self.pool is None:
@@ -702,81 +801,70 @@ class DataStore:
             return False, "存在引用缺失会话的记录：鼠标 {} 条，系统 {} 条".format(bad_mouse, bad_system)
         return True, "一致"
 
+    def _compact_database(self, cooperative=None):
+        with self.lock:
+            try:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                for _ in range(16):
+                    if cooperative is not None and not cooperative():
+                        break
+                    self.conn.execute("PRAGMA incremental_vacuum(512)")
+                self.conn.commit()
+            except sqlite3.Error:
+                pass
+
     def prune_experience(self, maximum, cancelled, progress, cooperative=None):
         maximum = max(1, int(maximum))
+        self.recover_deletions()
+        self._compact_database(cooperative)
         current = self.pool_size()
         if current <= maximum:
             return 0, current
         target = int(maximum * 0.5)
-        need = max(0, current - target)
         removed = 0
-        freed = 0
-        with self.lock:
-            rows = self.conn.execute("""
-                SELECT id, screenshot_path, size_bytes,
-                       ((reward * 0.45 + novelty * 0.25 + action_result * 0.15 + coverage * 0.10) / MAX(size_bytes, 1))
-                       - (model_refs * 0.000001) + ((? - last_used) * 0.0000000001) AS evict_score
-                FROM frames
-                ORDER BY evict_score ASC, last_used ASC
-            """, (time.time(),)).fetchall()
-        batch = []
-        paths = []
-        for index, row in enumerate(rows):
-            if cancelled():
-                return removed, current - freed
-            if cooperative is not None and index % 64 == 0 and not cooperative():
-                return removed, current - freed
-            batch.append(row[0])
-            paths.append(row[1])
-            freed += max(0, int(row[2] or 0))
-            removed += 1
-            if len(batch) >= 128 or freed >= need:
-                with self.lock:
-                    now = time.time()
-                    self.conn.executemany("INSERT OR REPLACE INTO deletion_journal(id, object_type, object_id, path, stage, created, updated, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [(uuid.uuid4().hex, "frame", item, path, "marked", now, now, "") for item, path in zip(batch, paths)])
-                    self.conn.commit()
-                for stored in paths:
-                    candidate = self._safe_screen_path(stored)
-                    if candidate is not None:
-                        try:
-                            candidate.unlink(missing_ok=True)
-                        except OSError as error:
-                            with self.lock:
-                                self.conn.execute("UPDATE deletion_journal SET stage=?, updated=?, error=? WHERE path=?", ("file_failed", time.time(), str(error), stored))
-                                self.conn.commit()
-                with self.lock:
-                    self.conn.executemany("DELETE FROM mouse_events WHERE session_id IN (SELECT session_id FROM frames WHERE id=?)", [(item,) for item in batch])
-                    self.conn.executemany("DELETE FROM frames WHERE id=?", [(item,) for item in batch])
-                    self.conn.executemany("UPDATE deletion_journal SET stage=?, updated=? WHERE object_id=?", [("complete", time.time(), item) for item in batch])
-                    self.conn.commit()
-                batch = []
-                paths = []
-                progress(min(95.0, 56.0 + 39.0 * min(1.0, freed / max(1, need))))
-            if freed >= need:
+        while current > target and not cancelled():
+            if cooperative is not None and not cooperative():
                 break
-        if batch:
             with self.lock:
-                self.conn.executemany("DELETE FROM frames WHERE id=?", [(item,) for item in batch])
+                now = time.time()
+                self.conn.execute("""
+                    UPDATE frames
+                    SET state_support_count=(SELECT COUNT(*) FROM frames peer WHERE peer.state_cluster_id=frames.state_cluster_id)
+                    WHERE state_cluster_id IS NOT NULL
+                """)
+                rows = self.conn.execute("""
+                    SELECT id, screenshot_path, size_bytes,
+                           state_cluster_id,
+                           state_support_count,
+                           (
+                               (CASE WHEN state_support_count <= 1 THEN 1000000.0 ELSE 1.0 / state_support_count END)
+                               + ABS(action_outcome_information) * 0.40
+                               + model_dependency_count * 1000.0
+                               + asset_ref_count * 10.0
+                               - MIN(size_bytes, 10485760) / 10485760.0
+                               - MAX(0.0, ? - validation_last_used) * 0.0000001
+                           ) AS keep_value
+                    FROM frames
+                    WHERE COALESCE(model_dependency_count, 0)=0 AND COALESCE(asset_ref_count, 1)<=1 AND COALESCE(state_support_count, 1)>1
+                    ORDER BY keep_value ASC, validation_last_used ASC, created ASC
+                    LIMIT 128
+                """, (now,)).fetchall()
                 self.conn.commit()
-            for stored in paths:
-                candidate = self._safe_screen_path(stored)
-                if candidate is not None:
-                    try:
-                        candidate.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+            if not rows:
+                break
+            before = current
+            removed += self._delete_frame_batch([(row[0], row[1], row[2]) for row in rows])
+            self._compact_database(cooperative)
+            current = self.pool_size()
+            if before <= current:
+                break
+            progress(min(95.0, 56.0 + 39.0 * min(1.0, (maximum - current) / max(1, maximum - target))))
         remaining = self.pool_size()
         if remaining > target and not cancelled():
-            raise RuntimeError("经验池无法清理到上限 50%，当前 {:.2f} MB，目标 {:.2f} MB".format(remaining / 1024 / 1024, target / 1024 / 1024))
-        if cooperative is not None and cooperative():
-            with self.lock:
-                try:
-                    self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                    if cooperative():
-                        self.conn.execute("VACUUM")
-                    self.conn.commit()
-                except sqlite3.Error:
-                    pass
+            self._compact_database(cooperative)
+            remaining = self.pool_size()
+            if remaining > target:
+                raise RuntimeError("经验池无法清理到上限 50%，当前 {:.2f} MB，目标 {:.2f} MB".format(remaining / 1024 / 1024, target / 1024 / 1024))
         progress(96.0)
         return removed, remaining
 
@@ -1250,9 +1338,10 @@ class Controller:
         self.last_move_kept = None
         self.writer_stop = threading.Event()
         self.writer_busy = threading.Event()
-        self.writer = threading.Thread(target=self._mouse_writer, name="MouseWriter", daemon=True)
+        self.worker_threads = []
+        self.writer = threading.Thread(target=self._mouse_writer, name="MouseWriter")
         self.writer.start()
-        self.control_thread = threading.Thread(target=self._control_loop, name="SessionControl", daemon=True)
+        self.control_thread = threading.Thread(target=self._control_loop, name="SessionControl")
         self.control_thread.start()
         self.hook = MouseHook(self.on_mouse)
         self.keyboard_hook = KeyboardHook(self.on_control_signal)
@@ -1483,11 +1572,12 @@ class Controller:
             self.ai_plan = [item for item in plan if isinstance(item, dict)] if isinstance(plan, list) else []
         self.store.add_system_event(session_id, "mode_enter", {"mode": mode, "automatic": automatic, "time": time.time(), "client_rect": rect, "resource": self.resources.sample()})
         self.post_state("已进入" + ("学习模式" if mode == "learning" else "训练模式"))
-        threads = [threading.Thread(target=self._capture_loop, args=(token,), name="CaptureLoop", daemon=True), threading.Thread(target=self._monitor_loop, args=(token,), name="SessionMonitor", daemon=True)]
+        threads = [threading.Thread(target=self._capture_loop, args=(token,), name="CaptureLoop"), threading.Thread(target=self._monitor_loop, args=(token,), name="SessionMonitor")]
         if mode == "training":
-            threads.append(threading.Thread(target=self._ai_loop, args=(token,), name="AIControl", daemon=True))
+            threads.append(threading.Thread(target=self._ai_loop, args=(token,), name="AIControl"))
         with self.lock:
             self.capture_threads = threads
+            self.worker_threads = [thread for thread in self.worker_threads if thread.is_alive()] + threads
         for thread in threads:
             thread.start()
         return True
@@ -1749,8 +1839,11 @@ class Controller:
             self.cancel_event = threading.Event()
             self.state = "sleep"
         self.post_state("已进入睡眠模式")
-        threading.Thread(target=self._sleep_monitor, args=(token,), name="SleepMonitor", daemon=True).start()
-        threading.Thread(target=self._sleep_worker, args=(token, False), name="SleepWorker", daemon=True).start()
+        threads = [threading.Thread(target=self._sleep_monitor, args=(token,), name="SleepMonitor"), threading.Thread(target=self._sleep_worker, args=(token, False), name="SleepWorker")]
+        with self.lock:
+            self.worker_threads = [thread for thread in self.worker_threads if thread.is_alive()] + threads
+        for thread in threads:
+            thread.start()
         return True
 
     def _begin_auto_sleep(self, token):
@@ -1763,8 +1856,11 @@ class Controller:
             self.state = "sleep"
         self._close_active_session("AI 判断进入睡眠模式", barrier=True)
         self.post_state("AI 判断当前值得进入睡眠模式")
-        threading.Thread(target=self._sleep_monitor, args=(sleep_token,), name="AutoSleepMonitor", daemon=True).start()
-        threading.Thread(target=self._sleep_worker, args=(sleep_token, True), name="AutoSleepWorker", daemon=True).start()
+        threads = [threading.Thread(target=self._sleep_monitor, args=(sleep_token,), name="AutoSleepMonitor"), threading.Thread(target=self._sleep_worker, args=(sleep_token, True), name="AutoSleepWorker")]
+        with self.lock:
+            self.worker_threads = [thread for thread in self.worker_threads if thread.is_alive()] + threads
+        for thread in threads:
+            thread.start()
 
     def _sleep_monitor(self, token):
         while self._is_current(token, ("sleep",)):
@@ -1962,12 +2058,36 @@ class Controller:
 
     def shutdown(self):
         self.request_idle("程序关闭")
-        self.control_queue.put(None)
+        self.cancel_event.set()
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            with self.lock:
+                active = [thread for thread in self.worker_threads if thread.is_alive() and thread is not threading.current_thread()]
+            if not active:
+                break
+            for thread in active:
+                thread.join(min(0.5, max(0.05, deadline - time.monotonic())))
+        flushed = self.flush_mouse_records(5.0)
         self.writer_stop.set()
+        self.writer.join(5.0)
+        self.control_queue.put(None)
+        self.control_thread.join(3.0)
         self.hook.stop()
         self.keyboard_hook.stop()
-        self.writer.join(2.0)
-        self.store.close()
+        with self.lock:
+            active = [thread for thread in self.worker_threads if thread.is_alive()]
+        if active or not flushed:
+            try:
+                self.store.add_system_event(None, "incomplete_shutdown", {"active_threads": [thread.name for thread in active], "mouse_flushed": flushed, "time": time.time()})
+            except Exception:
+                pass
+            return
+        try:
+            self.store.recover_deletions()
+            self.store._compact_database()
+            self.store.validate_consistency()
+        finally:
+            self.store.close()
 
 class Panel:
     def __init__(self, root):
