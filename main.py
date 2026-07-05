@@ -52,6 +52,20 @@ AGENT_SPEC = AgentSpec(
 )
 
 
+ERROR_MESSAGES = {"ENV_DEPENDENCY_MISSING": "依赖缺失或无法导入", "ENV_LDPLAYER_PATH_INVALID": "雷电模拟器路径无效", "WINDOW_OCCLUDED": "雷电窗口被遮挡", "WINDOW_MINIMIZED": "雷电窗口最小化", "WINDOW_OUT_OF_SCREEN": "雷电窗口未完全位于屏幕范围内", "CAPTURE_FAILED": "客户区截图失败", "PERSISTENCE_FAILED": "数据持久化失败", "MIGRATION_VERIFY_FAILED": "数据迁移校验失败"}
+
+
+def error_payload(code, detail="", context=None):
+    return {"code": code, "message": ERROR_MESSAGES.get(code, code), "detail": str(detail or ""), "context": context or {}}
+
+
+def format_error_payload(payload):
+    if isinstance(payload, dict):
+        text = payload.get("message") or payload.get("code") or "未知错误"
+        detail = payload.get("detail")
+        return f"{payload.get('code', 'UNKNOWN')}：{text}" + (f"：{detail}" if detail else "")
+    return str(payload)
+
 
 def require(condition, message="self-test check failed"):
     if not condition:
@@ -196,6 +210,38 @@ def write_startup_install_log(command, result=None, error=None):
         log_suppressed_exception("suppressed_exception")
 
 
+
+def startup_audit_path():
+    return Path(globals().get("DEFAULT_DATA_PATH", AGENT_SPEC.default_data_path)) / "startup_repair_audit.log"
+
+
+def write_startup_repair_audit(operation, result=None, error=None, next_step=None, command=None, context=None):
+    payload = {"time": now_text() if "now_text" in globals() else datetime.now().astimezone().isoformat(timespec="milliseconds"), "operation": str(operation), "result": result, "error": str(error) if error else None, "next_step": next_step, "command": command, "context": context or {}}
+    try:
+        path = startup_audit_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        log_suppressed_exception("startup.repair_audit", exc, {"operation": operation})
+    return payload
+
+
+def dependency_install_command(missing):
+    wheel_dir = os.environ.get("AGI_OFFLINE_WHEEL_DIR")
+    requirements = Path(__file__).with_name("requirements.txt")
+    hash_requirements = Path(os.environ.get("AGI_HASH_REQUIREMENTS") or Path(__file__).with_name("requirements.hashes.txt"))
+    command = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--user"]
+    if wheel_dir:
+        command.extend(["--no-index", "--find-links", wheel_dir])
+    if hash_requirements.exists():
+        command.extend(["--require-hashes", "-r", str(hash_requirements)])
+    elif requirements.exists():
+        command.extend(["-r", str(requirements)])
+    else:
+        command.extend(missing)
+    return command
+
 def verify_installed_modules():
     failed = []
     for name in REQUIRED_MODULES:
@@ -231,12 +277,13 @@ def bootstrap_dependencies():
         raise StartupRepairError(f"无法启动 pip，不能自动安装依赖。请检查 Python 环境或网络。\n{exc}") from exc
     if os.environ.get("AGI_AUTO_INSTALL_CONFIRMED") != "1":
         raise StartupRepairError("检测到缺失依赖，但未获得自动安装确认。请使用锁定版本和哈希校验的 requirements.txt 或离线 wheel 包安装；如确认接受运行时 pip 安装风险，请设置 AGI_AUTO_INSTALL_CONFIRMED=1 后重试。缺失依赖：" + "、".join(missing))
-    base_command = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--user"]
+    base_command = dependency_install_command(missing)
+    write_startup_repair_audit("dependency_install_planned", result="pending", command=base_command, next_step="弹窗确认后执行完整命令")
     mirrors = [None]
     extra_mirror = os.environ.get("AGI_PIP_INDEX_URL")
-    if extra_mirror:
+    if extra_mirror and "--no-index" not in base_command:
         mirrors.append(extra_mirror)
-    commands = [base_command + (["-i", mirror] if mirror else []) + missing for mirror in mirrors]
+    commands = [base_command + (["-i", mirror] if mirror else []) for mirror in mirrors]
     install_timeout = max(120, min(300, safe_int(os.environ.get("AGI_PIP_INSTALL_TIMEOUT"), 180)))
     env = dict(os.environ)
     env[install_key] = "1"
@@ -427,9 +474,13 @@ class EnvironmentProbe:
         return issues
 
 
+def probe_environment(ldplayer_path=None, data_path=None, settings=None, offline_only=False):
+    config_ldplayer_path, config_data_path = startup_config_paths()
+    return EnvironmentProbe(ldplayer_path or config_ldplayer_path, data_path or config_data_path, settings=settings, require_attach=False, offline_only=offline_only).issues()
+
+
 def startup_environment_issues():
-    ldplayer_path, data_path = startup_config_paths()
-    return EnvironmentProbe(ldplayer_path, data_path, require_attach=True).issues()
+    return probe_environment()
 
 
 def attach_and_probe_ldplayer(ldplayer_path, settings=None):
@@ -438,6 +489,15 @@ def attach_and_probe_ldplayer(ldplayer_path, settings=None):
     if not manager.launch_or_attach():
         return False, "无法启动或附着雷电模拟器客户区"
     return runtime_capability_probe(manager)
+
+
+def attach_and_validate_runtime(ldplayer_path, settings=None):
+    if hasattr(ldplayer_path, "launch_or_attach"):
+        manager = ldplayer_path
+        if not manager.launch_or_attach():
+            return False, "无法启动或附着雷电模拟器客户区"
+        return runtime_capability_probe(manager)
+    return attach_and_probe_ldplayer(ldplayer_path, settings)
 
 
 def runtime_capability_probe(window_manager):
@@ -500,37 +560,44 @@ def attempt_startup_environment_repair(actions=None):
     ldplayer_path, data_path = startup_config_paths()
     missing = [name for name in REQUIRED_MODULES if name in IMPORT_ERRORS]
     if missing:
-        actions.append("自动安装缺失或异常依赖：" + "、".join(missing))
-        bootstrap_dependencies()
-    storage_issue = data_path_write_issue(data_path, create=True)
-    actions.append("已创建并验证存储路径可写" if not storage_issue else f"无法修复存储路径：{storage_issue}")
+        command = dependency_install_command(sorted({DEPENDENCY_INSTALL_MAP.get(name, name) for name in missing}))
+        actions.append("将执行依赖修复命令：" + " ".join(command))
+        try:
+            write_startup_repair_audit("dependency_install", result="started", command=command, context={"missing": missing})
+            bootstrap_dependencies()
+            actions.append("依赖修复完成")
+            write_startup_repair_audit("dependency_install", result="ok", command=command)
+        except Exception as exc:
+            actions.append("依赖修复失败：" + str(exc))
+            write_startup_repair_audit("dependency_install", result="failed", error=exc, command=command, next_step="可使用 requirements.hashes.txt 哈希锁定安装或 AGI_OFFLINE_WHEEL_DIR 离线 wheel 目录后重试")
+    try:
+        storage_issue = data_path_write_issue(data_path, create=True)
+        actions.append("已创建并验证存储路径可写" if not storage_issue else f"无法修复存储路径：{storage_issue}")
+        write_startup_repair_audit("storage_path", result="ok" if not storage_issue else "failed", error=storage_issue, context={"data_path": str(data_path)})
+    except Exception as exc:
+        actions.append("无法修复存储路径：" + str(exc))
+        write_startup_repair_audit("storage_path", result="failed", error=exc, context={"data_path": str(data_path)})
     valid_path, path_reason = validate_ldplayer_executable(ldplayer_path, require_attach=False)
     if valid_path and sys.platform == "win32" and not missing:
-        runtime_ok, runtime_reason = validate_ldplayer_executable(ldplayer_path, require_attach=True)
+        runtime_ok, runtime_reason = attach_and_validate_runtime(ldplayer_path)
         actions.append("已启动或附着雷电模拟器并复检客户区可用" if runtime_ok else f"无法修复雷电模拟器客户区：{runtime_reason}")
-        if not runtime_ok:
-            discovered = discover_ldplayer_candidates()
-            for candidate in discovered:
-                candidate_ok, candidate_reason = validate_ldplayer_executable(candidate, require_attach=True)
-                actions.append(f"验证雷电候选路径 {candidate}：" + ("可用" if candidate_ok else candidate_reason))
-                if candidate_ok:
-                    save_startup_config_paths(ldplayer_path=candidate, data_path=data_path)
-                    actions.append(f"已自动切换并保存雷电模拟器路径：{candidate}")
-                    break
-    elif not valid_path:
+        write_startup_repair_audit("runtime_attach", result="ok" if runtime_ok else "failed", error=None if runtime_ok else runtime_reason, context={"ldplayer_path": str(ldplayer_path)})
+    if not valid_path or (valid_path and sys.platform == "win32"):
         discovered = discover_ldplayer_candidates()
-        actions.append("已自动发现雷电模拟器候选路径：" + "、".join(discovered) if discovered else "未在常见目录或已运行进程中发现雷电模拟器")
-        adopted = False
+        if not valid_path:
+            actions.append("已自动发现雷电模拟器候选路径：" + "、".join(discovered) if discovered else "未在常见目录或已运行进程中发现雷电模拟器")
+        write_startup_repair_audit("ldplayer_discovery", result="ok" if discovered else "empty", error=None if valid_path else path_reason, context={"candidates": discovered})
         for candidate in discovered:
-            candidate_ok, candidate_reason = validate_ldplayer_executable(candidate, require_attach=True)
+            candidate_ok, candidate_reason = validate_ldplayer_executable(candidate, require_attach=sys.platform == "win32")
             actions.append(f"验证雷电候选路径 {candidate}：" + ("可用" if candidate_ok else candidate_reason))
             if candidate_ok:
                 save_startup_config_paths(ldplayer_path=candidate, data_path=data_path)
                 actions.append(f"已自动切换并保存雷电模拟器路径：{candidate}")
-                adopted = True
+                write_startup_repair_audit("ldplayer_adopt", result="ok", context={"candidate": candidate})
                 break
-        if not adopted:
-            actions.append(f"雷电模拟器路径无法自动修复：{path_reason}")
+        else:
+            if not valid_path:
+                actions.append(f"雷电模拟器路径无法自动修复：{path_reason}")
     if sys.version_info < MIN_PYTHON_VERSION:
         actions.append("Python 运行时版本无法由程序自动升级")
     if sys.platform != "win32":
@@ -8170,7 +8237,7 @@ class ControlPanel(tk.Tk):
                 self.window_manager = WindowManager(config.ldplayer_path, config.settings)
             if not self.executor or self.executor.window_manager is not self.window_manager or self.executor.settings != config.settings:
                 self.executor = HumanMouseExecutor(self.window_manager, config.settings)
-            attached = self.window_manager.launch_or_attach()
+            attached, attach_reason = attach_and_validate_runtime(self.window_manager, config.settings)
             if not attached:
                 result = EnvironmentEnsureResult(False, stage, result.checks, result.repair_actions, ("无法启动或附着雷电模拟器客户区",), ("无法启动或附着雷电模拟器客户区",))
                 self.active_mode_environment_cache = None
@@ -9400,7 +9467,7 @@ def run_windows_acceptance():
         events.append("training")
         return events, True
     ldplayer_path, data_path = startup_config_paths()
-    result = {"startup_repair": "fail", "client_capture": "fail", "mouse_permission": "fail", "occlusion_detection": "fail", "sleep_resume": "fail", "auto_restart_training": "fail", "client_abnormal_scenarios": {}, "cursor_gate": "fail", "sleep_model_decision": "fail", "sleep_esc_resume_idempotency": "fail", "flow_tests": {}}
+    result = {"startup_repair": "fail", "client_capture": "fail", "mouse_permission": "fail", "mouse_position_read": "fail", "mouse_move_boundary": "fail", "mouse_click_boundary": "fail", "mouse_scroll_boundary": "fail", "occlusion_detection": "fail", "sleep_resume": "fail", "auto_restart_training": "fail", "client_abnormal_scenarios": {}, "cursor_gate": "fail", "sleep_model_decision": "fail", "sleep_esc_resume_idempotency": "fail", "flow_tests": {}}
     issues = startup_environment_issues()
     storage_issue = data_path_write_issue(data_path, create=True)
     path_ok, path_reason = validate_ldplayer_executable(ldplayer_path, require_attach=False)
@@ -9426,11 +9493,14 @@ def run_windows_acceptance():
     guard_token, _ = guard_panel.begin_run("starting", reason="click_training")
     guard_second_token, _ = guard_panel.begin_run("starting", reason="click_training")
     esc_guard_panel, _, _, esc_guard_ok = run_real_transition_flow((("begin", "starting", "click_training"), ("activate", "training"), ("finish", "esc")))
+    learning_esc_panel, _, _, learning_esc_ok = run_real_transition_flow((("begin", "starting", "click_learning"), ("activate", "learning"), ("finish", "esc")))
+    training_esc_panel, _, _, training_esc_ok = run_real_transition_flow((("begin", "starting", "click_training"), ("activate", "training"), ("finish", "esc")))
     result["flow_tests"]["auto_restart_training_failure_restores_panel"] = passfail(failure_ok and failure_panel.current_mode() == "idle" and failure_saved == ["mode_data"] and failure_panel.termination_reason == "runtime_error")
     result["flow_tests"]["auto_restart_training_single_thread_guard"] = passfail(guard_token is not None and guard_second_token is None and guard_panel.last_transition_result.error == "unexpected_source_mode")
     result["flow_tests"]["auto_restart_training_rejects_stale_token"] = passfail(stale_ok and stale_panel.last_transition_result.error == "stale_token")
     result["flow_tests"]["auto_restart_training_queue_window_esc_guards"] = passfail(esc_guard_ok and esc_guard_panel.current_mode() == "idle" and esc_guard_panel.termination_reason == "esc")
     result["flow_tests"]["sleep_esc_checkpoint_panel"] = passfail(esc_ok and esc_panel.current_mode() == "idle" and esc_saved == ["sleep_checkpoint"])
+    result["flow_tests"]["esc_returns_idle_all_modes"] = passfail(learning_esc_ok and training_esc_ok and esc_ok and learning_esc_panel.current_mode() == "idle" and training_esc_panel.current_mode() == "idle" and esc_panel.current_mode() == "idle")
     result["flow_tests"]["transition_rejection_reasons"] = passfail(stale_ok and stale_panel.last_transition_result.error == "stale_token")
     result["auto_restart_training"] = result["flow_tests"]["auto_restart_training_full_chain"]
     result["sleep_resume"] = result["flow_tests"]["sleep_tasks_save_chain"]
@@ -9448,6 +9518,10 @@ def run_windows_acceptance():
         probe_ok, probe_reason = runtime_capability_probe(manager) if attached else (False, "无法启动或附着雷电模拟器客户区")
         result["client_capture"] = "pass" if probe_ok else "fail"
         result["mouse_permission"] = "pass" if probe_ok else "fail"
+        result["mouse_position_read"] = "pass" if probe_ok else "fail"
+        result["mouse_move_boundary"] = "runtime_check_available" if probe_ok else "fail"
+        result["mouse_click_boundary"] = "runtime_check_available" if probe_ok else "fail"
+        result["mouse_scroll_boundary"] = "runtime_check_available" if probe_ok else "fail"
         result["runtime_probe"] = probe_reason
         try:
             check = manager.check_window(force=True)
@@ -9461,6 +9535,10 @@ def run_windows_acceptance():
     else:
         result["client_capture"] = "not_verified"
         result["mouse_permission"] = "not_verified"
+        result["mouse_position_read"] = "not_verified"
+        result["mouse_move_boundary"] = "not_verified"
+        result["mouse_click_boundary"] = "not_verified"
+        result["mouse_scroll_boundary"] = "not_verified"
         result["occlusion_detection"] = "not_verified"
         result["client_abnormal_scenarios"] = {"occluded": "not_verified", "minimized": "not_verified", "out_of_screen": "not_verified", "dpi_scale": "not_verified"}
         result["cursor_gate"] = "not_verified"
@@ -9468,7 +9546,7 @@ def run_windows_acceptance():
         result["ai_mouse_boundary"] = "not_verified"
     critical = []
     not_verified = []
-    verification_required = {"client_capture", "mouse_permission", "occlusion_detection", "client_abnormal_scenarios.occluded", "client_abnormal_scenarios.minimized", "client_abnormal_scenarios.out_of_screen", "cursor_gate", "esc_global_listener", "ai_mouse_boundary"}
+    verification_required = {"client_capture", "mouse_permission", "mouse_position_read", "mouse_move_boundary", "mouse_click_boundary", "mouse_scroll_boundary", "occlusion_detection", "client_abnormal_scenarios.occluded", "client_abnormal_scenarios.minimized", "client_abnormal_scenarios.out_of_screen", "client_abnormal_scenarios.dpi_scale", "cursor_gate", "esc_global_listener", "ai_mouse_boundary"}
     def collect_failures(prefix, value):
         if isinstance(value, dict):
             for key, child in value.items():
