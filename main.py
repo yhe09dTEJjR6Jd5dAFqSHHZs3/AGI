@@ -60,6 +60,8 @@ MOUSEEVENTF_HWHEEL = 0x01000
 MOUSEEVENTF_ABSOLUTE = 0x8000
 MOUSEEVENTF_VIRTUALDESK = 0x4000
 AI_MOUSE_MARKER = 0x4C445F41495F4D31 if ctypes.sizeof(ctypes.c_void_p) >= 8 else 0x495F4D31
+LLMHF_INJECTED = 0x00000001
+LLMHF_LOWER_IL_INJECTED = 0x00000002
 GA_ROOT = 2
 GW_HWNDPREV = 3
 SRCCOPY = 0x00CC0020
@@ -1568,6 +1570,28 @@ def frame_score(dhash, historical):
     meta = {"candidate_count": int(details.get("candidate_count", len(weighted))), "top_k_distance": float(max(distance for _, _, distance in weighted)), "retrieval_fallback": bool(details.get("retrieval_fallback", False))}
     return max(0.0, min(1.0, 1.0 - top_k_similarity)), meta
 
+class AIInputTracker:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pending = []
+
+    def register(self, event_type, button, wheel, x, y):
+        with self.lock:
+            self.pending.append({"event_type": event_type, "button": button, "wheel": wheel, "x": x, "y": y, "deadline_ns": time.monotonic_ns() + 500_000_000})
+
+    def consume(self, event_type, button, wheel, x, y, now_ns):
+        with self.lock:
+            self.pending = [item for item in self.pending if item["deadline_ns"] >= now_ns]
+            for index, item in enumerate(self.pending):
+                same_type = item["event_type"] == event_type
+                same_button = item["button"] == button
+                same_wheel = item["wheel"] == wheel
+                same_position = abs(item["x"] - x) <= 3 and abs(item["y"] - y) <= 3
+                if same_type and same_button and same_wheel and same_position:
+                    self.pending.pop(index)
+                    return True
+        return False
+
 class MouseHook:
     def __init__(self, sink):
         self.sink = sink
@@ -1645,8 +1669,7 @@ class MouseHook:
                     wheel = 0
                     if int(wparam) in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL):
                         wheel = ctypes.c_short((int(info.mouseData) >> 16) & 0xFFFF).value
-                    source = "AI" if int(info.dwExtraInfo) == AI_MOUSE_MARKER else "用户"
-                    self.sink(event_type, button, wheel, int(info.pt.x), int(info.pt.y), time.time(), time.monotonic_ns(), source)
+                    self.sink(event_type, button, wheel, int(info.pt.x), int(info.pt.y), time.time(), time.monotonic_ns(), int(info.flags), int(info.dwExtraInfo))
         except Exception:
             pass
         return user32.CallNextHookEx(self.handle, code, wparam, lparam)
@@ -1739,7 +1762,7 @@ class Controller:
         self.frame_scores = []
         self.frame_count = 0
         self.mouse_count = 0
-        self.last_mouse = None
+        self.last_mouse_by_source = {"ai": None, "user": None, "external_injected": None}
         self.ai_step = 0
         self.ai_plan = []
         self.latest_frame_features = None
@@ -1772,6 +1795,7 @@ class Controller:
         self.capture_threads = []
         self.loss_lock = threading.Lock()
         self.move_loss = {}
+        self.ai_input_tracker = AIInputTracker()
 
     def emit(self, kind, payload):
         self.event_sink(kind, payload)
@@ -1815,8 +1839,8 @@ class Controller:
             elif item.get("kind") == "esc":
                 self._perform_stop(item.get("reason") or "检测到 ESC 键", item.get("token"))
 
-    def enqueue_raw_mouse(self, event_type, button, wheel, x, y, created, created_monotonic_ns, source):
-        item = (event_type, button, wheel, x, y, created, created_monotonic_ns, source)
+    def enqueue_raw_mouse(self, event_type, button, wheel, x, y, created, created_monotonic_ns, flags, extra_info):
+        item = (event_type, button, wheel, x, y, created, created_monotonic_ns, flags, extra_info)
         target = self.raw_critical_queue if event_type != "move" or button or wheel else self.raw_mouse_queue
         try:
             target.put_nowait(item)
@@ -1883,24 +1907,38 @@ class Controller:
             time.sleep(0.04)
         return self.mouse_queue.empty() and not self.writer_busy.is_set()
 
-    def on_mouse(self, event_type, button, wheel, x, y, created, created_monotonic_ns, source):
+    def classify_mouse_source(self, event_type, button, wheel, x, y, flags, extra_info, created_monotonic_ns):
+        injected = bool(flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED))
+        if extra_info == AI_MOUSE_MARKER:
+            return "ai"
+        if injected and self.ai_input_tracker.consume(event_type, button, wheel, x, y, created_monotonic_ns):
+            return "ai"
+        if injected:
+            return "external_injected"
+        return "user"
+
+    def on_mouse(self, event_type, button, wheel, x, y, created, created_monotonic_ns, flags, extra_info):
+        source = self.classify_mouse_source(event_type, button, wheel, x, y, flags, extra_info, created_monotonic_ns)
         with self.lock:
             if self.state not in ("learning", "training") or not self.session_id or not self.target_rect:
                 return
             session_id = self.session_id
             rect = self.target_rect
             outside = not point_inside((x, y), rect)
-            previous = self.last_mouse
+            previous = self.last_mouse_by_source.get(source)
             critical = event_type != "move" or button or wheel
-            if self.state == "training" and source == "用户" and (critical or (previous is not None and math.hypot(x - previous[0], y - previous[1]) >= 12)):
-                self.on_control_signal("stop", "训练模式检测到真实用户鼠标操作，AI 已停止")
+            if self.state == "training":
+                if source == "user" and (critical or (previous is not None and math.hypot(x - previous[0], y - previous[1]) >= 12)):
+                    self.on_control_signal("stop", "训练模式检测到真实用户鼠标操作，AI 已停止")
+                elif source == "external_injected":
+                    self.on_control_signal("stop", "训练模式检测到非本程序注入鼠标操作，AI 已安全停止")
             if not critical:
                 last_kept = self.last_move_kept
                 if last_kept is not None and (created_monotonic_ns - last_kept[2]) < 10_000_000 and abs(x - last_kept[0]) < 3 and abs(y - last_kept[1]) < 3:
-                    self.last_mouse = (x, y, created_monotonic_ns)
+                    self.last_mouse_by_source[source] = (x, y, created_monotonic_ns)
                     return
                 self.last_move_kept = (x, y, created_monotonic_ns)
-            self.last_mouse = (x, y, created_monotonic_ns)
+            self.last_mouse_by_source[source] = (x, y, created_monotonic_ns)
             self.mouse_count += 1
         dx = 0.0
         dy = 0.0
@@ -2033,7 +2071,7 @@ class Controller:
             self.frame_scores = []
             self.frame_count = 0
             self.mouse_count = 0
-            self.last_mouse = None
+            self.last_mouse_by_source = {"ai": None, "user": None, "external_injected": None}
             self.ai_step = 0
             model = self.store.best_model() if mode == "training" else None
             plan = model.get("q_actions", model.get("hotspots", [])) if isinstance(model, dict) else []
@@ -2305,6 +2343,7 @@ class Controller:
                 return
             target = self._ai_target(rect)
             x, y = target["x"], target["y"]
+            self.ai_input_tracker.register("move", "", 0, x, y)
             if not point_inside((x, y), rect) or not ai_move_to(x, y):
                 self.request_idle("AI 鼠标操作无法确认位于雷电模拟器客户区内", token)
                 return
@@ -2316,13 +2355,25 @@ class Controller:
             action_type = target.get("action_type", "移动")
             ok = True
             if action_type == "左键" and self.resources.allow_compute():
+                current_x, current_y = cursor_position()
+                self.ai_input_tracker.register("button_down", "left", 0, current_x, current_y)
+                self.ai_input_tracker.register("button_up", "left", 0, current_x, current_y)
                 ok = ai_left_click()
             elif action_type == "右键" and self.resources.allow_compute():
+                current_x, current_y = cursor_position()
+                self.ai_input_tracker.register("button_down", "right", 0, current_x, current_y)
+                self.ai_input_tracker.register("button_up", "right", 0, current_x, current_y)
                 ok = ai_right_click()
             elif action_type == "滚轮" and self.resources.allow_compute():
-                ok = ai_wheel(target.get("wheel_delta", 120), False)
+                current_x, current_y = cursor_position()
+                delta = target.get("wheel_delta", 120)
+                self.ai_input_tracker.register("wheel", "vertical", delta, current_x, current_y)
+                ok = ai_wheel(delta, False)
             elif action_type == "水平滚轮" and self.resources.allow_compute():
-                ok = ai_wheel(target.get("wheel_delta", 120), True)
+                current_x, current_y = cursor_position()
+                delta = target.get("wheel_delta", 120)
+                self.ai_input_tracker.register("wheel", "horizontal", delta, current_x, current_y)
+                ok = ai_wheel(delta, True)
             if action_type != "移动" and ok:
                 with self.lock:
                     stat = self.action_limits.setdefault(action_type, {"last": 0.0, "times": []})
@@ -2468,7 +2519,7 @@ class Controller:
         last_move = None
         for row in mouse_rows:
             mid, sid, created_ns, created, event_type, source, rx, ry, speed, dx, dy, direction, button, wheel = row
-            if source not in ("用户", "AI") or rx is None or ry is None:
+            if source not in ("user", "ai", "用户", "AI") or rx is None or ry is None:
                 continue
             ns = int(created_ns)
             if event_type == "button_down" and button in ("left", "right"):
@@ -2573,7 +2624,7 @@ class Controller:
                     key = (state_key, gx, gy, action["action_type"], wheel_axis, wheel_direction, wheel_bucket)
                     item = states.setdefault(key, {"samples": 0, "human_samples": 0, "ai_samples": 0, "sum": 0.0, "sum2": 0.0, "recent": 0.0, "examples": [], "state_hash": before[4] or before[5], "gray32x18": before[10], "edge_density": before[11], "color_histogram": before[12], "aspect": before[8] / max(1, before[9])})
                     item["samples"] += 1
-                    item["human_samples" if action["source"] == "用户" else "ai_samples"] += 1
+                    item["human_samples" if action["source"] in ("user", "用户") else "ai_samples"] += 1
                     item["sum"] += reward_delta
                     item["sum2"] += reward_delta * reward_delta
                     item["recent"] = reward_delta
@@ -2780,7 +2831,6 @@ class Panel:
         self.mode_buttons = []
         self.configuration_buttons = []
         self.scroll_canvas = None
-        self.panel_hidden_for_mode = False
         self.build()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(90, self.drain)
@@ -2854,25 +2904,43 @@ class Panel:
         rainbow.bind("<Configure>", draw_rainbow)
         body = Frame(outer, bg="#f8fafc", padx=18, pady=18)
         body.grid(row=2, column=0, sticky="nsew")
-        body.grid_columnconfigure(1, weight=1)
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_rowconfigure(0, weight=1)
         labels = (("雷电模拟器", self.path_var), ("存储路径", self.storage_var), ("经验池上限", self.experience_var), ("AI 模型数量上限", self.model_var))
         colors = ("#ef4444", "#f97316", "#eab308", "#22c55e")
         commands = (self.choose_emulator, self.choose_storage, self.change_experience, self.change_models)
         texts = ("选择雷电模拟器路径", "选择存储路径", "修改经验池上限", "修改AI模型数量上限")
-        for row, ((title, variable), color, command, text) in enumerate(zip(labels, colors, commands, texts)):
-            base_row = row * 3
-            Label(body, text=title, bg="#f8fafc", fg="#334155", font=("Microsoft YaHei UI", 10, "bold"), anchor="w").grid(row=base_row, column=0, columnspan=3, sticky="w", pady=(8, 2))
-            value = Label(body, textvariable=variable, bg="#e2e8f0", fg="#0f172a", font=("Consolas", 9), anchor="w", padx=10, pady=9, justify="left", wraplength=720)
-            value.grid(row=base_row + 1, column=0, columnspan=3, sticky="ew", pady=3)
-            action = self.button(body, text, command, color, row=base_row + 2, column=0, columnspan=3, sticky="ew", pady=(3, 8))
+        config_panel = Frame(body, bg="#f8fafc")
+        config_panel.grid(row=0, column=0, sticky="nsew")
+        config_cards = []
+        value_labels = []
+        for index, ((title, variable), color, command, text) in enumerate(zip(labels, colors, commands, texts)):
+            card = Frame(config_panel, bg="#ffffff", highlightthickness=1, highlightbackground="#dbe4f0", padx=12, pady=11)
+            card.grid_columnconfigure(0, weight=1)
+            Label(card, text=title, bg="#ffffff", fg="#334155", font=("Microsoft YaHei UI", 10, "bold"), anchor="w").grid(row=0, column=0, sticky="w")
+            value = Label(card, textvariable=variable, bg="#f1f5f9", fg="#0f172a", font=("Consolas", 9), anchor="w", padx=10, pady=8, justify="left", wraplength=360)
+            value.grid(row=1, column=0, sticky="ew", pady=(8, 8))
+            action = self.button(card, text, command, color, row=2, column=0, sticky="ew")
             self.configuration_buttons.append(action)
-            def update_wrap(event=None, label=value):
-                label.configure(wraplength=max(140, body.winfo_width() - 72))
-            body.bind("<Configure>", update_wrap, add="+")
+            config_cards.append(card)
+            value_labels.append(value)
+        def layout_config(event=None):
+            width = max(1, config_panel.winfo_width())
+            columns = 2 if width >= 720 else 1
+            for column in range(2):
+                config_panel.grid_columnconfigure(column, weight=1 if column < columns else 0, uniform="config" if columns == 2 else "")
+            for index, card in enumerate(config_cards):
+                card.grid_configure(row=index // columns, column=index % columns, sticky="nsew", padx=6, pady=6)
+            wrap = max(160, width // columns - 62)
+            for label in value_labels:
+                label.configure(wraplength=wrap)
+            sync_region()
+        config_panel.bind("<Configure>", layout_config)
+        self.root.after_idle(layout_config)
         divider = Frame(body, bg="#cbd5e1", height=1)
-        divider.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(12, 12))
+        divider.grid(row=1, column=0, sticky="ew", pady=(12, 12))
         actions = Frame(body, bg="#f8fafc")
-        actions.grid(row=13, column=0, columnspan=3, sticky="ew")
+        actions.grid(row=2, column=0, sticky="ew")
         for index in range(4):
             actions.grid_columnconfigure(index, weight=1)
         info_button = self.button(actions, "更多信息", self.more_info, "#06b6d4", row=0, column=0, sticky="ew", padx=(0, 7))
@@ -2890,11 +2958,11 @@ class Panel:
         actions.bind("<Configure>", layout_actions)
         self.root.after_idle(layout_actions)
         self.mode_buttons = [learn, train, sleep]
-        Label(body, text="任务进度", bg="#f8fafc", fg="#334155", font=("Microsoft YaHei UI", 10, "bold"), anchor="w").grid(row=14, column=0, sticky="w", pady=(17, 6))
+        Label(body, text="任务进度", bg="#f8fafc", fg="#334155", font=("Microsoft YaHei UI", 10, "bold"), anchor="w").grid(row=3, column=0, sticky="w", pady=(17, 6))
         progress = ttk.Progressbar(body, orient="horizontal", maximum=100.0, variable=self.progress_var, mode="determinate")
-        progress.grid(row=14, column=1, columnspan=2, sticky="ew", pady=(17, 6))
+        progress.grid(row=4, column=0, sticky="ew", pady=(0, 6))
         footer = Frame(body, bg="#eef2ff", padx=12, pady=10)
-        footer.grid(row=15, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        footer.grid(row=5, column=0, sticky="ew", pady=(12, 0))
         footer.grid_columnconfigure(0, weight=1)
         Label(footer, textvariable=self.status_var, bg="#eef2ff", fg="#1e3a8a", font=("Microsoft YaHei UI", 9), anchor="w", justify="left", wraplength=550).grid(row=0, column=0, sticky="ew")
         Label(footer, textvariable=self.performance_var, bg="#eef2ff", fg="#475569", font=("Microsoft YaHei UI", 9), anchor="e").grid(row=0, column=1, sticky="e", padx=(12, 0))
@@ -2920,33 +2988,20 @@ class Panel:
             return None
 
     def restore_panel(self):
-        if not self.panel_hidden_for_mode:
-            return
-        self.panel_hidden_for_mode = False
-        try:
-            self.root.deiconify()
-            self.root.lift()
-            self.root.update_idletasks()
-        except Exception:
-            pass
+        return None
 
     def start_mode(self, mode):
         if self.controller.busy():
             self.controller.emit("notice", "当前模式：" + self.controller.current_state() + "，拒绝重复进入。")
             return False
-        self.panel_hidden_for_mode = True
-        try:
-            self.root.withdraw()
-            self.root.update_idletasks()
-        except Exception:
-            self.restore_panel()
-            self.controller.emit("notice", "控制面板无法临时隐藏，未进入模式。")
-            return False
+        self.root.attributes("-topmost", False)
+        self.root.lower()
+        self.root.update_idletasks()
         def continue_start():
             started = self.controller.start_session(mode)
             if not started:
-                self.restore_panel()
-        self.root.after(80, continue_start)
+                self.status_var.set("未进入模式，请检查雷电模拟器客户区状态。")
+        self.root.after_idle(continue_start)
         return True
 
     def protect_configuration(self):
@@ -3052,8 +3107,6 @@ class Panel:
                     detail = payload.get("detail", "")
                     self.status_var.set(detail or "控制面板已就绪。")
                     self.performance_var.set("CPU {:.1f}% · 内存 {:.1f}%".format(payload.get("cpu", 0.0), payload.get("memory", 0.0)))
-                    if state == "idle":
-                        self.restore_panel()
                     normal = "normal" if state == "idle" else "disabled"
                     for button in self.mode_buttons:
                         button.configure(state=normal)
