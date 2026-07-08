@@ -2,6 +2,7 @@ import ctypes
 import concurrent.futures
 import collections
 import heapq
+import pickle
 import datetime
 import shutil
 import re
@@ -205,6 +206,8 @@ user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
 user32.GetWindowTextLengthW.restype = ctypes.c_int
 user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.GetWindowTextW.restype = ctypes.c_int
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
 user32.SetWindowsHookExW.argtypes = [ctypes.c_int, ctypes.c_void_p, wintypes.HINSTANCE, wintypes.DWORD]
 user32.SetWindowsHookExW.restype = wintypes.HHOOK
 user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
@@ -438,6 +441,60 @@ def packet_byte_cost(packet):
             total += len(value)
     return max(4096, total + 8192)
 
+def _is_windows_reparse_point(path):
+    if os.name != "nt":
+        return False
+    try:
+        attrs = kernel32.GetFileAttributesW(str(Path(path)))
+        if attrs == 0xFFFFFFFF:
+            return False
+        return bool(int(attrs) & 0x0400)
+    except Exception:
+        return False
+
+def _existing_storage_ancestors(path):
+    current = Path(path).expanduser()
+    result = []
+    while True:
+        if current.exists():
+            result.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return list(reversed(result))
+
+def storage_path_allowed(path, storage_root):
+    try:
+        root_input = Path(storage_root).expanduser()
+        candidate_input = Path(path).expanduser()
+        root = root_input.resolve()
+        candidate = candidate_input.resolve()
+        if os.path.commonpath([str(root), str(candidate)]) != str(root):
+            return False
+        if os.name == "nt":
+            for item in _existing_storage_ancestors(root_input):
+                if _is_windows_reparse_point(item):
+                    return False
+            for item in _existing_storage_ancestors(candidate_input):
+                try:
+                    resolved_item = item.resolve()
+                    if os.path.commonpath([str(root), str(resolved_item)]) != str(root):
+                        return False
+                except Exception:
+                    return False
+                if _is_windows_reparse_point(item):
+                    return False
+        return True
+    except Exception:
+        return False
+
+def checked_storage_path(path, storage_root):
+    candidate = Path(path).expanduser().resolve()
+    if not storage_path_allowed(path, storage_root):
+        raise OSError("落盘路径越界或包含 Windows reparse point：{} 不在 {} 内".format(candidate, Path(storage_root).expanduser().resolve()))
+    return candidate
+
 @dataclass
 class PipelineContext:
     token: int
@@ -638,7 +695,17 @@ class HardwareProbe:
             return dict(result)
 
     def choose_gpu(self, metrics):
-        return "CPU"
+        metrics = metrics or {}
+        if not metrics.get("gpu_metrics_available", metrics.get("available", False)):
+            return "CPU"
+        gpu_p95 = float(metrics.get("gpu_engine_p95", metrics.get("gpu_engine", metrics.get("gpu", 100.0))) or 0.0)
+        program_gpu = float(metrics.get("program_gpu_p95", metrics.get("program_gpu", 0.0)) or 0.0)
+        free = metrics.get("gpu_dedicated_free", metrics.get("dedicated_free"))
+        if gpu_p95 >= 80.0 or program_gpu >= 70.0:
+            return "CPU"
+        if free is not None and int(free) < 512 * 1024 * 1024:
+            return "CPU"
+        return "GPU"
 
 class ComputeBackend:
     def __init__(self, probe):
@@ -723,7 +790,14 @@ class ComputeBackend:
                 self.runtime_ready = True
             return self.runtime_ready
 
-    def run_gpu_features(self, vector, metrics, timeout=0.06):
+    def _vision_tensor(self, features):
+        gray = feature_bytes((features or {}).get("gray32x18"), 32 * 18)
+        if not gray:
+            gray = bytes([128] * (32 * 18))
+        values = [max(0.0, min(1.0, item / 255.0)) for item in gray]
+        return [[[[values[y * 32 + x] for x in range(32)] for y in range(18)]]]
+
+    def run_gpu_features(self, features, metrics, timeout=0.06):
         if not self.refresh_gpu_stability(metrics):
             return None
         if not self.gpu_inflight.acquire(timeout=0.0):
@@ -735,7 +809,8 @@ class ComputeBackend:
                 executor = self.gpu_executor
             inputs = session.get_inputs()
             sample = inputs[0]
-            array = np.asarray(vector, dtype=np.float32)
+            rank = len(sample.shape or [])
+            array = np.asarray(self._vision_tensor(features) if rank == 4 else self._policy_vector(features), dtype=np.float32)
             if array.ndim == 1:
                 array = array.reshape(1, -1)
             future = executor.submit(session.run, None, {sample.name: array})
@@ -861,7 +936,7 @@ class ComputeBackend:
         backend = "CPU 表格策略"
         metrics = features.get("resource_metrics") or {}
         timeout = min(0.18, max(0.02, float(getattr(budget, "retrieval_deadline_seconds", 0.08) or 0.08)))
-        gpu_result = self.run_gpu_features(self._policy_vector(features), metrics, timeout=timeout)
+        gpu_result = self.run_gpu_features(features, metrics, timeout=timeout)
         if gpu_result is not None:
             try:
                 import numpy as np
@@ -907,9 +982,9 @@ class ModelRuntime:
         return "low"
 
 class ResourceGovernor:
-    def __init__(self):
+    def __init__(self, storage_path):
         self.lock = threading.RLock()
-        self.storage_path = Path.cwd()
+        self.storage_path = Path(storage_path).expanduser().resolve()
         self.emulator_path = ""
         self.emulator_pid = 0
         self.previous = None
@@ -918,7 +993,7 @@ class ResourceGovernor:
         self.last_sample = 0.0
         self.last_disk_probe = 0.0
         self.window = []
-        self.metrics = {"cpu": 0.0, "process_cpu": 0.0, "process_memory": 0, "ldplayer_cpu": 0.0, "ldplayer_memory": 0, "memory": 0.0, "avail_memory": 0, "commit_free": 0, "disk_free": 0, "disk_write_latency": None, "sqlite_latency": 0.0, "capture_latency": 0.0, "queue": 0, "queue_age": 0.0, "pipeline_queue": 0, "pipeline_queue_age": 0.0, "pipeline_queue_capacity": 96, "pipeline_queue_ratio": 0.0, "gpu": None, "gpu_dedicated_total": None, "gpu_dedicated_used": None, "gpu_dedicated_free": None, "gpu_engine": None, "ldplayer_gpu": None, "program_gpu": None, "gpu_metrics_available": False, "gpu_sampling_source": "Windows GPU 性能计数器不可用", "last_user_input": time.time(), "capture_failure_rate": 0.0, "png_encode_ms": 0.0, "png_active": 0, "png_queue_age": 0.0, "exact_score_backlog": 0, "exact_score_oldest_age": 0.0, "wal_bytes": 0, "wal_checkpoint_ms": 0.0, "sqlite_transaction_ms": 0.0, "metric_sources": {"本程序 CPU": "GetProcessTimes", "雷电 CPU": "GetProcessTimes（绑定雷电进程树）", "本程序 GPU 引擎": "Windows GPU 性能计数器", "雷电 GPU 引擎": "Windows GPU 性能计数器", "可用显存": "Windows GPU Adapter Memory 性能计数器", "磁盘写入延迟": "fsync 探针", "SQLite 写入延迟": "实际 SQLite 事务计时", "队列年龄": "队列记录时间戳"}}
+        self.metrics = {"cpu": 0.0, "process_cpu": 0.0, "process_memory": 0, "ldplayer_cpu": 0.0, "ldplayer_memory": 0, "memory": 0.0, "avail_memory": 0, "commit_free": 0, "disk_free": 0, "disk_write_latency": None, "sqlite_latency": 0.0, "capture_latency": 0.0, "queue": 0, "queue_age": 0.0, "pipeline_queue": 0, "pipeline_queue_age": 0.0, "pipeline_queue_capacity": 96, "pipeline_queue_ratio": 0.0, "gpu": None, "gpu_dedicated_total": None, "gpu_dedicated_used": None, "gpu_dedicated_free": None, "gpu_engine": None, "ldplayer_gpu": None, "program_gpu": None, "gpu_metrics_available": False, "gpu_sampling_source": "Windows GPU 性能计数器不可用", "last_user_input": time.time(), "capture_failure_rate": 0.0, "png_encode_ms": 0.0, "png_active": 0, "png_queue_age": 0.0, "exact_score_backlog": 0, "exact_score_oldest_age": 0.0, "wal_bytes": 0, "wal_checkpoint_ms": 0.0, "sqlite_transaction_ms": 0.0, "ui_heartbeat_jitter_ms": 0.0, "metric_sources": {"本程序 CPU": "GetProcessTimes", "目标进程 CPU": "GetProcessTimes（绑定雷电进程树）", "本程序 GPU 引擎": "Windows GPU 性能计数器", "目标进程 GPU 引擎": "Windows GPU 性能计数器", "可用显存": "Windows GPU Adapter Memory 性能计数器", "磁盘写入延迟": "fsync 探针", "SQLite 写入延迟": "实际 SQLite 事务计时", "队列年龄": "队列记录时间戳", "UI 心跳抖动": "Tk after 心跳延迟"}}
         self.probe = HardwareProbe()
         self.backend = ComputeBackend(self.probe)
         self.backend.set_encode_metrics_sink(self.update_encode_metrics)
@@ -937,6 +1012,7 @@ class ResourceGovernor:
         self.pressure_reasons = []
         self._slow_stop = threading.Event()
         self._slow_thread = None
+        checked_storage_path(self.storage_path, self.storage_path)
         self.sample()
         self._slow_thread = threading.Thread(target=self._slow_sample_loop, name="ResourceSlowProbe", daemon=True)
         self._slow_thread.start()
@@ -946,8 +1022,10 @@ class ResourceGovernor:
         self._fast_thread.start()
 
     def set_storage_path(self, path):
+        resolved = Path(path).expanduser().resolve()
+        checked_storage_path(resolved, resolved)
         with self.lock:
-            self.storage_path = Path(path)
+            self.storage_path = resolved
 
     def set_emulator_path(self, path):
         with self.lock:
@@ -997,6 +1075,10 @@ class ResourceGovernor:
             self.metrics["png_encode_ms"] = float(elapsed_ms)
             self.metrics["png_active"] = max(0, int(active_after))
             self.metrics["png_queue_age"] = max(0.0, float(queue_age))
+
+    def update_ui_heartbeat(self, jitter_ms):
+        with self.lock:
+            self.metrics["ui_heartbeat_jitter_ms"] = max(0.0, float(jitter_ms))
 
     def update_exact_score_metrics(self, pending, oldest_age):
         with self.lock:
@@ -1076,7 +1158,7 @@ class ResourceGovernor:
         if now - self.last_disk_probe < 5.0:
             return self.metrics.get("disk_write_latency")
         self.last_disk_probe = now
-        probe_path = Path(self.storage_path) / "experience_pool" / ".write_latency_probe.tmp"
+        probe_path = checked_storage_path(Path(self.storage_path) / "experience_pool" / ".write_latency_probe.tmp", self.storage_path)
         try:
             probe_path.parent.mkdir(parents=True, exist_ok=True)
             started = time.perf_counter()
@@ -1084,7 +1166,8 @@ class ResourceGovernor:
                 handle.write(b"0" * 4096)
                 handle.flush()
                 os.fsync(handle.fileno())
-            probe_path.unlink(missing_ok=True)
+            if storage_path_allowed(probe_path, self.storage_path) and not _is_windows_reparse_point(probe_path):
+                probe_path.unlink(missing_ok=True)
             return (time.perf_counter() - started) * 1000.0
         except OSError:
             return None
@@ -1201,6 +1284,7 @@ class ResourceGovernor:
         wal_bytes = int(sample.get("wal_bytes", 0) or 0)
         checkpoint_p95 = float(sample.get("wal_checkpoint_ms_p95", sample.get("wal_checkpoint_ms", 0.0)) or 0.0)
         exact_backlog = int(sample.get("exact_score_backlog", 0) or 0)
+        ui_jitter_p95 = float(sample.get("ui_heartbeat_jitter_ms_p95", sample.get("ui_heartbeat_jitter_ms", 0.0)) or 0.0)
         red_now = False
         if cpu_p95 >= 95.0:
             red_now = True
@@ -1223,16 +1307,20 @@ class ResourceGovernor:
         if checkpoint_p95 > 2000.0:
             red_now = True
             reasons.append("SQLite WAL checkpoint P95 超过 2 秒")
+        if ui_jitter_p95 > 500.0:
+            red_now = True
+            reasons.append("控制面板 UI 心跳 P95 超过 500 ms")
         if cpu_p95 >= 85.0:
             yellow.append("系统 CPU P95 ≥ 85%")
         if float(sample.get("process_cpu", 0.0) or 0.0) >= 60.0:
             yellow.append("本程序 CPU ≥ 60%")
         if float(sample.get("ldplayer_cpu", 0.0) or 0.0) >= 70.0:
-            yellow.append("雷电 CPU ≥ 70%")
+            yellow.append("目标进程 CPU ≥ 70%")
         if float(sample.get("memory", 0.0) or 0.0) >= 88.0:
             yellow.append("内存占用 ≥ 88%")
-        if sample.get("gpu_metrics_available") and float(sample.get("gpu_engine_p95", sample.get("gpu_engine", 0.0)) or 0.0) >= 85.0:
-            yellow.append("GPU 引擎 P95 ≥ 85%")
+        gpu_p95 = float(sample.get("gpu_engine_p95", sample.get("gpu_engine", 0.0)) or 0.0)
+        if sample.get("gpu_metrics_available") and gpu_p95 >= 80.0:
+            yellow.append("GPU 引擎 P95 ≥ 80%")
             if self.backend.can_use_gpu():
                 self.backend.disable_gpu("GPU 引擎 P95 过高", 300.0)
         if float(sample.get("capture_latency_p95", sample.get("capture_latency", 0.0)) or 0.0) > 150.0:
@@ -1255,6 +1343,24 @@ class ResourceGovernor:
             yellow.append("SQLite WAL 文件增长过大")
         if exact_backlog >= 96:
             yellow.append("精确评分积压过多")
+        if ui_jitter_p95 > 200.0:
+            yellow.append("控制面板 UI 心跳 P95 超过 200 ms")
+        sqlite_p95 = float(sample.get("sqlite_latency_p95", sample.get("sqlite_latency", 0.0)) or 0.0)
+        capture_p95 = float(sample.get("capture_latency_p95", sample.get("capture_latency", 0.0)) or 0.0)
+        avail_memory = int(sample.get("avail_memory", 0) or 0)
+        memory_error = max(0.0, (768 * 1024 * 1024 - avail_memory) / float(768 * 1024 * 1024))
+        errors = [
+            max(0.0, queue_age / 0.25 - 1.0),
+            max(0.0, sqlite_p95 / 100.0 - 1.0),
+            max(0.0, capture_p95 / 150.0 - 1.0),
+            max(0.0, cpu_p95 / 85.0 - 1.0),
+            max(0.0, gpu_p95 / 80.0 - 1.0) if sample.get("gpu_metrics_available") else 0.0,
+            max(0.0, ui_jitter_p95 / 200.0 - 1.0),
+            memory_error,
+        ]
+        control_error = max(errors)
+        if control_error > 0.0 and not red_now:
+            yellow.append("闭环控制误差 {:.2f}".format(control_error))
         with self.lock:
             if red_now:
                 self.red_latched = True
@@ -1262,57 +1368,140 @@ class ResourceGovernor:
             elif self.red_latched:
                 if self.red_recovery_since is None:
                     self.red_recovery_since = now
-                elif now - self.red_recovery_since >= 20.0 and queue_age <= 0.25:
+                elif now - self.red_recovery_since >= 20.0 and queue_age <= 0.25 and sqlite_p95 <= 100.0 and capture_p95 <= 150.0 and cpu_p95 <= 85.0 and ui_jitter_p95 <= 200.0 and (not sample.get("gpu_metrics_available") or gpu_p95 <= 80.0) and avail_memory >= 768 * 1024 * 1024:
                     self.red_latched = False
                     self.red_recovery_since = None
             red_pause = bool(self.red_latched)
             pressure = red_pause or bool(yellow)
-            if pressure:
+            current_level = float(self.levels.get(task, 4.0))
+            if red_pause:
+                next_level = max(1.0, current_level * 0.70)
                 self.last_pressure = now
                 self.healthy_since = now
-                for key in ("capture", "ai_inference", "sleep_training", "maintenance"):
-                    self.levels[key] = max(1, int(self.levels.get(key, 4) / 2))
-            elif now - self.healthy_since >= 20.0 and now - self.last_pressure >= 20.0:
-                self.levels[task] = min(16, int(self.levels.get(task, 4)) + 1)
-                self.healthy_since = now
-            level = int(self.levels.get(task, 4))
+            else:
+                gain = 0.18 if pressure else -0.06
+                next_level = current_level * math.exp(-gain * min(3.0, control_error))
+                if not pressure and now - self.healthy_since >= 2.0:
+                    next_level = min(16.0, next_level + 0.20)
+                    self.healthy_since = now
+                if pressure:
+                    self.last_pressure = now
+                    self.healthy_since = now
+            self.levels[task] = max(1.0, min(16.0, next_level))
+            level = int(max(1, round(self.levels.get(task, 4.0))))
             recovery_note = "红色条件已消失，恢复观察中" if red_pause and not red_now else ""
             self.pressure_reasons = reasons + yellow + ([recovery_note] if recovery_note else [])
         cores = max(1, os.cpu_count() or 1)
-        workers = 1 if task in ("maintenance", "ai_inference") else max(1, min(max(1, cores - max(1, math.ceil(cores * 0.25))), level))
+        workers_float = max(1.0, min(float(max(1, cores - max(1, math.ceil(cores * 0.25)))), self.levels.get(task, float(level))))
+        workers = 1 if task in ("maintenance", "ai_inference") else max(1, int(round(workers_float)))
         interval_base = {"capture": 1.0, "ai_inference": 0.8, "sleep_training": 0.05, "maintenance": 1.0}.get(task, 1.0)
-        interval = max(0.05, interval_base * max(1.0, 4.0 / max(1, level)))
+        interval = max(0.05, interval_base * max(0.35, 4.0 / max(1.0, self.levels.get(task, float(level)))))
+        interval *= max(1.0, 1.0 + min(2.5, control_error * 0.85))
         if png_p95 > 120.0:
             workers = 1
-        resolution = (640, 360) if level >= 4 else (426, 240) if level >= 2 else (320, 180)
+        if control_error <= 0.10 and png_p95 <= 100.0 and capture_p95 <= 120.0:
+            resolution = (640, 360)
+        elif control_error <= 0.65:
+            resolution = (426, 240)
+        else:
+            resolution = (320, 180)
         if png_p95 > 250.0:
             resolution = (426, 240)
         if png_p95 > 500.0:
             interval *= 2.0
         if queue_ratio >= 0.70:
-            interval *= 2.0
-        draining = queue_ratio >= 0.85 or exact_backlog >= 128
+            interval *= 1.0 + min(2.0, (queue_ratio - 0.70) * 6.0)
+        draining = queue_ratio >= 0.85 or exact_backlog >= 128 or queue_age > 1.0
         if draining:
             workers = 1
             resolution = (320, 180)
-            interval *= 3.0
-        max_batch = 1 if draining else max(1, min(64, level * (2 if task == "sleep_training" else 1)))
-        pause = red_pause
+            interval *= 1.0 + min(3.0, max(queue_age / 0.25, exact_backlog / 128.0))
+        exact_batch_factor = 0.35 if control_error >= 1.0 else 0.65 if control_error >= 0.35 else 1.0
+        max_batch = 1 if draining else max(1, min(64, int(round(level * (2 if task == "sleep_training" else 1) * exact_batch_factor))))
+        maintenance_task = str(task) == "maintenance"
+        extreme_memory = int(sample.get("avail_memory", 0) or 0) < 128 * 1024 * 1024 or int(sample.get("commit_free", 0) or 0) < 128 * 1024 * 1024
+        extreme_disk = int(sample.get("disk_free", 0) or 0) < 256 * 1024 * 1024
+        sqlite_error = sqlite_p95 >= 2000.0 or checkpoint_p95 >= 5000.0 or float(sample.get("sqlite_transaction_ms_p95", sample.get("sqlite_transaction_ms", 0.0)) or 0.0) >= 2000.0
+        if maintenance_task:
+            hard_reasons = []
+            if extreme_memory:
+                hard_reasons.append("维护暂停：内存极低")
+            if extreme_disk:
+                hard_reasons.append("维护暂停：磁盘极低")
+            if sqlite_error:
+                hard_reasons.append("维护暂停：SQLite 错误或严重阻塞")
+            pause = bool(hard_reasons)
+            if hard_reasons:
+                self.pressure_reasons = hard_reasons + [item for item in self.pressure_reasons if item not in hard_reasons]
+            workers = 1
+            max_batch = max(1, min(8, max_batch))
+            interval = max(0.25, min(5.0, interval))
+            resolution = (320, 180)
+        else:
+            pause = red_pause
         state = "暂停" if pause else "排空" if draining else "降速" if pressure else "正常"
         with self.lock:
             self._set_resource_state_locked(state, self.pressure_reasons)
         deadline = max(0.03, min(0.25, interval * 0.35))
         gpu_assignment = self.gpu_scheduler.assign(sample, self.backend)
         gpu_batch = max_batch if gpu_assignment == "GPU" else 0
-        return ResourceBudget(not pause, interval, max_batch, workers, gpu_assignment, gpu_batch, resolution, pause, "；".join(self.pressure_reasons), state, max(8, min(512, level * 16)), max(8, min(128, level * 8)), max(8, min(256, level * 16)), max(1, min(workers, 4)), deadline, queue_ratio)
+        return ResourceBudget(not pause, interval, max_batch, workers, gpu_assignment, gpu_batch, resolution, pause, "；".join(self.pressure_reasons), state, max(8, min(512, level * 16)), max(1, min(8, max_batch if maintenance_task else level * 8)), max(8, min(256, level * 16)), max(1, min(workers, 4)), deadline, queue_ratio)
 
 class Settings:
+    DEFAULT_STORAGE_PATH = r"C:\Users\Administrator\Desktop\AAA"
+
     def __init__(self):
-        appdata = Path(os.environ.get("APPDATA", str(Path.home())))
-        self.path = appdata / "LDTrainingPanel" / "settings.json"
-        self.data = {"emulator_path": r"D:\LDPlayer9\dnplayer.exe", "storage_path": r"C:\Users\Administrator\Desktop\AAA", "experience_limit": 10 * 1024 * 1024 * 1024, "model_limit": 100, "transaction_reserve_bytes": 8 * 1024 * 1024, "emulator_pid": 0, "emulator_title": ""}
+        self.data = {"emulator_path": r"D:\LDPlayer9\dnplayer.exe", "storage_path": self.DEFAULT_STORAGE_PATH, "experience_limit": 10 * 1024 * 1024 * 1024, "model_limit": 100, "transaction_reserve_bytes": 8 * 1024 * 1024, "emulator_pid": 0, "emulator_title": ""}
         self.config_errors = []
-        self.load()
+        self.path = self._path_for_storage(self.data["storage_path"])
+        self._bootstrap_storage_config()
+
+    def _legacy_path(self):
+        appdata = Path(os.environ.get("APPDATA", str(Path.home())))
+        return appdata / "LDTrainingPanel" / "settings.json"
+
+    def _path_for_storage(self, storage_path):
+        root = Path(storage_path).expanduser().resolve()
+        path = root / "config" / "settings.json"
+        if not storage_path_allowed(path, root):
+            raise OSError("配置路径越界")
+        return path
+
+    def _apply_loaded(self, loaded):
+        if not isinstance(loaded, dict):
+            self.config_errors.append("配置根对象不是字典")
+            return False
+        for key in ("emulator_path", "storage_path", "emulator_title"):
+            if key in loaded:
+                if isinstance(loaded[key], str): self.data[key] = loaded[key]
+                else: self.config_errors.append(key + " 类型无效")
+        for key, minimum, maximum in (("experience_limit", int(0.1*1024*1024*1024), 4096*1024*1024*1024), ("transaction_reserve_bytes", 1*1024*1024, 512*1024*1024), ("model_limit", 1, 100000), ("emulator_pid", 0, 2**31-1)):
+            if key in loaded:
+                value = loaded[key]
+                if isinstance(value, int) and minimum <= value <= maximum: self.data[key] = value
+                else: self.config_errors.append(key + " 超出范围或类型无效")
+        return True
+
+    def _bootstrap_storage_config(self):
+        self.config_errors = []
+        default_path = self._path_for_storage(self.data["storage_path"])
+        legacy = self._legacy_path()
+        loaded = None
+        source = None
+        if default_path.exists():
+            source = default_path
+        elif legacy.exists():
+            source = legacy
+        if source is not None:
+            try:
+                loaded = json.loads(source.read_text(encoding="utf-8"))
+            except Exception as error:
+                self.config_errors.append("配置读取失败:" + str(error))
+        if loaded is not None:
+            self._apply_loaded(loaded)
+        self.path = self._path_for_storage(self.data["storage_path"])
+        checked_storage_path(self.path.parent, self.data["storage_path"]).mkdir(parents=True, exist_ok=True)
+        self.save()
 
     def load(self):
         self.config_errors = []
@@ -1321,22 +1510,30 @@ class Settings:
         except Exception as error:
             if self.path.exists(): self.config_errors.append("配置读取失败:" + str(error))
             return
-        if not isinstance(loaded, dict):
-            self.config_errors.append("配置根对象不是字典")
-            return
-        for key in ("emulator_path", "storage_path", "emulator_title"):
-            if key in loaded:
-                if isinstance(loaded[key], str): self.data[key] = loaded[key]
-                else: self.config_errors.append(key + " 类型无效")
-        for key, minimum, maximum in (("experience_limit", int(0.1*1024*1024*1024), 4096*1024*1024*1024), ("transaction_reserve_bytes", 1*1024*1024, 512*1024*1024), ("model_limit", 1, 100000), ("emulator_pid", 0, 2**31-1)):
-            if key in loaded:
-                value=loaded[key]
-                if isinstance(value,int) and minimum <= value <= maximum: self.data[key]=value
-                else: self.config_errors.append(key + " 超出范围或类型无效")
+        self._apply_loaded(loaded)
+        self.path = self._path_for_storage(self.data["storage_path"])
+
+    def migrate_storage_path(self, storage_path):
+        old_path = self.path
+        old_data = dict(self.data)
+        self.data["storage_path"] = str(Path(storage_path).expanduser().resolve())
+        self.path = self._path_for_storage(self.data["storage_path"])
+        self.save()
+        try:
+            if old_path != self.path and old_path.exists():
+                backup = old_path.with_suffix(".migrated")
+                old_path.replace(backup)
+        except OSError:
+            self.data.update(old_data)
+            self.path = old_path
+            self.save()
+            raise
 
     def save(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temp = self.path.with_suffix(".tmp")
+        self.path = self._path_for_storage(self.data.get("storage_path", self.DEFAULT_STORAGE_PATH))
+        checked_storage_path(self.path, self.data.get("storage_path", self.DEFAULT_STORAGE_PATH))
+        checked_storage_path(self.path.parent, self.data.get("storage_path", self.DEFAULT_STORAGE_PATH)).mkdir(parents=True, exist_ok=True)
+        temp = checked_storage_path(self.path.with_suffix(".tmp"), self.data.get("storage_path", self.DEFAULT_STORAGE_PATH))
         payload = json.dumps(self.data, ensure_ascii=False, indent=2)
         with temp.open("w", encoding="utf-8") as handle:
             handle.write(payload)
@@ -1362,13 +1559,14 @@ class PoolCapacityBlocked(RuntimeError):
     pass
 
 class DataStore:
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 7
 
     def __init__(self):
         self.root = None
         self.pool = None
         self.models = None
         self.screens = None
+        self.journal = None
         self.conn = None
         self.lock = threading.RLock()
         self._database_bytes_cached = 0
@@ -1393,35 +1591,96 @@ class DataStore:
             self.faults[str(stage)] = remaining - 1
         raise OSError("故障注入：" + str(stage))
 
+    def _commit_critical_locked(self):
+        if self.conn is None:
+            return
+        try:
+            self.conn.execute("PRAGMA synchronous=FULL")
+            self.conn.commit()
+            try:
+                self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except sqlite3.Error:
+                pass
+        finally:
+            try:
+                self.conn.execute("PRAGMA synchronous=NORMAL")
+            except sqlite3.Error:
+                pass
+
+    def _fsync_directory(self, directory):
+        try:
+            directory = self._assert_storage_path(directory, "fsync_directory")
+            if os.name == "nt":
+                handle = kernel32.CreateFileW(str(directory), 0x80000000, 0x00000001 | 0x00000002 | 0x00000004, None, 3, 0x02000000 | 0x04000000, None)
+                if handle and handle != INVALID_HANDLE_VALUE:
+                    try:
+                        kernel32.FlushFileBuffers(handle)
+                    finally:
+                        kernel32.CloseHandle(handle)
+            else:
+                fd = os.open(str(directory), os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        except Exception:
+            pass
+
     def set_transaction_reserve(self, value):
         with self.lock:
             self.transaction_reserve_bytes = max(1 * 1024 * 1024, min(512 * 1024 * 1024, int(value)))
+
+    def _critical_path_event(self, path, operation):
+        payload = {"operation": str(operation), "path": str(path), "root": str(self.root or ""), "time": time.time()}
+        try:
+            if self.conn is not None:
+                self.conn.execute("INSERT INTO system_events(id, session_id, created, kind, payload) VALUES (?, NULL, ?, 'critical_path_violation', ?)", (uuid.uuid4().hex, time.time(), json.dumps(payload, ensure_ascii=False)))
+                self._trim_system_events_locked()
+                self.conn.commit()
+        except Exception:
+            pass
+
+    def _assert_storage_path(self, path, operation="write"):
+        if self.root is None:
+            raise OSError("存储根路径尚未初始化")
+        try:
+            return checked_storage_path(path, self.root)
+        except OSError:
+            self._critical_path_event(path, operation)
+            raise
 
     def ensure(self, location):
         root = Path(location).expanduser().resolve()
         pool = root / "experience_pool"
         models = root / "models"
         screens = pool / "screens"
+        journal = pool / "journal"
+        for candidate in (root, pool, models, screens, journal, journal / "frames", pool / "records.sqlite3"):
+            checked_storage_path(candidate, root)
         with self.lock:
             if self.root == root and self.conn is not None:
                 return
             self.close()
-            root.mkdir(parents=True, exist_ok=True)
-            pool.mkdir(parents=True, exist_ok=True)
-            models.mkdir(parents=True, exist_ok=True)
-            screens.mkdir(parents=True, exist_ok=True)
+            checked_storage_path(root, root).mkdir(parents=True, exist_ok=True)
+            checked_storage_path(pool, root).mkdir(parents=True, exist_ok=True)
+            checked_storage_path(models, root).mkdir(parents=True, exist_ok=True)
+            checked_storage_path(screens, root).mkdir(parents=True, exist_ok=True)
+            checked_storage_path(journal, root).mkdir(parents=True, exist_ok=True)
+            checked_storage_path(journal / "frames", root).mkdir(parents=True, exist_ok=True)
             self.root = root
             self.pool = pool
             self.models = models
             self.screens = screens
+            self.journal = journal
             self._database_bytes_cached = 0
             self._database_bytes_checked = 0.0
-            self.conn = sqlite3.connect(str(pool / "records.sqlite3"), check_same_thread=False, timeout=30)
-            self.conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
-            self.conn.execute("PRAGMA journal_mode=WAL")
-            self.conn.execute("PRAGMA synchronous=NORMAL")
-            self.conn.execute("PRAGMA foreign_keys=ON")
-            self.conn.executescript("""
+            try:
+                self.conn = sqlite3.connect(str(checked_storage_path(pool / "records.sqlite3", root)), check_same_thread=False, timeout=30)
+                self.conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                self.conn.execute("PRAGMA journal_mode=WAL")
+                self.conn.execute("PRAGMA synchronous=NORMAL")
+                self.conn.execute("PRAGMA foreign_keys=ON")
+                self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 mode TEXT NOT NULL,
@@ -1459,6 +1718,8 @@ class DataStore:
                 raw_score REAL,
                 raw_reward REAL,
                 score_status TEXT NOT NULL DEFAULT 'invalid',
+                score_generation TEXT NOT NULL DEFAULT 'online',
+                history_boundary_frame_id TEXT,
                 width INTEGER NOT NULL,
                 height INTEGER NOT NULL,
                 size_bytes INTEGER NOT NULL DEFAULT 0,
@@ -1477,9 +1738,6 @@ class DataStore:
             CREATE INDEX IF NOT EXISTS idx_frames_created ON frames(created DESC);
             CREATE INDEX IF NOT EXISTS idx_frames_reward ON frames(reward ASC, created ASC);
             CREATE INDEX IF NOT EXISTS idx_frames_buckets ON frames(bucket0, bucket1, bucket2, bucket3);
-            CREATE INDEX IF NOT EXISTS idx_frames_finished_id ON frames(capture_finished_monotonic_ns, id);
-            CREATE INDEX IF NOT EXISTS idx_frames_score_pending ON frames(score_valid, score_status, capture_finished_monotonic_ns);
-            CREATE INDEX IF NOT EXISTS idx_frames_prune_refs ON frames(model_dependency_count, model_refs, asset_ref_count, retain_value, created);
             CREATE TABLE IF NOT EXISTS mouse_loss_events (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -1518,6 +1776,8 @@ class DataStore:
             CREATE INDEX IF NOT EXISTS idx_mouse_session ON mouse_events(session_id, created);
             CREATE INDEX IF NOT EXISTS idx_mouse_session_mono ON mouse_events(session_id, created_monotonic_ns);
             CREATE INDEX IF NOT EXISTS idx_frames_session_mono ON frames(session_id, created_monotonic_ns);
+            CREATE INDEX IF NOT EXISTS idx_frames_session_score_ready ON frames(session_id, capture_complete, score_valid, score_status, capture_finished_monotonic_ns);
+            CREATE INDEX IF NOT EXISTS idx_mouse_session_type_mono ON mouse_events(session_id, event_type, created_monotonic_ns);
             CREATE TABLE IF NOT EXISTS state_clusters (cluster_id TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS frame_lsh (key INTEGER NOT NULL, frame_id TEXT NOT NULL, PRIMARY KEY(key, frame_id));
             CREATE INDEX IF NOT EXISTS idx_frame_lsh_key ON frame_lsh(key);
@@ -1530,6 +1790,21 @@ class DataStore:
                 kind TEXT NOT NULL,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS mode_transitions (
+                id TEXT PRIMARY KEY,
+                created REAL NOT NULL,
+                from_mode TEXT NOT NULL,
+                to_mode TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                trigger TEXT NOT NULL,
+                session_id TEXT,
+                window_state TEXT NOT NULL,
+                cursor_x INTEGER,
+                cursor_y INTEGER,
+                resource_state TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_mode_transitions_created ON mode_transitions(created);
             CREATE TABLE IF NOT EXISTS deletion_journal (
                 id TEXT PRIMARY KEY,
                 object_type TEXT NOT NULL,
@@ -1576,8 +1851,13 @@ class DataStore:
                 path_length REAL NOT NULL,
                 trajectory_blob BLOB NOT NULL DEFAULT X'',
                 trajectory_codec TEXT NOT NULL DEFAULT 'varint-zigzag-dtxy-v1',
-                rule TEXT NOT NULL
+                rule TEXT NOT NULL,
+                average_speed REAL NOT NULL DEFAULT 0,
+                direction_change_count INTEGER NOT NULL DEFAULT 0,
+                click_pre_dwell_ms REAL NOT NULL DEFAULT 0,
+                crossed_client_boundary INTEGER NOT NULL DEFAULT 0
             );
+            CREATE INDEX IF NOT EXISTS idx_mouse_segments_session_ended ON mouse_compression_segments(session_id, ended_monotonic_ns);
             CREATE TABLE IF NOT EXISTS deferred_exact_scores (
                 frame_id TEXT PRIMARY KEY REFERENCES frames(id),
                 dhash64 TEXT NOT NULL,
@@ -1614,18 +1894,71 @@ class DataStore:
                 reason TEXT NOT NULL
             );
             """)
-            self._migrate()
-            self.conn.commit()
-            self.recover_ingestions()
-            self.recover_deletions()
+                self._migrate()
+                self.conn.commit()
+                self.replay_accepted_journal()
+                self.recover_ingestions()
+                self.recover_deletions()
+            except Exception:
+                try:
+                    if self.conn is not None:
+                        self.conn.rollback()
+                        self.conn.close()
+                except Exception:
+                    pass
+                self.conn = None
+                self.root = None
+                self.pool = None
+                self.models = None
+                self.screens = None
+                self.journal = None
+                raise
 
     def _migrate(self):
         user_version = int(self.conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+        self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS system_events (
+            id TEXT PRIMARY KEY,
+            session_id TEXT REFERENCES sessions(id),
+            created REAL NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT NOT NULL
+        )
+        """)
+        self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS deletion_journal (
+            id TEXT PRIMARY KEY,
+            object_type TEXT NOT NULL,
+            object_id TEXT NOT NULL,
+            path TEXT,
+            stage TEXT NOT NULL,
+            created REAL NOT NULL,
+            updated REAL NOT NULL,
+            error TEXT
+        )
+        """)
+        self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS mode_transitions (
+            id TEXT PRIMARY KEY,
+            created REAL NOT NULL,
+            from_mode TEXT NOT NULL,
+            to_mode TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            trigger TEXT NOT NULL,
+            session_id TEXT,
+            window_state TEXT NOT NULL,
+            cursor_x INTEGER,
+            cursor_y INTEGER,
+            resource_state TEXT NOT NULL,
+            payload TEXT NOT NULL
+        )
+        """)
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_mode_transitions_created ON mode_transitions(created)")
         if user_version >= self.SCHEMA_VERSION:
             return
         frame_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(frames)").fetchall()}
         additions = {
-            "size_bytes": "INTEGER NOT NULL DEFAULT 0", "online_score": "REAL", "raw_score": "REAL", "raw_reward": "REAL", "score_status": "TEXT NOT NULL DEFAULT 'invalid'", "novelty": "REAL NOT NULL DEFAULT 0", "action_result": "REAL NOT NULL DEFAULT 0", "coverage": "REAL NOT NULL DEFAULT 0", "model_refs": "INTEGER NOT NULL DEFAULT 0", "retain_value": "REAL NOT NULL DEFAULT 0", "retain_version": "INTEGER NOT NULL DEFAULT 1", "last_used": "REAL NOT NULL DEFAULT 0", "dhash64": "TEXT", "bucket0": "INTEGER NOT NULL DEFAULT 0", "bucket1": "INTEGER NOT NULL DEFAULT 0", "bucket2": "INTEGER NOT NULL DEFAULT 0", "bucket3": "INTEGER NOT NULL DEFAULT 0", "state_cluster_id": "TEXT", "state_support_count": "INTEGER NOT NULL DEFAULT 1", "action_outcome_information": "REAL NOT NULL DEFAULT 0", "model_dependency_count": "INTEGER NOT NULL DEFAULT 0", "validation_last_used": "REAL NOT NULL DEFAULT 0", "created_monotonic_ns": "INTEGER NOT NULL DEFAULT 0", "capture_backend": "TEXT NOT NULL DEFAULT 'gdi'", "capture_elapsed_ms": "REAL NOT NULL DEFAULT 0", "capture_complete": "INTEGER NOT NULL DEFAULT 1", "brightness": "REAL NOT NULL DEFAULT 0", "variance": "REAL NOT NULL DEFAULT 0", "gray32x18": "BLOB", "edge_density": "REAL NOT NULL DEFAULT 0", "color_histogram": "BLOB", "asset_ref_count": "INTEGER NOT NULL DEFAULT 1", "score_candidate_count": "INTEGER NOT NULL DEFAULT 0", "score_top_k_distance": "REAL NOT NULL DEFAULT 64", "score_retrieval_fallback": "INTEGER NOT NULL DEFAULT 0", "score_retrieval_mode": "TEXT NOT NULL DEFAULT 'warmup'", "score_exact_or_approx": "TEXT NOT NULL DEFAULT 'exact'", "score_recall_guard": "INTEGER NOT NULL DEFAULT 0", "score_valid": "INTEGER NOT NULL DEFAULT 0", "capture_started_monotonic_ns": "INTEGER NOT NULL DEFAULT 0", "capture_finished_monotonic_ns": "INTEGER NOT NULL DEFAULT 0", "capture_started": "REAL NOT NULL DEFAULT 0", "capture_finished": "REAL NOT NULL DEFAULT 0", "capture_failure_reason": "TEXT NOT NULL DEFAULT ''", "capture_hash_delta": "REAL NOT NULL DEFAULT 64", "capture_fallback": "INTEGER NOT NULL DEFAULT 0"
+            "size_bytes": "INTEGER NOT NULL DEFAULT 0", "online_score": "REAL", "raw_score": "REAL", "raw_reward": "REAL", "score_status": "TEXT NOT NULL DEFAULT 'invalid'", "novelty": "REAL NOT NULL DEFAULT 0", "action_result": "REAL NOT NULL DEFAULT 0", "coverage": "REAL NOT NULL DEFAULT 0", "model_refs": "INTEGER NOT NULL DEFAULT 0", "retain_value": "REAL NOT NULL DEFAULT 0", "retain_version": "INTEGER NOT NULL DEFAULT 1", "last_used": "REAL NOT NULL DEFAULT 0", "dhash64": "TEXT", "bucket0": "INTEGER NOT NULL DEFAULT 0", "bucket1": "INTEGER NOT NULL DEFAULT 0", "bucket2": "INTEGER NOT NULL DEFAULT 0", "bucket3": "INTEGER NOT NULL DEFAULT 0", "state_cluster_id": "TEXT", "state_support_count": "INTEGER NOT NULL DEFAULT 1", "action_outcome_information": "REAL NOT NULL DEFAULT 0", "model_dependency_count": "INTEGER NOT NULL DEFAULT 0", "validation_last_used": "REAL NOT NULL DEFAULT 0", "created_monotonic_ns": "INTEGER NOT NULL DEFAULT 0", "capture_backend": "TEXT NOT NULL DEFAULT 'gdi'", "capture_elapsed_ms": "REAL NOT NULL DEFAULT 0", "capture_complete": "INTEGER NOT NULL DEFAULT 1", "brightness": "REAL NOT NULL DEFAULT 0", "variance": "REAL NOT NULL DEFAULT 0", "gray32x18": "BLOB", "edge_density": "REAL NOT NULL DEFAULT 0", "color_histogram": "BLOB", "asset_ref_count": "INTEGER NOT NULL DEFAULT 1", "score_candidate_count": "INTEGER NOT NULL DEFAULT 0", "score_top_k_distance": "REAL NOT NULL DEFAULT 64", "score_retrieval_fallback": "INTEGER NOT NULL DEFAULT 0", "score_retrieval_mode": "TEXT NOT NULL DEFAULT 'warmup'", "score_exact_or_approx": "TEXT NOT NULL DEFAULT 'exact'", "score_recall_guard": "INTEGER NOT NULL DEFAULT 0", "score_valid": "INTEGER NOT NULL DEFAULT 0", "accepted_journal_id": "TEXT", "capture_started_monotonic_ns": "INTEGER NOT NULL DEFAULT 0", "capture_finished_monotonic_ns": "INTEGER NOT NULL DEFAULT 0", "capture_started": "REAL NOT NULL DEFAULT 0", "capture_finished": "REAL NOT NULL DEFAULT 0", "capture_failure_reason": "TEXT NOT NULL DEFAULT ''", "capture_hash_delta": "REAL NOT NULL DEFAULT 64", "capture_fallback": "INTEGER NOT NULL DEFAULT 0", "score_generation": "TEXT NOT NULL DEFAULT 'online'", "history_boundary_frame_id": "TEXT"
         }
         for name, definition in additions.items():
             if name not in frame_columns:
@@ -1633,9 +1966,12 @@ class DataStore:
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_frames_buckets ON frames(bucket0, bucket1, bucket2, bucket3)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_frames_cluster ON frames(state_cluster_id, state_support_count)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_frames_session_mono ON frames(session_id, created_monotonic_ns)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_frames_session_score_ready ON frames(session_id, capture_complete, score_valid, score_status, capture_finished_monotonic_ns)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_frames_session_finished_id ON frames(session_id, capture_finished_monotonic_ns, id)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_frames_finished_id ON frames(capture_finished_monotonic_ns, id)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_frames_score_pending ON frames(score_valid, score_status, capture_finished_monotonic_ns)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_frames_history_boundary ON frames(history_boundary_frame_id, score_generation)")
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_frames_accepted_journal ON frames(accepted_journal_id) WHERE accepted_journal_id IS NOT NULL AND accepted_journal_id!=''")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_frames_prune_refs ON frames(model_dependency_count, model_refs, asset_ref_count, retain_value, created)")
         session_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(sessions)").fetchall()}
         if "trainable" not in session_columns:
@@ -1649,6 +1985,7 @@ class DataStore:
             if name not in mouse_columns:
                 self.conn.execute("ALTER TABLE mouse_events ADD COLUMN {} TEXT".format(name))
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_mouse_session_mono ON mouse_events(session_id, created_monotonic_ns)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_mouse_session_type_mono ON mouse_events(session_id, event_type, created_monotonic_ns)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_mouse_after_frame_pending ON mouse_events(session_id, after_frame_id, created_monotonic_ns)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS mouse_loss_events (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, created REAL NOT NULL, started REAL NOT NULL, ended REAL NOT NULL, lost_count INTEGER NOT NULL, rule TEXT NOT NULL)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS mouse_compression_segments (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, source TEXT NOT NULL, started REAL NOT NULL, ended REAL NOT NULL, started_monotonic_ns INTEGER NOT NULL, ended_monotonic_ns INTEGER NOT NULL, start_x INTEGER NOT NULL, start_y INTEGER NOT NULL, end_x INTEGER NOT NULL, end_y INTEGER NOT NULL, original_count INTEGER NOT NULL, max_speed REAL NOT NULL, path_length REAL NOT NULL, trajectory_blob BLOB NOT NULL DEFAULT X'', trajectory_codec TEXT NOT NULL DEFAULT 'varint-zigzag-dtxy-v1', rule TEXT NOT NULL)")
@@ -1657,9 +1994,10 @@ class DataStore:
             self.conn.execute("ALTER TABLE mouse_compression_segments ADD COLUMN trajectory_blob BLOB")
         if "trajectory_codec" not in segment_columns:
             self.conn.execute("ALTER TABLE mouse_compression_segments ADD COLUMN trajectory_codec TEXT NOT NULL DEFAULT 'varint-zigzag-dtxy-v1'")
-        for name, definition in (("client_left", "INTEGER"), ("client_top", "INTEGER"), ("client_right", "INTEGER"), ("client_bottom", "INTEGER")):
+        for name, definition in (("client_left", "INTEGER"), ("client_top", "INTEGER"), ("client_right", "INTEGER"), ("client_bottom", "INTEGER"), ("average_speed", "REAL NOT NULL DEFAULT 0"), ("direction_change_count", "INTEGER NOT NULL DEFAULT 0"), ("click_pre_dwell_ms", "REAL NOT NULL DEFAULT 0"), ("crossed_client_boundary", "INTEGER NOT NULL DEFAULT 0")):
             if name not in segment_columns:
                 self.conn.execute("ALTER TABLE mouse_compression_segments ADD COLUMN {} {}".format(name, definition))
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_mouse_segments_session_ended ON mouse_compression_segments(session_id, ended_monotonic_ns)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS deferred_exact_scores (frame_id TEXT PRIMARY KEY REFERENCES frames(id), dhash64 TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'pending', last_error TEXT NOT NULL DEFAULT '')")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_deferred_exact_scores_state ON deferred_exact_scores(state, created)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS sleep_decision_samples (id TEXT PRIMARY KEY, created REAL NOT NULL, features TEXT NOT NULL, expected_gain REAL NOT NULL DEFAULT 0, actual_quality_delta REAL, cleanup_bytes INTEGER, duration_seconds REAL, restored_training_gain REAL, training_status TEXT NOT NULL DEFAULT '', training_reason TEXT NOT NULL DEFAULT '', training_samples INTEGER NOT NULL DEFAULT 0, validation_samples INTEGER NOT NULL DEFAULT 0, outcome_ready INTEGER NOT NULL DEFAULT 0)")
@@ -1747,8 +2085,115 @@ class DataStore:
             self._trim_system_events_locked()
             self.conn.commit()
 
+    def _accepted_journal_path(self):
+        return self.journal / "accepted.jsonl" if self.journal is not None else None
+
+    def _append_accepted_journal_line(self, item):
+        path = self._accepted_journal_path()
+        if path is None:
+            return None
+        path = self._assert_storage_path(path, "accepted_journal")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return item.get("id")
+
+    def journal_frame_packet(self, packet):
+        if self.journal is None or not isinstance(packet, dict) or not isinstance(packet.get("image"), dict):
+            return None
+        image = packet.get("image")
+        jid = packet.get("accepted_journal_id") or image.get("accepted_journal_id") or uuid.uuid4().hex
+        payload_path = self._assert_storage_path(self.journal / "frames" / (jid + ".pickle"), "journal_frame")
+        temporary = self._assert_storage_path(payload_path.with_suffix(".tmp"), "journal_frame_tmp")
+        payload = {"session_id": packet.get("session_id"), "image": image, "phash": image.get("phash"), "online_score": packet.get("online_score"), "exact_score": packet.get("exact_score"), "hunger": packet.get("hunger"), "reward": packet.get("reward")}
+        with temporary.open("wb") as handle:
+            pickle.dump(payload, handle, protocol=4)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(payload_path)
+        self._append_accepted_journal_line({"id": jid, "kind": "frame", "state": "accepted", "created": time.time(), "path": str(payload_path.relative_to(self.pool)), "session_id": str(packet.get("session_id") or "")})
+        packet["accepted_journal_id"] = jid
+        image["accepted_journal_id"] = jid
+        return jid
+
+    def journal_mouse_record(self, record):
+        if self.journal is None or not isinstance(record, dict):
+            return None
+        jid = record.get("accepted_journal_id") or uuid.uuid4().hex
+        record["accepted_journal_id"] = jid
+        self._append_accepted_journal_line({"id": jid, "kind": "mouse", "state": "accepted", "created": time.time(), "record": record})
+        return jid
+
+    def complete_accepted_journal(self, jid):
+        if not jid:
+            return
+        self._append_accepted_journal_line({"id": str(jid), "state": "complete", "created": time.time()})
+        try:
+            if self.journal is not None:
+                self._safe_unlink_storage(self.journal / "frames" / (str(jid) + ".pickle"), "journal_complete_unlink")
+        except OSError:
+            pass
+
+    def replay_accepted_journal(self, experience_limit=None):
+        path = self._accepted_journal_path()
+        if path is None or not path.exists():
+            return 0
+        states = {}
+        entries = {}
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            jid = str(item.get("id") or "")
+            if not jid:
+                continue
+            states[jid] = str(item.get("state") or "")
+            if states[jid] == "accepted":
+                entries[jid] = item
+        restored = 0
+        for jid, item in list(entries.items()):
+            if states.get(jid) == "complete":
+                continue
+            try:
+                if item.get("kind") == "mouse":
+                    record = item.get("record") or {}
+                    if record:
+                        self.save_mouse_batch([record])
+                        self.complete_accepted_journal(jid)
+                        restored += 1
+                elif item.get("kind") == "frame":
+                    with self.lock:
+                        exists = self.conn.execute("SELECT id FROM frames WHERE accepted_journal_id=?", (jid,)).fetchone() if self.conn is not None else None
+                    if exists:
+                        self.complete_accepted_journal(jid)
+                        continue
+                    rel = str(item.get("path") or "")
+                    payload_path = (self.pool / rel).resolve() if self.pool is not None else None
+                    if payload_path is None or self.pool.resolve() not in payload_path.parents or not payload_path.exists():
+                        continue
+                    with payload_path.open("rb") as handle:
+                        payload = pickle.load(handle)
+                    image = payload.get("image") or {}
+                    image["accepted_journal_id"] = jid
+                    if not image.get("png") and (image.get("bgra") is not None or image.get("rgb") is not None):
+                        if image.get("bgra") is not None:
+                            image["png"] = encode_png_bgra(int(image["width"]), int(image["height"]), image.pop("bgra"))
+                        else:
+                            image["png"] = encode_png(int(image["width"]), int(image["height"]), image.pop("rgb"))
+                    if image.get("png"):
+                        self.save_frame(payload.get("session_id"), image, image.get("phash") or payload.get("phash") or "", online_score=payload.get("online_score"), exact_score=payload.get("exact_score"), hunger=payload.get("hunger"), reward=payload.get("reward"), experience_limit=experience_limit)
+                        self.complete_accepted_journal(jid)
+                        restored += 1
+            except Exception as error:
+                self._append_accepted_journal_line({"id": jid, "state": "failed", "created": time.time(), "error": str(error)})
+        return restored
+
     def recover_after_forced_stop(self):
         try:
+            self.replay_accepted_journal()
             self.recover_ingestions()
             self.recover_deletions()
             self._cleanup_pool_files()
@@ -1771,6 +2216,14 @@ class DataStore:
             self.conn.execute("INSERT INTO system_events(id, session_id, created, kind, payload) VALUES (?, ?, ?, ?, ?)", (uuid.uuid4().hex, session_id, time.time(), kind, json.dumps(payload, ensure_ascii=False)))
             self._trim_system_events_locked()
             self.conn.commit()
+
+    def record_mode_transition(self, session_id, source, target, reason, trigger, window_state, cursor, resource_state, payload):
+        with self.lock:
+            if self.conn is None:
+                return
+            x, y = cursor if isinstance(cursor, tuple) and len(cursor) == 2 else (None, None)
+            self.conn.execute("INSERT INTO mode_transitions(id, created, from_mode, to_mode, reason, trigger, session_id, window_state, cursor_x, cursor_y, resource_state, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (uuid.uuid4().hex, time.time(), str(source), str(target), str(reason or ""), str(trigger or ""), session_id, str(window_state or ""), x, y, str(resource_state or ""), json.dumps(payload or {}, ensure_ascii=False)))
+            self._commit_critical_locked()
 
     def record_exception_event(self, session_id, kind, error, payload=None):
         data = dict(payload or {})
@@ -2120,7 +2573,7 @@ class DataStore:
         with self.lock:
             if self.conn is None:
                 raise RuntimeError("存储未打开")
-            self.conn.execute("INSERT INTO mouse_compression_segments(id, session_id, source, started, ended, started_monotonic_ns, ended_monotonic_ns, start_x, start_y, end_x, end_y, original_count, max_speed, path_length, trajectory_blob, trajectory_codec, rule, client_left, client_top, client_right, client_bottom) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (uuid.uuid4().hex, segment["session_id"], segment.get("source", "user"), float(segment["started"]), float(segment["ended"]), int(segment["started_ns"]), int(segment["ended_ns"]), int(segment["start_x"]), int(segment["start_y"]), int(segment["end_x"]), int(segment["end_y"]), int(segment["count"]), float(segment.get("max_speed", 0.0)), float(segment.get("path_length", 0.0)), sqlite3.Binary(payload), "varint-zigzag-dtxy-v1", str(segment.get("rule", "无损移动轨迹压缩")), *[None if value is None else int(value) for value in rect]))
+            self.conn.execute("INSERT INTO mouse_compression_segments(id, session_id, source, started, ended, started_monotonic_ns, ended_monotonic_ns, start_x, start_y, end_x, end_y, original_count, max_speed, path_length, trajectory_blob, trajectory_codec, rule, client_left, client_top, client_right, client_bottom, average_speed, direction_change_count, click_pre_dwell_ms, crossed_client_boundary) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (uuid.uuid4().hex, segment["session_id"], segment.get("source", "user"), float(segment["started"]), float(segment["ended"]), int(segment["started_ns"]), int(segment["ended_ns"]), int(segment["start_x"]), int(segment["start_y"]), int(segment["end_x"]), int(segment["end_y"]), int(segment["count"]), float(segment.get("max_speed", 0.0)), float(segment.get("path_length", 0.0)), sqlite3.Binary(payload), "varint-zigzag-dtxy-v1", str(segment.get("rule", "无损移动轨迹压缩")), *[None if value is None else int(value) for value in rect], float(segment.get("average_speed", 0.0)), int(segment.get("direction_change_count", 0)), float(segment.get("click_pre_dwell_ms", 0.0)), 1 if segment.get("crossed_client_boundary") else 0))
             self.conn.commit()
         return True
 
@@ -2192,11 +2645,11 @@ class DataStore:
                 if item.name == "screens":
                     continue
                 if item.name == "trash" or item.name.endswith(".tmp") or item.name.startswith(".write_latency_probe"):
-                    transient += sum(int(child.stat().st_size) for child in item.rglob("*") if child.is_file()) if item.is_dir() else int(item.stat().st_size)
+                    transient += sum(int(child.stat().st_size) for child in self._iter_storage_files(item, None, "pool_transient_walk")) if item.is_dir() else int(item.stat().st_size)
                 elif item.is_file():
                     other += int(item.stat().st_size)
                 elif item.is_dir():
-                    other += sum(int(child.stat().st_size) for child in item.rglob("*") if child.is_file())
+                    other += sum(int(child.stat().st_size) for child in self._iter_storage_files(item, None, "pool_other_walk"))
             except OSError:
                 pass
         return transient, other
@@ -2230,6 +2683,13 @@ class DataStore:
     def save_frame(self, session_id, image, phash, online_score=None, exact_score=None, hunger=None, reward=None, experience_limit=None):
         if not session_id or not isinstance(image, dict) or not image.get("png"):
             raise RuntimeError("无效截图写入请求")
+        accepted_journal_id = str(image.get("accepted_journal_id") or "")
+        if accepted_journal_id:
+            with self.lock:
+                if self.conn is not None:
+                    existing = self.conn.execute("SELECT id FROM frames WHERE accepted_journal_id=?", (accepted_journal_id,)).fetchone()
+                    if existing:
+                        return existing[0]
         identifier = uuid.uuid4().hex
         journal_id = uuid.uuid4().hex
         moment = float(image.get("capture_finished", time.time()))
@@ -2274,10 +2734,10 @@ class DataStore:
                 reserved = True
                 pool = self.pool
                 screens = self.screens
-            folder = screens / session_id
+            folder = self._assert_storage_path(screens / session_id, "frame_folder")
             folder.mkdir(parents=True, exist_ok=True)
-            final_path = pool / relative
-            temporary = final_path.with_suffix(".tmp")
+            final_path = self._assert_storage_path(pool / relative, "frame_png")
+            temporary = self._assert_storage_path(final_path.with_suffix(".tmp"), "frame_png_tmp")
             self._inject_fault("png_write")
             with temporary.open("wb") as handle:
                 handle.write(png)
@@ -2296,9 +2756,12 @@ class DataStore:
                 hunger_value = float(hunger) if score_valid and hunger is not None else 0.0
                 reward_value = float(reward) if score_valid and reward is not None else None
                 score_status = "exact" if score_valid else "provisional" if online_value is not None or dhash else "invalid"
-                frame_values = (identifier, session_id, moment, mono, capture_started_mono, mono, capture_started_wall, moment, str(relative), phash, dhash, score_value, online_value, hunger_value, reward_value, score_value, reward_value, score_status, image["width"], image["height"], actual_size, 0.0, 0.0, 0.0, 0, moment, *buckets, state_cluster_id, support, 0.0, 0, moment, 1, image.get("capture_backend", "gdi"), image.get("capture_elapsed_ms", 0.0), image.get("capture_complete", 1), image.get("brightness", 0.0), image.get("variance", 0.0), sqlite3.Binary(feature_bytes(image.get("gray32x18"), 32 * 18)), image.get("edge_density", 0.0), sqlite3.Binary(histogram_blob(image.get("color_histogram"))), str(image.get("capture_failure_reason", "")), float(image.get("capture_hash_delta", 64.0)), 1 if image.get("capture_fallback") else 0, int(image.get("score_candidate_count", 0)), float(image.get("score_top_k_distance", 64.0)), int(image.get("score_retrieval_fallback", 0)))
-                self.conn.execute("INSERT INTO frames(id, session_id, created, created_monotonic_ns, capture_started_monotonic_ns, capture_finished_monotonic_ns, capture_started, capture_finished, screenshot_path, phash, dhash64, score, online_score, hunger, reward, raw_score, raw_reward, score_status, width, height, size_bytes, novelty, action_result, coverage, model_refs, last_used, bucket0, bucket1, bucket2, bucket3, state_cluster_id, state_support_count, action_outcome_information, model_dependency_count, validation_last_used, asset_ref_count, capture_backend, capture_elapsed_ms, capture_complete, brightness, variance, gray32x18, edge_density, color_histogram, capture_failure_reason, capture_hash_delta, capture_fallback, score_candidate_count, score_top_k_distance, score_retrieval_fallback) VALUES ({})".format(",".join("?" for _ in frame_values)), frame_values)
-                self.conn.execute("UPDATE frames SET score_retrieval_mode=?, score_exact_or_approx=?, score_recall_guard=?, score_valid=? WHERE id=?", (str(image.get("score_retrieval_mode", "online_pending")), "exact" if score_valid else ("approximate" if score_status == "provisional" else "invalid"), 1 if score_valid else 0, 1 if score_valid else 0, identifier))
+                boundary_row = self.conn.execute("SELECT id FROM frames WHERE capture_finished_monotonic_ns<? ORDER BY capture_finished_monotonic_ns DESC, id DESC LIMIT 1", (mono,)).fetchone()
+                history_boundary_frame_id = str(boundary_row[0]) if boundary_row else None
+                score_generation = str(image.get("score_generation") or ("online" if score_status != "invalid" else "online"))
+                frame_values = (identifier, session_id, moment, mono, capture_started_mono, mono, capture_started_wall, moment, str(relative), phash, dhash, score_value, online_value, hunger_value, reward_value, score_value, reward_value, score_status, score_generation, history_boundary_frame_id, image["width"], image["height"], actual_size, 0.0, 0.0, 0.0, 0, moment, *buckets, state_cluster_id, support, 0.0, 0, moment, 1, image.get("capture_backend", "gdi"), image.get("capture_elapsed_ms", 0.0), image.get("capture_complete", 1), image.get("brightness", 0.0), image.get("variance", 0.0), sqlite3.Binary(feature_bytes(image.get("gray32x18"), 32 * 18)), image.get("edge_density", 0.0), sqlite3.Binary(histogram_blob(image.get("color_histogram"))), str(image.get("capture_failure_reason", "")), float(image.get("capture_hash_delta", 64.0)), 1 if image.get("capture_fallback") else 0, int(image.get("score_candidate_count", 0)), float(image.get("score_top_k_distance", 64.0)), int(image.get("score_retrieval_fallback", 0)))
+                self.conn.execute("INSERT INTO frames(id, session_id, created, created_monotonic_ns, capture_started_monotonic_ns, capture_finished_monotonic_ns, capture_started, capture_finished, screenshot_path, phash, dhash64, score, online_score, hunger, reward, raw_score, raw_reward, score_status, score_generation, history_boundary_frame_id, width, height, size_bytes, novelty, action_result, coverage, model_refs, last_used, bucket0, bucket1, bucket2, bucket3, state_cluster_id, state_support_count, action_outcome_information, model_dependency_count, validation_last_used, asset_ref_count, capture_backend, capture_elapsed_ms, capture_complete, brightness, variance, gray32x18, edge_density, color_histogram, capture_failure_reason, capture_hash_delta, capture_fallback, score_candidate_count, score_top_k_distance, score_retrieval_fallback) VALUES ({})".format(",".join("?" for _ in frame_values)), frame_values)
+                self.conn.execute("UPDATE frames SET score_retrieval_mode=?, score_exact_or_approx=?, score_recall_guard=?, score_valid=?, accepted_journal_id=? WHERE id=?", (str(image.get("score_retrieval_mode", "online_pending")), "exact" if score_valid else ("approximate" if score_status == "provisional" else "invalid"), 1 if score_valid else 0, 1 if score_valid else 0, accepted_journal_id or None, identifier))
                 if not score_valid and dhash:
                     self.conn.execute("INSERT OR REPLACE INTO deferred_exact_scores(frame_id, dhash64, created, updated, attempts, state, last_error) VALUES (?, ?, ?, ?, 0, 'pending', '')", (identifier, dhash, moment, moment))
                 self.conn.execute("INSERT OR IGNORE INTO state_clusters(cluster_id, count, updated_at) VALUES (?, 0, ?)", (state_cluster_id, moment))
@@ -2339,12 +2802,12 @@ class DataStore:
                 pass
             if temporary is not None:
                 try:
-                    temporary.unlink(missing_ok=True)
+                    self._safe_unlink_storage(temporary, "save_frame_tmp_cleanup")
                 except OSError:
                     pass
             if final_path is not None:
                 try:
-                    final_path.unlink(missing_ok=True)
+                    self._safe_unlink_storage(final_path, "save_frame_final_cleanup")
                 except OSError:
                     pass
             if reserved:
@@ -2380,6 +2843,9 @@ class DataStore:
             self.conn.executemany("INSERT INTO mouse_events(id, session_id, created, created_monotonic_ns, source, event_type, button, wheel, x, y, relative_x, relative_y, dx, dy, direction, speed, behavior_probability, before_frame_id, after_frame_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
             self.conn.executemany("UPDATE sessions SET mouse_count=mouse_count+? WHERE id=?", [(value, key) for key, value in counts.items()])
             self.conn.commit()
+        for record in records:
+            if record.get("accepted_journal_id"):
+                self.complete_accepted_journal(record.get("accepted_journal_id"))
 
     def bind_mouse_events_after_frame(self, session_id, frame_id, frame_finished_ns):
         if not session_id or not frame_id:
@@ -2602,7 +3068,7 @@ class DataStore:
             if refs:
                 self.conn.executemany("INSERT OR IGNORE INTO model_frame_refs(model_id, frame_id, role) VALUES (?, ?, ?)", refs)
                 self._recalculate_model_refs_locked([item[1] for item in refs])
-            self.conn.commit()
+            self._commit_critical_locked()
 
     def save_model_frame_refs(self, model_id, outcomes, validation_outcomes):
         refs = []
@@ -2646,7 +3112,7 @@ class DataStore:
                 "UPDATE sleep_decision_samples SET actual_quality_delta=?, cleanup_bytes=?, duration_seconds=?, restored_training_gain=?, training_status=?, training_reason=?, training_samples=?, validation_samples=?, outcome_ready=1 WHERE id=?",
                 (quality_delta, int(cleanup_bytes or 0), float(duration_seconds or 0.0), restored, status, reason, int(result.get("training_samples", 0) or 0), int(result.get("validation_samples", 0) or 0), identifier),
             )
-            self.conn.commit()
+            self._commit_critical_locked()
 
     def sleep_decision_history(self, limit=128):
         with self.lock:
@@ -2662,6 +3128,36 @@ class DataStore:
             except Exception:
                 pass
         return result
+
+    def _immediate_exact_reward_locked(self, frame_id, score, session_id, hunger_rate_provider=None):
+        rate = 0.00004
+        if callable(hunger_rate_provider):
+            try:
+                rate = max(0.000004, min(0.00016, float(hunger_rate_provider())))
+            except Exception:
+                rate = 0.00004
+        current = self.conn.execute("SELECT capture_finished_monotonic_ns FROM frames WHERE id=?", (frame_id,)).fetchone()
+        if not current:
+            return
+        current_ns = int(current[0] or 0)
+        previous = self.conn.execute("""
+            SELECT score, hunger, capture_finished_monotonic_ns
+            FROM frames
+            WHERE session_id=? AND score_valid=1 AND score_status='exact' AND score IS NOT NULL AND capture_finished_monotonic_ns<?
+            ORDER BY capture_finished_monotonic_ns DESC, id DESC LIMIT 1
+        """, (session_id, current_ns)).fetchone()
+        if previous is None:
+            hunger = 1e-9
+        else:
+            previous_score, previous_hunger, previous_ns = previous
+            previous_anchor = int(previous_ns or 0) - int(max(0.0, float(previous_hunger or 0.0) - 1e-9) * 1_000_000_000.0 / rate)
+            if float(score) > float(previous_score):
+                hunger = 1e-9
+            else:
+                hunger = 1e-9 + max(0, current_ns - previous_anchor) * rate / 1_000_000_000.0
+        reward = float(score) - hunger
+        self.conn.execute("UPDATE frames SET hunger=?, reward=?, raw_score=?, raw_reward=? WHERE id=?", (hunger, reward, float(score), reward, frame_id))
+        self._refresh_retain_values_locked([frame_id])
 
     def _recalculate_session_scores_locked(self, session_id, hunger_rate_provider=None):
         rate = 0.00004
@@ -2693,7 +3189,7 @@ class DataStore:
             updates.append((hunger, reward, float(score), reward, frame_id))
             last_score = float(score)
         if updates:
-            self.conn.executemany("UPDATE frames SET hunger=?, reward=?, raw_score=?, raw_reward=? WHERE id=?", updates)
+            self.conn.executemany("UPDATE frames SET hunger=?, reward=?, raw_score=?, raw_reward=?, score_generation=CASE WHEN score_generation='deferred_exact' THEN score_generation ELSE 'recomputed' END WHERE id=?", updates)
             self._refresh_retain_values_locked([item[-1] for item in updates])
 
     def _refresh_retain_values_locked(self, frame_ids=None):
@@ -2709,7 +3205,7 @@ class DataStore:
             SELECT f.id, f.state_support_count, f.reward, f.capture_complete, f.variance,
                    f.validation_last_used, f.model_dependency_count, f.model_refs,
                    f.created, f.session_id,
-                   COALESCE((SELECT MAX(ABS(a.action_advantage)) FROM action_outcomes a WHERE a.before_frame_id=f.id OR a.after_frame_id=f.id), 0),
+                   COALESCE((SELECT MAX(a.action_advantage) FROM action_outcomes a WHERE a.before_frame_id=f.id OR a.after_frame_id=f.id), 0),
                    COALESCE((SELECT COUNT(*) FROM action_outcomes a WHERE a.before_frame_id=f.id OR a.after_frame_id=f.id), 0),
                    COALESCE((SELECT COUNT(*) FROM frames later WHERE later.session_id=f.session_id AND later.dhash64=f.dhash64 AND later.created>f.created), 0)
             FROM frames f
@@ -2718,14 +3214,17 @@ class DataStore:
         updates = []
         for frame_id, support, reward, complete, variance, validation_used, dependency_count, model_refs, created, session_id, action_info, action_refs, duplicates in rows:
             rarity = 1.0 / max(1.0, float(support or 1))
-            action_value = min(0.85, abs(float(action_info or 0.0)) * 2.0 + min(0.25, float(action_refs or 0) * 0.08))
+            action_value = min(0.85, max(0.0, float(action_info or 0.0)) * 2.0 + min(0.25, float(action_refs or 0) * 0.08))
             model_value = min(0.90, float(dependency_count or 0) * 0.20 + float(model_refs or 0) * 0.10)
-            validation_value = 0.35 if float(validation_used or 0.0) > 0 else 0.0
-            coverage_value = 0.20 if float(created or 0.0) <= now - 60.0 else 0.10
-            reward_value = min(0.45, abs(float(reward or 0.0)))
+            validation_value = 0.45 if float(validation_used or 0.0) > 0 else 0.0
+            coverage_value = 0.25 if float(created or 0.0) <= now - 60.0 else 0.10
+            reward_number = float(reward or 0.0)
+            reward_value = min(0.55, max(0.0, reward_number))
+            negative_penalty = min(0.75, max(0.0, -reward_number) + max(0.0, -float(action_info or 0.0)) * 2.0)
             quality_value = (0.20 if int(complete or 0) else 0.0) + min(0.15, max(0.0, float(variance or 0.0) / 2550.0))
-            duplicate_penalty = min(0.70, float(duplicates or 0) * 0.08)
-            retain = max(0.0, rarity + action_value + model_value + validation_value + coverage_value + reward_value + quality_value - duplicate_penalty)
+            duplicate_penalty = min(0.80, float(duplicates or 0) * 0.10)
+            provisional_penalty = 0.20 if reward is None and float(created or 0.0) < now - 3600.0 else 0.0
+            retain = max(0.0, rarity + action_value + model_value + validation_value + coverage_value + reward_value + quality_value - duplicate_penalty - negative_penalty - provisional_penalty)
             updates.append((retain, frame_id))
         if updates:
             self.conn.executemany("UPDATE frames SET retain_value=?, retain_version=2 WHERE id=?", updates)
@@ -2767,6 +3266,57 @@ class DataStore:
         entries.sort(key=lambda item: (-item["similarity"], item["distance"], item["frame_id"]))
         return entries, scanned, "complete"
 
+    def _exact_entries_from_database(self, current_dhash, current_features, finished_ns, limit, cancelled=None, cooperative=None, chunk_size=512):
+        heap = []
+        scanned = 0
+        wanted = max(1, int(limit))
+        chunk_size = max(128, min(1024, int(chunk_size or 512)))
+        last_ns = -1
+        last_id = ""
+        while True:
+            if cancelled is not None and cancelled():
+                return [item[1] for item in sorted(heap, key=lambda value: value[0], reverse=True)], scanned, "cancelled"
+            if cooperative is not None and not cooperative():
+                return [item[1] for item in sorted(heap, key=lambda value: value[0], reverse=True)], scanned, "pressure"
+            with self.lock:
+                if self.conn is None:
+                    return [item[1] for item in sorted(heap, key=lambda value: value[0], reverse=True)], scanned, "closed"
+                rows = self.conn.execute(
+                    "SELECT id, dhash64, phash, gray32x18, edge_density, color_histogram, capture_finished_monotonic_ns FROM frames "
+                    "WHERE (dhash64 IS NOT NULL OR phash IS NOT NULL) AND capture_finished_monotonic_ns < ? "
+                    "AND (capture_finished_monotonic_ns > ? OR (capture_finished_monotonic_ns = ? AND id > ?)) "
+                    "ORDER BY capture_finished_monotonic_ns ASC, id ASC LIMIT ?",
+                    (int(finished_ns), int(last_ns), int(last_ns), str(last_id), int(chunk_size)),
+                ).fetchall()
+            if not rows:
+                break
+            for index, row in enumerate(rows):
+                if cancelled is not None and cancelled():
+                    return [item[1] for item in sorted(heap, key=lambda value: value[0], reverse=True)], scanned, "cancelled"
+                if cooperative is not None and index % 128 == 0 and not cooperative():
+                    return [item[1] for item in sorted(heap, key=lambda value: value[0], reverse=True)], scanned, "pressure"
+                last_id = str(row[0])
+                last_ns = int(row[6] or 0)
+                entry = self._frame_composite_entry(current_dhash, current_features, row[:6])
+                if entry is None:
+                    continue
+                scanned += 1
+                try:
+                    tie = -int(entry["frame_id"], 16)
+                except ValueError:
+                    tie = -sum(ord(part) for part in entry["frame_id"])
+                priority = (float(entry["similarity"]), -float(entry["distance"]), tie)
+                item = (priority, entry)
+                if len(heap) < wanted:
+                    heapq.heappush(heap, item)
+                elif priority > heap[0][0]:
+                    heapq.heapreplace(heap, item)
+            if len(rows) < chunk_size:
+                break
+        entries = [item[1] for item in heap]
+        entries.sort(key=lambda item: (-item["similarity"], item["distance"], item["frame_id"]))
+        return entries, scanned, "complete"
+
     def process_deferred_exact_scores(self, cancelled=None, cooperative=None, maximum=1, session_id=None, hunger_rate_provider=None):
         if not self.exact_score_lock.acquire(blocking=False):
             return 0
@@ -2785,49 +3335,40 @@ class DataStore:
                     "WHERE d.state='pending'{} ORDER BY f.capture_finished_monotonic_ns ASC, f.id ASC LIMIT ?".format(predicate),
                     tuple(params + [maximum]),
                 ).fetchall()
-                if not rows:
-                    return 0
-                max_finished = max(int(row[7] or 0) for row in rows)
-                history_rows = self.conn.execute(
-                    "SELECT id, dhash64, phash, gray32x18, edge_density, color_histogram, capture_finished_monotonic_ns FROM frames "
-                    "WHERE (dhash64 IS NOT NULL OR phash IS NOT NULL) AND capture_finished_monotonic_ns < ? ORDER BY capture_finished_monotonic_ns ASC, id ASC",
-                    (max_finished,),
-                ).fetchall()
+            if not rows:
+                return 0
             resolved = 0
-            history_index = 0
-            active_history = []
             valid_updates = []
             invalid_updates = []
-            completed = []
+            chunk_size = 512
             for frame_id, dhash, session_key, phash, gray, edge, histogram, finished_ns in rows:
                 if cancelled is not None and cancelled():
                     break
                 finished_ns = int(finished_ns or 0)
-                while history_index < len(history_rows) and int(history_rows[history_index][6] or 0) < finished_ns:
-                    active_history.append(history_rows[history_index][:6])
-                    history_index += 1
                 current_features = {"phash": phash, "gray32x18": gray, "edge_density": edge, "color_histogram": histogram}
-                if not active_history:
+                with self.lock:
+                    history_count = int(self.conn.execute("SELECT COUNT(*) FROM frames WHERE (dhash64 IS NOT NULL OR phash IS NOT NULL) AND capture_finished_monotonic_ns < ?", (finished_ns,)).fetchone()[0] or 0)
+                if history_count <= 0:
                     result = {"hashes": [], "frame_ids": [], "similarities": [], "candidate_count": 0, "top_k_distance": 64.0, "retrieval_fallback": False, "retrieval_mode": "warmup_no_history", "exact_or_approx": "exact", "recall_guard": True, "total_history": 0, "score_valid": True, "provisional": False}
                     meta_status = "complete"
                 else:
-                    entries, scanned, meta_status = self._exact_entries_from_snapshot(dhash, current_features, active_history, 8, cancelled, cooperative)
-                    complete = meta_status == "complete" and len(entries) >= min(8, len(active_history))
-                    result = {"hashes": [item["hash"] for item in entries], "frame_ids": [item["frame_id"] for item in entries], "similarities": [float(item["similarity"]) for item in entries], "candidate_count": scanned, "top_k_distance": float(max((item["distance"] for item in entries), default=64.0)), "retrieval_fallback": False, "retrieval_mode": "batch_sleep_full_exact_composite" if complete else "batch_sleep_full_exact_composite_" + meta_status, "exact_or_approx": "exact" if complete else "unknown", "recall_guard": bool(complete), "total_history": len(active_history), "score_valid": bool(complete), "provisional": False, "candidate_sources": {"snapshot": scanned}}
+                    entries, scanned, meta_status = self._exact_entries_from_database(dhash, current_features, finished_ns, 8, cancelled, cooperative, chunk_size)
+                    complete = meta_status == "complete" and len(entries) >= min(8, history_count)
+                    result = {"hashes": [item["hash"] for item in entries], "frame_ids": [item["frame_id"] for item in entries], "similarities": [float(item["similarity"]) for item in entries], "candidate_count": scanned, "top_k_distance": float(max((item["distance"] for item in entries), default=64.0)), "retrieval_fallback": False, "retrieval_mode": "chunked_exact_composite" if complete else "chunked_exact_composite_" + meta_status, "exact_or_approx": "exact" if complete else "unknown", "recall_guard": bool(complete), "total_history": history_count, "score_valid": bool(complete), "provisional": False, "candidate_sources": {"chunked_scan": scanned, "chunk_size": chunk_size}}
                 if meta_status != "complete":
                     break
                 score, meta = frame_score(dhash, result, current_features)
                 if not meta.get("score_valid") or score is None:
                     invalid_updates.append((time.time(), str(meta.get("retrieval_mode", "deferred")), frame_id))
                     continue
-                valid_updates.append((float(score), float(score), str(meta.get("retrieval_mode", "batch_sleep_full_exact_composite")), frame_id, str(session_key)))
-                completed.append((time.time(), frame_id))
+                valid_updates.append((float(score), float(score), str(meta.get("retrieval_mode", "chunked_exact_composite")), frame_id, str(session_key)))
             if valid_updates or invalid_updates:
                 sessions = sorted({item[4] for item in valid_updates if item[4]})
                 with self.lock:
                     self.conn.execute("BEGIN IMMEDIATE")
-                    for score, raw_score, mode, frame_id, _ in valid_updates:
-                        self.conn.execute("UPDATE frames SET score=?, raw_score=?, score_status='exact', score_valid=1, score_retrieval_mode=?, score_exact_or_approx='exact', score_recall_guard=1 WHERE id=?", (score, raw_score, mode, frame_id))
+                    for score, raw_score, mode, frame_id, session_key in valid_updates:
+                        self.conn.execute("UPDATE frames SET score=?, raw_score=?, score_status='exact', score_generation='deferred_exact', score_valid=1, score_retrieval_mode=?, score_exact_or_approx='exact', score_recall_guard=1 WHERE id=?", (score, raw_score, mode, frame_id))
+                        self._immediate_exact_reward_locked(frame_id, score, session_key, hunger_rate_provider)
                         self.conn.execute("UPDATE deferred_exact_scores SET state='complete', updated=?, attempts=attempts+1, last_error='' WHERE frame_id=?", (time.time(), frame_id))
                         resolved += 1
                     for updated, error, frame_id in invalid_updates:
@@ -2884,7 +3425,7 @@ class DataStore:
         if self.pool is None:
             return result
         try:
-            for item in self.pool.rglob("*"):
+            for item in self._iter_storage_files(self.pool, None, "reconcile_pool_walk"):
                 try:
                     if not item.is_file():
                         continue
@@ -2943,6 +3484,57 @@ class DataStore:
             self.conn.commit()
 
 
+    def _safe_unlink_storage(self, path, operation):
+        try:
+            target = self._assert_storage_path(path, operation)
+            if _is_windows_reparse_point(target):
+                self._critical_path_event(target, operation)
+                return False
+            target.unlink(missing_ok=True)
+            return True
+        except OSError:
+            return False
+
+    def _iter_storage_files(self, root, suffix=None, operation="walk"):
+        try:
+            base = self._assert_storage_path(root, operation)
+            if not base.exists() or _is_windows_reparse_point(base):
+                return []
+            suffix = str(suffix or "")
+            result = []
+            for current, dirs, files in os.walk(str(base), topdown=True, followlinks=False):
+                current_path = Path(current)
+                try:
+                    self._assert_storage_path(current_path, operation)
+                    if _is_windows_reparse_point(current_path):
+                        dirs[:] = []
+                        continue
+                except OSError:
+                    dirs[:] = []
+                    continue
+                kept = []
+                for name in dirs:
+                    child = current_path / name
+                    try:
+                        self._assert_storage_path(child, operation)
+                        if not _is_windows_reparse_point(child):
+                            kept.append(name)
+                    except OSError:
+                        self._critical_path_event(child, operation)
+                dirs[:] = kept
+                for name in files:
+                    item = current_path / name
+                    if suffix and not item.name.lower().endswith(suffix.lower()):
+                        continue
+                    try:
+                        self._assert_storage_path(item, operation)
+                        result.append(item)
+                    except OSError:
+                        self._critical_path_event(item, operation)
+            return result
+        except OSError:
+            return []
+
 
     def _cleanup_pool_files(self):
         if self.pool is None:
@@ -2951,24 +3543,24 @@ class DataStore:
         with self.lock:
             if self.conn is not None:
                 referenced = {str(row[0]) for row in self.conn.execute("SELECT screenshot_path FROM frames").fetchall()}
-        for item in list(self.pool.rglob("*.tmp")):
+        for item in self._iter_storage_files(self.pool, ".tmp", "cleanup_tmp_walk"):
             try:
-                item.unlink(missing_ok=True)
+                self._safe_unlink_storage(item, "cleanup_tmp")
             except OSError:
                 pass
         if self.screens and self.screens.exists():
-            for item in self.screens.rglob("*.png"):
+            for item in self._iter_storage_files(self.screens, ".png", "cleanup_screens_walk"):
                 try:
                     if str(item.relative_to(self.pool)) not in referenced:
-                        item.unlink(missing_ok=True)
+                        self._safe_unlink_storage(item, "cleanup_orphan_png")
                 except OSError:
                     pass
         trash = self.pool / "trash"
         if trash.exists():
-            for item in trash.rglob("*"):
+            for item in self._iter_storage_files(trash, None, "cleanup_trash_walk"):
                 try:
                     if item.is_file():
-                        item.unlink(missing_ok=True)
+                        self._safe_unlink_storage(item, "cleanup_trash_file")
                 except OSError:
                     pass
 
@@ -3001,7 +3593,7 @@ class DataStore:
     def _reconcile_asset_bytes(self):
         return self.reconcile_pool_ledger()
 
-    def prune_models(self, maximum, cancelled=None, cooperative=None):
+    def prune_models(self, maximum, cancelled=None, cooperative=None, batch_size=8):
         maximum = max(1, int(maximum))
         self.sync_model_metadata()
         with self.lock:
@@ -3037,13 +3629,14 @@ class DataStore:
             ranked.append((int(champion or 0), -deletion_score, validation_value, quality_value, refs, -overlap, unique_count, float(updated or 0.0), str(model_id), row, overlap, unique_count))
         ranked.sort()
         removed = 0
-        trash_root = self.models / ".trash"
+        batch_size = max(1, min(8, int(batch_size or 1)))
+        trash_root = self._assert_storage_path(self.models / ".trash", "model_trash")
         trash_root.mkdir(parents=True, exist_ok=True)
         removed_overlap = []
         for index, item in enumerate(ranked):
             champion, _, _, _, _, _, _, _, _, row, overlap, unique_count = item
             model_id, file_name, validation_quality, quality, champion_value, updated, ref_count = row
-            if initial - removed <= target:
+            if initial - removed <= target or removed >= batch_size:
                 break
             if champion or int(champion_value):
                 continue
@@ -3051,8 +3644,8 @@ class DataStore:
                 break
             if index % 8 == 0 and cooperative is not None and not cooperative():
                 break
-            path = self.models / str(file_name)
-            trash = trash_root / (uuid.uuid4().hex + ".json")
+            path = self._assert_storage_path(self.models / str(file_name), "model_prune")
+            trash = self._assert_storage_path(trash_root / (uuid.uuid4().hex + ".json"), "model_prune_trash")
             onnx_path = None
             try:
                 payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
@@ -3061,6 +3654,7 @@ class DataStore:
                     onnx_path = Path(str(onnx_value))
                     if not onnx_path.is_absolute():
                         onnx_path = self.models / onnx_path
+                    onnx_path = self._assert_storage_path(onnx_path, "model_prune_onnx")
             except Exception:
                 onnx_path = None
             if not path.exists():
@@ -3096,9 +3690,9 @@ class DataStore:
                     self.conn.execute("DELETE FROM model_metadata WHERE id=? AND champion=0", (model_id,))
                     self._recalculate_model_refs_locked(frame_ids)
                     self.conn.commit()
-                trash.unlink(missing_ok=True)
+                self._safe_unlink_storage(trash, "model_prune_trash_complete")
                 if onnx_path is not None and onnx_path.exists():
-                    onnx_path.unlink(missing_ok=True)
+                    self._safe_unlink_storage(onnx_path, "model_prune_onnx_complete")
                 removed += 1
                 removed_overlap.append({"model_id": str(model_id), "overlap": float(overlap), "unique_states": int(unique_count), "refs": int(ref_count or 0), "validation_quality": float(validation_quality or 0.0)})
             except Exception:
@@ -3123,12 +3717,13 @@ class DataStore:
     def _safe_screen_path(self, stored):
         candidate = (self.pool / stored).resolve()
         base = self.pool.resolve()
-        if candidate == base or base not in candidate.parents:
+        if candidate == base or base not in candidate.parents or not storage_path_allowed(candidate, self.root):
+            self._critical_path_event(candidate, "safe_screen_path")
             return None
         return candidate
 
     def _trash_path(self, journal_id):
-        path = self.pool / "trash" / journal_id
+        path = self._assert_storage_path(self.pool / "trash" / journal_id, "frame_trash")
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -3156,7 +3751,7 @@ class DataStore:
                 self.conn.execute("INSERT INTO system_events(id, session_id, created, kind, payload) SELECT ?, session_id, ?, 'frame_pruned', ? FROM frames WHERE id=?", (uuid.uuid4().hex, now, json.dumps({"reason": deletion_reason, "retain_value": retain_value, "retain_version": 1}, ensure_ascii=False), identifier))
                 self._trim_system_events_locked()
                 moved.append((journal_id, identifier, stored, int(size_bytes or 0)))
-            self.conn.commit()
+            self._commit_critical_locked()
         for journal_id, identifier, stored, size_bytes in moved:
             source = self._safe_screen_path(stored)
             trash = self._trash_path(journal_id)
@@ -3178,11 +3773,11 @@ class DataStore:
                 self.conn.execute("UPDATE deletion_journal SET stage='db_deleted', updated=?, error='' WHERE id=?", (time.time(), journal_id))
                 self.conn.execute("INSERT OR REPLACE INTO pool_meta(key, value) VALUES ('asset_bytes', MAX(0, COALESCE((SELECT value FROM pool_meta WHERE key='asset_bytes'), 0) - ?))", (size_bytes,))
                 self.conn.execute("INSERT OR REPLACE INTO pool_meta(key, value) VALUES ('total_asset_bytes', COALESCE((SELECT value FROM pool_meta WHERE key='asset_bytes'), 0))")
-                self.conn.commit()
-            trash.unlink(missing_ok=True)
+                self._commit_critical_locked()
+            self._safe_unlink_storage(trash, "frame_trash_complete")
             with self.lock:
                 self.conn.execute("UPDATE deletion_journal SET stage='complete', updated=? WHERE id=?", (time.time(), journal_id))
-                self.conn.commit()
+                self._commit_critical_locked()
         return len(moved)
 
 
@@ -3190,9 +3785,9 @@ class DataStore:
         if self.conn is None or self.pool is None:
             return
         if self.pool.exists():
-            for item in self.pool.rglob("*.tmp"):
+            for item in self._iter_storage_files(self.pool, ".tmp", "recover_tmp_walk"):
                 try:
-                    item.unlink(missing_ok=True)
+                    self._safe_unlink_storage(item, "recover_tmp")
                 except OSError:
                     pass
         with self.lock:
@@ -3210,7 +3805,7 @@ class DataStore:
                 continue
             if file_exists and not frame_exists:
                 try:
-                    path.unlink(missing_ok=True)
+                    self._safe_unlink_storage(path, "recover_ingestion_orphan")
                 except OSError:
                     pass
             if frame_exists and not file_exists:
@@ -3223,11 +3818,11 @@ class DataStore:
         if self.screens and self.screens.exists():
             with self.lock:
                 referenced = {str(row[0]) for row in self.conn.execute("SELECT screenshot_path FROM frames").fetchall()}
-            for item in self.screens.rglob("*.png"):
+            for item in self._iter_storage_files(self.screens, ".png", "recover_ingestion_screens_walk"):
                 try:
                     rel = str(item.relative_to(self.pool))
                     if rel not in referenced:
-                        item.unlink(missing_ok=True)
+                        self._safe_unlink_storage(item, "recover_ingestion_orphan_png")
                 except OSError:
                     pass
         self.reconcile_pool_ledger()
@@ -3243,16 +3838,16 @@ class DataStore:
                     self._restore_trash(journal_id, stored)
                     with self.lock:
                         self.conn.execute("UPDATE deletion_journal SET stage='complete', updated=?, error='' WHERE id=?", (time.time(), journal_id))
-                        self.conn.commit()
+                        self._commit_critical_locked()
                 elif stage == "db_deleted":
-                    self._trash_path(journal_id).unlink(missing_ok=True)
+                    self._safe_unlink_storage(self._trash_path(journal_id), "recover_deletion_trash")
                     with self.lock:
                         self.conn.execute("UPDATE deletion_journal SET stage='complete', updated=?, error='' WHERE id=?", (time.time(), journal_id))
-                        self.conn.commit()
+                        self._commit_critical_locked()
             except OSError as error:
                 with self.lock:
                     self.conn.execute("UPDATE deletion_journal SET updated=?, error=? WHERE id=?", (time.time(), str(error), journal_id))
-                    self.conn.commit()
+                    self._commit_critical_locked()
         referenced = set()
         with self.lock:
             rows = self.conn.execute("SELECT id, screenshot_path, size_bytes FROM frames").fetchall()
@@ -3266,10 +3861,10 @@ class DataStore:
         if missing:
             self._delete_frame_batch(missing)
         if self.screens and self.screens.exists():
-            for item in self.screens.rglob("*.png"):
+            for item in self._iter_storage_files(self.screens, ".png", "recover_deletion_screens_walk"):
                 try:
                     if item.resolve() not in referenced:
-                        item.unlink(missing_ok=True)
+                        self._safe_unlink_storage(item, "recover_deletion_orphan_png")
                 except OSError:
                     pass
         with self.lock:
@@ -3366,9 +3961,10 @@ class DataStore:
             self.conn.commit()
         self._compact_database(cooperative)
 
-    def prune_experience(self, maximum, cancelled, progress, cooperative=None):
+    def prune_experience(self, maximum, cancelled, progress, cooperative=None, batch_size=8):
         maximum = max(1, int(maximum))
         target_total = int(math.floor(maximum * 0.5))
+        batch_size = max(1, min(8, int(batch_size or 1)))
         self.recover_deletions()
         self.sync_model_metadata()
         self._prune_metadata_before_assets(cooperative)
@@ -3407,7 +4003,7 @@ class DataStore:
                         (CASE WHEN frames.score_status='exact' THEN 1 ELSE 0 END) ASC,
                         (CASE WHEN COALESCE(state_clusters.count, frames.state_support_count, 1)>1 THEN 1 ELSE 0 END) DESC,
                         frames.retain_value ASC, frames.created ASC
-                        LIMIT 256""".format(predicate), params()).fetchall()
+                        LIMIT ?""".format(predicate), tuple(params()) + (batch_size,)).fetchall()
                 if not rows:
                     break
                 removed += self._delete_frame_batch(rows)
@@ -3416,10 +4012,9 @@ class DataStore:
                     remaining_clusters = {str(row[0]) for row in self.conn.execute("SELECT DISTINCT state_cluster_id FROM frames WHERE state_cluster_id IS NOT NULL AND state_cluster_id!=''").fetchall()}
                 loss = max(0, len(initial_clusters) - len(remaining_clusters))
                 ratio = loss / max(1, len(initial_clusters))
-                self.last_prune_coverage_loss = {"before": len(initial_clusters), "after": len(remaining_clusters), "loss": loss, "ratio": ratio, "paused": ratio > 0.10}
+                self.last_prune_coverage_loss = {"before": len(initial_clusters), "after": len(remaining_clusters), "loss": loss, "ratio": ratio, "paused": False, "priority_only": True}
                 if ratio > 0.10:
-                    self.add_system_event(None, "pool_prune_paused_coverage_loss", dict(self.last_prune_coverage_loss))
-                    break
+                    self.add_system_event(None, "pool_prune_coverage_priority_only", dict(self.last_prune_coverage_loss))
                 span = max(0.0, progress_end - progress_start)
                 progress(min(progress_end, progress_start + span * min(1.0, max(0.0, initial_assets - current_assets) / max(1, initial_assets - asset_target))))
             return current_assets <= asset_target
@@ -3442,7 +4037,7 @@ class DataStore:
                     counts = {}
                     for cluster_id, count, refs, retain, last_used in cluster_rows:
                         count = int(count or 0)
-                        floor = 1 + min(4, int(refs or 0)) + (1 if float(retain or 0.0) >= 1.35 else 0) + (1 if float(last_used or 0.0) > now_value - 86400.0 else 0)
+                        floor = 1
                         floors[str(cluster_id)] = max(1, min(max(1, count), floor))
                         counts[str(cluster_id)] = count
                     candidates = self.conn.execute("""SELECT frames.id, frames.screenshot_path, frames.size_bytes, frames.retain_value,
@@ -3450,14 +4045,14 @@ class DataStore:
                         FROM frames LEFT JOIN state_clusters ON state_clusters.cluster_id=frames.state_cluster_id
                         WHERE frames.state_cluster_id IS NOT NULL AND frames.state_cluster_id!=''
                         ORDER BY (CASE WHEN frames.score_status='exact' THEN 1 ELSE 0 END) ASC, frames.model_dependency_count ASC, frames.model_refs ASC, frames.asset_ref_count ASC, frames.retain_value ASC, frames.validation_last_used ASC, frames.created ASC
-                        LIMIT 2048""").fetchall()
+                        LIMIT ?""", (max(8, batch_size * 16),)).fetchall()
                 rows = []
                 for row in candidates:
                     cluster_id = str(row[5])
                     if counts.get(cluster_id, 0) > floors.get(cluster_id, 1):
                         rows.append(row[:5])
                         counts[cluster_id] = counts.get(cluster_id, 0) - 1
-                    if len(rows) >= 256:
+                    if len(rows) >= batch_size:
                         break
                 if not rows:
                     break
@@ -3478,12 +4073,12 @@ class DataStore:
             56.0,
             70.0,
         )
-        if current_assets > asset_target and not cancelled() and not self.last_prune_coverage_loss.get("paused"):
+        if current_assets > asset_target and not cancelled():
             delete_until("frames.model_dependency_count=0 AND frames.model_refs=0 AND COALESCE(state_clusters.count, frames.state_support_count, 1)>1 AND frames.retain_value<1.35", lambda: (), 70.0, 82.0)
-        if current_assets > asset_target and not cancelled() and not self.last_prune_coverage_loss.get("paused"):
+        if current_assets > asset_target and not cancelled():
             self._release_model_frame_refs(False)
             delete_until("frames.model_dependency_count=0 AND frames.model_refs=0 AND COALESCE(state_clusters.count, frames.state_support_count, 1)>1", lambda: (), 82.0, 90.0)
-        if current_assets > asset_target and not cancelled() and not self.last_prune_coverage_loss.get("paused"):
+        if current_assets > asset_target and not cancelled():
             self._release_model_frame_refs(True)
             delete_until("COALESCE(state_clusters.count, frames.state_support_count, 1)>1", lambda: (), 90.0, 95.0)
         if current_assets > asset_target and not cancelled():
@@ -3845,7 +4440,7 @@ def activate_root_window(hwnd, timeout=0.80):
             activate_root_window.last_reason = ""
             return True
         time.sleep(0.02)
-    activate_root_window.last_reason = "前台窗口不是绑定的雷电根窗口"
+    activate_root_window.last_reason = "前台窗口不是绑定的目标根窗口"
     return False
 
 def window_title(hwnd):
@@ -3853,6 +4448,36 @@ def window_title(hwnd):
     buffer = ctypes.create_unicode_buffer(length + 1)
     user32.GetWindowTextW(hwnd, buffer, len(buffer))
     return buffer.value
+
+def window_class_name(hwnd):
+    buffer = ctypes.create_unicode_buffer(256)
+    try:
+        user32.GetClassNameW(hwnd, buffer, len(buffer))
+        return buffer.value
+    except Exception:
+        return ""
+
+def is_ld_window_candidate(path, title):
+    exe = Path(path).name.lower() if path else ""
+    title_key = str(title or "").lower()
+    return exe in {"dnplayer.exe", "ldplayer.exe", "ldplayer9.exe"} or "雷电" in str(title or "") or "ldplayer" in title_key
+
+def selectable_top_level_window(hwnd):
+    if not hwnd or not user32.IsWindow(hwnd) or not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+        return False
+    if window_is_toolwindow(hwnd) or window_is_transparent(hwnd) or window_is_cloaked(hwnd):
+        return False
+    cls = window_class_name(hwnd)
+    if cls in {"Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Progman", "WorkerW", "DV2ControlHost", "TaskListThumbnailWnd", "Windows.UI.Core.CoreWindow", "ApplicationFrameInputSinkWindow"}:
+        return False
+    pid = wintypes.DWORD(); user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if int(pid.value or 0) == os.getpid():
+        return False
+    title = window_title(hwnd)
+    rect = client_rect(hwnd)
+    if rect is None or rect[2] - rect[0] < 96 or rect[3] - rect[1] < 96:
+        return False
+    return bool(title.strip() or Path(process_full_path(int(pid.value))).name)
 
 def normalized_windows_path(value):
     try:
@@ -3863,9 +4488,8 @@ def normalized_windows_path(value):
 def find_emulator_window_candidates(configured_path=""):
     selected = normalized_windows_path(configured_path) if configured_path else ""
     candidates = []
-    names = {"dnplayer.exe", "ldplayer.exe", "ldplayer9.exe"}
     def callback(hwnd, _):
-        if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+        if not selectable_top_level_window(hwnd):
             return True
         pid = wintypes.DWORD(); user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         if not pid.value:
@@ -3873,25 +4497,22 @@ def find_emulator_window_candidates(configured_path=""):
         path = process_full_path(int(pid.value))
         normalized = normalized_windows_path(path)
         title = window_title(hwnd)
-        exe = Path(path).name.lower() if path else ""
-        title_key = title.lower()
-        if selected and normalized == selected:
-            matched = True
-        else:
-            matched = exe in names or "雷电" in title or "ldplayer" in title_key
-        if not matched:
-            return True
         rect = client_rect(hwnd)
-        if rect is None:
-            return True
-        candidates.append({"hwnd": hwnd, "pid": int(pid.value), "title": title, "path": path, "rect": rect, "area": (rect[2] - rect[0]) * (rect[3] - rect[1])})
+        ld_rank = 0 if is_ld_window_candidate(path, title) else 1
+        selected_rank = 0 if selected and normalized == selected else 1
+        candidates.append({"hwnd": hwnd, "pid": int(pid.value), "title": title, "path": path, "rect": rect, "area": (rect[2] - rect[0]) * (rect[3] - rect[1]), "class": window_class_name(hwnd), "ld_rank": ld_rank, "selected_rank": selected_rank})
         return True
     user32.EnumWindows(EnumWindowsProc(callback), 0)
-    return sorted(candidates, key=lambda item: (normalized_windows_path(item.get("path", "")) != selected, item["title"].lower(), item["pid"], -item["area"]))
+    return sorted(candidates, key=lambda item: (item["ld_rank"], item["selected_rank"], item["title"].lower(), item["pid"], -item["area"]))
 
 def find_emulator_candidates(executable):
-    selected = normalized_windows_path(executable)
-    return [item for item in find_emulator_window_candidates(executable) if normalized_windows_path(item.get("path", "")) == selected]
+    selected = normalized_windows_path(executable) if executable else ""
+    rows = find_emulator_window_candidates(executable)
+    if selected:
+        matched = [item for item in rows if normalized_windows_path(item.get("path", "")) == selected]
+        if matched:
+            return matched
+    return rows
 
 def find_emulator_window(executable, selected_pid=None, selected_title=None):
     candidates = find_emulator_candidates(executable)
@@ -3975,17 +4596,106 @@ def _onnx_node(op_type, inputs, outputs, name):
     payload += _pb_string(4, op_type)
     return payload
 
-def policy_onnx_bytes(confidence_bias=0.48, uncertainty_bias=0.18):
-    confidence_bias = max(0.05, min(0.95, float(confidence_bias)))
-    uncertainty_bias = max(0.02, min(0.90, float(uncertainty_bias)))
-    weight = [0.15, -0.08, 0.14, -0.10, -0.22, 0.50, -0.10, 0.20, 0.10, -0.10]
-    bias = [confidence_bias, uncertainty_bias]
-    graph = _pb_message(1, _onnx_node("MatMul", ["input", "weight"], ["hidden"], "policy_matmul"))
-    graph += _pb_message(1, _onnx_node("Add", ["hidden", "bias"], ["output"], "policy_add"))
-    graph += _pb_string(2, "ld_training_policy")
-    graph += _pb_message(5, _onnx_tensor("weight", [5, 2], weight))
+def _logit(value):
+    value = max(0.001, min(0.999, float(value)))
+    return math.log(value / (1.0 - value))
+
+def _clamp_float(value, low, high):
+    try:
+        value = float(value)
+    except Exception:
+        value = low
+    return max(float(low), min(float(high), value))
+
+def _sigmoid_float(value):
+    value = max(-60.0, min(60.0, float(value)))
+    return 1.0 / (1.0 + math.exp(-value))
+
+def _gray32_values(value):
+    data = feature_bytes(value, 32 * 18)
+    if not data:
+        return []
+    return [item / 255.0 for item in data]
+
+def _gray_patch(values, rx, ry):
+    if not values:
+        return []
+    cx = max(1, min(30, int(round(float(rx) * 31))))
+    cy = max(1, min(16, int(round(float(ry) * 17))))
+    patch = []
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            patch.append(values[(cy + dy) * 32 + (cx + dx)])
+    return patch
+
+def _normalize_kernel(values, fallback=None):
+    values = [float(item) for item in values[:9]]
+    if len(values) < 9:
+        values += [0.0] * (9 - len(values))
+    mean = sum(values) / 9.0
+    centered = [item - mean for item in values]
+    scale = max([abs(item) for item in centered] + [1e-6])
+    if scale <= 1e-6:
+        centered = [float(item) for item in (fallback or [0.0] * 9)[:9]]
+        if len(centered) < 9:
+            centered += [0.0] * (9 - len(centered))
+        mean = sum(centered) / 9.0
+        centered = [item - mean for item in centered]
+        scale = max([abs(item) for item in centered] + [1e-6])
+    return [max(-1.0, min(1.0, item / scale * 0.42)) for item in centered]
+
+def conv_policy_features(gray_values, conv_weight, conv_bias):
+    if len(gray_values) != 32 * 18:
+        return []
+    features = []
+    weights = [float(item) for item in conv_weight]
+    biases = [float(item) for item in conv_bias]
+    if len(weights) != 4 * 9 or len(biases) != 4:
+        return []
+    for channel in range(4):
+        kernel = weights[channel * 9:(channel + 1) * 9]
+        bias = biases[channel]
+        for y in range(16):
+            row = y * 32
+            for x in range(30):
+                value = bias
+                value += gray_values[row + x] * kernel[0]
+                value += gray_values[row + x + 1] * kernel[1]
+                value += gray_values[row + x + 2] * kernel[2]
+                value += gray_values[row + 32 + x] * kernel[3]
+                value += gray_values[row + 32 + x + 1] * kernel[4]
+                value += gray_values[row + 32 + x + 2] * kernel[5]
+                value += gray_values[row + 64 + x] * kernel[6]
+                value += gray_values[row + 64 + x + 1] * kernel[7]
+                value += gray_values[row + 64 + x + 2] * kernel[8]
+                features.append(value if value > 0.0 else 0.0)
+    return features
+
+def policy_onnx_bytes(conv_weight, fc_weight, bias, conv_bias=None):
+    conv_weight = [float(item) for item in (conv_weight or [])]
+    fc_weight = [float(item) for item in (fc_weight or [])]
+    bias = [float(item) for item in (bias or [])]
+    conv_bias = [float(item) for item in (conv_bias or [0.0, 0.0, 0.0, 0.0])]
+    if len(conv_weight) != 4 * 1 * 3 * 3:
+        raise ValueError("conv_weight 必须是 4×1×3×3")
+    if len(conv_bias) != 4:
+        raise ValueError("conv_bias 必须是 4")
+    if len(fc_weight) != 4 * 16 * 30 * 2:
+        raise ValueError("fc_weight 必须是 1920×2")
+    if len(bias) != 2:
+        raise ValueError("bias 必须是 2")
+    graph = _pb_message(1, _onnx_node("Conv", ["input", "conv_weight", "conv_bias"], ["conv"], "vision_conv3x3"))
+    graph += _pb_message(1, _onnx_node("Relu", ["conv"], ["relu"], "vision_relu"))
+    graph += _pb_message(1, _onnx_node("Flatten", ["relu"], ["flat"], "vision_flatten"))
+    graph += _pb_message(1, _onnx_node("MatMul", ["flat", "fc_weight"], ["logits"], "vision_matmul"))
+    graph += _pb_message(1, _onnx_node("Add", ["logits", "bias"], ["biased"], "vision_bias"))
+    graph += _pb_message(1, _onnx_node("Sigmoid", ["biased"], ["output"], "vision_sigmoid"))
+    graph += _pb_string(2, "ld_training_visual_policy")
+    graph += _pb_message(5, _onnx_tensor("conv_weight", [4, 1, 3, 3], conv_weight))
+    graph += _pb_message(5, _onnx_tensor("conv_bias", [4], conv_bias))
+    graph += _pb_message(5, _onnx_tensor("fc_weight", [4 * 16 * 30, 2], fc_weight))
     graph += _pb_message(5, _onnx_tensor("bias", [1, 2], bias))
-    graph += _pb_message(11, _onnx_value_info("input", [1, 5]))
+    graph += _pb_message(11, _onnx_value_info("input", [1, 1, 18, 32]))
     graph += _pb_message(12, _onnx_value_info("output", [1, 2]))
     opset = _pb_string(1, "") + _pb_int(2, 13)
     return _pb_int(1, 7) + _pb_string(2, "ld_training_panel") + _pb_message(7, graph) + _pb_message(8, opset)
@@ -4214,66 +4924,80 @@ def extract_frame_features(image):
     height = int(image["height"])
     bgra = image.get("bgra")
     rgb = image.get("rgb")
-    if bgra:
-        def pixel(x, y):
-            index = (y * width + x) * 4
-            return bgra[index + 2], bgra[index + 1], bgra[index]
-    else:
-        def pixel(x, y):
-            index = (y * width + x) * 3
-            return rgb[index], rgb[index + 1], rgb[index + 2]
-    grayscale = [[0] * 9 for _ in range(8)]
+    channels = 4 if bgra is not None else 3
+    raw = memoryview(bgra if bgra is not None else rgb)
+    if width <= 0 or height <= 0 or len(raw) < width * height * channels:
+        image.update({"phash": "0" * 16, "dhash64": "0" * 16, "capture_complete": 0, "brightness": 0.0, "variance": 0.0, "gray32x18": bytes(32 * 18), "edge_density": 0.0, "color_histogram": struct.pack("<24I", *([0] * 24))})
+        return image
+    def luma_at(x, y):
+        index = (int(y) * width + int(x)) * channels
+        if channels == 4:
+            b = raw[index]
+            g = raw[index + 1]
+            r = raw[index + 2]
+        else:
+            r = raw[index]
+            g = raw[index + 1]
+            b = raw[index + 2]
+        return (r * 299 + g * 587 + b * 114) // 1000, r, g, b
+    low = [0] * 72
     for y in range(8):
         sy = min(height - 1, int((y + 0.5) * height / 8))
         for x in range(9):
             sx = min(width - 1, int((x + 0.5) * width / 9))
-            r, g, b = pixel(sx, sy)
-            grayscale[y][x] = (r * 299 + g * 587 + b * 114) // 1000
-    value = 0
+            low[y * 9 + x] = luma_at(sx, sy)[0]
+    dhash = 0
     for y in range(8):
+        base = y * 9
         for x in range(8):
-            value = (value << 1) | (1 if grayscale[y][x] > grayscale[y][x + 1] else 0)
-    lowfreq = [grayscale[y][x] for y in range(8) for x in range(8)]
+            dhash = (dhash << 1) | (1 if low[base + x] > low[base + x + 1] else 0)
+    lowfreq = [low[y * 9 + x] for y in range(8) for x in range(8)]
     low_mean = sum(lowfreq) / max(1, len(lowfreq))
     perceptual = 0
     for item in lowfreq:
         perceptual = (perceptual << 1) | (1 if item >= low_mean else 0)
-    sample_values = []
-    if bgra:
-        step = max(4, (len(bgra) // 4096) & ~3)
-        for index in range(0, len(bgra), step):
-            if index + 2 < len(bgra):
-                sample_values.append((bgra[index + 2] * 299 + bgra[index + 1] * 587 + bgra[index] * 114) // 1000)
-    else:
-        step = max(3, (len(rgb) // 4096) // 3 * 3 or 3)
-        for index in range(0, len(rgb), step):
-            if index + 2 < len(rgb):
-                sample_values.append((rgb[index] * 299 + rgb[index + 1] * 587 + rgb[index + 2] * 114) // 1000)
-    mean = sum(sample_values) / max(1, len(sample_values))
-    variance = sum((v - mean) ** 2 for v in sample_values) / max(1, len(sample_values))
-    sample_gray = []
+    sample_gray = bytearray(32 * 18)
+    hist = [0] * 24
+    total_luma = 0.0
+    total_luma2 = 0.0
+    sample_count = 0
+    edge_hits = 0
+    grid_points = set()
     for gy in range(18):
         sy = min(height - 1, int((gy + 0.5) * height / 18))
         for gx in range(32):
             sx = min(width - 1, int((gx + 0.5) * width / 32))
-            r, g, b = pixel(sx, sy)
-            sample_gray.append((r * 299 + g * 587 + b * 114) // 1000)
-    edge_hits = 0
+            luma, r, g, b = luma_at(sx, sy)
+            sample_gray[gy * 32 + gx] = luma
+            total_luma += luma
+            total_luma2 += luma * luma
+            sample_count += 1
+            hist[min(7, r // 32)] += 1
+            hist[8 + min(7, g // 32)] += 1
+            hist[16 + min(7, b // 32)] += 1
+            grid_points.add(sy * width + sx)
     for gy in range(18):
+        base = gy * 32
         for gx in range(31):
-            if abs(sample_gray[gy * 32 + gx] - sample_gray[gy * 32 + gx + 1]) > 24:
+            if abs(sample_gray[base + gx] - sample_gray[base + gx + 1]) > 24:
                 edge_hits += 1
-    hist = [0] * 24
     total_pixels = width * height
     step_pixels = max(1, total_pixels // 12288)
     for point in range(0, total_pixels, step_pixels):
-        x = point % width
+        if point in grid_points:
+            continue
         y = point // width
-        r, g, b = pixel(x, y)
+        x = point - y * width
+        luma, r, g, b = luma_at(x, y)
+        total_luma += luma
+        total_luma2 += luma * luma
+        sample_count += 1
         hist[min(7, r // 32)] += 1
         hist[8 + min(7, g // 32)] += 1
         hist[16 + min(7, b // 32)] += 1
-    image.update({"phash": f"{perceptual:016x}", "dhash64": f"{value:016x}", "capture_complete": 1 if mean >= 3.0 and variance >= 2.0 else 0, "brightness": mean, "variance": variance, "gray32x18": bytes(sample_gray), "edge_density": edge_hits / (18 * 31), "color_histogram": struct.pack("<24I", *hist)})
+    mean = total_luma / max(1, sample_count)
+    variance = max(0.0, total_luma2 / max(1, sample_count) - mean * mean)
+    image.update({"phash": f"{perceptual:016x}", "dhash64": f"{dhash:016x}", "capture_complete": 1 if mean >= 3.0 and variance >= 2.0 else 0, "brightness": mean, "variance": variance, "gray32x18": bytes(sample_gray), "edge_density": edge_hits / (18 * 31), "color_histogram": struct.pack("<24I", *hist)})
     return image
 
 def compress_frame_png(image):
@@ -4626,7 +5350,7 @@ class Controller:
         self.event_sink = event_sink
         self.store = DataStore()
         self.pending_critical_errors = []
-        self.resources = ResourceGovernor()
+        self.resources = ResourceGovernor(self.settings.data["storage_path"])
         self.lock = threading.RLock()
         self.state = "idle"
         self.epoch = 0
@@ -4667,6 +5391,9 @@ class Controller:
         self.ai_plan = []
         self.latest_frame_features = None
         self.latest_frame_id = None
+        self.immediate_capture_event = threading.Event()
+        self.last_immediate_capture = 0.0
+        self.ai_region_counts = collections.Counter()
         self.exact_state_cache = collections.deque(maxlen=128)
         self.action_limits = {}
         self.last_model_training = 0.0
@@ -4680,6 +5407,8 @@ class Controller:
         self.last_observation = 0.0
         self.capture_interval_seconds = 1.0
         self.capture_failures = 0
+        self.last_capacity_notice_at = 0.0
+        self.last_capacity_notice_tier = 0
         self.mouse_queue = queue.Queue(maxsize=12000)
         self.raw_mouse_queue = queue.Queue(maxsize=16000)
         self.raw_critical_queue = queue.Queue(maxsize=2048)
@@ -4721,7 +5450,19 @@ class Controller:
         self.loss_lock = threading.Lock()
         self.move_loss = {}
         self.ai_input_tracker = AIInputTracker()
-        self.state_transitions = {"idle": {"learning", "training", "sleep"}, "learning": {"stopping", "idle"}, "training": {"stopping", "sleep", "idle"}, "sleep": {"training", "idle", "stopping"}, "stopping": {"idle", "sleep"}}
+        self.state_events = {"idle_click_learning", "idle_click_training", "manual_sleep", "auto_sleep_worth", "esc", "mouse_outside", "client_invalid", "manual_sleep_task2_done", "auto_sleep_task2_done_resume_training"}
+        self.state_transitions = {
+            "idle_click_learning": {("idle", "learning")},
+            "idle_click_training": {("idle", "training")},
+            "manual_sleep": {("idle", "sleep")},
+            "auto_sleep_worth": {("training", "stopping"), ("stopping", "sleep")},
+            "esc": {("learning", "stopping"), ("training", "stopping"), ("sleep", "stopping"), ("stopping", "idle")},
+            "mouse_outside": {("learning", "stopping"), ("training", "stopping"), ("stopping", "idle")},
+            "client_invalid": {("learning", "stopping"), ("training", "stopping"), ("stopping", "idle")},
+            "manual_sleep_task2_done": {("sleep", "idle")},
+            "auto_sleep_task2_done_resume_training": {("sleep", "training")}
+        }
+        self.detached_pipeline_contexts = []
 
     def emit(self, kind, payload):
         self.event_sink(kind, payload)
@@ -4747,26 +5488,49 @@ class Controller:
             except Exception:
                 pass
 
-    def _transition_state_locked(self, target, reason="", token=None):
-        source = self.state
+    def _event_for_stop_reason(self, reason):
+        text = str(reason or "")
+        if "ESC" in text or "Esc" in text or "esc" in text:
+            return "esc"
+        if "鼠标" in text and ("离开" in text or "客户区外" in text):
+            return "mouse_outside"
+        return "client_invalid"
+
+    def _transition_state_locked(self, event, source, target, reason="", token=None):
+        event = str(event or "")
+        source = str(source or self.state)
+        target = str(target or "")
+        actual = self.state
+        if actual != source:
+            try:
+                self.store.add_system_event(self.session_id, "state_transition_rejected", {"event": event, "declared_source": source, "actual_source": actual, "to": target, "reason": reason, "token": token, "time": time.time()})
+            except Exception:
+                pass
+            return False
         if source == target:
             return True
-        if target not in self.state_transitions.get(source, set()):
+        if event not in self.state_events or (source, target) not in self.state_transitions.get(event, set()):
             try:
-                self.store.add_system_event(self.session_id, "state_transition_rejected", {"from": source, "to": target, "reason": reason, "token": token, "time": time.time()})
+                self.store.add_system_event(self.session_id, "state_transition_rejected", {"event": event, "from": source, "to": target, "reason": reason, "token": token, "time": time.time()})
             except Exception:
                 pass
             return False
         self.state = target
+        now = time.time()
+        cursor = cursor_position()
+        window_state = "hwnd={} pid={} rect={}".format(int(self.target_hwnd or 0), int(self.target_pid or 0), self.target_rect)
+        resource = self.resources.sample()
+        payload = {"event": event, "from": source, "to": target, "reason": reason, "trigger": event, "token": token, "time": now, "timestamp": now, "target_hwnd": int(self.target_hwnd or 0), "target_pid": int(self.target_pid or 0), "window_state": window_state, "cursor_position": cursor, "resource_state": resource.get("resource_state", ""), "resource": {"cpu": resource.get("cpu"), "memory": resource.get("memory"), "pause_reason": resource.get("pause_reason", "")}}
         try:
-            self.store.add_system_event(self.session_id, "state_transition", {"from": source, "to": target, "reason": reason, "token": token, "time": time.time(), "target_hwnd": int(self.target_hwnd or 0), "target_pid": int(self.target_pid or 0)})
+            self.store.add_system_event(self.session_id, "state_transition", payload)
+            self.store.record_mode_transition(self.session_id, source, target, reason, event, window_state, cursor, resource.get("resource_state", ""), payload)
         except Exception:
             pass
         return True
 
-    def _transition_state(self, target, reason="", token=None):
+    def _transition_state(self, event, source, target, reason="", token=None):
         with self.lock:
-            return self._transition_state_locked(target, reason, token)
+            return self._transition_state_locked(event, source, target, reason, token)
 
     def _cache_exact_state(self, frame_id, image_or_features, score, hunger=None):
         if not frame_id or score is None or not isinstance(image_or_features, dict):
@@ -4853,6 +5617,9 @@ class Controller:
         if active:
             self.on_control_signal("window_validate", "窗口状态变化", token=token)
 
+    def request_start_session(self, mode):
+        self.on_control_signal("start_mode", str(mode))
+
     def on_control_signal(self, kind, reason, created=None, token=None):
         emergency = kind in ("stop", "esc")
         if emergency:
@@ -4893,6 +5660,10 @@ class Controller:
                 self._begin_auto_sleep(item.get("token"))
             elif kind == "sleep_finish":
                 self._finish_idle(item.get("token"), item.get("reason") or "睡眠任务结束", True)
+            elif kind == "start_mode":
+                mode = str(item.get("reason") or "")
+                if not self.start_session(mode):
+                    self.post_state("未进入模式，请检查目标窗口、客户区状态和资源预算。")
             elif kind == "window_validate":
                 with self.lock:
                     token = self.epoch
@@ -5059,13 +5830,13 @@ class Controller:
             return "external_injected", None
         return "user", None
 
-    def _append_move_compression(self, session_id, source, last_kept, x, y, created, created_ns, speed, rect):
+    def _append_move_compression(self, session_id, source, last_kept, x, y, created, created_ns, speed, direction, rect):
         key = (session_id, source)
         item = self.move_segments.get(key)
         if item is None:
             base_x, base_y, base_ns, base_created = int(last_kept[0]), int(last_kept[1]), int(last_kept[2]), float(last_kept[3])
             dt, dx, dy = max(0, int(created_ns) - base_ns), int(x) - base_x, int(y) - base_y
-            item = {"session_id": session_id, "source": source, "started": base_created, "ended": created, "started_ns": base_ns, "ended_ns": int(created_ns), "start_x": base_x, "start_y": base_y, "end_x": int(x), "end_y": int(y), "count": 1, "max_speed": float(speed), "path_length": math.hypot(dx, dy), "points": [(dt, dx, dy)], "client_rect": tuple(int(value) for value in rect), "rule": "varint/zigzag 无损相对时间与坐标轨迹压缩"}
+            item = {"session_id": session_id, "source": source, "started": base_created, "ended": created, "started_ns": base_ns, "ended_ns": int(created_ns), "start_x": base_x, "start_y": base_y, "end_x": int(x), "end_y": int(y), "count": 1, "max_speed": float(speed), "speed_sum": float(speed), "speed_count": 1, "average_speed": float(speed), "last_direction": float(direction), "direction_change_count": 0, "click_pre_dwell_ms": 0.0, "crossed_client_boundary": not point_inside((int(x), int(y)), rect), "path_length": math.hypot(dx, dy), "points": [(dt, dx, dy)], "client_rect": tuple(int(value) for value in rect), "rule": "varint/zigzag 无损相对时间与坐标轨迹压缩"}
             self.move_segments[key] = item
         else:
             prev_x, prev_y, prev_ns = int(item["end_x"]), int(item["end_y"]), int(item["ended_ns"])
@@ -5076,7 +5847,16 @@ class Controller:
             item["end_x"] = int(x)
             item["end_y"] = int(y)
             item["count"] += 1
+            previous_direction = float(item.get("last_direction", direction))
+            turn = abs(math.atan2(math.sin(float(direction) - previous_direction), math.cos(float(direction) - previous_direction)))
+            if turn >= 0.65:
+                item["direction_change_count"] = int(item.get("direction_change_count", 0)) + 1
+            item["last_direction"] = float(direction)
             item["max_speed"] = max(float(item["max_speed"]), float(speed))
+            item["speed_sum"] = float(item.get("speed_sum", 0.0)) + float(speed)
+            item["speed_count"] = int(item.get("speed_count", 0)) + 1
+            item["average_speed"] = float(item.get("speed_sum", 0.0)) / max(1, int(item.get("speed_count", 1)))
+            item["crossed_client_boundary"] = bool(item.get("crossed_client_boundary")) or not point_inside((int(x), int(y)), rect)
             item["points"].append((dt, dx, dy))
 
     def _flush_move_compression(self, session_id=None, source=None):
@@ -5093,28 +5873,27 @@ class Controller:
         return ok
 
     def on_mouse(self, event_type, button, wheel, x, y, created, created_monotonic_ns, flags, extra_info):
-        source, behavior_probability = self.classify_mouse_source(event_type, button, wheel, x, y, flags, extra_info, created_monotonic_ns)
-        if source == "user":
-            self.resources.update_user_input()
         with self.lock:
-            if self.state not in ("learning", "training") or not self.session_id or not self.target_rect:
+            current_state = self.state
+            if current_state not in ("learning", "training") or not self.session_id or not self.target_rect:
                 return
             session_id = self.session_id
             rect = self.target_rect
+            training = current_state == "training"
+        if training:
+            source, behavior_probability = self.classify_mouse_source(event_type, button, wheel, x, y, flags, extra_info, created_monotonic_ns)
+        else:
+            source, behavior_probability = "user", None
+        if source == "user":
+            self.resources.update_user_input()
+        with self.lock:
+            if self.state != current_state or self.session_id != session_id:
+                return
             outside = not point_inside((x, y), rect)
             previous = self.last_mouse_by_source.get(source)
             critical = event_type != "move" or button or wheel
-            training = self.state == "training"
         if outside:
-            self.on_control_signal("stop", "鼠标已离开雷电模拟器客户区")
-            return
-        if training and source == "user":
-            self.cancel_event.set()
-            self.on_control_signal("stop", "训练模式检测到真实用户鼠标事件，AI 已立即停止")
-            return
-        if training and source != "ai":
-            self.cancel_event.set()
-            self.on_control_signal("stop", "训练模式检测到未匹配的外部鼠标注入，AI 已立即停止")
+            self.on_control_signal("stop", "鼠标已离开目标窗口客户区")
             return
         input_budget = self.resources.capture_snapshot()
         if input_budget.must_pause and not critical:
@@ -5132,9 +5911,14 @@ class Controller:
             last_kept = kept_map.get(source)
             direction_turn = last_kept is not None and previous is not None and abs(math.atan2(math.sin(direction - last_kept[4]), math.cos(direction - last_kept[4]))) >= 0.65
             if not critical and last_kept is not None and (created_monotonic_ns - last_kept[2]) < 10_000_000 and abs(x - last_kept[0]) < 3 and abs(y - last_kept[1]) < 3 and not direction_turn:
-                self._append_move_compression(session_id, source, last_kept, x, y, created, created_monotonic_ns, speed, rect)
+                self._append_move_compression(session_id, source, last_kept, x, y, created, created_monotonic_ns, speed, direction, rect)
                 self.last_mouse_by_source[source] = (x, y, created_monotonic_ns)
                 return
+        if critical:
+            with self.lock:
+                segment = self.move_segments.get((session_id, source))
+                if segment is not None:
+                    segment["click_pre_dwell_ms"] = max(float(segment.get("click_pre_dwell_ms", 0.0)), max(0.0, (int(created_monotonic_ns) - int(segment.get("ended_ns", created_monotonic_ns))) / 1_000_000.0))
         if not self._flush_move_compression(session_id, source):
             return
         with self.lock:
@@ -5149,10 +5933,14 @@ class Controller:
         height = max(1, rect[3] - rect[1])
         record = {"session_id": session_id, "created": created, "created_monotonic_ns": int(created_monotonic_ns), "source": source, "event_type": event_type, "button": button, "wheel": wheel, "x": x, "y": y, "relative_x": (x - rect[0]) / width, "relative_y": (y - rect[1]) / height, "dx": dx, "dy": dy, "direction": direction, "speed": speed, "behavior_probability": behavior_probability, "before_frame_id": before_frame_id, "after_frame_id": None}
         try:
+            if critical:
+                self.store.journal_mouse_record(record)
             self.mouse_queue.put_nowait(record)
             if source in ("user", "ai") and event_type in ("button_up", "wheel", "move"):
                 with self.lock:
                     self.session_valid_actions += 1
+            if source in ("user", "ai") and event_type in ("button_up", "wheel"):
+                self.request_immediate_capture("mouse_action")
         except queue.Full:
             self.on_control_signal("stop", "鼠标轨迹事件无法进入数据库写入队列，已安全结束会话")
             return
@@ -5168,23 +5956,23 @@ class Controller:
     def _find_valid_target(self, cursor_required=False):
         candidates = find_emulator_candidates(self.settings.data["emulator_path"])
         if not candidates:
-            return None, None, "未检测到已启动的雷电模拟器窗口。"
+            return None, None, "未检测到可选择的目标窗口。"
         selected_pid = int(self.settings.data.get("emulator_pid", 0) or 0)
         selected_title = str(self.settings.data.get("emulator_title", "") or "")
         if len(candidates) > 1 and not selected_pid and not selected_title:
-            return None, None, "检测到多个雷电实例。请先在控制面板中明确选择窗口标题、PID 或实例编号。"
+            return None, None, "检测到多个候选目标窗口。请先在控制面板中明确选择窗口标题和 PID。"
         if selected_pid or selected_title:
             candidates = [item for item in candidates if (not selected_pid or item["pid"] == selected_pid) and (not selected_title or item["title"] == selected_title)]
             if len(candidates) != 1:
-                return None, None, "已选择的雷电实例不存在、标题已变化或不再唯一。请重新选择实例。"
+                return None, None, "已选择的目标窗口不存在、标题已变化或不再唯一。请重新选择窗口。"
         elif len(candidates) == 1:
             pass
         else:
-            return None, None, "多个雷电实例未明确选择。"
+            return None, None, "多个目标窗口未明确选择。"
         chosen = candidates[0]
         rect = valid_client(chosen["hwnd"], cursor_required)
         if rect is None:
-            return None, None, "雷电模拟器客户区异常：" + (getattr(valid_client, "last_reason", "不可见、被遮挡、最小化或未完全位于物理显示器范围内"))
+            return None, None, "目标窗口客户区异常：" + (getattr(valid_client, "last_reason", "不可见、被遮挡、最小化或未完全位于物理显示器范围内"))
         return chosen["hwnd"], rect, ""
 
     def _place_cursor_before_entry(self, hwnd, rect):
@@ -5206,6 +5994,10 @@ class Controller:
         with self.lock:
             recovery_pending = bool(self.recovery_pending)
         if recovery_pending:
+            if not self._wait_detached_pipeline_contexts(10.0):
+                self.post_state("空闲；已接受数据仍在排空，暂不允许启动新会话。")
+                self.emit("notice", "已接受数据仍在排空，暂不允许启动新会话。")
+                return False
             try:
                 ok, detail = self.store.recover_after_forced_stop()
             except Exception as error:
@@ -5245,24 +6037,32 @@ class Controller:
         if hwnd is None:
             self.emit("notice", reason); self.hook.stop(); self.keyboard_hook.stop(); return False
         if mode in ("learning", "training") and not activate_root_window(hwnd):
-            self.emit("notice", "进入{}模式前无法将雷电模拟器置为前台：{}".format("学习" if mode == "learning" else "训练", getattr(activate_root_window, "last_reason", "未知"))); self.hook.stop(); self.keyboard_hook.stop(); return False
+            self.emit("notice", "进入{}模式前无法将目标窗口置为前台：{}".format("学习" if mode == "learning" else "训练", getattr(activate_root_window, "last_reason", "未知"))); self.hook.stop(); self.keyboard_hook.stop(); return False
         time.sleep(0.08)
         if mode in ("learning", "training") and not foreground_root_matches(hwnd):
-            self.emit("notice", "进入{}模式前前台校验失败：雷电模拟器不是前台窗口".format("学习" if mode == "learning" else "训练")); self.hook.stop(); self.keyboard_hook.stop(); return False
+            self.emit("notice", "进入{}模式前前台校验失败：目标窗口不是前台窗口".format("学习" if mode == "learning" else "训练")); self.hook.stop(); self.keyboard_hook.stop(); return False
         if not self._place_cursor_before_entry(hwnd, rect):
-            self.emit("notice", "进入模式前无法确认鼠标与雷电模拟器客户区状态。"); self.hook.stop(); self.keyboard_hook.stop(); return False
+            self.emit("notice", "进入模式前无法确认鼠标与目标窗口客户区状态。"); self.hook.stop(); self.keyboard_hook.stop(); return False
         if not entry_capture_pixel_validation(hwnd):
             self.emit("notice", "进入模式前截图像素校验失败：" + getattr(entry_capture_pixel_validation, "last_reason", "未知")); self.hook.stop(); self.keyboard_hook.stop(); return False
         rect = valid_client(hwnd, True)
         if rect is None:
-            self.emit("notice", "雷电模拟器客户区状态异常：" + getattr(valid_client, "last_reason", "未知")); self.hook.stop(); self.keyboard_hook.stop(); return False
+            self.emit("notice", "目标窗口客户区状态异常：" + getattr(valid_client, "last_reason", "未知")); self.hook.stop(); self.keyboard_hook.stop(); return False
         try: session_id = self.store.create_session(mode)
         except Exception as error:
             self.emit("notice", "无法创建会话记录：" + str(error)); self.hook.stop(); self.keyboard_hook.stop(); return False
-        pid = wintypes.DWORD(); user32.GetWindowThreadProcessId(root_window(hwnd), ctypes.byref(pid))
+        pid = wintypes.DWORD(); target_root = root_window(hwnd); user32.GetWindowThreadProcessId(target_root, ctypes.byref(pid)); target_pid = int(pid.value); target_process_path = normalized_windows_path(process_full_path(target_pid))
+        try:
+            self.store.add_system_event(session_id, "mode_enter", {"mode": mode, "automatic": automatic, "time": time.time(), "client_rect": rect, "target_pid": target_pid, "resource": self.resources.sample()})
+        except Exception as error:
+            try:
+                self.store.close_session(session_id, "进入模式失败：mode_enter 写入失败：" + str(error))
+            except Exception:
+                pass
+            self.emit("notice", "无法写入模式进入事件：" + str(error)); self.hook.stop(); self.keyboard_hook.stop(); return False
         with self.lock:
-            self.epoch += 1; token = self.epoch; self.cancel_event = threading.Event(); self._transition_state_locked(mode, "start_session", token)
-            self.target_hwnd = hwnd; self.target_root = root_window(hwnd); self.target_pid = int(pid.value); self.target_process_path = normalized_windows_path(process_full_path(int(pid.value))); self.target_rect = rect; self.session_id = session_id; self.session_mode = mode; self.session_started = time.monotonic(); self.hunger_anchor_ns = time.monotonic_ns(); self.last_observation = self.session_started; self.capture_failures = 0; self.last_valid_score = None; self.frame_scores = []; self.frame_count = 0; self.mouse_count = 0; self.session_valid_frames = 0; self.session_valid_actions = 0; self.latest_frame_id = None; self.last_sleep_fingerprint_check = 0.0; self.current_training_fingerprint = ""; self.gdi_failures = 0; self.gdi_static_count = 0; self.last_feature_hash = ""; self.stable_feature_frames = 0; self.last_gdi_hash = ""; self.last_gdi_hash_input_ns = 0; self.fallback_capture_pending = False; self.last_mouse_activity_ns = 0; self.raw_mouse_drops = 0; self.last_mouse_by_source = {"ai": None, "user": None, "external_injected": None}; self.ai_step = 0; self.training_auto_sleep_count = 0 if mode == "training" and not automatic else self.training_auto_sleep_count
+            self.epoch += 1; token = self.epoch; self.cancel_event = threading.Event()
+            self.target_hwnd = hwnd; self.target_root = target_root; self.target_pid = target_pid; self.target_process_path = target_process_path; self.target_rect = rect; self.session_id = session_id; self.session_mode = mode; self.session_started = time.monotonic(); self.hunger_anchor_ns = time.monotonic_ns(); self.last_observation = self.session_started; self.capture_failures = 0; self.last_valid_score = None; self.frame_scores = []; self.frame_count = 0; self.mouse_count = 0; self.session_valid_frames = 0; self.session_valid_actions = 0; self.latest_frame_id = None; self.last_sleep_fingerprint_check = 0.0; self.current_training_fingerprint = ""; self.gdi_failures = 0; self.gdi_static_count = 0; self.last_feature_hash = ""; self.stable_feature_frames = 0; self.last_gdi_hash = ""; self.last_gdi_hash_input_ns = 0; self.fallback_capture_pending = False; self.last_mouse_activity_ns = 0; self.raw_mouse_drops = 0; self.last_mouse_by_source = {"ai": None, "user": None, "external_injected": None}; self.ai_step = 0; self.training_auto_sleep_count = 0 if mode == "training" and not automatic else self.training_auto_sleep_count
             model = self.store.best_model() if mode == "training" else None
             plan = model.get("q_actions", model.get("hotspots", [])) if isinstance(model, dict) and model.get("champion", True) else []
             self.ai_plan = [item for item in plan if isinstance(item, dict)] if isinstance(plan, list) else []
@@ -5284,7 +6084,13 @@ class Controller:
             self.feature_queue = context.feature_queue
             self.persist_queue = context.persist_queue
             self.pipeline_stop = context.stop_event
-        self.store.add_system_event(session_id, "mode_enter", {"mode": mode, "automatic": automatic, "time": time.time(), "client_rect": rect, "target_pid": self.target_pid, "resource": self.resources.sample()})
+            transition_ok = self._transition_state_locked("idle_click_training" if mode == "training" and not automatic else "auto_sleep_task2_done_resume_training" if mode == "training" and automatic else "idle_click_learning", "sleep" if automatic else "idle", mode, "start_session", token)
+        if not transition_ok:
+            try:
+                self.store.close_session(session_id, "进入模式失败：状态切换被拒绝")
+            except Exception:
+                pass
+            self.hook.stop(); self.keyboard_hook.stop(); return False
         self.window_guard.start(self.target_hwnd)
         detail = "已进入" + ("学习模式" if mode == "learning" else ("训练模式；无已验证模型，安全观察且不执行点击、右键或滚轮" if not self.ai_plan else "训练模式"))
         self.post_state(detail)
@@ -5385,6 +6191,23 @@ class Controller:
             return False
         return bool(context.accepting or context.draining)
 
+    def request_immediate_capture(self, reason=""):
+        with self.lock:
+            context = self.pipeline_context
+            active = self.state in ("learning", "training") and context is not None and context.accepting and not context.stop_event.is_set()
+        if not active:
+            return False
+        budget = self.resources.capture_snapshot()
+        if not budget.allowed or budget.must_pause or float(getattr(budget, "queue_fill_ratio", 0.0) or 0.0) >= 0.85:
+            return False
+        now = time.monotonic()
+        with self.lock:
+            if now - self.last_immediate_capture < 0.10:
+                return False
+            self.last_immediate_capture = now
+        self.immediate_capture_event.set()
+        return True
+
     def _capture_loop(self, context):
         token = context.token
         try:
@@ -5403,7 +6226,14 @@ class Controller:
                     budget.next_interval = max(float(budget.next_interval), 0.40 if capacity_tier < 95 else 1.20)
                     budget.max_capture_resolution = (320, 180) if capacity_tier >= 90 else (426, 240)
                     if capacity_tier >= 95:
-                        self.emit("notice", "经验池已达到 95% 预警，已降低采样；建议进入睡眠模式执行精确评分与清理。")
+                        now_notice = time.monotonic()
+                        with self.lock:
+                            should_notice = capacity_tier > self.last_capacity_notice_tier or now_notice - self.last_capacity_notice_at >= 60.0
+                            if should_notice:
+                                self.last_capacity_notice_at = now_notice
+                                self.last_capacity_notice_tier = capacity_tier
+                        if should_notice:
+                            self.emit("notice", "经验池已达到 {}% 预警，已降低采样；建议进入睡眠模式执行精确评分与清理。".format(capacity_tier))
                 if not budget.allowed:
                     if budget.must_pause:
                         self.request_idle("资源红色条件触发，停止截图与会话：" + (budget.pause_reason or "资源红线"), token)
@@ -5414,7 +6244,7 @@ class Controller:
                     self.capture_interval_seconds = float(budget.next_interval)
                 rect, reason = self._validate_bound_target(require_cursor=True, require_foreground=False)
                 if rect is None:
-                    self.request_idle("绑定雷电实例校验失败：" + reason, token)
+                    self.request_idle("绑定目标窗口校验失败：" + reason, token)
                     return
                 with self.lock:
                     hwnd = self.target_hwnd
@@ -5445,7 +6275,7 @@ class Controller:
                         self.capture_failures += 1
                         failures = self.capture_failures
                     if failures >= 12:
-                        self.request_idle("连续无法记录雷电模拟器画面", token)
+                        self.request_idle("连续无法记录目标窗口画面", token)
                         return
                 else:
                     self.resources.update_capture_metrics(image.get("capture_elapsed_ms"), False)
@@ -5459,7 +6289,9 @@ class Controller:
                     if self._packet_current(context, packet):
                         self._put_value_packet(context.capture_queue, packet, "capture", context)
                         self.resources.update_pipeline_queue(context.capture_queue.qsize() + context.feature_queue.qsize() + context.persist_queue.qsize(), self._pipeline_age(context), context.queue_capacity * 3)
-                time.sleep(budget.next_interval)
+                wait_time = max(0.05, float(budget.next_interval))
+                if self.immediate_capture_event.wait(wait_time):
+                    self.immediate_capture_event.clear()
         finally:
             context.capture_done.set()
 
@@ -5512,6 +6344,7 @@ class Controller:
                         "score_recall_guard": meta["recall_guard"],
                         "score_provisional": bool(meta.get("provisional", True)),
                         "score_valid": bool(meta.get("score_valid", False)) and online_score is not None,
+                        "score_generation": "online",
                     })
                     with self.lock:
                         previous_hash = self.last_gdi_hash
@@ -5592,6 +6425,8 @@ class Controller:
                             self._release_packet_budget(packet, context)
                             continue
                         packet["image"] = image
+                        if image.get("png"):
+                            self.store.journal_frame_packet(packet)
                         packet["queued_at"] = time.time()
                         packet["queued_monotonic"] = time.monotonic()
                         self._put_value_packet(context.persist_queue, packet, "encode", context)
@@ -5630,6 +6465,7 @@ class Controller:
                         experience_limit=self.settings.data.get("experience_limit"),
                     )
                     self.store.bind_mouse_events_after_frame(packet["session_id"], frame_id, packet["image"].get("capture_finished_monotonic_ns", 0))
+                    self.store.complete_accepted_journal(packet.get("accepted_journal_id") or packet["image"].get("accepted_journal_id"))
                     elapsed_ms = (time.monotonic() - started) * 1000.0
                     self.resources.update_sqlite_latency(elapsed_ms)
                     wal = self.store.wal_metrics()
@@ -5654,6 +6490,8 @@ class Controller:
                             "score": packet.get("exact_score"),
                             "hunger": packet.get("hunger"),
                             "score_status": "exact" if packet.get("exact_score") is not None else "provisional",
+                            "score_generation": packet["image"].get("score_generation", "online"),
+                            "history_boundary_frame_id": packet["image"].get("history_boundary_frame_id"),
                             "state_stable": bool(packet["image"].get("state_stable")),
                             "capture_complete": bool(packet["image"].get("capture_complete")),
                         }
@@ -5712,7 +6550,7 @@ class Controller:
                             self.frame_scores = list(summary["scores"])[-120:]
                             latest = summary.get("latest")
                             if latest and self.latest_frame_features and int(self.latest_frame_features.get("capture_finished_monotonic_ns", 0) or 0) == int(latest[4] or 0):
-                                self.latest_frame_features.update({"score": float(latest[1]), "hunger": float(latest[2]), "score_status": "exact"})
+                                self.latest_frame_features.update({"score": float(latest[1]), "hunger": float(latest[2]), "score_status": "exact", "score_generation": "deferred_exact"})
                                 self._cache_exact_state(latest[0], self.latest_frame_features, float(latest[1]), float(latest[2]))
                     continue
                 time.sleep(max(0.01, budget.next_interval * 0.25))
@@ -5737,7 +6575,7 @@ class Controller:
                         self.store.add_system_event(session_id, "client_validation_failure", details)
                     except Exception:
                         pass
-                self.request_idle("雷电模拟器客户区或绑定实例异常：" + reason, token)
+                self.request_idle("目标窗口客户区或绑定实例异常：" + reason, token)
                 return
             with self.lock:self.target_rect=rect
             if self._should_sleep(token):
@@ -5947,8 +6785,11 @@ class Controller:
             plan = list(self.ai_plan)
             current = dict(self.latest_frame_features) if self.latest_frame_features else None
             limits = dict(self.action_limits)
+            counts = dict(self.ai_region_counts)
         gates = {"左键": (12, 0.60, 0.0, 2.0, 20), "右键": (16, 0.65, 0.02, 3.0, 12), "滚轮": (14, 0.62, 0.0, 1.5, 24), "水平滚轮": (16, 0.65, 0.02, 2.0, 12)}
+        total_visits = max(1, sum(int(v) for v in counts.values()))
         viable = []
+        sample_metrics = self.resources.sample()
         for item in plan:
             if not isinstance(item, dict):
                 continue
@@ -5961,15 +6802,18 @@ class Controller:
                 effective_samples = float(item.get("effective_samples", samples) or 0.0)
                 interval_width = float(item.get("confidence_interval_width", 999.0) or 999.0)
                 baseline_support = float(item.get("baseline_support", 0.0) or 0.0)
-                queue_age = float(self.resources.sample().get("pipeline_queue_age", 0.0) or 0.0)
+                queue_age = float(sample_metrics.get("pipeline_queue_age", 0.0) or 0.0)
                 fresh = int((current or {}).get("capture_finished_monotonic_ns", 0) or 0) > 0 and time.monotonic_ns() - int((current or {}).get("capture_finished_monotonic_ns", 0) or 0) <= 1_000_000_000
                 distance, state_parts, critical_mismatch = self._state_distance_details(current, item)
-                if distance > float(item.get("state_similarity_threshold", 0.32)):
+                if distance > float(item.get("state_similarity_threshold", 0.38)):
                     continue
                 if critical_mismatch:
                     action_type = "移动"
                 x_ratio = min(0.95, max(0.05, float(item.get("x", 0.5))))
                 y_ratio = min(0.95, max(0.05, float(item.get("y", 0.5))))
+                gx = max(0, min(9, int(x_ratio * 10)))
+                gy = max(0, min(5, int(y_ratio * 6)))
+                visit_count = int(counts.get((gx, gy), 0) or 0)
                 current_local = local_visual_descriptor((current or {}).get("gray32x18"), (current or {}).get("color_histogram"), (current or {}).get("edge_density", 0.0), x_ratio, y_ratio, int((item.get("local_descriptor") or {}).get("radius", 3) or 3))
                 local_distance = local_visual_distance(current_local, item.get("local_descriptor") or {})
                 local_radius = max(0.0, min(1.0, float(item.get("local_uncertainty_radius", 1.0) or 1.0)))
@@ -5981,30 +6825,49 @@ class Controller:
                     recent = [t for t in stat.get("times", []) if time.monotonic() - t < 60.0]
                     if samples < min_samples or effective_samples < 8.0 or probability < min_probability or lcb <= min_lcb or float(item.get("validation_lower_bound", -1.0)) <= 0 or int(item.get("validation_samples", 0)) < 8 or float(item.get("validation_false_positive_rate", 1.0)) > 0.10 or interval_width >= 0.24 or baseline_support < 4.0 or uncertainty > 0.12 or distance >= 0.32 or not fresh or not bool((current or {}).get("state_stable")) or not bool((current or {}).get("capture_complete")) or str((current or {}).get("score_status", "")) != "exact" or queue_age > 0.25 or time.monotonic() - stat.get("last", 0.0) < cooldown or len(recent) >= per_minute:
                         action_type = "移动"
-                viable.append((probability - distance * 0.25, samples, action_type, distance, uncertainty, probability, item))
+                edge_risk = max(0.0, 0.12 - min(x_ratio, 1.0 - x_ratio, y_ratio, 1.0 - y_ratio)) * 3.0
+                exploration = math.sqrt(math.log(total_visits + 2.0) / (visit_count + 1.0))
+                coverage_bonus = 0.18 * exploration
+                uncertainty_bonus = 0.30 * uncertainty if action_type == "移动" else -0.55 * uncertainty
+                stability_bonus = 0.05 if bool((current or {}).get("state_stable")) else -0.05
+                risk = edge_risk + max(0.0, local_distance - 0.20) * 0.35 + distance * 0.35
+                score = probability + uncertainty_bonus + coverage_bonus + stability_bonus - risk + min(0.10, samples / 400.0)
+                viable.append((score, exploration, samples, action_type, distance, uncertainty, probability, x_ratio, y_ratio, item))
             except (TypeError, ValueError):
                 pass
-        viable.sort(reverse=True, key=lambda value: (value[0], value[1]))
-        item_tuple = viable[step % len(viable)] if viable else None
+        viable.sort(reverse=True, key=lambda value: (value[0], value[1], value[2]))
+        item_tuple = viable[0] if viable else None
         if item_tuple is not None:
-            _, samples, action_type, distance, uncertainty, probability, item = item_tuple
-            x_ratio = min(0.95, max(0.05, float(item.get("x", 0.5))))
-            y_ratio = min(0.95, max(0.05, float(item.get("y", 0.5))))
+            _, exploration, samples, action_type, distance, uncertainty, probability, x_ratio, y_ratio, item = item_tuple
             wheel_delta = max(-1200, min(1200, int(item.get("wheel_delta", 120 if action_type in ("滚轮", "水平滚轮") else 0))))
             model_available = True
         else:
-            x_ratio = 0.08 + 0.84 * ((step * 0.618033988749895) % 1.0)
-            y_ratio = 0.08 + 0.84 * ((step * 0.414213562373095) % 1.0)
+            grid = []
+            for gy in range(6):
+                for gx in range(10):
+                    x_ratio = (gx + 0.5) / 10.0
+                    y_ratio = (gy + 0.5) / 6.0
+                    visit_count = int(counts.get((gx, gy), 0) or 0)
+                    edge_risk = max(0.0, 0.10 - min(x_ratio, 1.0 - x_ratio, y_ratio, 1.0 - y_ratio)) * 2.0
+                    score = math.sqrt(math.log(total_visits + 2.0) / (visit_count + 1.0)) - edge_risk + ((step + gx * 17 + gy * 31) % 7) * 0.0001
+                    grid.append((score, gx, gy, x_ratio, y_ratio))
+            grid.sort(reverse=True)
+            _, gx, gy, x_ratio, y_ratio = grid[0]
             action_type = "移动"
-            probability = 0.58
-            uncertainty = 0.55
+            probability = 0.52
+            uncertainty = 0.68
             samples = 0
             wheel_delta = 0
             distance = 1.0
+            exploration = 1.0
             model_available = False
         x = rect[0] + int(width * x_ratio)
         y = rect[1] + int(height * y_ratio)
-        return {"x": x, "y": y, "action_type": action_type, "wheel_delta": wheel_delta, "confidence_probability": probability, "confidence": probability, "uncertainty": uncertainty, "samples": samples, "state_match_distance": distance, "model_available": model_available, "resource_metrics": self.resources.sample(), "capture_finished_monotonic_ns": int((current or {}).get("capture_finished_monotonic_ns", 0) or 0), "score_status": str((current or {}).get("score_status", "invalid")), "state_stable": bool((current or {}).get("state_stable")), "capture_complete": bool((current or {}).get("capture_complete"))}
+        gx = max(0, min(9, int(x_ratio * 10)))
+        gy = max(0, min(5, int(y_ratio * 6)))
+        with self.lock:
+            self.ai_region_counts[(gx, gy)] += 1
+        return {"x": x, "y": y, "action_type": action_type, "wheel_delta": wheel_delta, "confidence_probability": probability, "confidence": probability, "uncertainty": uncertainty, "samples": samples, "state_match_distance": distance, "model_available": model_available, "ucb_exploration": exploration, "region_visit_count": int(counts.get((gx, gy), 0) or 0), "resource_metrics": sample_metrics, "capture_finished_monotonic_ns": int((current or {}).get("capture_finished_monotonic_ns", 0) or 0), "score_status": str((current or {}).get("score_status", "invalid")), "state_stable": bool((current or {}).get("state_stable")), "capture_complete": bool((current or {}).get("capture_complete"))}
 
     def _validate_bound_target(self, require_cursor=True, require_foreground=False):
         with self.lock:
@@ -6013,7 +6876,7 @@ class Controller:
             expected_pid = self.target_pid
             expected_path = self.target_process_path
         if not hwnd or not expected_root or not expected_pid:
-            return None, "未绑定雷电实例"
+            return None, "未绑定目标窗口"
         if not user32.IsWindow(hwnd) or root_window(hwnd) != expected_root:
             return None, "窗口句柄已失效或根窗口已变化"
         pid = wintypes.DWORD()
@@ -6021,16 +6884,18 @@ class Controller:
         if int(pid.value) != int(expected_pid):
             return None, "绑定窗口 PID 已变化"
         actual_path = normalized_windows_path(process_full_path(int(pid.value)))
-        configured_path = normalized_windows_path(self.settings.data.get("emulator_path", ""))
-        if not actual_path or actual_path != expected_path or actual_path != configured_path:
+        configured_path = normalized_windows_path(self.settings.data.get("emulator_path", "")) if self.settings.data.get("emulator_path", "") else ""
+        if expected_path and (not actual_path or actual_path != expected_path):
             return None, "绑定窗口可执行文件路径已变化"
+        if configured_path and actual_path and actual_path != configured_path:
+            return None, "绑定窗口可执行文件路径与配置不一致"
         rect = valid_client(hwnd, require_cursor)
         if rect is None:
             return None, getattr(valid_client, "last_reason", "客户区无效")
         if require_foreground:
             foreground = root_window(user32.GetForegroundWindow())
             if not foreground or foreground != expected_root:
-                return None, "模拟器不是前台窗口"
+                return None, "目标窗口不是前台窗口"
             fg_pid = wintypes.DWORD()
             user32.GetWindowThreadProcessId(foreground, ctypes.byref(fg_pid))
             if int(fg_pid.value) != int(expected_pid):
@@ -6125,6 +6990,8 @@ class Controller:
             if not ok:
                 self.request_idle("AI 鼠标动作无法执行" + str(action_type), token)
                 return
+            if ok:
+                self.request_immediate_capture("ai_action_complete")
             if action_type != "移动":
                 if not self._wait_for_post_action_frame(token, action_finished_ns):
                     self.request_idle("非移动动作后未获得新鲜后置画面，已安全结束训练会话", token)
@@ -6161,23 +7028,10 @@ class Controller:
             queue_sets = (("capture", context.capture_queue), ("feature", context.feature_queue), ("persist", context.persist_queue))
             queues_left = sum(item[1].qsize() for item in queue_sets)
             if alive or queues_left:
-                context.stop_event.set()
-                lost = 0
-                for stage, pending in queue_sets:
-                    stage_lost = 0
-                    while True:
-                        try:
-                            packet = pending.get_nowait()
-                        except queue.Empty:
-                            break
-                        stage_lost += 1
-                        self._release_packet_budget(packet, context)
-                    if stage_lost:
-                        lost += stage_lost
-                        self.store.record_pipeline_loss(session_id, time.time(), time.time(), stage_lost, stage, "写入屏障超时强制丢弃")
-                context.closed = True
-                context.drain_complete.set()
-                forced_detail = "写入屏障超时：线程 {}，强制隔离并丢弃数据包 {}".format(",".join(alive) or "无", lost)
+                with self.lock:
+                    if context not in self.detached_pipeline_contexts:
+                        self.detached_pipeline_contexts.append(context)
+                forced_detail = "写入屏障超时：线程 {}，队列剩余 {}；已停止接收新数据，保留已接受数据继续排空或由 journal 恢复".format(",".join(alive) or "无", queues_left)
             else:
                 context.closed = True
                 context.stop_event.set()
@@ -6198,6 +7052,28 @@ class Controller:
             return False, "写入屏障一致性校验失败：" + detail
         self.store.add_system_event(session_id, "write_barrier", {"reason": reason, "time": time.time(), "consistency": detail, "pipeline_queue_age": self._pipeline_age(context), "pipeline_token": context.token if context is not None else None, "drained": True})
         return True, detail
+
+    def _wait_detached_pipeline_contexts(self, timeout=10.0):
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        with self.lock:
+            contexts = list(self.detached_pipeline_contexts)
+        remaining_contexts = []
+        for context in contexts:
+            for thread in list(context.threads):
+                if thread is threading.current_thread():
+                    continue
+                thread.join(max(0.05, deadline - time.monotonic()))
+            alive = [thread for thread in context.threads if thread is not threading.current_thread() and thread.is_alive()]
+            queues_left = context.capture_queue.qsize() + context.feature_queue.qsize() + context.persist_queue.qsize()
+            if alive or queues_left:
+                remaining_contexts.append(context)
+            else:
+                context.closed = True
+                context.stop_event.set()
+                context.drain_complete.set()
+        with self.lock:
+            self.detached_pipeline_contexts = remaining_contexts
+        return not remaining_contexts
 
     def _close_active_session(self, reason, barrier=True):
         with self.lock:
@@ -6252,12 +7128,14 @@ class Controller:
             self.cancel_event.set()
             context = self.pipeline_context
             if previous in ("learning", "training"):
-                self._transition_state_locked("stopping", reason, token)
+                self._transition_state_locked(self._event_for_stop_reason(reason), previous, "stopping", reason, token)
                 if context is not None:
                     context.accepting = False
                     context.draining = True
+            elif previous == "sleep":
+                self._transition_state_locked("esc", "sleep", "stopping", reason, token)
             else:
-                self._transition_state_locked("idle", reason, token)
+                self._transition_state_locked("client_invalid", previous, "idle", reason, token)
         clean = True
         detail = ""
         if previous in ("learning", "training"):
@@ -6272,7 +7150,10 @@ class Controller:
                 self.recovery_pending = True
                 self.recovery_reason = detail or "停止期间数据恢复待处理"
             self.epoch += 1
-            self._transition_state_locked("idle", reason, token)
+            if previous in ("learning", "training", "sleep"):
+                self._transition_state_locked(self._event_for_stop_reason(reason) if previous in ("learning", "training") else "esc", "stopping", "idle", reason, token)
+            else:
+                self._transition_state_locked("client_invalid", previous, "idle", reason, token)
             self.stop_requested.clear()
         self.ai_input_tracker.clear()
         self.emit("progress", 0.0)
@@ -6308,7 +7189,7 @@ class Controller:
             self.epoch += 1
             token = self.epoch
             self.cancel_event = threading.Event()
-            self._transition_state_locked("sleep", "manual_sleep", token)
+            self._transition_state_locked("manual_sleep", "idle", "sleep", "manual_sleep", token)
         self.post_state("已进入睡眠模式")
         threads = [threading.Thread(target=self._sleep_monitor, args=(token,), name="SleepMonitor"), threading.Thread(target=self._sleep_worker, args=(token, False), name="SleepWorker")]
         with self.lock:
@@ -6325,7 +7206,7 @@ class Controller:
             if token != self.epoch or self.state != "training":
                 return
             context = self.pipeline_context
-            self._transition_state_locked("stopping", "auto_sleep_drain", token)
+            self._transition_state_locked("auto_sleep_worth", "training", "stopping", "auto_sleep_worth", token)
             self.cancel_event.set()
             if context is not None:
                 context.accepting = False
@@ -6337,7 +7218,7 @@ class Controller:
             with self.lock:
                 self.recovery_pending = True
                 self.recovery_reason = detail or "自动睡眠前写入屏障未完成"
-                self._transition_state_locked("idle", "auto_sleep_cancelled", token)
+                self._transition_state_locked("client_invalid", "stopping", "idle", "auto_sleep_cancelled", token)
                 self.epoch += 1
             self.post_state("空闲；自动睡眠取消，数据恢复待处理：" + self.recovery_reason)
             return
@@ -6354,7 +7235,7 @@ class Controller:
                 self.last_auto_sleep_pool_bytes = int(self.store.pool_size_fast())
             except Exception:
                 self.last_auto_sleep_pool_bytes = 0
-            self._transition_state_locked("sleep", "auto_sleep", sleep_token)
+            self._transition_state_locked("auto_sleep_worth", "stopping", "sleep", "auto_sleep_worth", sleep_token)
         self.post_state("AI 判断当前值得进入睡眠模式")
         threads = [threading.Thread(target=self._sleep_monitor, args=(sleep_token,), name="AutoSleepMonitor"), threading.Thread(target=self._sleep_worker, args=(sleep_token, True), name="AutoSleepWorker")]
         with self.lock:
@@ -6379,7 +7260,12 @@ class Controller:
             if budget.allowed:
                 return True
             if budget.must_pause:
-                self.request_idle("资源红色条件触发，停止训练和维护：" + (budget.pause_reason or "资源红线"), token)
+                if task == "maintenance":
+                    sample = self.resources.sample()
+                    self.emit("state", {"state": "sleep", "detail": budget.pause_reason or "维护预算暂停，等待内存/磁盘/SQLite 恢复，按 ESC 才能空闲", "cpu": sample["cpu"], "memory": sample["memory"]})
+                    time.sleep(max(1.0, budget.next_interval))
+                    continue
+                self.request_idle("资源红色条件触发，停止训练：" + (budget.pause_reason or "资源红线"), token)
                 return False
             sample = self.resources.sample()
             self.emit("state", {"state": "sleep", "detail": budget.pause_reason or "资源预算要求暂停睡眠任务", "cpu": sample["cpu"], "memory": sample["memory"]})
@@ -6485,17 +7371,156 @@ class Controller:
             "champion_persisted": bool(champion_persisted),
         }
 
+    def _visual_policy_target(self, example):
+        advantage = float(example.get("action_advantage", example.get("reward_delta", 0.0)) or 0.0)
+        score_delta = float(example.get("score_delta", 0.0) or 0.0)
+        reward_delta = float(example.get("reward_delta", 0.0) or 0.0)
+        stability = _clamp_float(example.get("stability", 0.0), 0.0, 1.0)
+        baseline = max(0.0, float(example.get("baseline_count", 0.0) or 0.0))
+        confidence = _clamp_float(0.5 + 0.38 * math.tanh(advantage / 0.08) + 0.08 * math.tanh(score_delta / 0.08) + 0.04 * math.tanh(reward_delta / 0.08), 0.02, 0.98)
+        uncertainty = _clamp_float(0.08 + 0.62 * (1.0 - stability) + 0.20 / math.sqrt(1.0 + baseline) + 0.10 * (1.0 - min(1.0, abs(advantage) / 0.08)), 0.03, 0.95)
+        weight = _clamp_float(0.25 + 0.75 * stability + min(1.0, baseline / 8.0) * 0.5 + min(1.0, abs(advantage) / 0.12) * 0.5, 0.05, 2.0)
+        return confidence, uncertainty, weight
+
+    def _visual_policy_examples(self, items):
+        result = []
+        for item in items or []:
+            example = item[-1] if isinstance(item, tuple) else item
+            if not isinstance(example, dict) or not example.get("outcome_valid"):
+                continue
+            gray = feature_bytes(example.get("gray32x18"), 32 * 18)
+            if not gray:
+                continue
+            try:
+                rx = _clamp_float(example.get("action_rx", example.get("rx", 0.5)), 0.0, 1.0)
+                ry = _clamp_float(example.get("action_ry", example.get("ry", 0.5)), 0.0, 1.0)
+                confidence, uncertainty, weight = self._visual_policy_target(example)
+                result.append({"gray": gray.hex(), "rx": rx, "ry": ry, "confidence": confidence, "uncertainty": uncertainty, "weight": weight, "advantage": float(example.get("action_advantage", 0.0) or 0.0), "score_delta": float(example.get("score_delta", 0.0) or 0.0), "reward_delta": float(example.get("reward_delta", 0.0) or 0.0), "split_role": str(example.get("split_role", "")), "action_id": str(example.get("action_id", example.get("mouse_event_id", "")))})
+            except Exception:
+                continue
+        return result
+
+    def _train_visual_policy_weights(self, train_items, validation_items, token):
+        train_examples = self._visual_policy_examples(train_items)
+        validation_examples = self._visual_policy_examples([item[1] if isinstance(item, tuple) and len(item) == 2 else item for item in validation_items or []])
+        if len(train_examples) < 16 or len(validation_examples) < 4:
+            return None, "视觉策略样本不足：训练 {}，验证 {}".format(len(train_examples), len(validation_examples))
+        train_examples = sorted(train_examples, key=lambda item: item.get("action_id", ""))[-512:]
+        pos = [0.0] * 9
+        neg = [0.0] * 9
+        score = [0.0] * 9
+        reward = [0.0] * 9
+        signal = 0.0
+        for item in train_examples:
+            values = _gray32_values(item.get("gray"))
+            patch = _gray_patch(values, item.get("rx", 0.5), item.get("ry", 0.5))
+            if len(patch) != 9:
+                continue
+            advantage = float(item.get("advantage", 0.0))
+            score_delta = float(item.get("score_delta", 0.0))
+            reward_delta = float(item.get("reward_delta", 0.0))
+            weight = float(item.get("weight", 1.0))
+            signal += abs(advantage) * weight + abs(score_delta) * 0.5 + abs(reward_delta) * 0.5
+            for index, value in enumerate(patch):
+                pos[index] += max(0.0, advantage) * value * weight
+                neg[index] += max(0.0, -advantage) * value * weight
+                score[index] += score_delta * value * weight
+                reward[index] += reward_delta * value * weight
+        kernels = [
+            _normalize_kernel([a - b for a, b in zip(pos, neg)]),
+            _normalize_kernel(pos),
+            _normalize_kernel(neg),
+            _normalize_kernel([a + b for a, b in zip(score, reward)]),
+        ]
+        conv_weight = [value for kernel in kernels for value in kernel]
+        if signal <= 1e-6 or sum(abs(value) for value in conv_weight) <= 1e-6:
+            return None, "视觉样本没有可学习的动作结果信号"
+        conv_bias = [0.0, 0.0, 0.0, 0.0]
+        prepared = []
+        for item in train_examples:
+            features = conv_policy_features(_gray32_values(item.get("gray")), conv_weight, conv_bias)
+            if features:
+                prepared.append((features, (float(item["confidence"]), float(item["uncertainty"])), float(item["weight"])))
+        if len(prepared) < 16:
+            return None, "视觉卷积特征不足"
+        mean_conf = sum(item[1][0] for item in prepared) / len(prepared)
+        mean_unc = sum(item[1][1] for item in prepared) / len(prepared)
+        fc_weight = [0.0] * (4 * 16 * 30 * 2)
+        bias = [_logit(mean_conf), _logit(mean_unc)]
+        learning_rate = 0.035
+        l2 = 0.0007
+        for epoch in range(5):
+            if self._cancelled(token):
+                return None, "训练被取消"
+            budget = self.resources.acquire("sleep_training")
+            if not budget.allowed:
+                return None, "视觉策略训练资源预算不足"
+            for features, target, weight in prepared:
+                logits = [bias[0], bias[1]]
+                for index, value in enumerate(features):
+                    if value:
+                        base = index * 2
+                        logits[0] += value * fc_weight[base]
+                        logits[1] += value * fc_weight[base + 1]
+                pred0 = _sigmoid_float(logits[0])
+                pred1 = _sigmoid_float(logits[1])
+                errors = [(pred0 - target[0]) * weight, (pred1 - target[1]) * weight]
+                bias[0] = _clamp_float(bias[0] - learning_rate * errors[0], -8.0, 8.0)
+                bias[1] = _clamp_float(bias[1] - learning_rate * errors[1], -8.0, 8.0)
+                for index, value in enumerate(features):
+                    if not value:
+                        continue
+                    base = index * 2
+                    fc_weight[base] = _clamp_float(fc_weight[base] - learning_rate * (errors[0] * value + l2 * fc_weight[base]), -0.75, 0.75)
+                    fc_weight[base + 1] = _clamp_float(fc_weight[base + 1] - learning_rate * (errors[1] * value + l2 * fc_weight[base + 1]), -0.75, 0.75)
+        validation_rows = []
+        sign_hits = 0
+        mae_conf = 0.0
+        mae_unc = 0.0
+        for item in validation_examples:
+            features = conv_policy_features(_gray32_values(item.get("gray")), conv_weight, conv_bias)
+            if not features:
+                continue
+            logits = [bias[0], bias[1]]
+            for index, value in enumerate(features):
+                if value:
+                    base = index * 2
+                    logits[0] += value * fc_weight[base]
+                    logits[1] += value * fc_weight[base + 1]
+            pred = (_sigmoid_float(logits[0]), _sigmoid_float(logits[1]))
+            target = (float(item["confidence"]), float(item["uncertainty"]))
+            sign_hits += int((pred[0] >= 0.5) == (target[0] >= 0.5))
+            mae_conf += abs(pred[0] - target[0])
+            mae_unc += abs(pred[1] - target[1])
+            validation_rows.append((pred, target))
+        if len(validation_rows) < 4:
+            return None, "视觉策略验证样本不足"
+        sign_rate = sign_hits / max(1, len(validation_rows))
+        mae_conf /= len(validation_rows)
+        mae_unc /= len(validation_rows)
+        if sign_rate < 0.45 or mae_conf > 0.42:
+            return None, "视觉策略验证未通过：方向命中 {:.1%}，置信 MAE {:.3f}".format(sign_rate, mae_conf)
+        weights = {"conv_weight": [round(float(v), 7) for v in conv_weight], "conv_bias": [round(float(v), 7) for v in conv_bias], "fc_weight": [round(float(v), 7) for v in fc_weight], "bias": [round(float(v), 7) for v in bias]}
+        metrics = {"train_examples": len(prepared), "validation_examples": len(validation_rows), "validation_sign_hit_rate": sign_rate, "validation_confidence_mae": mae_conf, "validation_uncertainty_mae": mae_unc, "input": "gray32x18", "target": "action_advantage+score_delta+reward_delta", "split": "session_or_time_block"}
+        return {"weights": weights, "metrics": metrics}, ""
+
     def _export_policy_onnx(self, payload, path):
         try:
-            actions = [item for item in payload.get("q_actions", []) if isinstance(item, dict)] if isinstance(payload, dict) else []
-            probabilities = [float(item.get("confidence_probability", 0.5) or 0.5) for item in actions]
-            uncertainties = [float(item.get("uncertainty", 0.18) or 0.18) for item in actions]
-            confidence_bias = sum(probabilities) / max(1, len(probabilities))
-            uncertainty_bias = sum(uncertainties) / max(1, len(uncertainties))
+            weights = (payload or {}).get("visual_policy_weights") or {}
+            conv_weight = weights.get("conv_weight")
+            conv_bias = weights.get("conv_bias")
+            fc_weight = weights.get("fc_weight")
+            bias = weights.get("bias")
+            path = self.store._assert_storage_path(path, "onnx_export")
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(policy_onnx_bytes(confidence_bias, uncertainty_bias))
-            payload["onnx_input_schema"] = ["is_move", "samples_norm", "state_match_distance", "uncertainty", "model_available"]
+            temporary_bytes = policy_onnx_bytes(conv_weight, fc_weight, bias, conv_bias)
+            with path.open("wb") as handle:
+                handle.write(temporary_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+            payload["onnx_input_schema"] = ["gray32x18_normalized", "NCHW", 1, 18, 32]
             payload["onnx_output_schema"] = ["confidence", "uncertainty"]
+            payload["onnx_model_kind"] = "trained_visual_conv_policy"
             payload["onnx_exported"] = True
             return True
         except Exception as error:
@@ -6519,9 +7544,9 @@ class Controller:
                 raise RuntimeError("ONNX 输入输出数量不符合策略 schema")
             sample = inputs[0]
             shape = [1 if not isinstance(dim, int) or dim <= 0 else int(dim) for dim in sample.shape]
-            if len(shape) != 2 or shape[1] != 5:
-                raise RuntimeError("ONNX 输入 shape 不符合策略 schema")
-            result = session.run(None, {sample.name: np.asarray([[1.0, 0.5, 0.2, 0.1, 1.0]], dtype=np.float32)})
+            if len(shape) != 4 or shape[1:] != [1, 18, 32]:
+                raise RuntimeError("ONNX 输入 shape 不符合视觉策略 schema")
+            result = session.run(None, {sample.name: np.full(shape, 0.5, dtype=np.float32)})
             values = np.asarray(result[0], dtype=np.float32).reshape(-1)
             if values.size < 2:
                 raise RuntimeError("ONNX 输出数量不足")
@@ -6625,7 +7650,7 @@ class Controller:
                 gx=min(15,max(0,int(float(action["rx"])*16)));gy=min(8,max(0,int(float(action["ry"])*9)))
                 local_descriptor=local_visual_descriptor(before[11],before[13],before[12],action["rx"],action["ry"],3)
                 local_key=local_descriptor.get("gray","")[:48]
-                example={"action_id":action["action_id"],"session_id":session_id,"before_frame_id":before[0],"after_frame_id":after[0],"mouse_event_id":action["mouse_event_id"],"action_time":action_ns,"post_action_delay_ms":post_ms,"score_delta":score_delta,"reward_delta":reward_delta,"hunger_delta_expected":expected_hunger,"baseline_score_delta":baseline_score_delta,"expected_no_action_reward_delta":expected_no_action_reward_delta,"action_advantage":advantage,"stability":stable,"baseline_count":len(nearest),"trajectory":dict(action.get("trajectory") or {}),"behavior_probability":action.get("behavior_probability"),"local_descriptor":local_descriptor,"outcome_valid":role!="excluded_gap" and stable>=0.45,"split_role":role}
+                example={"action_id":action["action_id"],"session_id":session_id,"before_frame_id":before[0],"after_frame_id":after[0],"mouse_event_id":action["mouse_event_id"],"action_time":action_ns,"post_action_delay_ms":post_ms,"score_delta":score_delta,"reward_delta":reward_delta,"hunger_delta_expected":expected_hunger,"baseline_score_delta":baseline_score_delta,"expected_no_action_reward_delta":expected_no_action_reward_delta,"action_advantage":advantage,"stability":stable,"baseline_count":len(nearest),"trajectory":dict(action.get("trajectory") or {}),"behavior_probability":action.get("behavior_probability"),"local_descriptor":local_descriptor,"gray32x18":before[11],"edge_density":before[12],"color_histogram":before[13],"action_rx":float(action["rx"]),"action_ry":float(action["ry"]),"outcome_valid":role!="excluded_gap" and stable>=0.45,"split_role":role}
                 persisted.append(example)
                 wheel_axis=action.get("wheel_axis","");signed=int(action.get("wheel_delta",action.get("signed_delta",0)) or 0);wheel_direction=1 if signed>0 else -1 if signed<0 else 0;wheel_bucket=min(10,abs(signed)//120)
                 key=(state_key,gx,gy,action["action_type"],wheel_axis,wheel_direction,wheel_bucket,local_key)
@@ -6712,7 +7737,17 @@ class Controller:
         safe_actions=validated_move+validated_nonmoving
         policy_layers={"state_encoder":{"verified":True,"source":"gray32x18+dhash64+color_histogram","uncertainty":"student_t_lcb_and_local_radius"},"action_value_model":{"verified":bool(validated_move),"target":"action_advantage","cross_session":not single_session_split},"move_policy":{"verified":bool(validated_move),"actions":len(validated_move),"quality":move_quality,"validation_samples":move_n},"click_policy":{"verified":bool(click_actions),"actions":len(click_actions)},"sleep_policy":{"verified":True,"source":"sleep_decision_samples","actions":0},"delete_policy":{"verified":True,"source":"retain_value_pruning","actions":0},"wheel_policy":{"verified":bool(wheel_actions),"actions":len(wheel_actions)}}
         model_grade="single_session_move_only" if single_session_split else "cross_session_validated"
-        payload={"id":uuid.uuid4().hex,"trained_at":time.time(),"quality":candidate_quality,"train_quality":sum(a["average_action_advantage"] for a in actions)/max(1,len(actions)),"frame_count":sum(len(v) for v in frames_by_session.values()),"mouse_count":sum(len(v) for v in mouse_by_session.values()),"training_samples":len(outcomes),"semantic_actions":all_actions_count,"validation_samples":len(validation_outcomes),"validation_hits":hits,"validation_mean_action_advantage":val_mean,"validation_confidence_interval":val_ci,"validation_failure_rate":failures/max(1,len(validation_outcomes)),"validation_mean_absolute_error":sum(absolute_errors)/max(1,len(absolute_errors)),"validation_sign_hit_rate":sign_hits/max(1,hits),"validation_lcb_coverage_rate":lcb_coverages/max(1,hits),"validation_state_coverage":len({key[0] for key,_ in validation_outcomes}),"validation_sessions":sorted(set(validation_blocks)),"coverage_states":len({a["state_key"] for a in actions}),"failure_rate":len([a for a in actions if a["confidence_lower_bound"]<=0])/max(1,len(actions)),"nonmoving_candidates":len(nonmoving),"nonmoving_validated":len(validated_nonmoving),"move_candidates":len(move_actions),"move_validated":len(validated_move),"policy_layers":policy_layers,"offline_policy_evaluation":offline_policy,"model_version":11,"model_grade":model_grade,"champion":True,"last_used":time.time(),"action_quality":candidate_quality,"validation_quality":candidate_quality,"global_validation_quality":quality,"move_validation_quality":move_quality,"policy":{"min_samples":12,"min_effective_samples":8,"min_validation_samples":8,"uncertainty_threshold":0.12,"max_confidence_interval_width":0.24,"min_confidence_lower_bound":0.0,"min_baseline_support":4,"similarity_threshold":0.78,"max_nonmoving_false_positive_rate":0.10,"low_confidence_action":"move_only","blacklist_regions":[],"target":"action_advantage"},"q_actions":sorted(safe_actions,key=lambda a:(a.get("validation_lower_bound",-1.0),a["confidence_lower_bound"],a["samples"]),reverse=True)[:256],"outcome_examples":outcomes[-256:]}
+        payload={"id":uuid.uuid4().hex,"trained_at":time.time(),"quality":candidate_quality,"train_quality":sum(a["average_action_advantage"] for a in actions)/max(1,len(actions)),"frame_count":sum(len(v) for v in frames_by_session.values()),"mouse_count":sum(len(v) for v in mouse_by_session.values()),"training_samples":len(outcomes),"semantic_actions":all_actions_count,"validation_samples":len(validation_outcomes),"validation_hits":hits,"validation_mean_action_advantage":val_mean,"validation_confidence_interval":val_ci,"validation_failure_rate":failures/max(1,len(validation_outcomes)),"validation_mean_absolute_error":sum(absolute_errors)/max(1,len(absolute_errors)),"validation_sign_hit_rate":sign_hits/max(1,hits),"validation_lcb_coverage_rate":lcb_coverages/max(1,hits),"validation_state_coverage":len({key[0] for key,_ in validation_outcomes}),"validation_sessions":sorted(set(validation_blocks)),"coverage_states":len({a["state_key"] for a in actions}),"failure_rate":len([a for a in actions if a["confidence_lower_bound"]<=0])/max(1,len(actions)),"nonmoving_candidates":len(nonmoving),"nonmoving_validated":len(validated_nonmoving),"move_candidates":len(move_actions),"move_validated":len(validated_move),"policy_layers":policy_layers,"offline_policy_evaluation":offline_policy,"model_version":12,"model_grade":model_grade,"champion":True,"last_used":time.time(),"action_quality":candidate_quality,"validation_quality":candidate_quality,"global_validation_quality":quality,"move_validation_quality":move_quality,"policy":{"min_samples":12,"min_effective_samples":8,"min_validation_samples":8,"uncertainty_threshold":0.12,"max_confidence_interval_width":0.24,"min_confidence_lower_bound":0.0,"min_baseline_support":4,"similarity_threshold":0.78,"max_nonmoving_false_positive_rate":0.10,"low_confidence_action":"move_only","blacklist_regions":[],"target":"action_advantage"},"q_actions":sorted(safe_actions,key=lambda a:(a.get("validation_lower_bound",-1.0),a["confidence_lower_bound"],a["samples"]),reverse=True)[:256],"outcome_examples":outcomes[-256:]}
+        visual_result, visual_reason = self._train_visual_policy_weights(outcomes, validation_outcomes, token)
+        if visual_result is None:
+            payload["champion"] = False
+            payload["visual_policy_error"] = visual_reason
+            self._record_training_failure(fingerprint, visual_reason)
+            self.store.add_system_event(None, "visual_policy_training_failed", {"reason": visual_reason, "training_samples": len(outcomes), "validation_samples": len(validation_outcomes), "fingerprint": fingerprint, "time": time.time()})
+            return self._training_result("failed", visual_reason, payload, len(outcomes), len(validation_outcomes), 0.0, False)
+        payload["visual_policy_weights"] = visual_result["weights"]
+        payload["visual_policy_metrics"] = visual_result["metrics"]
+        payload["policy_layers"]["vision_policy"] = {"verified": True, "source": "gray32x18+local_visual_features+action_result+score_delta", "validation": visual_result["metrics"]}
         champion=self.store.best_model();champion_layers=champion.get("policy_layers",{}) if isinstance(champion,dict) else {};champion_quality=float(champion_layers.get("move_policy",{}).get("quality",champion.get("validation_quality",-999999.0))) if isinstance(champion,dict) else -999999.0
         enough=len(outcomes)>=24 and bool(validated_move) and len({a["state_key"] for a in move_actions})>=1 and len(set(validation_blocks))>=1 and (move_n>=4 or hits>=8)
         if not enough or candidate_quality <= champion_quality:
@@ -6721,19 +7756,36 @@ class Controller:
             self._record_training_failure(fingerprint, reason)
             self.store.add_system_event(None, "model_candidate_rejected", {"validation_quality": candidate_quality, "champion_quality": champion_quality, "validation_samples": len(validation_outcomes), "validation_hits": hits, "training_samples": len(outcomes), "move_validated": len(validated_move), "nonmoving_validated": len(validated_nonmoving), "fingerprint": fingerprint, "time": time.time()})
             return self._training_result("rejected", reason, champion if isinstance(champion, dict) else payload, len(outcomes), len(validation_outcomes), candidate_quality - champion_quality, False)
-        name="model_"+datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")+"_"+payload["id"][:8]+".json";final_path=self.store.models/name;onnx_path=final_path.with_suffix(".onnx");temp_onnx=onnx_path.with_name(onnx_path.name+".tmp")
-        if self._export_policy_onnx(payload, temp_onnx) and self._verify_policy_onnx(temp_onnx, payload):
-            temp_onnx.replace(onnx_path)
-            payload["onnx_path"] = onnx_path.name
-        else:
-            temp_onnx.unlink(missing_ok=True)
-        temp_path=final_path.with_suffix(".tmp");temp_path.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8")
+        name="model_"+datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")+"_"+payload["id"][:8]+".json"
+        final_path=self.store._assert_storage_path(self.store.models/name, "model_json")
+        onnx_path=self.store._assert_storage_path(final_path.with_suffix(".onnx"), "model_onnx")
+        temp_onnx=self.store._assert_storage_path(onnx_path.with_name(onnx_path.name+".tmp"), "model_onnx_tmp")
+        export_ok = self._export_policy_onnx(payload, temp_onnx)
+        verify_ok = self._verify_policy_onnx(temp_onnx, payload) if export_ok else False
+        if not (export_ok and verify_ok and payload.get("onnx_exported") is True and payload.get("onnx_policy_verified") is True):
+            self.store._safe_unlink_storage(temp_onnx, "onnx_export_failed_cleanup")
+            payload["champion"] = False
+            reason = "ONNX 导出或验证失败，拒绝保存冠军模型：{}".format(payload.get("onnx_export_error") or payload.get("onnx_self_test_error") or "未通过")
+            self._record_training_failure(fingerprint, reason)
+            try:
+                self.store.add_system_event(None, "model_candidate_rejected", {"reason": reason, "onnx_exported": bool(payload.get("onnx_exported")), "onnx_policy_verified": bool(payload.get("onnx_policy_verified")), "fingerprint": fingerprint, "time": time.time()})
+            except Exception:
+                pass
+            return self._training_result("failed", reason, payload, len(outcomes), len(validation_outcomes), candidate_quality - champion_quality, False)
+        temp_onnx.replace(onnx_path)
+        self.store._fsync_directory(onnx_path.parent)
+        payload["onnx_path"] = onnx_path.name
+        temp_path=self.store._assert_storage_path(final_path.with_suffix(".tmp"), "model_json_tmp")
+        with temp_path.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload,ensure_ascii=False,indent=2))
+            handle.flush()
+            os.fsync(handle.fileno())
         if self._cancelled(token):
-            temp_path.unlink(missing_ok=True)
-            if payload.get("onnx_path"):
-                onnx_path.unlink(missing_ok=True)
+            self.store._safe_unlink_storage(temp_path, "model_json_cancelled_cleanup")
+            self.store._safe_unlink_storage(onnx_path, "model_onnx_cancelled_cleanup")
             return self._training_result("cancelled", "模型落盘前被取消", training_samples=len(outcomes), validation_samples=len(validation_outcomes))
         temp_path.replace(final_path)
+        self.store._fsync_directory(final_path.parent)
         self.store.register_model_metadata(payload["id"], final_path, payload, outcomes, validation_outcomes)
         self.last_model_training = time.time()
         self.last_training_success = self.last_model_training
@@ -6741,7 +7793,74 @@ class Controller:
         self.training_retry_count = 0
         self.next_training_retry_at = 0.0
         self.last_training_failure_reason = ""
-        return self._training_result("trained", "新冠军移动策略已落盘；未验证动作类型保持禁用", payload, len(outcomes), len(validation_outcomes), candidate_quality - champion_quality, True)
+        return self._training_result("trained", "新冠军视觉策略已落盘并通过 ONNX 自测", payload, len(outcomes), len(validation_outcomes), candidate_quality - champion_quality, True)
+
+    def _run_sleep_task2_until_done(self, token, experience_limit, before_pool, pool_was_over_limit):
+        retry = 0
+        while not self._cancelled(token):
+            self.store.recover_deletions()
+            if not self._wait_resource(token, "maintenance"):
+                continue
+            budget = self.resources.acquire("maintenance")
+            if not budget.allowed:
+                time.sleep(max(1.0, budget.next_interval))
+                continue
+            batch_size = max(1, min(8, int(budget.max_batch)))
+            self.flush_mouse_records()
+            model_removed = self.store.prune_models(max(1, int(self.settings.data["model_limit"])), lambda: self._cancelled(token), lambda: self._wait_resource(token, "maintenance"), batch_size=batch_size)
+            if not self._wait_resource(token, "maintenance"):
+                continue
+            budget = self.resources.acquire("maintenance")
+            if not budget.allowed:
+                time.sleep(max(1.0, budget.next_interval))
+                continue
+            batch_size = max(1, min(8, int(budget.max_batch)))
+            experience_removed, remaining = self.store.prune_experience(max(1, experience_limit), lambda: self._cancelled(token), lambda value: self.emit("progress", value), lambda: self._wait_resource(token, "maintenance"), batch_size=batch_size)
+            if self._cancelled(token):
+                return None
+            model_status = getattr(self.store, "last_model_prune_result", {"success": True, "remaining": len(self.store.model_files()), "target": len(self.store.model_files())})
+            pool_status = getattr(self.store, "last_experience_prune_result", {"success": remaining <= experience_limit, "remaining": remaining, "target": int(experience_limit * 0.5)})
+            actual_breakdown = self.store.pool_breakdown(True)
+            remaining = int(actual_breakdown.get("experience_total_bytes", 0))
+            target = int(experience_limit * 0.5)
+            model_ok = bool(model_status.get("success"))
+            pool_ok = bool(pool_status.get("success")) and (not pool_was_over_limit or remaining <= target)
+            if model_ok and pool_ok:
+                return model_removed, experience_removed, remaining
+            retry += 1
+            detail = "任务2未完成：模型 {} / 目标 {}；经验池 {} / 目标 {}。保持睡眠模式低频重试清理；按 ESC 才能空闲。".format(model_status.get("remaining"), model_status.get("target"), remaining, target)
+            try:
+                self.store.add_system_event(None, "sleep_task2_retry", {"reason": detail, "retry": retry, "model_status": model_status, "pool_status": pool_status, "time": time.time()})
+            except Exception:
+                pass
+            sample = self.resources.sample()
+            self.emit("state", {"state": "sleep", "detail": detail, "cpu": sample["cpu"], "memory": sample["memory"]})
+            self.emit("progress", 56.0)
+            time.sleep(min(30.0, 3.0 + retry))
+        return None
+
+    def _wait_auto_sleep_training_resume(self, token, detail):
+        while not self._cancelled(token):
+            hwnd, rect, reason = self._find_valid_target(False)
+            resume_reason = reason or ""
+            ok = False
+            if hwnd is not None and rect is not None and activate_root_window(hwnd):
+                time.sleep(0.08)
+                if foreground_root_matches(hwnd) and self._place_cursor_before_entry(hwnd, rect) and not self._cancelled(token) and valid_client(hwnd, True) is not None and entry_capture_pixel_validation(hwnd):
+                    ok = True
+                else:
+                    resume_reason = "前台、鼠标入区或客户区像素校验失败：" + getattr(entry_capture_pixel_validation, "last_reason", "校验失败")
+            else:
+                resume_reason = resume_reason or getattr(activate_root_window, "last_reason", "客户区状态异常")
+            if ok:
+                self.emit("progress", 0.0)
+                if self.start_session("training", automatic=True):
+                    return True
+                resume_reason = "自动睡眠完成，但恢复训练模式启动失败"
+            sample = self.resources.sample()
+            self.emit("state", {"state": "sleep", "detail": detail + "；等待目标窗口恢复后自动回到训练模式：" + str(resume_reason), "cpu": sample["cpu"], "memory": sample["memory"]})
+            time.sleep(2.0)
+        return False
 
     def _sleep_worker(self, token, resume_training):
         started = time.monotonic()
@@ -6763,17 +7882,21 @@ class Controller:
                     sessions = self.store.exclude_failed_deferred_sessions()
                     training_result = self._training_result("failed", "{} 个会话存在三次失败的精确评分".format(len(sessions)))
                     self.store.finalize_sleep_decision(decision_id, training_result, 0, time.monotonic() - started, 0.0)
-                    self._finish_idle(token, "任务1未产出新模型：{}".format(training_result["reason"]), True)
-                    return
+                    sample = self.resources.sample()
+                    self.emit("state", {"state": "sleep", "detail": "精确评分失败，保持睡眠；按 ESC 才能空闲：{}".format(training_result["reason"]), "cpu": sample["cpu"], "memory": sample["memory"]})
+                    time.sleep(5.0)
+                    continue
                 if pending["pending"] <= 0:
                     break
                 budget = self.resources.acquire("maintenance")
                 if not budget.allowed:
                     if budget.must_pause:
-                        training_result = self._training_result("cancelled", "资源红线阻止精确评分")
+                        training_result = self._training_result("cancelled", "维护预算暂停精确评分")
                         self.store.finalize_sleep_decision(decision_id, training_result, 0, time.monotonic() - started, 0.0)
-                        self._finish_idle(token, "任务1未产出新模型：资源红线", True)
-                        return
+                        sample = self.resources.sample()
+                        self.emit("state", {"state": "sleep", "detail": "维护暂停精确评分，保持睡眠；按 ESC 才能空闲：" + (budget.pause_reason or "资源红线"), "cpu": sample["cpu"], "memory": sample["memory"]})
+                        time.sleep(max(1.0, budget.next_interval))
+                        continue
                     time.sleep(max(0.02, budget.next_interval))
                     continue
                 resolved = self.store.process_deferred_exact_scores(lambda: self._cancelled(token), lambda: self.resources.capture_snapshot().allowed, maximum=max(1, int(getattr(budget, "database_batch_size", 1))), hunger_rate_provider=self._current_hunger_rate)
@@ -6789,33 +7912,24 @@ class Controller:
             if self._cancelled(token):
                 return
             if training_result["status"] == "trained":
-                task1_detail = "任务1完成：已产出并落盘新冠军模型"
+                task1_detail = "任务1完成：已产出并落盘新冠军视觉模型"
             else:
-                task1_detail = "任务1未产出新模型：{}".format(training_result.get("reason") or training_result.get("status"))
+                task1_detail = "任务1失败，未生成有效视觉模型：{}".format(training_result.get("reason") or training_result.get("status"))
+                self.store.finalize_sleep_decision(decision_id, training_result, 0, time.monotonic() - started, 0.0)
+                sample = self.resources.sample()
+                self.emit("progress", 56.0)
+                self.emit("state", {"state": "sleep", "detail": task1_detail + "；不会执行任务2，不删除经验池或旧模型；按 ESC 才能空闲。", "cpu": sample["cpu"], "memory": sample["memory"]})
+                while not self._cancelled(token):
+                    time.sleep(1.0)
+                    sample = self.resources.sample()
+                    self.emit("state", {"state": "sleep", "detail": task1_detail + "；任务2已阻止；按 ESC 才能空闲。", "cpu": sample["cpu"], "memory": sample["memory"]})
+                return
             self.emit("progress", 56.0)
             self.emit("state", {"state": "sleep", "detail": task1_detail + "；任务2：检查 AI 模型与经验池", "cpu": self.resources.sample()["cpu"], "memory": self.resources.sample()["memory"]})
-            self.store.recover_deletions()
-            if not self._wait_resource(token, "maintenance"):
+            task2_result = self._run_sleep_task2_until_done(token, experience_limit, before_pool, pool_was_over_limit)
+            if task2_result is None:
                 return
-            self.flush_mouse_records()
-            model_removed = self.store.prune_models(max(1, int(self.settings.data["model_limit"])), lambda: self._cancelled(token), lambda: self._wait_resource(token, "maintenance"))
-            experience_removed, remaining = self.store.prune_experience(max(1, experience_limit), lambda: self._cancelled(token), lambda value: self.emit("progress", value), lambda: self._wait_resource(token, "maintenance"))
-            if self._cancelled(token):
-                return
-            model_status = getattr(self.store, "last_model_prune_result", {"success": True, "remaining": len(self.store.model_files()), "target": len(self.store.model_files())})
-            pool_status = getattr(self.store, "last_experience_prune_result", {"success": remaining <= experience_limit, "remaining": remaining, "target": int(experience_limit * 0.5)})
-            if not model_status.get("success") or not pool_status.get("success"):
-                detail = "任务2未完成：模型 {} / 目标 {}；经验池 {} / 目标 {}。已停止采集新截图，等待清理完成。".format(model_status.get("remaining"), model_status.get("target"), pool_status.get("remaining"), pool_status.get("target"))
-                self.store.finalize_sleep_decision(decision_id, training_result, max(0, before_pool - remaining), time.monotonic() - started, 0.0)
-                self._finish_idle(token, detail, True)
-                return
-            actual_breakdown = self.store.pool_breakdown(True)
-            remaining = int(actual_breakdown.get("experience_total_bytes", 0))
-            if pool_was_over_limit and remaining > int(experience_limit * 0.5):
-                detail = "任务2实际目录大小未降至经验池上限的 50%，禁止恢复训练"
-                self.store.finalize_sleep_decision(decision_id, training_result, max(0, before_pool - remaining), time.monotonic() - started, 0.0)
-                self._finish_idle(token, detail, True)
-                return
+            model_removed, experience_removed, remaining = task2_result
             after_model = self.store.best_model() or {}
             after_quality = float(after_model.get("validation_quality", after_model.get("quality", 0.0)) or 0.0) if isinstance(after_model, dict) else 0.0
             restored_gain = after_quality - before_quality if resume_training and training_result["status"] == "trained" else 0.0
@@ -6824,20 +7938,7 @@ class Controller:
             self.emit("progress", 100.0)
             detail = "{}；任务2完成：删除 AI 模型 {} 个，删除经验 {} 条，经验池 {:.2f} MB".format(task1_detail, model_removed, experience_removed, remaining / 1024 / 1024)
             if resume_training:
-                hwnd, rect, reason = self._find_valid_target(False)
-                if hwnd is None or rect is None or not activate_root_window(hwnd):
-                    self._finish_idle(token, "自动睡眠完成，但无法恢复训练：" + (reason or getattr(activate_root_window, "last_reason", "客户区状态异常")), True)
-                    return
-                time.sleep(0.08)
-                if not foreground_root_matches(hwnd) or not self._place_cursor_before_entry(hwnd, rect):
-                    self._finish_idle(token, "自动睡眠完成，但无法恢复训练：前台或鼠标入区校验失败", True)
-                    return
-                if self._cancelled(token) or valid_client(hwnd, True) is None or not entry_capture_pixel_validation(hwnd):
-                    self._finish_idle(token, "自动睡眠完成，但雷电模拟器客户区状态异常：" + getattr(entry_capture_pixel_validation, "last_reason", "像素校验失败"), True)
-                    return
-                self.emit("progress", 0.0)
-                if not self.start_session("training", automatic=True):
-                    self._finish_idle(token, "自动睡眠完成，但无法恢复训练模式", True)
+                self._wait_auto_sleep_training_resume(token, detail)
             else:
                 self._finish_idle(token, detail, True)
         except Exception as error:
@@ -6846,7 +7947,8 @@ class Controller:
                 self.store.finalize_sleep_decision(decision_id, training_result, 0, time.monotonic() - started, 0.0)
             except Exception:
                 pass
-            self._finish_idle(token, "睡眠模式发生错误：" + str(error), True)
+            sample = self.resources.sample()
+            self.emit("state", {"state": "sleep", "detail": "睡眠模式发生错误，保持睡眠；按 ESC 才能空闲：" + str(error), "cpu": sample["cpu"], "memory": sample["memory"]})
 
     def _finish_idle(self, token, detail, release_keyboard=True):
         if threading.current_thread() is not self.control_thread:
@@ -6855,7 +7957,7 @@ class Controller:
         with self.lock:
             if token != self.epoch:
                 return
-            self._transition_state_locked("idle", detail, token)
+            self._transition_state_locked("manual_sleep_task2_done" if not str(detail).startswith("自动睡眠完成") else "auto_sleep_task2_done_resume_training", "sleep", "idle", detail, token)
             self.cancel_event.set()
             self.epoch += 1
         if release_keyboard:
@@ -6887,7 +7989,14 @@ class Controller:
             recent_errors = []
         capture_budget = self.resources.capture_snapshot()
         backend_status = self.resources.backend.snapshot()
-        return {"state": state, "frames": frames, "mouse": mouse, "session": session or "无", "recovery_pending": bool(self.recovery_pending), "recovery_reason": self.recovery_reason, "cpu": sample["cpu"], "memory": sample["memory"], "pool_size": pool_size, "pool_size_fast": pool_size, "pool_breakdown": breakdown, "model_count": model_count, "capacity": capacity, "resource": dict(sample), "gpu_name": self.resources.backend.name(), "backend": self.resources.backend.name(), "gpu_backend_status": backend_status, "recent_errors": recent_errors, "gpu": sample.get("gpu"), "gpu_total": sample.get("gpu_dedicated_total"), "gpu_used": sample.get("gpu_dedicated_used"), "gpu_free": sample.get("gpu_dedicated_free"), "gpu_batch_size": 0, "cpu_workers": capture_budget.cpu_workers, "capture_fps": 1.0 / max(0.001, capture_budget.next_interval), "capture_resolution": "{}×{}".format(*capture_budget.max_capture_resolution), "queue_age": sample.get("queue_age", 0.0), "pipeline_queue_age": sample.get("pipeline_queue_age", 0.0), "resource_state": capture_budget.state, "pause_reason": capture_budget.pause_reason or "无", "metric_sources": sample.get("metric_sources", {}), "ldplayer_cpu": sample.get("ldplayer_cpu", 0.0), "program_cpu": sample.get("process_cpu", 0.0), "program_gpu": sample.get("program_gpu"), "ldplayer_gpu": sample.get("ldplayer_gpu"), "gpu_sampling_source": sample.get("gpu_sampling_source", "不可用"), "disk_write_latency": sample.get("disk_write_latency"), "sqlite_latency": sample.get("sqlite_latency", 0.0)}
+        best_model = self.store.best_model() if self.store.conn else {}
+        client_rect, client_reason = self._validate_bound_target(require_cursor=False, require_foreground=False)
+        sleep_exit_condition = "任务2完成后空闲；任务1失败或任务2未完成时仅 ESC 可退出"
+        recording = state in ("learning", "training")
+        mouse_source_enabled = state == "training"
+        onnx_verified = bool(isinstance(best_model, dict) and best_model.get("onnx_policy_verified") is True)
+        info = {"state": state, "mode": state, "mode_reason": "状态机当前值", "sleep_exit_condition": sleep_exit_condition, "recording": recording, "mouse_source_enabled": mouse_source_enabled, "client_valid": client_rect is not None, "client_validity": "合法" if client_rect is not None else client_reason, "frames": frames, "mouse": mouse, "session": session or "无", "recovery_pending": bool(self.recovery_pending), "recovery_reason": self.recovery_reason, "cpu": sample["cpu"], "memory": sample["memory"], "pool_size": pool_size, "pool_size_fast": pool_size, "pool_breakdown": breakdown, "model_count": model_count, "current_model_onnx_verified": onnx_verified, "current_model_id": best_model.get("id", "") if isinstance(best_model, dict) else "", "capacity": capacity, "resource": dict(sample), "gpu_name": self.resources.backend.name(), "backend": self.resources.backend.name(), "gpu_backend_status": backend_status, "gpu_runtime_provider": backend_status.get("runtime_provider", "不可用"), "gpu_real_ready": bool(backend_status.get("runtime_ready")), "gpu_failure_reason": backend_status.get("gpu_failure_reason", ""), "recent_errors": recent_errors, "gpu": sample.get("gpu"), "gpu_total": sample.get("gpu_dedicated_total"), "gpu_used": sample.get("gpu_dedicated_used"), "gpu_free": sample.get("gpu_dedicated_free"), "gpu_batch_size": 0, "cpu_workers": capture_budget.cpu_workers, "capture_fps": 1.0 / max(0.001, capture_budget.next_interval), "capture_resolution": "{}×{}".format(*capture_budget.max_capture_resolution), "queue_age": sample.get("queue_age", 0.0), "pipeline_queue_age": sample.get("pipeline_queue_age", 0.0), "ui_heartbeat_jitter_ms": sample.get("ui_heartbeat_jitter_ms", 0.0), "resource_state": capture_budget.state, "pause_reason": capture_budget.pause_reason or "无", "metric_sources": sample.get("metric_sources", {}), "ldplayer_cpu": sample.get("ldplayer_cpu", 0.0), "program_cpu": sample.get("process_cpu", 0.0), "program_gpu": sample.get("program_gpu"), "ldplayer_gpu": sample.get("ldplayer_gpu"), "gpu_sampling_source": sample.get("gpu_sampling_source", "不可用"), "disk_write_latency": sample.get("disk_write_latency"), "sqlite_latency": sample.get("sqlite_latency", 0.0)}
+        return info
 
     def shutdown(self):
         self.request_idle("程序关闭")
@@ -6953,7 +8062,7 @@ def emulator_window_text(settings):
     path = str(settings.data.get("emulator_path", "") or "")
     if pid:
         return "PID {} · {}{}{}".format(pid, title or "无标题", chr(10), path)
-    return "未绑定；请点击按钮选择已打开的雷电模拟器窗口"
+    return "未绑定；请点击按钮选择已打开的目标窗口"
 
 class Panel:
     def __init__(self, root):
@@ -6989,6 +8098,21 @@ class Panel:
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(90, self.drain)
         self.root.after(1200, self.refresh_performance)
+        self.heartbeat_expected = time.monotonic() + 0.25
+        self.root.after(250, self.ui_heartbeat)
+
+    def ui_heartbeat(self):
+        try:
+            now = time.monotonic()
+            jitter_ms = max(0.0, (now - float(self.heartbeat_expected)) * 1000.0)
+            self.controller.resources.update_ui_heartbeat(jitter_ms)
+            self.heartbeat_expected = now + 0.25
+        except Exception:
+            pass
+        try:
+            self.root.after(250, self.ui_heartbeat)
+        except Exception:
+            pass
 
     def format_bytes(self, value):
         return "{:.2f} GB".format(float(value) / 1024 / 1024 / 1024)
@@ -7003,7 +8127,7 @@ class Panel:
         return item
 
     def build(self):
-        self.root.title("雷电智能学习与训练控制面板")
+        self.root.title("目标窗口智能学习与训练控制面板")
         wx1, wy1, wx2, wy2 = work_area_for_window(self.root)
         width = int(min(960, (wx2 - wx1) * 0.72))
         height = int(min(660, (wy2 - wy1) * 0.78))
@@ -7043,7 +8167,7 @@ class Panel:
         header = Frame(outer, bg="#101826")
         header.grid(row=0, column=0, sticky="ew")
         header.grid_columnconfigure(0, weight=1)
-        Label(header, text="雷电智能学习与训练控制面板", bg="#101826", fg="white", font=("Microsoft YaHei UI", 20, "bold")).grid(row=0, column=0, sticky="w")
+        Label(header, text="目标窗口智能学习与训练控制面板", bg="#101826", fg="white", font=("Microsoft YaHei UI", 20, "bold")).grid(row=0, column=0, sticky="w")
         Label(header, textvariable=self.mode_var, bg="#1e293b", fg="#f8fafc", font=("Microsoft YaHei UI", 10, "bold"), padx=12, pady=6).grid(row=0, column=1, sticky="e")
         rainbow = Canvas(outer, height=10, bg="#101826", highlightthickness=0, bd=0)
         rainbow.grid(row=1, column=0, sticky="ew", pady=(12, 16))
@@ -7061,7 +8185,7 @@ class Panel:
         body.grid(row=2, column=0, sticky="nsew")
         body.grid_columnconfigure(0, weight=1)
         body.grid_rowconfigure(0, weight=1)
-        labels = (("雷电模拟器窗口", self.emulator_window_var), ("存储路径", self.storage_var), ("经验池上限", self.experience_var), ("AI 模型数量上限", self.model_var))
+        labels = (("目标窗口", self.emulator_window_var), ("存储路径", self.storage_var), ("经验池上限", self.experience_var), ("AI 模型数量上限", self.model_var))
         colors = ("#ef4444", "#eab308", "#22c55e", "#06b6d4")
         commands = (self.choose_emulator_window, self.choose_storage, self.change_experience, self.change_models)
         texts = ("选择雷电模拟器窗口", "选择存储路径", "修改经验池上限", "修改AI模型数量上限")
@@ -7223,10 +8347,8 @@ class Panel:
             self.restore_panel()
             return False
         def continue_start():
-            started = self.controller.start_session(mode)
-            if not started:
-                self.status_var.set("未进入模式，请检查雷电实例选择和客户区状态。")
-                self.restore_panel()
+            self.controller.request_start_session(mode)
+            self.status_var.set("已投递进入模式请求，等待控制线程预检。")
         self.root.after(80, continue_start)
         return True
 
@@ -7240,7 +8362,7 @@ class Panel:
         if not self.protect_configuration(): return
         candidates = find_emulator_window_candidates(self.settings.data.get("emulator_path", ""))
         if not candidates:
-            messagebox.showwarning("未发现窗口", "未发现可见的雷电模拟器窗口。请先启动雷电模拟器窗口后再选择。", parent=self.root)
+            messagebox.showwarning("未发现窗口", "未发现可见的目标窗口。请先启动目标窗口后再选择。", parent=self.root)
             return
         choices = ["{}: PID {} · {} · {}".format(index + 1, item["pid"], item["title"] or "无标题", item.get("path", "")) for index, item in enumerate(candidates)]
         answer = simpledialog.askstring("选择雷电模拟器窗口", "请输入窗口编号：" + chr(10) + chr(10).join(choices), initialvalue="1" if len(candidates) == 1 else "", parent=self.root)
@@ -7285,10 +8407,13 @@ class Panel:
             return
         selected = filedialog.askdirectory(parent=self.root, title="选择存储路径", initialdir=self.settings.data["storage_path"])
         if selected:
-            self.settings.data["storage_path"] = selected
-            self.settings.save()
-            self.storage_var.set(selected)
-            self.status_var.set("已更新存储路径。")
+            try:
+                self.settings.migrate_storage_path(selected)
+            except Exception as error:
+                messagebox.showerror("迁移失败", "配置迁移到新存储路径失败：" + str(error), parent=self.root)
+                return
+            self.storage_var.set(self.settings.data["storage_path"])
+            self.status_var.set("已更新存储路径；settings.json 已迁移到该路径的 config 目录。")
 
     def change_experience(self):
         if not self.protect_configuration():
@@ -7352,7 +8477,7 @@ class Panel:
             moment = time.strftime("%m-%d %H:%M:%S", time.localtime(float(item.get("created", 0.0) or 0.0))) if isinstance(item, dict) else "未知时间"
             message = payload.get("message") or payload.get("error") or payload.get("reason") or str(payload)
             recent_error_lines.append("{} · {} · {}".format(moment, item.get("kind", "事件"), message))
-        rows = [("当前状态", info["state"]), ("本次会话", info["session"]), ("本次记录画面", str(info["frames"])), ("本次记录鼠标事件", str(info["mouse"])), ("本程序 CPU", number(info.get("program_cpu"), "%") + " · " + info.get("metric_sources", {}).get("本程序 CPU", "未知来源")), ("雷电 CPU", number(info.get("ldplayer_cpu"), "%") + " · " + info.get("metric_sources", {}).get("雷电 CPU", "未知来源")), ("策略执行后端", info.get("backend", "CPU 表格策略")), ("GPU 状态", gpu_state), ("ONNX Provider", str(provider)), ("ONNX Runtime Ready", "是" if backend_status.get("runtime_ready") else "否"), ("GPU 模型路径", str(backend_status.get("gpu_model_path") or "未加载")), ("GPU 失败原因", str(backend_status.get("gpu_failure_reason") or "无")), ("最近策略后端", str(backend_status.get("last_backend", info.get("backend", "CPU 表格策略")))), ("本程序 GPU 引擎", number(info.get("program_gpu"), "%") + " · " + info.get("gpu_sampling_source", "不可用")), ("雷电 GPU 引擎", number(info.get("ldplayer_gpu"), "%") + " · " + info.get("gpu_sampling_source", "不可用")), ("可用显存", "不可用" if info.get("gpu_free") is None else self.format_bytes(info.get("gpu_free", 0))), ("磁盘写入延迟", number(info.get("disk_write_latency"), " ms") + " · fsync 探针"), ("SQLite 写入延迟", number(info.get("sqlite_latency"), " ms") + " · 实际事务计时"), ("当前截图频率", "约 {:.2f} FPS".format(info.get("capture_fps", 0.0))), ("当前截图分辨率", info.get("capture_resolution", "未知")), ("鼠标队列年龄", "{:.2f} 秒".format(info.get("queue_age", 0.0))), ("流水线队列年龄", "{:.2f} 秒".format(info.get("pipeline_queue_age", 0.0))), ("当前资源状态", info.get("resource_state", "正常")), ("限速原因", info.get("pause_reason", "无")), ("经验池大小", self.format_bytes(info["pool_size"]) + "（容量账本；更多信息时已校验）"), ("容量阶段", "{}% 预警；事务预留 {}".format(capacity.get("tier", 0), self.format_bytes(capacity.get("transaction_reserve", 0)))), ("经验池硬状态", "已停止采集；{} / 目标 {}".format(self.format_bytes(capacity.get("remaining", 0)), self.format_bytes(capacity.get("target", 0))) if capacity.get("blocked") else "正常"), ("AI 模型数量", str(info["model_count"])), ("奖励定义", "reward = exact_screen_score - hunger"), ("雷电窗口路径", self.settings.data.get("emulator_path", "")), ("检索保障", "两阶段评分：LSH/哈希召回 → 灰度结构/颜色/局部变化精确距离 → 历史聚合相似度"), ("资源保护", "预算合同、in-flight 上限、字节预算、队列限速、降分辨率、SQLite/磁盘延迟监测、硬容量阻断"), ("最近 5 条关键错误", "无" if not recent_error_lines else "\n".join(recent_error_lines[:5]))]
+        rows = [("当前状态", info["state"]), ("当前模式", info.get("mode", info["state"])), ("进入原因", info.get("mode_reason", "状态机当前值")), ("退出条件", info.get("sleep_exit_condition", "按状态机规则")), ("客户区合法性", info.get("client_validity", "未知")), ("正在记录", "是" if info.get("recording") else "否"), ("鼠标来源区分", "启用" if info.get("mouse_source_enabled") else "未启用"), ("当前模型 ONNX 验证", "通过" if info.get("current_model_onnx_verified") else "未通过或未加载"), ("当前模型 ID", str(info.get("current_model_id") or "无")), ("UI 心跳抖动", "{:.1f} ms".format(float(info.get("ui_heartbeat_jitter_ms", 0.0) or 0.0))), ("GPU 真实参与", "是" if info.get("gpu_real_ready") else "否"), ("本次会话", info["session"]), ("本次记录画面", str(info["frames"])), ("本次记录鼠标事件", str(info["mouse"])), ("本程序 CPU", number(info.get("program_cpu"), "%") + " · " + info.get("metric_sources", {}).get("本程序 CPU", "未知来源")), ("目标进程 CPU", number(info.get("ldplayer_cpu"), "%") + " · " + info.get("metric_sources", {}).get("目标进程 CPU", "未知来源")), ("策略执行后端", info.get("backend", "CPU 表格策略")), ("GPU 状态", gpu_state), ("ONNX Provider", str(provider)), ("ONNX Runtime Ready", "是" if backend_status.get("runtime_ready") else "否"), ("GPU 模型路径", str(backend_status.get("gpu_model_path") or "未加载")), ("GPU 失败原因", str(backend_status.get("gpu_failure_reason") or "无")), ("最近策略后端", str(backend_status.get("last_backend", info.get("backend", "CPU 表格策略")))), ("本程序 GPU 引擎", number(info.get("program_gpu"), "%") + " · " + info.get("gpu_sampling_source", "不可用")), ("目标进程 GPU 引擎", number(info.get("ldplayer_gpu"), "%") + " · " + info.get("gpu_sampling_source", "不可用")), ("可用显存", "不可用" if info.get("gpu_free") is None else self.format_bytes(info.get("gpu_free", 0))), ("磁盘写入延迟", number(info.get("disk_write_latency"), " ms") + " · fsync 探针"), ("SQLite 写入延迟", number(info.get("sqlite_latency"), " ms") + " · 实际事务计时"), ("当前截图频率", "约 {:.2f} FPS".format(info.get("capture_fps", 0.0))), ("当前截图分辨率", info.get("capture_resolution", "未知")), ("鼠标队列年龄", "{:.2f} 秒".format(info.get("queue_age", 0.0))), ("流水线队列年龄", "{:.2f} 秒".format(info.get("pipeline_queue_age", 0.0))), ("当前资源状态", info.get("resource_state", "正常")), ("限速原因", info.get("pause_reason", "无")), ("经验池大小", self.format_bytes(info["pool_size"]) + "（容量账本；更多信息时已校验）"), ("容量阶段", "{}% 预警；事务预留 {}".format(capacity.get("tier", 0), self.format_bytes(capacity.get("transaction_reserve", 0)))), ("经验池硬状态", "已停止采集；{} / 目标 {}".format(self.format_bytes(capacity.get("remaining", 0)), self.format_bytes(capacity.get("target", 0))) if capacity.get("blocked") else "正常"), ("AI 模型数量", str(info["model_count"])), ("奖励定义", "reward = exact_screen_score - hunger"), ("目标窗口路径", self.settings.data.get("emulator_path", "")), ("检索保障", "两阶段评分：LSH/哈希召回 → 灰度结构/颜色/局部变化精确距离 → 历史聚合相似度"), ("资源保护", "预算合同、in-flight 上限、字节预算、队列限速、降分辨率、SQLite/磁盘延迟监测、硬容量阻断"), ("最近 5 条关键错误", "无" if not recent_error_lines else "\n".join(recent_error_lines[:5]))]
         for index, (name, value) in enumerate(rows):
             Label(content, text=name, bg="#f8fafc", fg="#475569", font=("Microsoft YaHei UI", 10, "bold"), anchor="w").grid(row=index, column=0, sticky="w", pady=5)
             Label(content, text=value, bg="#f8fafc", fg="#0f172a", font=("Microsoft YaHei UI", 10), anchor="w", wraplength=520, justify="left").grid(row=index, column=1, sticky="ew", padx=(18, 0), pady=5)
