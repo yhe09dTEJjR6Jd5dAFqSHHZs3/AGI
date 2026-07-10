@@ -1,6 +1,6 @@
 无注释。
 
-适配Linux、Windows、macOS。
+适配Linux和Windows。
 
 单文件启动→屏幕上出现控制面板→空闲；
 
